@@ -1,6 +1,6 @@
 {
   "name": "react-native-sync-provider",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "react-native-sync-provider",
   "main": "lib/commonjs/index",
   "module": "lib/module/index",
@@ -156,5 +156,9 @@
         }
       ]
     ]
+  },
+  "dependencies": {
+    "@react-native-community/netinfo": "^11.3.2",
+    "react-native-mmkv": "^2.12.2"
   }
 }
