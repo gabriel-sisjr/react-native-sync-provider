@@ -1,0 +1,23 @@
+{
+  "cxxNamespace": ["syncprovider"],
+  "ios": {
+    "iosModuleName": "SyncProvider"
+  },
+  "android": {
+    "androidNamespace": ["syncprovider"],
+    "androidCxxLibName": "syncprovider"
+  },
+  "autolinking": {
+    "SyncProvider": {
+      "ios": {
+        "language": "swift",
+        "implementationClassName": "SyncProvider"
+      },
+      "android": {
+        "language": "kotlin",
+        "implementationClassName": "SyncProvider"
+      }
+    }
+  },
+  "ignorePaths": ["node_modules"]
+}
