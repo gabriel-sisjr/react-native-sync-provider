@@ -1,0 +1,181 @@
+name: Bug Report
+description: "Report a bug in @gabriel-sisjr/react-native-sync-provider"
+title: "[Bug]: "
+labels:
+  - bug
+  - needs triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        # Bug report
+
+        Thanks for taking the time to file a bug. To help us reproduce and fix it quickly, please fill in **every required field** below.
+
+        Issues missing a reproduction or environment details may be closed without investigation.
+  - type: checkboxes
+    id: pre-flight
+    attributes:
+      label: Before submitting a new issue
+      description: Please perform these checks first.
+      options:
+        - label: I searched [existing issues](https://github.com/gabriel-sisjr/react-native-sync-provider/issues?q=is%3Aissue) and did not find a duplicate.
+          required: true
+        - label: I am using the latest version of `@gabriel-sisjr/react-native-sync-provider`.
+          required: true
+        - label: I read the [troubleshooting docs](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/troubleshooting) and the relevant API reference.
+          required: true
+  - type: input
+    id: library-version
+    attributes:
+      label: Library version
+      description: Version of `@gabriel-sisjr/react-native-sync-provider` you are running.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: react-native-version
+    attributes:
+      label: React Native version
+      description: Version of `react-native` in your app.
+      placeholder: "0.85.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      description: Which platform reproduces the bug?
+      options:
+        - iOS
+        - Android
+        - Both
+    validations:
+      required: true
+  - type: input
+    id: os-version
+    attributes:
+      label: OS version
+      description: OS version of the device or simulator/emulator where the bug reproduces.
+      placeholder: "iOS 17.4 / Android 14"
+    validations:
+      required: true
+  - type: dropdown
+    id: architecture-mode
+    attributes:
+      label: Architecture mode
+      description: Which React Native architecture is your app using?
+      options:
+        - New Architecture (Fabric)
+        - Old Architecture
+        - Not sure
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        ## Sync state at time of bug
+
+        The fields below describe the state of the sync queue when the bug occurred. They are optional but **strongly recommended** -- they often determine whether we can reproduce the issue.
+  - type: input
+    id: queue-size
+    attributes:
+      label: Queue size
+      description: How many items were in the sync queue when the bug occurred?
+      placeholder: "0"
+    validations:
+      required: false
+  - type: dropdown
+    id: connection-state
+    attributes:
+      label: Connection state
+      description: Connectivity state reported by the library when the bug occurred.
+      options:
+        - CONNECTED
+        - DISCONNECTED
+        - METERED
+        - UNKNOWN
+        - Not sure
+    validations:
+      required: false
+  - type: textarea
+    id: retry-policy
+    attributes:
+      label: Retry policy in use
+      description: Describe the `RetryPolicy` configuration in effect (`maxAttempts`, backoff strategy, `baseDelayMs`, `retryOnStatusCodes`, etc.).
+      render: ts
+      placeholder: |
+        const retryPolicy: RetryPolicy = {
+          maxAttempts: 5,
+          backoff: 'EXPONENTIAL',
+          baseDelayMs: 1000,
+          retryOnStatusCodes: [408, 429, 500, 502, 503, 504],
+        };
+    validations:
+      required: false
+  - type: dropdown
+    id: background-sync-enabled
+    attributes:
+      label: Background sync enabled
+      description: Is background dispatch (BGTaskScheduler / WorkManager) enabled in your configuration?
+      options:
+        - "Yes"
+        - "No"
+        - N/A
+    validations:
+      required: false
+  - type: textarea
+    id: bug-summary
+    attributes:
+      label: Bug summary
+      description: Clear, concise description of the bug. What is happening that should not be?
+    validations:
+      required: true
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Numbered list of steps -- include code snippets, configuration, and the actions you took.
+      value: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: actual-behavior
+    attributes:
+      label: Actual behavior
+      description: What actually happened? Include error codes (`SyncErrorCode.*`), messages, and any unexpected state transitions you observed.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / stack trace
+      description: Relevant logs, stack traces, or `adb logcat` / Xcode console output. Redact any sensitive data (URLs, tokens, payloads).
+      render: shell
+    validations:
+      required: false
+  - type: input
+    id: reproducible-example
+    attributes:
+      label: Reproducible example
+      description: Link to a minimal repository, Snack, or gist that reproduces the issue. Reports without a reproduction may be closed.
+      placeholder: "https://github.com/<you>/<repro>"
+    validations:
+      required: false
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Anything else we should know -- screenshots, related issues, network conditions, special configuration.
+    validations:
+      required: false
