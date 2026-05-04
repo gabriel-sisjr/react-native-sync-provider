@@ -85,6 +85,11 @@ android/generated
 # React Native Nitro Modules
 nitrogen/
 
+# Room schemas MUST be committed (do NOT ignore android/schemas/)
+# Explicit allowlist to defend against accidental future broad ignore rules.
+!android/schemas/
+!android/schemas/**
+
 # Claude
 .claude/
 CLAUDE.md

@@ -26,5 +26,6 @@
     "strict": true,
     "target": "ESNext",
     "verbatimModuleSyntax": true
-  }
+  },
+  "exclude": ["lib", "nitrogen", "example/node_modules", "node_modules"]
 }
