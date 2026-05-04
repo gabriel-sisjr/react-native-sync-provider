@@ -1,6 +1,10 @@
 buildscript {
   ext.SyncProvider = [
     kotlinVersion: "2.0.21",
+    // KSP is keyed `<kotlinVersion>-<ksp-revision>`. We auto-select a KSP
+    // revision compatible with whichever Kotlin version the host project
+    // forces — see the `resolveKspVersion` helper below.
+    kspVersion: "2.0.21-1.0.27",
     minSdkVersion: 24,
     compileSdkVersion: 36,
     targetSdkVersion: 36
@@ -17,12 +21,32 @@ buildscript {
   repositories {
     google()
     mavenCentral()
+    gradlePluginPortal()
   }
 
   dependencies {
+    def resolvedKotlinVersion = getExtOrDefault('kotlinVersion')
+    // KSP is keyed `<kotlinVersion>-<ksp-revision>`. Lookup table covering
+    // the Kotlin versions React Native ships with so the library compiles
+    // cleanly when the host app forces a newer Kotlin.
+    def kspVersionTable = [
+      "2.0.21": "2.0.21-1.0.27",
+      "2.1.0":  "2.1.0-1.0.29",
+      "2.1.10": "2.1.10-1.0.31",
+      "2.1.20": "2.1.20-2.0.0",
+      "2.1.21": "2.1.21-2.0.2",
+      "2.2.0":  "2.2.0-2.0.2",
+      "2.2.10": "2.2.10-2.0.3",
+      "2.2.20": "2.2.20-2.0.5",
+      "2.2.21": "2.2.21-2.0.5",
+    ]
+    def resolvedKspVersion = kspVersionTable.containsKey(resolvedKotlinVersion)
+      ? kspVersionTable[resolvedKotlinVersion]
+      : SyncProvider.kspVersion
     classpath "com.android.tools.build:gradle:8.7.2"
     // noinspection DifferentKotlinGradleVersion
-    classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:${getExtOrDefault('kotlinVersion')}"
+    classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:${resolvedKotlinVersion}"
+    classpath "com.google.devtools.ksp:com.google.devtools.ksp.gradle.plugin:${resolvedKspVersion}"
   }
 }
 
@@ -33,6 +57,7 @@ def reactNativeArchitectures() {
 
 apply plugin: "com.android.library"
 apply plugin: "kotlin-android"
+apply plugin: "com.google.devtools.ksp"
 apply from: '../nitrogen/generated/android/syncprovider+autolinking.gradle'
 
 apply plugin: "com.facebook.react"
@@ -45,6 +70,8 @@ android {
   defaultConfig {
     minSdkVersion getExtOrDefault("minSdkVersion")
     targetSdkVersion getExtOrDefault("targetSdkVersion")
+
+    consumerProguardFiles 'proguard-rules.pro'
 
     externalNativeBuild {
       cmake {
@@ -60,6 +87,16 @@ android {
             cppFlags "-O2"
           }
         }
+      }
+    }
+
+    javaCompileOptions {
+      annotationProcessorOptions {
+        arguments += [
+          "room.schemaLocation": "$projectDir/schemas".toString(),
+          "room.incremental": "true",
+          "room.expandProjection": "true"
+        ]
       }
     }
   }
@@ -107,12 +144,44 @@ android {
   }
 
   compileOptions {
-    sourceCompatibility JavaVersion.VERSION_1_8
-    targetCompatibility JavaVersion.VERSION_1_8
+    sourceCompatibility JavaVersion.VERSION_17
+    targetCompatibility JavaVersion.VERSION_17
   }
+
+  kotlinOptions {
+    jvmTarget = "17"
+  }
+}
+
+ksp {
+  arg("room.schemaLocation", "$projectDir/schemas")
+  arg("room.incremental", "true")
+  arg("room.generateKotlin", "true")
 }
 
 dependencies {
   implementation "com.facebook.react:react-android"
   implementation project(":react-native-nitro-modules")
+
+  // Kotlin Coroutines
+  implementation "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1"
+  implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1"
+
+  // Room (KSP) — 2.7.x is the floor for Kotlin 2.0+. 2.6.x's KSP processor
+  // throws "unexpected jvm signature V" on suspend `Unit` queries when paired
+  // with Kotlin 2.0.x metadata.
+  implementation "androidx.room:room-runtime:2.7.0"
+  implementation "androidx.room:room-ktx:2.7.0"
+  ksp "androidx.room:room-compiler:2.7.0"
+
+  // WorkManager
+  implementation "androidx.work:work-runtime-ktx:2.9.1"
+
+  // OkHttp
+  implementation "com.squareup.okhttp3:okhttp:4.12.0"
+  implementation "com.squareup.okhttp3:logging-interceptor:4.12.0"
+
+  // AndroidX
+  implementation "androidx.core:core-ktx:1.13.1"
+  implementation "androidx.startup:startup-runtime:1.1.1"
 }
