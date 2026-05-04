@@ -99,6 +99,27 @@ actor SyncDispatcher {
                                             delegateQueue: nil)
     }
 
+    /// Test-only initializer. Accepts pre-built foreground/background sessions
+    /// (typically a `URLSession` configured with a `URLProtocol` stub) so
+    /// XCTest cases can drive `dispatchOne`/`flush` without touching the
+    /// network. The background session is reused as-is — tests that don't
+    /// exercise background uploads should pass an idle `URLSession`.
+    internal init(storage: SyncQueueStorage,
+                  emitter: SyncEventEmitter,
+                  connectivity: ConnectivityMonitor,
+                  config: DispatcherConfig,
+                  foregroundSession: URLSession,
+                  backgroundSession: URLSession,
+                  backgroundDelegate: BackgroundURLSessionDelegate = BackgroundURLSessionDelegate()) {
+        self.storage = storage
+        self.emitter = emitter
+        self.connectivity = connectivity
+        self.config = config
+        self.foregroundSession = foregroundSession
+        self.backgroundSession = backgroundSession
+        self.backgroundDelegate = backgroundDelegate
+    }
+
     // MARK: - Configuration
 
     func updateConfig(_ newConfig: DispatcherConfig) {

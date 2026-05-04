@@ -48,6 +48,9 @@ final class CoreDataStack {
 
     /// Backing storage. Lazily loaded on the queue that asks for it.
     private(set) lazy var persistentContainer: NSPersistentContainer = {
+        if let injected = self.injectedContainer {
+            return injected
+        }
         let bundle = Self.resolveBundle()
         guard let modelURL = bundle.url(forResource: Self.modelName, withExtension: "momd"),
               let model = NSManagedObjectModel(contentsOf: modelURL) else {
@@ -95,7 +98,24 @@ final class CoreDataStack {
         return loadError
     }
 
-    private init() {}
+    /// Optional pre-built container injected via the test-only initializer.
+    /// When non-nil, the lazy `persistentContainer` short-circuits and returns
+    /// it instead of resolving the bundled `.momd`.
+    private let injectedContainer: NSPersistentContainer?
+
+    private init() {
+        self.injectedContainer = nil
+    }
+
+    /// Test-only initializer. Accepts a pre-loaded `NSPersistentContainer`
+    /// (typically backed by `NSInMemoryStoreType`) so XCTest cases can run
+    /// without touching disk or the bundled `.momd` resource.
+    ///
+    /// - Important: callers are responsible for invoking
+    ///   `loadPersistentStores` on the container before passing it in.
+    internal init(container: NSPersistentContainer) {
+        self.injectedContainer = container
+    }
 
     // MARK: - Background work
 
