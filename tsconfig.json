@@ -25,6 +25,8 @@
     "skipLibCheck": true,
     "strict": true,
     "target": "ESNext",
+    "types": ["jest", "node"],
     "verbatimModuleSyntax": true
-  }
+  },
+  "exclude": ["lib", "nitrogen", "example/node_modules", "node_modules"]
 }

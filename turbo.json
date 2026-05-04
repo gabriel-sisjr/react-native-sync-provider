@@ -3,19 +3,36 @@
   "globalDependencies": [".nvmrc", ".yarnrc.yml"],
   "globalEnv": ["NODE_ENV"],
   "tasks": {
+    "test": {
+      "env": ["NODE_ENV", "CI"],
+      "inputs": [
+        "package.json",
+        "yarn.lock",
+        "tsconfig.json",
+        "src/**",
+        "!src/**/__snapshots__/**"
+      ],
+      "outputs": ["coverage/**"]
+    },
     "build:android": {
       "env": ["ANDROID_HOME", "ORG_GRADLE_PROJECT_newArchEnabled"],
       "inputs": [
         "package.json",
+        "yarn.lock",
+        "nitro.json",
         "android",
         "!android/build",
+        "!android/.gradle",
+        "!android/.cxx",
         "src/*.ts",
         "src/*.tsx",
+        "src/**/*.nitro.ts",
         "example/package.json",
         "example/android",
         "!example/android/.gradle",
         "!example/android/build",
-        "!example/android/app/build"
+        "!example/android/app/build",
+        "!example/android/app/.cxx"
       ],
       "outputs": []
     },
@@ -28,14 +45,19 @@
       ],
       "inputs": [
         "package.json",
+        "yarn.lock",
+        "nitro.json",
         "*.podspec",
         "ios",
         "src/*.ts",
         "src/*.tsx",
+        "src/**/*.nitro.ts",
         "example/package.json",
         "example/ios",
         "!example/ios/build",
-        "!example/ios/Pods"
+        "!example/ios/Pods",
+        "!example/ios/**/*.xcuserstate",
+        "!example/ios/**/xcuserdata"
       ],
       "outputs": []
     }

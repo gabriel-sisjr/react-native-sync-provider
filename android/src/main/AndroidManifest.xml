@@ -1,2 +1,28 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+  <!-- Networking -->
+  <uses-permission android:name="android.permission.INTERNET" />
+  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+  <!-- Boot recovery: re-enqueue in-flight items after device restart -->
+  <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+  <application>
+    <!--
+      BootCompletedReceiver schedules RecoveryWorker so any item left in
+      "IN_FLIGHT" state from before the reboot is reset to "PENDING" and the
+      periodic flush worker is re-armed when the user previously enabled it.
+    -->
+    <receiver
+      android:name="com.margelo.nitro.syncprovider.work.BootCompletedReceiver"
+      android:enabled="true"
+      android:exported="true">
+      <intent-filter>
+        <action android:name="android.intent.action.BOOT_COMPLETED" />
+        <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+        <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+      </intent-filter>
+    </receiver>
+  </application>
+
 </manifest>

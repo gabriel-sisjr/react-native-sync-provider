@@ -2,6 +2,7 @@ import UIKit
 import React
 import React_RCTAppDelegate
 import ReactAppDependencyProvider
+import SyncProvider
 
 @main
 class AppDelegate: UIResponder, UIApplicationDelegate {
@@ -30,6 +31,19 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     )
 
     return true
+  }
+
+  // Forward background URLSession events to the SyncProvider library so
+  // queued uploads finished while the app was suspended can complete.
+  func application(
+    _ application: UIApplication,
+    handleEventsForBackgroundURLSession identifier: String,
+    completionHandler: @escaping () -> Void
+  ) {
+    SyncProvider.handleBackgroundURLSessionEvents(
+      identifier: identifier,
+      completionHandler: completionHandler
+    )
   }
 }
 
