@@ -61,6 +61,7 @@ apply plugin: "com.google.devtools.ksp"
 apply from: '../nitrogen/generated/android/syncprovider+autolinking.gradle'
 
 apply plugin: "com.facebook.react"
+apply plugin: "jacoco"
 
 android {
   namespace "com.margelo.nitro.syncprovider"
@@ -143,6 +144,13 @@ android {
     disable "GradleCompatible"
   }
 
+  testOptions {
+    unitTests {
+      includeAndroidResources = true
+      returnDefaultValues = true
+    }
+  }
+
   compileOptions {
     sourceCompatibility JavaVersion.VERSION_17
     targetCompatibility JavaVersion.VERSION_17
@@ -184,4 +192,55 @@ dependencies {
   // AndroidX
   implementation "androidx.core:core-ktx:1.13.1"
   implementation "androidx.startup:startup-runtime:1.1.1"
+
+  // ---------- Test dependencies ----------
+  testImplementation "junit:junit:4.13.2"
+  testImplementation "io.mockk:mockk:1.13.13"
+  testImplementation "io.mockk:mockk-agent-jvm:1.13.13"
+  testImplementation "org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1"
+  testImplementation "androidx.room:room-testing:2.7.0"
+  testImplementation "androidx.work:work-testing:2.9.1"
+  testImplementation "com.squareup.okhttp3:mockwebserver:4.12.0"
+  testImplementation "org.robolectric:robolectric:4.13"
+  testImplementation "androidx.test:core:1.6.1"
+  testImplementation "androidx.test:core-ktx:1.6.1"
+  testImplementation "androidx.test.ext:junit:1.2.1"
+  testImplementation "androidx.test.ext:junit-ktx:1.2.1"
+  testImplementation "androidx.arch.core:core-testing:2.2.0"
+  testImplementation "com.google.truth:truth:1.4.4"
+}
+
+jacoco {
+  toolVersion = "0.8.11"
+}
+
+tasks.withType(Test).configureEach {
+  jacoco {
+    includeNoLocationClasses = true
+    excludes = ['jdk.internal.*']
+  }
+}
+
+tasks.register('jacocoTestReport', JacocoReport) {
+  dependsOn 'testDebugUnitTest'
+  group = 'verification'
+  description = 'Generates Jacoco coverage report for the debug unit tests.'
+
+  reports {
+    xml.required.set(true)
+    html.required.set(true)
+    csv.required.set(false)
+  }
+
+  def fileFilter = [
+    '**/R.class', '**/R$*.class', '**/BuildConfig.*', '**/Manifest*.*',
+    '**/*Test*.*', 'android/**/*.*',
+    '**/com/margelo/nitro/syncprovider/Hybrid*.*',
+    'nitrogen/**/*.*',
+  ]
+  def kotlinTree = fileTree(dir: "${buildDir}/tmp/kotlin-classes/debug", excludes: fileFilter)
+  def javaTree = fileTree(dir: "${buildDir}/intermediates/javac/debug/classes", excludes: fileFilter)
+  classDirectories.setFrom(files([kotlinTree, javaTree]))
+  sourceDirectories.setFrom(files(['src/main/java', 'src/main/kotlin']))
+  executionData.setFrom(fileTree(dir: buildDir, includes: ['jacoco/testDebugUnitTest.exec']))
 }
