@@ -36,6 +36,19 @@ To invoke **Nitrogen**, use the following command:
 yarn nitrogen
 ```
 
+#### The Nitro workflow (CRITICAL)
+
+`src/SyncProvider.nitro.ts` is the single source of truth for the JS↔native contract. Both `ios/SyncProvider.swift` and `android/src/main/java/com/margelo/nitro/syncprovider/SyncProvider.kt` implement the regenerated `HybridSyncProviderSpec` base class — old method signatures will fail to compile after the spec changes.
+
+The full lifecycle for adding or changing a Nitro method:
+
+1. Edit the interface in `src/SyncProvider.nitro.ts`.
+2. Run `yarn nitrogen` (regenerates the Swift/Kotlin/C++ base classes — old impls break loudly).
+3. Implement the new method in **both** `ios/SyncProvider.swift` and `android/src/main/java/com/margelo/nitro/syncprovider/SyncProvider.kt`.
+4. Surface it in the JS facade by re-exporting from `src/index.tsx`. If the method needs platform-specific JS shims, add `src/<name>.native.tsx` and a throwing fallback in `src/<name>.tsx`.
+5. Run `yarn typecheck && yarn lint && yarn test`.
+6. Rebuild the example app (`yarn example android` / `ios`) — JS-only changes hot-reload, native changes need a rebuild.
+
 The [example app](/example/) demonstrates usage of the library. You need to run it to test any changes you make.
 
 It is configured to use the local version of the library, so any changes you make to the library's source code will be reflected in the example app. Changes to the library's JavaScript code will be reflected in the example app without a rebuild, but native code changes will require a rebuild of the example app.
