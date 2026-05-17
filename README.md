@@ -168,21 +168,29 @@ That's it. Force-close the app, toggle airplane mode on, enqueue more items via 
 
 ### Hooks
 
-| Hook                  | Returns                                                              |
-| --------------------- | -------------------------------------------------------------------- |
-| `useConnection()`     | `{ status, isOnline, isMetered, type }`                              |
-| `useSyncQueue()`      | `{ size, items, enqueue, enqueueBatch, removeItem, clear, refresh }` |
-| `useSyncStatus()`     | `{ isSyncing, lastResult, lastSyncAt, errorRate }`                   |
-| `useOfflineQueue()`   | `{ pendingCount, hasPending, oldest, newest }`                       |
-| `useSyncEvents(opts)` | Subscribe to typed sync events (started, completed, failed, …)       |
-| `useSyncConfig()`     | `{ config, configure, reset }`                                       |
-| `useAutoSync(opts)`   | Auto-flush on connection regain / interval / app foreground.         |
+| Hook                  | Returns                                                                                            |
+| --------------------- | -------------------------------------------------------------------------------------------------- |
+| `useConnection()`     | `{ status, type, isOnline, isMetered }`                                                            |
+| `useSyncQueue()`      | `{ size, items, isLoading, error, enqueue, enqueueBatch, removeItem, clearQueue, refresh }`        |
+| `useSyncStatus()`     | `{ isSyncing, isPaused, progress, lastResult, error, flush, pause, resume }`                       |
+| `useOfflineQueue()`   | `{ connection, size, items, isSyncing, isWaitingForConnection, error, enqueue, flush }`            |
+| `useSyncEvents(opts)` | `void` — subscribe to typed sync events (15 `SyncEventType`s) with optional filter.                |
+| `useSyncConfig()`     | `{ config, isLoading, error, setConfig, refresh }`                                                 |
+| `useAutoSync(opts)`   | `void` — orchestrator: periodic interval + reconnect flush + opt-in AppState foreground trigger.   |
+
+### Listener helpers
+
+| Symbol                                       | Purpose                                                                                |
+| -------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `addSyncEventListener(cb): Promise<string>`  | Subscribe to the `'sync-event'` channel; returns the subscription id.                  |
+| `removeSyncEventListener(id): Promise<void>` | Unsubscribe.                                                                           |
+| `SYNC_EVENT_CHANNEL` (`'sync-event'`)        | Channel constant for advanced consumers using the underlying Nitro `addListener` API.  |
 
 ### Types & enums
 
-`SyncItem`, `SyncOptions`, `SyncResult`, `SyncEvent`, `RetryPolicy`, `BackgroundSyncOptions`, `ConnectionState`, `ConnectionStatus`, `SyncStrategy`, `SyncPriority`, `SyncEventType`, `BackoffStrategy`, `SyncError`, `SyncErrorCode`.
+`SyncItem`, `SyncItemInput`, `SyncOptions`, `SyncResult`, `SyncEvent`, `RetryPolicy`, `BackgroundSyncOptions`, `ConnectionState`, `ConnectionStatus`, `ConnectionType`, `SyncStrategy`, `SyncPriority`, `SyncEventType`, `BackoffStrategy`, `HttpMethod`, `SyncError`, `SyncErrorCode`.
 
-Full reference will live at **<https://gabriel-sisjr.github.io/react-native-sync-provider>** once Phase 7 of the roadmap ships.
+Full reference is live at **<https://gabriel-sisjr.github.io/react-native-sync-provider/>**.
 
 ## How it compares
 
@@ -216,9 +224,22 @@ Use them independently or together — for example, pipe `useLocationUpdates()` 
 - Default batch size is `10`. Tunable via `configureSync({ batchSize })`.
 - Background dispatch on iOS uses `URLSessionConfiguration.background` so uploads continue if the OS suspends the app mid-flight.
 
+## Documentation
+
+Full reference is live at **<https://gabriel-sisjr.github.io/react-native-sync-provider/>**:
+
+- [Introduction](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/getting-started/introduction)
+- [Installation](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/getting-started/installation)
+- [Quick Start](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/getting-started/quick-start)
+- [iOS Setup](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/getting-started/ios-setup) · [Android Setup](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/getting-started/android-setup)
+- Guides: [Offline Queue](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/guides/offline-queue) · [Background Sync](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/guides/background-sync) · [Retry Policy](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/guides/retry-policy) · [Connectivity](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/guides/connectivity-detection) · [Error Handling](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/guides/error-handling) · [Priority & Ordering](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/guides/priority-and-ordering) · [Idempotency](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/guides/idempotency)
+- API: [Functions](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/functions) · [Hooks](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncQueue) · [Types](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/types) · [Enums](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/enums) · [Errors](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/errors)
+- Architecture: [Overview](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/architecture/overview) · [iOS](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/architecture/ios-native) · [Android](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/architecture/android-native)
+- [Troubleshooting](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/troubleshooting)
+
 ## Roadmap
 
-The **ALPHA VERSION** of library is being delivered in 9 phases.
+The **ALPHA VERSION** of library is being delivered iteratively toward `v0.1.0`.
 
 | Milestone | Deliverable                                         |
 | --------- | --------------------------------------------------- |
