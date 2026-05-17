@@ -1,0 +1,205 @@
+name: Pre-release to NPM
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to release from (default: develop)'
+        required: false
+        type: string
+        default: 'develop'
+      version_suffix:
+        description: 'Optional version suffix (e.g., "rc1", "beta1"). Leave empty for auto-generated beta version.'
+        required: false
+        type: string
+      description:
+        description: 'Optional description for this pre-release'
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prerelease:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      id-token: write
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.event.inputs.branch || 'develop' }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup
+        uses: ./.github/actions/setup
+
+      - name: Configure Git
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Setup NPM Authentication
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_TOKEN }}" > ~/.npmrc
+
+      - name: Generate pre-release version
+        id: version
+        run: |
+          CURRENT_VERSION=$(node -p "require('./package.json').version")
+          COMMIT_SHA=${GITHUB_SHA::7}
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+
+          # Remove any existing pre-release tag
+          BASE_VERSION=$(echo $CURRENT_VERSION | sed 's/-.*$//')
+
+          # Use custom suffix if provided, otherwise auto-generate beta version
+          if [ -n "${{ github.event.inputs.version_suffix }}" ]; then
+            PRERELEASE_VERSION="${BASE_VERSION}-${{ github.event.inputs.version_suffix }}"
+          else
+            PRERELEASE_VERSION="${BASE_VERSION}-beta.${TIMESTAMP}.${COMMIT_SHA}"
+          fi
+
+          echo "version=$PRERELEASE_VERSION" >> $GITHUB_OUTPUT
+          echo "Generated pre-release version: $PRERELEASE_VERSION"
+
+          # Update package.json version
+          npm version $PRERELEASE_VERSION --no-git-tag-version
+
+      # Nitro Modules require generated bindings before `yarn prepare` can run.
+      # The nitrogen/ directory is gitignored and bob's custom target only runs
+      # when triggered explicitly here (parity with ci.yml).
+      - name: Generate nitrogen code
+        run: yarn nitrogen
+
+      - name: Build package
+        run: yarn prepare
+
+      - name: Run tests
+        run: yarn test --coverage --maxWorkers=2
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-prerelease
+          path: |
+            coverage/**
+          if-no-files-found: warn
+
+      - name: Upload coverage reports to Codecov
+        if: always()
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          file: ./coverage/lcov.info
+          flags: prerelease
+          fail_ci_if_error: false
+
+      - name: Publish coverage summary
+        if: always()
+        run: |
+          if [ -f coverage/coverage-summary.json ]; then
+            echo "### Test Coverage" >> $GITHUB_STEP_SUMMARY
+            node -e '
+              const fs = require("fs");
+              const s = JSON.parse(fs.readFileSync("coverage/coverage-summary.json", "utf8"));
+              const t = s.total;
+              const row = (k,v)=>`| ${k} | ${v.pct}% | ${v.covered}/${v.total} |`;
+              console.log("| Metric | % | Covered/Total |\n|---|---:|---:|\n" +
+                [
+                  row("Statements", t.statements),
+                  row("Branches", t.branches),
+                  row("Functions", t.functions),
+                  row("Lines", t.lines)
+                ].join("\n")
+              );
+            ' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No coverage summary found." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Publish to NPM (beta tag)
+        run: |
+          npm publish --access public --tag beta --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create Pre-release Tag
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          git add package.json
+          git commit -m "chore: pre-release $VERSION [skip ci]"
+          git tag -a "v$VERSION" -m "Pre-release v$VERSION"
+          git push origin "v$VERSION"
+
+      - name: Create GitHub Pre-release
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const version = '${{ steps.version.outputs.version }}';
+            const tagName = `v${version}`;
+
+            const description = '${{ github.event.inputs.description }}' || 'This is a beta release from the develop branch.';
+
+            await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tagName,
+              name: `Pre-release ${tagName}`,
+              body: `Pre-release version ${version}\n\n` +
+                    `${description}\n\n` +
+                    `Install with: \`npm install @gabriel-sisjr/react-native-sync-provider@beta\`\n\n` +
+                    `Commit: ${context.sha}`,
+              draft: false,
+              prerelease: true
+            });
+
+      - name: Comment on related PRs
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const version = '${{ steps.version.outputs.version }}';
+
+            // Find PRs that were just merged
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'closed',
+              base: 'develop',
+              sort: 'updated',
+              direction: 'desc',
+              per_page: 5
+            });
+
+            const recentlyMergedPRs = prs.filter(pr => {
+              const mergedAt = new Date(pr.merged_at);
+              const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+              return pr.merged_at && mergedAt > fiveMinutesAgo;
+            });
+
+            for (const pr of recentlyMergedPRs) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                body: `A pre-release version has been published: **v${version}**\n\n` +
+                      `You can install it with:\n` +
+                      `\`\`\`bash\n` +
+                      `npm install @gabriel-sisjr/react-native-sync-provider@beta\n` +
+                      `# or\n` +
+                      `yarn add @gabriel-sisjr/react-native-sync-provider@beta\n` +
+                      `\`\`\`\n\n` +
+                      `This version includes your changes and is available for testing!`
+              });
+            }

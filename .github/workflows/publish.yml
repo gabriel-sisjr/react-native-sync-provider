@@ -1,0 +1,214 @@
+name: Publish to NPM
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      id-token: write
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup
+        uses: ./.github/actions/setup
+
+      - name: Configure Git
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Setup NPM Authentication
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_TOKEN }}" > ~/.npmrc
+
+      - name: Check if version changed
+        id: version-check
+        run: |
+          CURRENT_VERSION=$(node -p "require('./package.json').version")
+
+          # Get the last published version from npm
+          PUBLISHED_VERSION=$(npm view @gabriel-sisjr/react-native-sync-provider version 2>/dev/null || echo "0.0.0")
+
+          echo "Current version: $CURRENT_VERSION"
+          echo "Published version: $PUBLISHED_VERSION"
+
+          if [ "$CURRENT_VERSION" = "$PUBLISHED_VERSION" ]; then
+            echo "version_changed=false" >> $GITHUB_OUTPUT
+            echo "Version has not changed. Skipping publish."
+          else
+            echo "version_changed=true" >> $GITHUB_OUTPUT
+            echo "New version detected. Proceeding with publish."
+          fi
+
+      # Nitro Modules require generated bindings before `yarn prepare` can run.
+      # The nitrogen/ directory is gitignored and bob's custom target only runs
+      # when triggered explicitly here (parity with ci.yml).
+      - name: Generate nitrogen code
+        if: steps.version-check.outputs.version_changed == 'true'
+        run: yarn nitrogen
+
+      - name: Build package
+        if: steps.version-check.outputs.version_changed == 'true'
+        run: yarn prepare
+
+      - name: Run tests
+        if: steps.version-check.outputs.version_changed == 'true'
+        run: yarn test --coverage --maxWorkers=2
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-release
+          path: |
+            coverage/**
+          if-no-files-found: warn
+
+      - name: Upload coverage reports to Codecov
+        if: always()
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          file: ./coverage/lcov.info
+          flags: release
+          fail_ci_if_error: false
+
+      - name: Publish coverage summary
+        if: always()
+        run: |
+          if [ -f coverage/coverage-summary.json ]; then
+            echo "### Test Coverage" >> $GITHUB_STEP_SUMMARY
+            node -e '
+              const fs = require("fs");
+              const s = JSON.parse(fs.readFileSync("coverage/coverage-summary.json", "utf8"));
+              const t = s.total;
+              const row = (k,v)=>`| ${k} | ${v.pct}% | ${v.covered}/${v.total} |`;
+              console.log("| Metric | % | Covered/Total |\n|---|---:|---:|\n" +
+                [
+                  row("Statements", t.statements),
+                  row("Branches", t.branches),
+                  row("Functions", t.functions),
+                  row("Lines", t.lines)
+                ].join("\n")
+              );
+            ' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No coverage summary found." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Publish to NPM
+        if: steps.version-check.outputs.version_changed == 'true'
+        run: |
+          npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create Git Tag
+        if: steps.version-check.outputs.version_changed == 'true'
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          git tag -a "v$VERSION" -m "Release v$VERSION"
+          git push origin "v$VERSION"
+
+      - name: Create GitHub Release
+        if: steps.version-check.outputs.version_changed == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const version = require('./package.json').version;
+            const tagName = `v${version}`;
+
+            // Generate release notes from commits since last tag
+            let releaseNotes = '';
+            try {
+              const { data: tags } = await github.rest.repos.listTags({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 2
+              });
+
+              if (tags.length > 0) {
+                const latestTag = tags[0].name;
+                const { data: comparison } = await github.rest.repos.compareCommits({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  base: tags[1]?.name || tags[0].commit.sha,
+                  head: latestTag
+                });
+
+                releaseNotes = comparison.commits
+                  .map(commit => `- ${commit.commit.message.split('\n')[0]} (${commit.sha.substring(0, 7)})`)
+                  .join('\n');
+              }
+            } catch (error) {
+              console.log('Could not generate release notes:', error.message);
+              releaseNotes = 'See CHANGELOG.md for details.';
+            }
+
+            await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tagName,
+              name: `Release ${tagName}`,
+              body: releaseNotes || `Release version ${version}`,
+              draft: false,
+              prerelease: false
+            });
+
+      - name: Comment on related PRs
+        if: steps.version-check.outputs.version_changed == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const version = require('./package.json').version;
+            // Find PRs that were just merged into main
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'closed',
+              base: 'main',
+              sort: 'updated',
+              direction: 'desc',
+              per_page: 5
+            });
+
+            const recentlyMergedPRs = prs.filter(pr => {
+              const mergedAt = new Date(pr.merged_at);
+              const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+              return pr.merged_at && mergedAt > fiveMinutesAgo;
+            });
+
+            for (const pr of recentlyMergedPRs) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                body: `A release has been published: **v${version}**\n\n` +
+                      `Install with:\n` +
+                      "```bash\n" +
+                      `npm install @gabriel-sisjr/react-native-sync-provider@${version}\n` +
+                      `# or\n` +
+                      `yarn add @gabriel-sisjr/react-native-sync-provider@${version}\n` +
+                      "```\n\n" +
+                      `This version includes your changes and is available for installation!`
+              });
+            }
