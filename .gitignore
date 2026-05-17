@@ -93,6 +93,11 @@ nitrogen/
 !android/schemas/
 !android/schemas/**
 
+# Docusaurus
+website/.docusaurus
+website/build
+website/node_modules
+
 # Claude
 .claude/
 CLAUDE.md

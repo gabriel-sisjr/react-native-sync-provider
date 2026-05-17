@@ -46,7 +46,11 @@
     "nitrogen": "nitrogen",
     "typecheck": "tsc",
     "lint": "eslint \"**/*.{js,ts,tsx}\"",
-    "test": "jest"
+    "test": "jest",
+    "docs:dev": "yarn workspace react-native-sync-provider-website start",
+    "docs:build": "yarn workspace react-native-sync-provider-website build",
+    "docs:serve": "yarn workspace react-native-sync-provider-website serve",
+    "docs:clear": "yarn workspace react-native-sync-provider-website clear"
   },
   "keywords": [
     "react-native",
@@ -145,7 +149,8 @@
     }
   },
   "workspaces": [
-    "example"
+    "example",
+    "website"
   ],
   "packageManager": "yarn@4.11.0",
   "react-native-builder-bob": {
