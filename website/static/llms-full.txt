@@ -1,0 +1,499 @@
+# React Native Sync Provider — Full API Reference
+
+> Cross-platform React Native Nitro Module that turns every HTTP request into a durable, offline-first job with native persistence and OS-scheduled background sync.
+> npm: @gabriel-sisjr/react-native-sync-provider
+> Documentation: https://gabriel-sisjr.github.io/react-native-sync-provider/
+
+## Installation
+
+```bash
+yarn add @gabriel-sisjr/react-native-sync-provider react-native-nitro-modules
+# or
+npm install @gabriel-sisjr/react-native-sync-provider react-native-nitro-modules
+```
+
+Optional peers (recommended):
+
+```bash
+yarn add @react-native-community/netinfo react-native-mmkv
+```
+
+Requirements:
+- React Native >= 0.74.0 with the New Architecture (Fabric + concurrent root) enabled.
+- React >= 18.2.0.
+- react-native-nitro-modules ^0.35.6.
+- Android: minSdk 24, targetSdk 36, Kotlin 2.0+.
+- iOS: 15+. Background Modes capability with `fetch` and `processing` selected.
+
+iOS post-install:
+
+```bash
+cd ios && bundle exec pod install
+```
+
+## Quick Start
+
+```typescript
+import {
+  SyncProvider,
+  useSyncQueue,
+  useSyncStatus,
+  useAutoSync,
+  type SyncOptions,
+} from '@gabriel-sisjr/react-native-sync-provider';
+
+const options: SyncOptions = {
+  strategy: 'AUTOMATIC',
+  requestTimeoutMs: 30_000,
+  maxQueueSize: 10_000,
+  persistResults: true,
+  historyLimit: 100,
+  retryPolicy: {
+    maxAttempts: 5,
+    backoff: 'EXPONENTIAL',
+    baseDelayMs: 1_000,
+    maxDelayMs: 60_000,
+    jitter: true,
+    retryOnStatusCodes: [408, 425, 429, 500, 502, 503, 504],
+  },
+};
+
+function Outbox() {
+  useAutoSync({ flushOnReconnect: true, flushOnFocus: true });
+  const { items, enqueue, remove, clear } = useSyncQueue();
+  const { lastResult, isSyncing } = useSyncStatus();
+
+  return (
+    <View>
+      <Text>Pending: {items.length}</Text>
+      <Text>Last flush ok: {lastResult?.successCount ?? 0}</Text>
+      <Text>Syncing: {String(isSyncing)}</Text>
+      <Button
+        title="Send event"
+        onPress={() =>
+          enqueue({
+            method: 'POST',
+            url: 'https://api.example.com/events',
+            contentType: 'application/json',
+            body: JSON.stringify({ kind: 'login' }),
+            idempotencyKey: 'login-2026-05-05',
+          })
+        }
+      />
+    </View>
+  );
+}
+
+export default function App() {
+  return (
+    <SyncProvider options={options}>
+      <Outbox />
+    </SyncProvider>
+  );
+}
+```
+
+## Queue Functions
+
+### enqueue
+
+```typescript
+function enqueue(item: SyncItemInput): Promise<string>;
+```
+
+Persists a single request and returns its assigned ULID. The native layer assigns `id` and `createdAt`. Throws SyncError with code QUEUE_FULL, INVALID_PAYLOAD, or INVALID_URL.
+
+### enqueueBatch
+
+```typescript
+function enqueueBatch(items: SyncItemInput[]): Promise<string[]>;
+```
+
+Atomic batch enqueue. All items are persisted together or none are. Returns ULIDs parallel to the input array.
+
+### removeItem
+
+```typescript
+function removeItem(id: string): Promise<boolean>;
+```
+
+Removes a pending item by ULID. Returns `true` on success, `false` if no item with that id exists.
+
+### clearQueue
+
+```typescript
+function clearQueue(): Promise<void>;
+```
+
+Drops every pending item. Does not affect history.
+
+### getQueueSize
+
+```typescript
+function getQueueSize(): Promise<number>;
+```
+
+### getPendingItems
+
+```typescript
+function getPendingItems(): Promise<SyncItem[]>;
+```
+
+Returns pending items in dispatch order with `id`, `createdAt`, `attemptCount`, and optional `lastAttemptAt` / `lastErrorCode` populated.
+
+## Sync Functions
+
+### flush
+
+```typescript
+function flush(): Promise<SyncResult>;
+```
+
+Forces a flush cycle. Returns the cycle outcome. May throw SyncError with NETWORK_ERROR, SERVER_ERROR, TIMEOUT, MAX_ATTEMPTS_EXCEEDED, or UNAUTHORIZED. Per-item failures are also surfaced via `result.errors`.
+
+### pauseSync / resumeSync
+
+```typescript
+function pauseSync(): Promise<void>;
+function resumeSync(): Promise<void>;
+```
+
+Pause the dispatcher (enqueues still accepted). Resume schedules a flush if strategy is AUTOMATIC and items are pending.
+
+### isSyncing
+
+```typescript
+function isSyncing(): Promise<boolean>;
+```
+
+## Configuration Functions
+
+### configureSync
+
+```typescript
+function configureSync(options: SyncOptions): Promise<void>;
+```
+
+Replaces the active config. Takes effect on the next flush cycle; in-flight requests honor the previous config.
+
+### getSyncConfig
+
+```typescript
+function getSyncConfig(): Promise<SyncOptions>;
+```
+
+## History Functions
+
+### getLastSyncResult
+
+```typescript
+function getLastSyncResult(): Promise<SyncResult | undefined>;
+```
+
+JS facade returns `undefined` when no flush has run; the underlying spec returns a sentinel with `startedAt === 0`.
+
+### getSyncHistory
+
+```typescript
+function getSyncHistory(limit?: number): Promise<SyncResult[]>;
+```
+
+Returns persisted results, most recent first. `0` (or omitted) means no limit.
+
+### clearSyncHistory
+
+```typescript
+function clearSyncHistory(): Promise<void>;
+```
+
+## Connection
+
+### getConnectionStatus
+
+```typescript
+function getConnectionStatus(): Promise<ConnectionState>;
+```
+
+## Background Sync
+
+### enableBackgroundSync
+
+```typescript
+function enableBackgroundSync(options: BackgroundSyncOptions): Promise<void>;
+```
+
+Registers the OS-level periodic task (`BGTaskScheduler` on iOS, `WorkManager` on Android). May throw BACKGROUND_TASK_REGISTRATION_FAILED or NATIVE_MODULE_UNAVAILABLE.
+
+### disableBackgroundSync / isBackgroundSyncEnabled
+
+```typescript
+function disableBackgroundSync(): Promise<void>;
+function isBackgroundSyncEnabled(): Promise<boolean>;
+```
+
+## Events
+
+### addListener / removeListener
+
+```typescript
+function addListener(
+  event: 'sync-event',
+  callback: (event: SyncEvent) => void
+): Promise<string>;
+
+function removeListener(
+  event: 'sync-event',
+  subscriptionId: string
+): Promise<void>;
+```
+
+The only supported channel today is `'sync-event'`. The native layer validates the channel name and throws INVALID_PAYLOAD on unknown values.
+
+## React Hooks
+
+### useConnection
+
+```typescript
+function useConnection(): { state: ConnectionState; isLoading: boolean };
+```
+
+Live ConnectionState that reacts to OS connectivity changes via the `CONNECTION_CHANGED` event.
+
+### useSyncQueue
+
+```typescript
+function useSyncQueue(): {
+  items: SyncItem[];
+  enqueue(input: SyncItemInput): Promise<string>;
+  enqueueBatch(inputs: SyncItemInput[]): Promise<string[]>;
+  remove(id: string): Promise<boolean>;
+  clear(): Promise<void>;
+  refresh(): Promise<void>;
+  isLoading: boolean;
+  error: SyncError | null;
+};
+```
+
+### useSyncStatus
+
+```typescript
+function useSyncStatus(): {
+  isSyncing: boolean;
+  lastResult: SyncResult | undefined;
+  history(limit?: number): Promise<SyncResult[]>;
+  clearHistory(): Promise<void>;
+  refresh(): Promise<void>;
+};
+```
+
+### useOfflineQueue
+
+```typescript
+function useOfflineQueue(): {
+  isOffline: boolean;
+  isPaused: boolean;
+  pendingCount: number;
+};
+```
+
+Pauses dispatch automatically when connectivity drops and resumes (with a flush) on reconnect.
+
+### useSyncEvents
+
+```typescript
+function useSyncEvents(handler: (event: SyncEvent) => void): void;
+```
+
+Subscribes to the `sync-event` channel for the lifetime of the component. Unsubscribes on unmount.
+
+### useSyncConfig
+
+```typescript
+function useSyncConfig(): {
+  config: SyncOptions | undefined;
+  update(next: SyncOptions): Promise<void>;
+  isLoading: boolean;
+};
+```
+
+### useAutoSync
+
+```typescript
+function useAutoSync(options?: {
+  flushOnFocus?: boolean;          // default: true
+  flushOnReconnect?: boolean;      // default: true
+  intervalMs?: number;             // optional periodic flush from JS
+}): void;
+```
+
+## Context
+
+### SyncProvider
+
+```typescript
+<SyncProvider options={syncOptions}>
+  <App />
+</SyncProvider>
+```
+
+Wraps the app, calls `configureSync(options)` on mount, exposes the singleton hybrid object via React context, and is the required ancestor for every hook in this library.
+
+## Types
+
+### SyncItemInput
+
+```typescript
+interface SyncItemInput {
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+  url: string;                          // absolute http(s)
+  headers?: Record<string, string>;
+  body?: string;                        // pre-serialized
+  contentType?: string;                 // e.g. 'application/json'
+  priority?: number;                    // higher dispatched first
+  idempotencyKey?: string;              // dedupe + safe-replay key
+  metadata?: Record<string, string>;    // user-defined tags
+}
+```
+
+### SyncItem
+
+```typescript
+interface SyncItem extends SyncItemInput {
+  id: string;                           // ULID, native-assigned
+  createdAt: number;                    // epoch ms
+  attemptCount: number;
+  lastAttemptAt?: number;
+  lastErrorCode?: SyncErrorCode;
+}
+```
+
+### SyncOptions
+
+```typescript
+interface SyncOptions {
+  strategy: SyncStrategy;
+  retryPolicy: RetryPolicy;
+  requestTimeoutMs: number;
+  maxQueueSize: number;
+  persistResults: boolean;
+  historyLimit: number;
+  defaultHeaders?: Record<string, string>;
+  defaultPriority?: number;
+}
+```
+
+### RetryPolicy
+
+```typescript
+interface RetryPolicy {
+  maxAttempts: number;
+  backoff: BackoffStrategy;
+  baseDelayMs: number;
+  maxDelayMs: number;
+  jitter: boolean;
+  retryOnStatusCodes: number[];
+}
+```
+
+### SyncResult
+
+```typescript
+interface SyncResult {
+  startedAt: number;                    // epoch ms (0 = sentinel)
+  finishedAt: number;                   // epoch ms (0 = sentinel)
+  attemptedCount: number;
+  successCount: number;
+  failureCount: number;
+  errors: Array<{
+    itemId: string;
+    code: SyncErrorCode;
+    message: string;
+    statusCode?: number;
+  }>;
+}
+```
+
+### BackgroundSyncOptions
+
+```typescript
+interface BackgroundSyncOptions {
+  minimumIntervalMs: number;            // OS may schedule less often
+  requiresUnmeteredNetwork?: boolean;
+  requiresCharging?: boolean;
+  requiresDeviceIdle?: boolean;
+}
+```
+
+### ConnectionState
+
+```typescript
+interface ConnectionState {
+  status: ConnectionStatus;
+  type: ConnectionType;
+  isInternetReachable: boolean;
+}
+```
+
+### SyncEvent (discriminated union)
+
+```typescript
+type SyncEvent =
+  | { type: 'ITEM_ADDED';        itemId: string }
+  | { type: 'ITEM_REMOVED';      itemId: string }
+  | { type: 'FLUSH_STARTED';     pendingCount: number }
+  | { type: 'ITEM_DISPATCHED';   itemId: string; attempt: number }
+  | { type: 'ITEM_SUCCEEDED';    itemId: string; statusCode: number }
+  | { type: 'ITEM_FAILED';       itemId: string; errorCode: SyncErrorCode; statusCode?: number; willRetry: boolean }
+  | { type: 'ITEM_RETRYING';     itemId: string; attempt: number; nextAttemptAt: number }
+  | { type: 'FLUSH_COMPLETED';   result: SyncResult }
+  | { type: 'CONNECTION_CHANGED';state: ConnectionState }
+  | { type: 'CONFIG_CHANGED';    config: SyncOptions };
+```
+
+## Enums
+
+### SyncStrategy
+- `MANUAL` — Only `flush()` triggers dispatch.
+- `AUTOMATIC` — Library schedules flushes after enqueue, on reconnect, on resume.
+- `BACKGROUND` — Same as AUTOMATIC plus OS-scheduled background work.
+
+### BackoffStrategy
+- `LINEAR` — `delay = baseDelayMs * attempt` (capped at `maxDelayMs`).
+- `EXPONENTIAL` — `delay = baseDelayMs * 2^(attempt-1)` (capped at `maxDelayMs`).
+
+### SyncEventType
+`ITEM_ADDED`, `ITEM_REMOVED`, `FLUSH_STARTED`, `ITEM_DISPATCHED`, `ITEM_SUCCEEDED`, `ITEM_FAILED`, `ITEM_RETRYING`, `FLUSH_COMPLETED`, `CONNECTION_CHANGED`, `CONFIG_CHANGED`.
+
+### ConnectionStatus
+`CONNECTED`, `DISCONNECTED`, `UNKNOWN`.
+
+### ConnectionType
+`WIFI`, `CELLULAR`, `ETHERNET`, `NONE`, `UNKNOWN`.
+
+### SyncErrorCode
+- `QUEUE_FULL` — Refused enqueue; capacity at `maxQueueSize`.
+- `INVALID_PAYLOAD` — Item shape invalid (missing field, bad type, unknown channel).
+- `INVALID_URL` — `url` is not an absolute http(s) URL.
+- `NETWORK_ERROR` — Transport-level failure (DNS, TLS, socket).
+- `SERVER_ERROR` — Non-retriable server status.
+- `TIMEOUT` — Request exceeded `requestTimeoutMs`.
+- `MAX_ATTEMPTS_EXCEEDED` — Item exhausted its retry budget.
+- `UNAUTHORIZED` — 401 / 403 response.
+- `BACKGROUND_TASK_REGISTRATION_FAILED` — OS rejected `enableBackgroundSync`.
+- `NATIVE_MODULE_UNAVAILABLE` — `BGTaskScheduler` / `WorkManager` not available.
+- `ITEM_NOT_FOUND` — Operation referenced an unknown id.
+- `INVALID_CONFIG` — `SyncOptions` failed validation.
+- `PERSISTENCE_FAILURE` — Core Data / Room I/O failed.
+- `UNKNOWN` — Unclassified native error.
+
+## Platform Support
+
+| Feature                | iOS                             | Android                                  |
+|------------------------|---------------------------------|------------------------------------------|
+| Persistence            | Core Data                       | Room                                     |
+| Background sync        | BGTaskScheduler (`processing`)  | WorkManager (`PeriodicWorkRequest`)      |
+| Foreground dispatcher  | URLSession (background config)  | OkHttp + Coroutines                      |
+| Connectivity           | NWPathMonitor                   | ConnectivityManager + NetworkCallback    |
+| Boot recovery          | OS task replay                  | BootCompletedReceiver + WorkManager      |
+| Privacy Manifest       | Required (PrivacyInfo.xcprivacy)| n/a                                      |
+| Min OS                 | iOS 15                          | Android 7.0 (API 24)                     |
