@@ -14,10 +14,6 @@ Example React Native application demonstrating `@gabriel-sisjr/react-native-sync
 
 ## Screenshots
 
-| Queue                                    | History                                      | Config                                     |
-| ---------------------------------------- | -------------------------------------------- | ------------------------------------------ |
-| ![Queue screen](./screenshots/queue.png) | ![History screen](./screenshots/history.png) | ![Config screen](./screenshots/config.png) |
-
 > Screenshots are placeholders -- capture them from a real device/simulator after running the demo.
 
 ## Running the Example
