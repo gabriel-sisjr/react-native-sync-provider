@@ -7,7 +7,6 @@ import {
   Text,
   View,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
 import type { ListRenderItem } from 'react-native';
 import {
   HttpMethod,
@@ -132,7 +131,7 @@ export function QueueScreen(): React.ReactElement {
   );
 
   return (
-    <SafeAreaView style={styles.container} edges={['top']}>
+    <View style={styles.container}>
       <FlatList
         data={queue.items}
         keyExtractor={keyExtractor}
@@ -213,6 +212,6 @@ export function QueueScreen(): React.ReactElement {
           ) : undefined
         }
       />
-    </SafeAreaView>
+    </View>
   );
 }

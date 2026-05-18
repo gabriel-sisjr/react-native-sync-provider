@@ -10,10 +10,11 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
 import {
   BackoffStrategy,
   SyncStrategy,
+  disableBackgroundSync,
+  enableBackgroundSync,
   isBackgroundSyncEnabled,
   useAutoSync,
   useSyncConfig,
@@ -234,15 +235,11 @@ export function ConfigScreen(): React.ReactElement {
     setBackgroundEnabled(next);
     try {
       if (next) {
-        const { enableBackgroundSync } =
-          await import('@gabriel-sisjr/react-native-sync-provider');
         await enableBackgroundSync({
           minimumIntervalMs: 15 * 60 * 1000,
           requiresUnmeteredNetwork: true,
         });
       } else {
-        const { disableBackgroundSync } =
-          await import('@gabriel-sisjr/react-native-sync-provider');
         await disableBackgroundSync();
       }
     } catch (err) {
@@ -258,7 +255,7 @@ export function ConfigScreen(): React.ReactElement {
   }, [savedAt]);
 
   return (
-    <SafeAreaView style={styles.container} edges={['top']}>
+    <View style={styles.container}>
       <ScrollView
         style={styles.scrollView}
         contentContainerStyle={styles.content}
@@ -450,6 +447,6 @@ export function ConfigScreen(): React.ReactElement {
           </View>
         </View>
       </ScrollView>
-    </SafeAreaView>
+    </View>
   );
 }

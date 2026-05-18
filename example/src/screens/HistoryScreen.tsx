@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Alert, Button, FlatList, Text, View } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
 import type { ListRenderItem } from 'react-native';
 import {
   SyncEventType,
@@ -114,7 +113,7 @@ export function HistoryScreen(): React.ReactElement {
   }, [lastResult]);
 
   return (
-    <SafeAreaView style={styles.container} edges={['top']}>
+    <View style={styles.container}>
       <FlatList
         data={history}
         keyExtractor={keyExtractor}
@@ -156,6 +155,6 @@ export function HistoryScreen(): React.ReactElement {
           ) : undefined
         }
       />
-    </SafeAreaView>
+    </View>
   );
 }
