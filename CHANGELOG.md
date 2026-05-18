@@ -7,7 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 > **Pre-1.0 notice:** while the library is on `0.x`, minor version bumps (`0.x.0`) may include breaking changes. Every breaking change is summarized in [`BREAKING_CHANGES.md`](./BREAKING_CHANGES.md) and ships with a dedicated migration guide under `website/docs/migration/`.
 
-## [Unreleased]
+## v0.1.0 - 2025-05-19
+
+### Documentation
+
+- **README rewrite.** Realigned `README.md` with the `react-native-background-location` information architecture: full badge set (NPM stable + beta + downloads + total downloads, CI / Pre-release / Release workflows, Codecov, GitHub Stars, Bundlephobia, License, Platform Android / iOS, TypeScript-Ready, New Architecture, Nitro Module), Table of Contents linking every section, expanded Features bullets describing the actual implemented surface (Room + Core Data persistence, `BGTaskScheduler` + `WorkManager` dispatch, `NWPathMonitor` + `ConnectivityManager` connectivity detection, 7 hooks, 15 typed events, `SyncError` discriminated codes, Nitro JSI bridge), per-platform Installation block (npm/yarn + iOS Background Modes + `BGTaskSchedulerPermittedIdentifiers` + pod install + Android `INTERNET` / `ACCESS_NETWORK_STATE` / `RECEIVE_BOOT_COMPLETED`), Quick Start sample exercising `configureSync` + `enableBackgroundSync` + `enqueue` + `useConnection`/`useSyncQueue`/`useSyncStatus`, Hooks table deep-linking every page in `website/docs/api-reference/hooks/`, API Reference signature tables (queue / sync / config / history / connectivity / background sync / event listeners / utilities), inline TypeScript blocks for every public type (`SyncItemInput`, `SyncItem`, `RetryPolicy`, `SyncOptions`, `SyncResult`, `SyncEvent`, `BackgroundSyncOptions`, `ConnectionState`, `SyncError`), inline enum tables for `SyncStrategy`, `SyncPriority`, `BackoffStrategy`, `HttpMethod`, `ConnectionStatus`, `ConnectionType`, `SyncEventType` (all 15), and `SyncErrorCode` (all 11), Platform Support table, and a curated Documentation section indexing every Docusaurus page. Dropped the pre-release banner — the v0.1 line is treated as opinionated GA. Preserved the unique "Why this library", "How it compares", "Ecosystem", "Performance notes", and "FAQ" sections.
+
+### Chore
+
+- **`package.json` metadata curated.** Refined `description` to align word-for-word with the README hero line (cross-platform React Native library for offline-first HTTP sync built on Nitro Modules / New Architecture). Expanded `keywords` to cover the full discovery surface (offline, queue, sync, http, background-sync, nitro-modules, etc.). Updated `homepage` to point at the Docusaurus site (`https://gabriel-sisjr.github.io/react-native-sync-provider/`).
+- **`.github/FUNDING.yml` added** so the GitHub Sponsors button renders on the repo.
+- **`context7.json` added** with a placeholder `public_key` to opt the package into the Context7 documentation index ahead of v0.1.0.
+- **Repository labels automation added.** New `labels.json` defines the canonical issue/PR label set; `scripts/sync-labels.sh` applies it via `gh label`. Run once after fork to bring a new repository (or a contributor's fork) into alignment with the upstream label taxonomy.
 
 ### Fixed
 
