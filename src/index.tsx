@@ -14,7 +14,7 @@
  *     `useOfflineQueue`, `useSyncEvents`, `useSyncConfig`, `useAutoSync`).
  *   - The optional {@link SyncProvider | SyncProvider Context} component.
  *   - Every public type, enum, and the `SyncError` / `SyncErrorCode` pair.
- *   - The `generateId` helper (UUID v7).
+ *   - The `generateId` helper (UUID v4, Math.random-backed).
  *
  * No module-level native call is made on import; the HybridObject is
  * resolved lazily on first use via {@link isNativeModuleAvailable}.

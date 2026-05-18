@@ -60,7 +60,7 @@ apply plugin: "kotlin-android"
 apply plugin: "com.google.devtools.ksp"
 apply from: '../nitrogen/generated/android/syncprovider+autolinking.gradle'
 
-apply plugin: "com.facebook.react"
+// Do NOT apply `com.facebook.react` — Nitro generates bindings via nitrogen; the RN plugin would run Codegen across hoisted RN libs in node_modules and dex-duplicate their view-manager delegates into this AAR.
 apply plugin: "jacoco"
 
 android {

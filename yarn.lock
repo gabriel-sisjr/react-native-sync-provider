@@ -3522,7 +3522,6 @@ __metadata:
     "@testing-library/react-native": "npm:^13.3.3"
     "@types/jest": "npm:^29.5.14"
     "@types/react": "npm:^19.2.0"
-    "@types/uuid": "npm:^10.0.0"
     commitlint: "npm:^20.5.0"
     del-cli: "npm:^7.0.0"
     eslint: "npm:^9.39.4"
@@ -3541,7 +3540,6 @@ __metadata:
     release-it: "npm:^19.2.4"
     turbo: "npm:^2.8.21"
     typescript: "npm:^6.0.2"
-    uuid: "npm:^10.0.0"
   peerDependencies:
     "@react-native-community/netinfo": ">=11.0.0"
     react: ">=18.2.0"
@@ -6480,13 +6478,6 @@ __metadata:
   version: 2.0.11
   resolution: "@types/unist@npm:2.0.11"
   checksum: 10c0/24dcdf25a168f453bb70298145eb043cfdbb82472db0bc0b56d6d51cd2e484b9ed8271d4ac93000a80da568f2402e9339723db262d0869e2bf13bc58e081768d
-  languageName: node
-  linkType: hard
-
-"@types/uuid@npm:^10.0.0":
-  version: 10.0.0
-  resolution: "@types/uuid@npm:10.0.0"
-  checksum: 10c0/9a1404bf287164481cb9b97f6bb638f78f955be57c40c6513b7655160beb29df6f84c915aaf4089a1559c216557dc4d2f79b48d978742d3ae10b937420ddac60
   languageName: node
   linkType: hard
 
@@ -18027,6 +18018,15 @@ __metadata:
   languageName: node
   linkType: hard
 
+"react-freeze@npm:^1.0.0":
+  version: 1.0.4
+  resolution: "react-freeze@npm:1.0.4"
+  peerDependencies:
+    react: ">=17.0.0"
+  checksum: 10c0/8f51257c261bfefff86f618e958683536248f708019632d309ee5ebdd52f25d3c130660d06fb6f0f4fdef79f00f8ec7177233a872c2321f7d46b7e77ccc522a1
+  languageName: node
+  linkType: hard
+
 "react-helmet-async@npm:@slorber/react-helmet-async@1.3.0":
   version: 1.3.0
   resolution: "@slorber/react-helmet-async@npm:1.3.0"
@@ -18158,6 +18158,29 @@ __metadata:
   languageName: node
   linkType: hard
 
+"react-native-safe-area-context@npm:^5.7.0":
+  version: 5.7.0
+  resolution: "react-native-safe-area-context@npm:5.7.0"
+  peerDependencies:
+    react: "*"
+    react-native: "*"
+  checksum: 10c0/c3799e17321b41df1e0a10492c98472f8f8225ef0bbaf8146c4a9acb9519aae9ac11429059143c215e4402c2808e8445274850a339f8477522ded2461e18da80
+  languageName: node
+  linkType: hard
+
+"react-native-screens@npm:^4.25.0":
+  version: 4.25.0
+  resolution: "react-native-screens@npm:4.25.0"
+  dependencies:
+    react-freeze: "npm:^1.0.0"
+    warn-once: "npm:^0.1.0"
+  peerDependencies:
+    react: "*"
+    react-native: ">=0.82.0"
+  checksum: 10c0/ca6fe80ebd4c4ac578394686fc31a62fed22261c4478ef50245d135378e947aa3cf9edb110ac880f292d96a0ea02855d467fb5a0781a05dfc1a19519dd394033
+  languageName: node
+  linkType: hard
+
 "react-native-sync-provider-example@workspace:example":
   version: 0.0.0-use.local
   resolution: "react-native-sync-provider-example@workspace:example"
@@ -18180,6 +18203,8 @@ __metadata:
     react-native-mmkv: "npm:^3.0.0"
     react-native-monorepo-config: "npm:^0.3.3"
     react-native-nitro-modules: "npm:^0.35.6"
+    react-native-safe-area-context: "npm:^5.7.0"
+    react-native-screens: "npm:^4.25.0"
   languageName: unknown
   linkType: soft
 
@@ -20813,15 +20838,6 @@ __metadata:
   languageName: node
   linkType: hard
 
-"uuid@npm:^10.0.0":
-  version: 10.0.0
-  resolution: "uuid@npm:10.0.0"
-  bin:
-    uuid: dist/bin/uuid
-  checksum: 10c0/eab18c27fe4ab9fb9709a5d5f40119b45f2ec8314f8d4cf12ce27e4c6f4ffa4a6321dc7db6c515068fa373c075b49691ba969f0010bf37f44c37ca40cd6bf7fe
-  languageName: node
-  linkType: hard
-
 "uuid@npm:^8.3.2":
   version: 8.3.2
   resolution: "uuid@npm:8.3.2"
@@ -20916,6 +20932,13 @@ __metadata:
   dependencies:
     makeerror: "npm:1.0.12"
   checksum: 10c0/a17e037bccd3ca8a25a80cb850903facdfed0de4864bd8728f1782370715d679fa72e0a0f5da7c1c1379365159901e5935f35be531229da53bbfc0efdabdb48e
+  languageName: node
+  linkType: hard
+
+"warn-once@npm:^0.1.0":
+  version: 0.1.1
+  resolution: "warn-once@npm:0.1.1"
+  checksum: 10c0/f531e7b2382124f51e6d8f97b8c865246db8ab6ff4e53257a2d274e0f02b97d7201eb35db481843dc155815e154ad7afb53b01c4d4db15fb5aa073562496aff7
   languageName: node
   linkType: hard
 
