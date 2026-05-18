@@ -1,4 +1,4 @@
-import { Platform, StyleSheet } from 'react-native';
+import { Platform, StatusBar, StyleSheet } from 'react-native';
 
 const monoFont = Platform.OS === 'ios' ? 'Courier' : 'monospace';
 
@@ -339,6 +339,33 @@ const styles = StyleSheet.create({
   },
   badgeSpacing: {
     marginTop: 12,
+  },
+
+  /* ------------------------------ tab bar --------------------------------- */
+  tabContainer: {
+    flexDirection: 'row',
+    backgroundColor: '#fff',
+    borderBottomWidth: 1,
+    borderBottomColor: '#e0e0e0',
+    alignSelf: 'stretch',
+    paddingTop: Platform.OS === 'ios' ? 54 : (StatusBar.currentHeight ?? 0),
+  },
+  tab: {
+    flex: 1,
+    paddingVertical: 14,
+    alignItems: 'center',
+  },
+  activeTab: {
+    borderBottomWidth: 3,
+    borderBottomColor: '#2196F3',
+  },
+  tabText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#999',
+  },
+  activeTabText: {
+    color: '#2196F3',
   },
 });
 

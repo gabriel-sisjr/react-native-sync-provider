@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **example:** replace dynamic `import('@gabriel-sisjr/react-native-sync-provider')` in `ConfigScreen.handleBackgroundToggle` with the existing static import. Metro does not support runtime bundle splitting in React Native, which was causing `JSBundleLoader` to throw "Could not load bundle" on Android when the user toggled the 'OS-level background sync' switch (surfaced as the alert "Background sync toggle failed — Could not load bundle"). Example-app only; the library's public API is unaffected.
+- **`generateId()`:** replace `uuid` v7 with a pure-JS UUID v4 generator backed by `Math.random()`. The previous implementation crashed on Hermes with `crypto.getRandomValues() is not supported`, breaking imports of the library in the example app. Public signature (`generateId(): string`) and 36-char dashed UUID format are unchanged; the trade-off is the deliberate loss of cryptographic-grade entropy and timestamp-sortability — acceptable because production ids are assigned natively (Core Data / Room) and `generateId()` is only used for the web stub and pre-generated `Idempotency-Key` headers.
+
+### Removed
+
+- **Runtime dep `uuid`** and **devDep `@types/uuid`** dropped from `package.json` along with the `generateId()` rewrite above. A transitive `uuid@8.3.2` pulled in by Docusaurus tooling remains in `yarn.lock`; the library itself no longer depends on `uuid`.
+
 ### Added
 
 - **Public Nitro spec frozen (Phase 1).** Rewrote `src/SyncProvider.nitro.ts` as the v0.1 source-of-truth bridge contract, exposing the full surface for queue ops (`enqueue`, `enqueueBatch`, `removeItem`, `clearQueue`, `getQueueSize`, `getPendingItems`), sync ops (`flush`, `pauseSync`, `resumeSync`, `isSyncing`), config (`configureSync`, `getSyncConfig`), history (`getLastSyncResult`, `getSyncHistory`, `clearSyncHistory`), connectivity (`getConnectionStatus`), background sync (`enableBackgroundSync`, `disableBackgroundSync`, `isBackgroundSyncEnabled`), and events (`addListener`, `removeListener`). Every method is documented with `@param`, `@returns`, `@throws`, and `@example` blocks.
@@ -57,6 +66,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`src/__tests__/index.test.tsx`** — empty placeholder test removed (along with the now-empty `src/__tests__/` directory). Phase 5 owns the real test suite.
 
 ### Fixed
+
+- **android:** remove `apply plugin: "com.facebook.react"` from `android/build.gradle` — the RN Gradle plugin ran Codegen across hoisted RN libs in `node_modules` and baked their `*ManagerDelegate` classes into this AAR, causing consumer builds to fail `:app:mergeLibDexDebug` with duplicate-class errors (e.g. `RNCSafeAreaProviderManagerDelegate`). Nitro generates bindings via `yarn nitrogen`; the RN plugin is unnecessary.
 
 ### Security
 

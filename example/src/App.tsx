@@ -1,8 +1,6 @@
-import React, { useMemo } from 'react';
-import { Text, View } from 'react-native';
+import React, { useMemo, useState } from 'react';
+import { Text, TouchableOpacity, View } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
-import { NavigationContainer } from '@react-navigation/native';
-import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import {
   BackoffStrategy,
   SyncProvider,
@@ -16,13 +14,18 @@ import { HistoryScreen } from './screens/HistoryScreen';
 import { QueueScreen } from './screens/QueueScreen';
 import styles from './styles';
 
-type TabParamList = {
-  Queue: undefined;
-  History: undefined;
-  Config: undefined;
+type ScreenKey = 'queue' | 'history' | 'config';
+
+type TabDefinition = {
+  readonly key: ScreenKey;
+  readonly label: string;
 };
 
-const Tab = createBottomTabNavigator<TabParamList>();
+const TABS: readonly TabDefinition[] = [
+  { key: 'queue', label: 'Queue' },
+  { key: 'history', label: 'History' },
+  { key: 'config', label: 'Config' },
+];
 
 const INITIAL_SYNC_OPTIONS: SyncOptions = {
   strategy: SyncStrategy.AUTOMATIC,
@@ -61,6 +64,7 @@ export default function App(): React.ReactElement {
   // every render (it re-applies whenever the reference changes).
   const initialOptions = useMemo(() => INITIAL_SYNC_OPTIONS, []);
   const nativeReady = isNativeModuleAvailable();
+  const [currentScreen, setCurrentScreen] = useState<ScreenKey>('queue');
 
   if (!nativeReady) {
     return (
@@ -70,34 +74,34 @@ export default function App(): React.ReactElement {
     );
   }
 
+  const tabBar = (
+    <View style={styles.tabContainer}>
+      {TABS.map((tab) => {
+        const isActive = currentScreen === tab.key;
+        return (
+          <TouchableOpacity
+            key={tab.key}
+            style={[styles.tab, isActive && styles.activeTab]}
+            onPress={() => setCurrentScreen(tab.key)}
+          >
+            <Text style={[styles.tabText, isActive && styles.activeTabText]}>
+              {tab.label}
+            </Text>
+          </TouchableOpacity>
+        );
+      })}
+    </View>
+  );
+
   return (
     <SafeAreaProvider>
       <SyncProvider options={initialOptions}>
-        <NavigationContainer>
-          <Tab.Navigator
-            screenOptions={{
-              headerShown: false,
-              tabBarActiveTintColor: '#2196F3',
-              tabBarInactiveTintColor: '#90A4AE',
-            }}
-          >
-            <Tab.Screen
-              name="Queue"
-              component={QueueScreen}
-              options={{ tabBarLabel: 'Queue' }}
-            />
-            <Tab.Screen
-              name="History"
-              component={HistoryScreen}
-              options={{ tabBarLabel: 'History' }}
-            />
-            <Tab.Screen
-              name="Config"
-              component={ConfigScreen}
-              options={{ tabBarLabel: 'Config' }}
-            />
-          </Tab.Navigator>
-        </NavigationContainer>
+        <View style={styles.container}>
+          {tabBar}
+          {currentScreen === 'queue' && <QueueScreen />}
+          {currentScreen === 'history' && <HistoryScreen />}
+          {currentScreen === 'config' && <ConfigScreen />}
+        </View>
       </SyncProvider>
     </SafeAreaProvider>
   );
