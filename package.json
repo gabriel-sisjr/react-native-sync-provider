@@ -101,9 +101,6 @@
   "publishConfig": {
     "registry": "https://registry.npmjs.org/"
   },
-  "dependencies": {
-    "uuid": "^10.0.0"
-  },
   "devDependencies": {
     "@commitlint/config-conventional": "^20.5.0",
     "@eslint/compat": "^2.0.3",
@@ -117,7 +114,6 @@
     "@testing-library/react-native": "^13.3.3",
     "@types/jest": "^29.5.14",
     "@types/react": "^19.2.0",
-    "@types/uuid": "^10.0.0",
     "commitlint": "^20.5.0",
     "del-cli": "^7.0.0",
     "eslint": "^9.39.4",
