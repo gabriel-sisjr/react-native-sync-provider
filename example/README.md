@@ -1,97 +1,170 @@
-This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
+# Sync Provider Example App
 
-# Getting Started
+Example React Native application demonstrating `@gabriel-sisjr/react-native-sync-provider`.
 
-> **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
+## What It Demonstrates
 
-## Step 1: Start Metro
+- **Hooks-first sync API** -- `useSyncQueue`, `useSyncStatus`, `useSyncEvents`, `useSyncConfig`, `useOfflineQueue`, `useConnection`, and `useAutoSync` wired into three real screens.
+- **Native persistence** -- Items survive force-quit and device reboot via Core Data (iOS) and Room (Android).
+- **Background sync** -- BGTaskScheduler on iOS and WorkManager on Android dispatch queued requests even when the app is killed.
+- **Connection awareness** -- `useConnection` reflects native connectivity callbacks (`NWPathMonitor` / `ConnectivityManager.NetworkCallback`), including the metered flag.
+- **Sync history & error drill-down** -- The History tab pages through `getSyncHistory()` and lets you expand `SyncErrorCode` per failed item.
+- **Configurable retry policy** -- The Config tab edits `SyncOptions` live via `configureSync`, including exponential backoff and per-status retry list.
+- **Crash & boot recovery** -- The `BootCompletedReceiver` on Android and the `handleBackgroundURLSessionEvents` hook on iOS drive recovery without user action.
 
-First, you will need to run **Metro**, the JavaScript build tool for React Native.
+## Screenshots
 
-To start the Metro dev server, run the following command from the root of your React Native project:
+| Queue                                    | History                                      | Config                                     |
+| ---------------------------------------- | -------------------------------------------- | ------------------------------------------ |
+| ![Queue screen](./screenshots/queue.png) | ![History screen](./screenshots/history.png) | ![Config screen](./screenshots/config.png) |
 
-```sh
-# Using npm
-npm start
+> Screenshots are placeholders -- capture them from a real device/simulator after running the demo.
 
-# OR using Yarn
-yarn start
+## Running the Example
+
+From the repository root:
+
+```bash
+# Install workspace dependencies
+yarn
+
+# Regenerate Nitro bindings (required before any build)
+yarn nitrogen
+
+# Start Metro bundler
+yarn example start
+
+# Run on Android device/emulator
+yarn example android
+
+# Run on iOS simulator (requires CocoaPods)
+yarn example ios
 ```
 
-## Step 2: Build and run your app
+For iOS, install CocoaPods on first run or whenever native deps change:
 
-With Metro running, open a new terminal window/pane from the root of your React Native project, and use one of the following commands to build and run your Android or iOS app:
-
-### Android
-
-```sh
-# Using npm
-npm run android
-
-# OR using Yarn
-yarn android
+```bash
+cd example && bundle install && bundle exec pod install --project-directory=ios
 ```
 
-### iOS
+## Default Configuration
 
-For iOS, remember to install CocoaPods dependencies (this only needs to be run on first clone or after updating native deps).
+The example bootstraps `SyncProvider` with `INITIAL_SYNC_OPTIONS` (see `src/App.tsx`):
 
-The first time you create a new project, run the Ruby bundler to install CocoaPods itself:
+| Field                            | Default                               | Notes                                                   |
+| -------------------------------- | ------------------------------------- | ------------------------------------------------------- |
+| `strategy`                       | `SyncStrategy.AUTOMATIC`              | Drains the queue opportunistically when online.         |
+| `retryPolicy.maxAttempts`        | `5`                                   | Per-item attempts before marking permanently failed.    |
+| `retryPolicy.backoff`            | `BackoffStrategy.EXPONENTIAL`         | Doubles delay each attempt up to `maxDelayMs`.          |
+| `retryPolicy.baseDelayMs`        | `1000`                                | First retry waits 1 second.                             |
+| `retryPolicy.maxDelayMs`         | `60000`                               | Cap of 60 seconds between retries.                      |
+| `retryPolicy.jitter`             | `true`                                | Adds randomization to avoid thundering herd.            |
+| `retryPolicy.retryOnStatusCodes` | `[408, 425, 429, 500, 502, 503, 504]` | HTTP codes that trigger retry; others fail immediately. |
+| `batchSize`                      | `10`                                  | Max items per dispatch batch.                           |
+| `requestTimeoutMs`               | `30000`                               | Per-request timeout.                                    |
+| `maxQueueSize`                   | `1000`                                | Hard cap; further enqueues throw `QUEUE_FULL`.          |
+| `persistQueue`                   | `true`                                | Items survive process death and reboot.                 |
+| `defaultHeaders.endpoint`        | `https://httpbin.org/post`            | Echo endpoint used by the "Add random item" button.     |
 
-```sh
-bundle install
+## Screen Walkthrough
+
+### Queue
+
+Lists every pending `SyncItem` in priority order. Wires `useSyncQueue` for the items, `useSyncStatus` for the global syncing flag, `useOfflineQueue` for the count badge, and `useSyncConfig` to read the current strategy. The toolbar exposes "Add random item" (`enqueue`), "Force flush" (`flush`), per-row "Remove" (`removeItem`), and "Clear queue" (`clearQueue`).
+
+### History
+
+Shows the last results returned by `getSyncHistory()`. Uses `useSyncEvents` to live-prepend new entries as they fire (`SYNC_STARTED`, `SYNC_COMPLETED`, `ITEM_FAILED`, etc.) and `useSyncStatus` for the active-run indicator. Each row expands to reveal HTTP status, `SyncErrorCode`, and the captured error message. "Clear history" calls `clearSyncHistory`.
+
+### Config
+
+Form-driven editor for `SyncOptions`. Uses `useSyncConfig` to read the current snapshot and `useAutoSync` to display whether automatic dispatch is currently armed. Submitting the form calls `configureSync`. Toggling "Background sync" calls `enableBackgroundSync` / `disableBackgroundSync`.
+
+## Hooks Reference
+
+| Hook              | Where used                     | What it shows                                                    |
+| ----------------- | ------------------------------ | ---------------------------------------------------------------- |
+| `useConnection`   | `ConnectionBadge`              | Connectivity state, metered flag, transport type.                |
+| `useSyncQueue`    | `QueueScreen`                  | Reactive list of pending `SyncItem` records.                     |
+| `useSyncStatus`   | `QueueScreen`, `HistoryScreen` | Whether a sync run is currently in flight.                       |
+| `useOfflineQueue` | `QueueScreen`                  | Number of items waiting while offline.                           |
+| `useSyncEvents`   | `HistoryScreen`                | Live stream of sync events from the native side.                 |
+| `useSyncConfig`   | `QueueScreen`, `ConfigScreen`  | Current `SyncOptions` snapshot from native.                      |
+| `useAutoSync`     | `ConfigScreen`                 | Whether automatic dispatch is enabled and which strategy is set. |
+
+## Offline Test
+
+End-to-end offline scenario showing that the queue survives connectivity loss, force-quit and reboot.
+
+### Steps
+
+1. Open the example app, switch to the **Queue** tab.
+2. With network on, tap **Add random item** five times. Five rows should appear, each enqueued via `enqueue` and tagged with `SyncPriority.NORMAL`.
+3. Enable **Airplane mode** on the device.
+4. Observe the **ConnectionBadge** flip to `DISCONNECTED`. Tap **Force flush** -- nothing dispatches; items stay queued (verify count is still 5).
+5. Tap **Add random item** twice more. Queue grows to 7 -- proving local persistence.
+6. **Force-quit** the app (swipe up on iOS, swipe away on Android).
+7. **Reboot the device** (optional but recommended on Android, to validate `RECEIVE_BOOT_COMPLETED` -> `BootCompletedReceiver` -> `RecoveryWorker`).
+8. Reopen the example app. The Queue tab still lists 7 pending items (loaded from Core Data / Room).
+9. Disable **Airplane mode**.
+10. The native connectivity callback (`NWPathMonitor` on iOS / `ConnectivityManager.NetworkCallback` on Android) fires; the **History** tab fills with one or more `SYNC_SUCCEEDED` entries.
+11. Queue is drained to 0.
+
+### What you should observe
+
+- Each `httpbin.org/post` echo returns 200 OK, marking the item succeeded.
+- The **History** tab shows the timestamp, succeeded count and any failures, with tap-to-expand drill-down for `SyncErrorCode`.
+- The **Config** tab continues to reflect the active `SyncOptions`; toggling **Auto-sync** off and on calls `enableBackgroundSync` / `disableBackgroundSync`.
+
+### iOS notes
+
+- Background Modes (`fetch`, `processing`) and BGTaskSchedulerPermittedIdentifiers (`com.gabriel-sisjr.syncprovider.background`, `com.gabriel-sisjr.syncprovider.processing`) are already declared in `Info.plist`.
+- Recovery on relaunch is handled in `AppDelegate.swift` via `SyncProvider.handleBackgroundURLSessionEvents(...)`.
+
+### Android notes
+
+- The example app declares `INTERNET`, `ACCESS_NETWORK_STATE` and `RECEIVE_BOOT_COMPLETED` in `AndroidManifest.xml`.
+- Consumers must declare the same permissions in their own apps for boot recovery to work.
+
+## Project Structure
+
+```text
+example/
+  src/
+    App.tsx                       # Root: SafeAreaProvider -> SyncProvider -> NavigationContainer
+    styles.ts                     # Centralized StyleSheet.create()
+    screens/
+      QueueScreen.tsx             # Queue tab (useSyncQueue, useSyncStatus, useOfflineQueue, useSyncConfig)
+      HistoryScreen.tsx           # History tab (useSyncEvents, useSyncStatus)
+      ConfigScreen.tsx            # Config tab (useSyncConfig, useAutoSync)
+    components/
+      ConnectionBadge.tsx         # Shared connectivity indicator (useConnection)
+      SyncItemRow.tsx             # Single queued-item row
+      HistoryRow.tsx              # Single history entry with expandable error drill-down
+  screenshots/                    # Placeholder folder for captured screens
+  android/                        # Android project (manifest declares the 3 required permissions)
+  ios/                            # iOS project (Background Modes + BGTaskScheduler identifiers wired)
 ```
 
-Then, and every time you update your native dependencies, run:
+## Requirements
 
-```sh
-bundle exec pod install
-```
+- **Node** 24.13.0 (pinned via `.nvmrc`).
+- **Yarn** 4.11 (Berry; declared via `packageManager`).
+- **iOS simulator** running iOS 15+, with Background Modes capability already enabled in the example's Xcode project.
+- **Android emulator** API 24+ with `INTERNET`, `ACCESS_NETWORK_STATE` and `RECEIVE_BOOT_COMPLETED` permissions declared in `AndroidManifest.xml`.
+- `yarn nitrogen` must be run before the first build (the `nitrogen/` directory is gitignored).
 
-For more information, please visit [CocoaPods Getting Started guide](https://guides.cocoapods.org/using/getting-started.html).
+## Troubleshooting
 
-```sh
-# Using npm
-npm run ios
+- **CocoaPods install fails** -- run `bundle install` inside `example/` first, then `bundle exec pod install --project-directory=ios`.
+- **Native module unavailable on startup** -- the `nitrogen/` directory is missing; run `yarn nitrogen` from the repo root.
+- **`yarn install` fails with version mismatch** -- ensure you are on Node 24.13.0 (`nvm use`) and Yarn 4.11 (`corepack enable`).
+- **Android boot recovery does not trigger** -- confirm `RECEIVE_BOOT_COMPLETED` is declared in your app's `AndroidManifest.xml`; on Android 10+ it must also be granted at runtime.
+- **iOS background task never fires** -- BGTaskScheduler will not run a task in the simulator unless triggered via the debug helper; test on a real device for true background dispatch.
 
-# OR using Yarn
-yarn ios
-```
+## See Also
 
-If everything is set up correctly, you should see your new app running in the Android Emulator, iOS Simulator, or your connected device.
-
-This is one way to run your app — you can also build it directly from Android Studio or Xcode.
-
-## Step 3: Modify your app
-
-Now that you have successfully run the app, let's make changes!
-
-Open `App.tsx` in your text editor of choice and make some changes. When you save, your app will automatically update and reflect these changes — this is powered by [Fast Refresh](https://reactnative.dev/docs/fast-refresh).
-
-When you want to forcefully reload, for example to reset the state of your app, you can perform a full reload:
-
-- **Android**: Press the <kbd>R</kbd> key twice or select **"Reload"** from the **Dev Menu**, accessed via <kbd>Ctrl</kbd> + <kbd>M</kbd> (Windows/Linux) or <kbd>Cmd ⌘</kbd> + <kbd>M</kbd> (macOS).
-- **iOS**: Press <kbd>R</kbd> in iOS Simulator.
-
-## Congratulations! :tada:
-
-You've successfully run and modified your React Native App. :partying_face:
-
-### Now what?
-
-- If you want to add this new React Native code to an existing application, check out the [Integration guide](https://reactnative.dev/docs/integration-with-existing-apps).
-- If you're curious to learn more about React Native, check out the [docs](https://reactnative.dev/docs/getting-started).
-
-# Troubleshooting
-
-If you're having issues getting the above steps to work, see the [Troubleshooting](https://reactnative.dev/docs/troubleshooting) page.
-
-# Learn More
-
-To learn more about React Native, take a look at the following resources:
-
-- [React Native Website](https://reactnative.dev) - learn more about React Native.
-- [Getting Started](https://reactnative.dev/docs/environment-setup) - an **overview** of React Native and how setup your environment.
-- [Learn the Basics](https://reactnative.dev/docs/getting-started) - a **guided tour** of the React Native **basics**.
-- [Blog](https://reactnative.dev/blog) - read the latest official React Native **Blog** posts.
-- [`@facebook/react-native`](https://github.com/facebook/react-native) - the Open Source; GitHub **repository** for React Native.
+- [Quick Start](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/getting-started/quick-start)
+- [Hooks API Reference](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/category/hooks)
+- [Installation Guide](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/getting-started/installation)
+- [Background Sync Advanced Guide](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/advanced/background-sync)
