@@ -56,9 +56,7 @@ final class ConnectivityMonitor: @unchecked Sendable {
 
     /// The last observed snapshot. Thread-safe.
     var current: ConnectionSnapshot {
-        lock.lock()
-        defer { lock.unlock() }
-        return _current
+        lock.withLock { _current }
     }
 
     private init(monitor: NWPathMonitor = NWPathMonitor()) {
@@ -69,12 +67,13 @@ final class ConnectivityMonitor: @unchecked Sendable {
 
     /// Start the monitor. Idempotent.
     func start() {
-        lock.lock()
-        let alreadyStarted = didStart
-        if !alreadyStarted {
-            didStart = true
+        let alreadyStarted = lock.withLock { () -> Bool in
+            let wasStarted = didStart
+            if !wasStarted {
+                didStart = true
+            }
+            return wasStarted
         }
-        lock.unlock()
 
         guard !alreadyStarted else { return }
 
@@ -87,10 +86,10 @@ final class ConnectivityMonitor: @unchecked Sendable {
     /// Stop the monitor. Mostly used by tests.
     func stop() {
         monitor.cancel()
-        lock.lock()
-        didStart = false
-        listeners.removeAll()
-        lock.unlock()
+        lock.withLock {
+            didStart = false
+            listeners.removeAll()
+        }
     }
 
     /// Subscribe for change notifications. Returns a token that can be passed
@@ -98,10 +97,10 @@ final class ConnectivityMonitor: @unchecked Sendable {
     @discardableResult
     func subscribe(_ listener: @escaping @Sendable (ConnectionSnapshot) -> Void) -> UUID {
         let id = UUID()
-        lock.lock()
-        listeners[id] = listener
-        let snapshot = _current
-        lock.unlock()
+        let snapshot = lock.withLock { () -> ConnectionSnapshot in
+            listeners[id] = listener
+            return _current
+        }
         // Replay the current snapshot synchronously so subscribers always see
         // a value rather than waiting for the next path update.
         listener(snapshot)
@@ -109,9 +108,9 @@ final class ConnectivityMonitor: @unchecked Sendable {
     }
 
     func unsubscribe(_ token: UUID) {
-        lock.lock()
-        listeners.removeValue(forKey: token)
-        lock.unlock()
+        lock.withLock {
+            listeners.removeValue(forKey: token)
+        }
     }
 
     // MARK: - Path translation
@@ -119,10 +118,10 @@ final class ConnectivityMonitor: @unchecked Sendable {
     private func handlePathUpdate(_ path: NWPath) {
         let snapshot = Self.translate(path)
 
-        lock.lock()
-        _current = snapshot
-        let snapshotListeners = Array(listeners.values)
-        lock.unlock()
+        let snapshotListeners = lock.withLock { () -> [@Sendable (ConnectionSnapshot) -> Void] in
+            _current = snapshot
+            return Array(listeners.values)
+        }
 
         SyncLogger.debug("Connectivity changed: status=\(snapshot.status.rawValue) type=\(snapshot.type.rawValue) expensive=\(snapshot.isExpensive ?? false)",
                          category: "connectivity")

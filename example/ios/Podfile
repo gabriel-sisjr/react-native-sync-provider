@@ -23,6 +23,15 @@ target 'SyncProviderExample' do
     :app_path => "#{Pod::Config.instance.installation_root}/.."
   )
 
+  # Opt the SyncProvider pod into its `Tests` test_spec so CocoaPods
+  # generates the XCTest target + shared scheme inside the Pods.xcodeproj
+  # that lives in this workspace. CocoaPods 1.10+ derives the scheme name
+  # by inserting `Unit-` for `:test_type => :unit` (the default), so the
+  # final scheme is named `SyncProvider-Unit-Tests`. The host app itself
+  # does not link against the test target; we just need pod install to
+  # materialise it so CI can run `xcodebuild test -scheme SyncProvider-Unit-Tests`.
+  pod 'SyncProvider', :path => '../..', :testspecs => ['Tests']
+
   post_install do |installer|
     react_native_post_install(
       installer,
@@ -30,5 +39,12 @@ target 'SyncProviderExample' do
       :mac_catalyst_enabled => false,
       # :ccache_enabled => true
     )
+
+    # Ensure CocoaPods-generated schemes (including `SyncProvider-Unit-Tests`)
+    # are written to `xcshareddata/xcschemes/` so `xcodebuild -workspace ...
+    # -scheme ...` (CI) can discover them. CocoaPods 1.10+ shares schemes by
+    # default, but we re-create them here defensively in case a future RN
+    # post_install or an upstream regression flips them back to user-data.
+    installer.pods_project.recreate_user_schemes(false)
   end
 end

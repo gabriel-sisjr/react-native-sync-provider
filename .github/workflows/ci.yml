@@ -277,26 +277,59 @@ jobs:
           xcrun xcodebuild -workspace SyncProviderExample.xcworkspace -list || \
             xcrun xcodebuild -list
 
+      # Diagnostic: dumps the simulator catalog the runner actually ships with.
+      # Non-blocking so a transient simctl failure can never fail the job.
+      - name: Show available iOS simulators
+        continue-on-error: true
+        run: |
+          xcrun simctl list devices iOS available
+
       - name: Run iOS unit tests
         run: |
-          cd example/ios
           set -o pipefail
-          xcrun xcodebuild test \
-            -workspace SyncProviderExample.xcworkspace \
-            -scheme "${IOS_TEST_SCHEME}" \
-            -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest' \
-            -resultBundlePath build/SyncProviderTests.xcresult \
-            -enableCodeCoverage YES \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO || \
-          xcrun xcodebuild test \
-            -workspace SyncProviderExample.xcworkspace \
-            -scheme "${IOS_TEST_SCHEME}" \
-            -destination 'platform=iOS Simulator,name=iPhone 15,OS=latest' \
-            -resultBundlePath build/SyncProviderTests.xcresult \
-            -enableCodeCoverage YES \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO
+          cd example/ios
+
+          # Pipe xcodebuild output through xcbeautify when present (it ships on
+          # the GitHub macos-latest image). Fallback to raw output otherwise.
+          if command -v xcbeautify >/dev/null 2>&1; then
+            PRETTIFY=(xcbeautify --renderer github-actions)
+          else
+            PRETTIFY=(cat)
+          fi
+
+          # Destinations are tried in order. iPhone 16 is the primary target on
+          # the current Xcode 26 image; iPhone 17 is forward-looking for image
+          # bumps; iPhone 16 Pro is a safety net within the same generation.
+          DESTINATIONS=(
+            "platform=iOS Simulator,name=iPhone 16,OS=latest"
+            "platform=iOS Simulator,name=iPhone 17,OS=latest"
+            "platform=iOS Simulator,name=iPhone 16 Pro,OS=latest"
+          )
+
+          for destination in "${DESTINATIONS[@]}"; do
+            echo "::group::xcodebuild test on $destination"
+            # xcodebuild errors out if -resultBundlePath already exists, so we
+            # always start each attempt from a clean slate.
+            rm -rf build/SyncProviderTests.xcresult
+            if xcrun xcodebuild test \
+              -workspace SyncProviderExample.xcworkspace \
+              -scheme "${IOS_TEST_SCHEME}" \
+              -destination "$destination" \
+              -resultBundlePath build/SyncProviderTests.xcresult \
+              -enableCodeCoverage YES \
+              -skipPackagePluginValidation \
+              -skipMacroValidation \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO | "${PRETTIFY[@]}"; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "::warning::xcodebuild test failed on $destination — trying next destination"
+          done
+
+          echo "::error::xcodebuild test failed on every destination"
+          exit 1
 
       - name: Upload iOS test results
         if: always()

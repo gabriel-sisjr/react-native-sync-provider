@@ -11,7 +11,7 @@
     "SyncProvider": {
       "ios": {
         "language": "swift",
-        "implementationClassName": "SyncProvider"
+        "implementationClassName": "HybridSyncProvider"
       },
       "android": {
         "language": "kotlin",

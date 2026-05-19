@@ -1954,6 +1954,30 @@ PODS:
     - ReactCommon/turbomodule/core
     - ReactNativeDependencies
     - Yoga
+  - SyncProvider/Tests (0.1.0):
+    - hermes-engine
+    - NitroModules
+    - RCTRequired
+    - RCTTypeSafety
+    - React-callinvoker
+    - React-Core
+    - React-Core-prebuilt
+    - React-debug
+    - React-Fabric
+    - React-featureflags
+    - React-graphics
+    - React-ImageManager
+    - React-jsi
+    - React-NativeModulesApple
+    - React-RCTFabric
+    - React-renderercss
+    - React-rendererdebug
+    - React-utils
+    - ReactCodegen
+    - ReactCommon/turbomodule/bridging
+    - ReactCommon/turbomodule/core
+    - ReactNativeDependencies
+    - Yoga
   - Yoga (0.0.0)
 
 DEPENDENCIES:
@@ -2036,6 +2060,7 @@ DEPENDENCIES:
   - ReactNativeDependencies (from `../node_modules/react-native/third-party-podspecs/ReactNativeDependencies.podspec`)
   - RNScreens (from `../node_modules/react-native-screens`)
   - SyncProvider (from `../..`)
+  - SyncProvider/Tests (from `../..`)
   - Yoga (from `../node_modules/react-native/ReactCommon/yoga`)
 
 EXTERNAL SOURCES:
@@ -2277,9 +2302,9 @@ SPEC CHECKSUMS:
   ReactCommon: fe2a3af8975e63efa60f95fca8c34dc85deee360
   ReactNativeDependencies: da8e9df65d9712acfe42f0674d770c12fe7f39b1
   RNScreens: a6a509f05ea74d50abab8c21b319b33cfca1ea1c
-  SyncProvider: b737d5e0e529ac9774216f49d5af87b0778da3e8
+  SyncProvider: e3f05351afe482684a8fa9fc869d02ecf725b0ff
   Yoga: e83c3121d079541e69f3c5c623faaaf933fb5812
 
-PODFILE CHECKSUM: 71598b6271e231c4857d279dfa2afa9cb757e756
+PODFILE CHECKSUM: a50b973fcddec24d4ac90f9eec5b77f8c93b061d
 
 COCOAPODS: 1.15.2

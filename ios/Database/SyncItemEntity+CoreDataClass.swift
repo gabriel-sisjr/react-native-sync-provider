@@ -23,7 +23,7 @@ public final class SyncItemEntity: NSManagedObject {
     @NSManaged public var createdAt: Int64
     @NSManaged public var headersJSON: Data?
     @NSManaged public var id: String?
-    @NSManaged public var lastAttemptAt: NSNumber?
+    @NSManaged public var lastAttemptAt: Int64
     @NSManaged public var lastErrorCode: String?
     @NSManaged public var metadataJSON: Data?
     @NSManaged public var method: String?

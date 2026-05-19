@@ -1,6 +1,6 @@
 {
   "name": "@gabriel-sisjr/react-native-sync-provider",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "React Native library for offline-first HTTP sync using Nitro Modules. Queue requests with Core Data on iOS and Room on Android, dispatch them in the background via BGTaskScheduler and WorkManager, and react to connectivity changes through a hooks-based facade — even when the app is killed.",
   "main": "./lib/module/index.js",
   "types": "./lib/typescript/src/index.d.ts",

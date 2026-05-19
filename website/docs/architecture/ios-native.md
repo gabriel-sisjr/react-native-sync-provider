@@ -31,7 +31,11 @@ All iOS native code lives under `ios/`. The implementation uses Swift 5.9+, Core
 | `ios/Utils/`                                       | `ULID` generator and `SyncLogger`.                                                                             |
 | `ios/Tests/`                                       | XCTest suite (driven by CocoaPods `s.test_spec 'Tests'`).                                                      |
 
-The HybridObject implementation lives in `ios/SyncProvider.swift` (`class SyncProvider: HybridSyncProviderSpec`) and delegates to the components above — it is the JSI front door and contains no business logic.
+The HybridObject implementation lives in `ios/SyncProvider.swift` (`final class HybridSyncProvider: HybridSyncProviderSpec`) and delegates to the components above — it is the JSI front door and contains no business logic.
+
+:::note
+The Swift class is intentionally named `HybridSyncProvider`, not `SyncProvider`. Nitro generates a C++ `SyncProvider::SyncProvider` class inside the `margelo::nitro::syncprovider` namespace; reusing the same name from Swift would collide with the generated bridging header (`SyncProvider-Swift.h`) and break the build. The Nitro `iosModuleName` (`SyncProvider`) and the JS lookup (`NitroModules.createHybridObject<SyncProvider>('SyncProvider')`) are unchanged — only the underlying Swift class name differs. The Kotlin implementation has no analogous collision and remains `class SyncProvider`. The autolinking mapping lives in `nitro.json → autolinking.SyncProvider.ios.implementationClassName: "HybridSyncProvider"`.
+:::
 
 ## Core Data
 
@@ -111,6 +115,36 @@ The podspec advertises:
 - `s.resources = "ios/Database/SyncProvider.xcdatamodeld"` (Core Data model bundled into the pod).
 - `s.resource_bundles = { "SyncProvider_Privacy" => ["ios/PrivacyInfo.xcprivacy"] }` (deliberately a resource bundle, not a top-level resource — the RN 0.85 privacy_manifest aggregator iterates only `file_accessor.resource_bundles`, and listing the manifest as a top-level resource collides with the host app's aggregated manifest with `Multiple commands produce ...PrivacyInfo.xcprivacy`).
 - `s.exclude_files = ["ios/Tests/**/*"]` so the test sources are owned exclusively by the `s.test_spec 'Tests'` block.
+
+## Running unit tests
+
+The iOS test target is declared on the library side via `s.test_spec 'Tests'` in `SyncProvider.podspec`. CocoaPods 1.10+ defaults `:test_type` to `:unit` and auto-prefixes the resulting scheme with `Unit-`, so the generated Xcode scheme is **`SyncProvider-Unit-Tests`** (not `SyncProvider-Tests`). We did not rename the test_spec — the segment is added by CocoaPods.
+
+:::warning
+`use_native_modules!` autolinking does **not** propagate `:testspecs` to consuming apps. The example app opts in explicitly in `example/ios/Podfile`:
+
+```ruby
+pod 'SyncProvider', :path => '../..', :testspecs => ['Tests']
+```
+
+Without this line, `pod install` will not generate the test target and `xcodebuild -scheme SyncProvider-Unit-Tests` will fail to resolve the scheme. The `post_install` block also calls `installer.pods_project.recreate_user_schemes(false)` to ensure the generated test scheme is shared (the `false` keeps user-state untouched).
+:::
+
+After `yarn nitrogen` and `bundle exec pod install --project-directory=ios` (run from `example/`), the suite can be exercised in two equivalent ways:
+
+```bash
+yarn test:ios
+```
+
+```bash
+cd example/ios
+xcodebuild test \
+  -workspace SyncProviderExample.xcworkspace \
+  -scheme SyncProvider-Unit-Tests \
+  -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest'
+```
+
+`yarn test:ios` shells out to `scripts/test-ios.sh`, which mirrors the CI invocation: it removes any stale `build/SyncProviderTests.xcresult` before each attempt (defends against the `"Existing file at -resultBundlePath"` failure mode) and walks a destination fallback list (`iPhone 16` → `iPhone 17` → `iPhone 16 Pro`, all `OS=latest`) so a missing simulator on a single machine does not block the run. The same loop runs in CI (`test-ios` job in `.github/workflows/ci.yml`).
 
 ## Privacy Manifest
 
