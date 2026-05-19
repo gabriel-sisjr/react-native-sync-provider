@@ -147,7 +147,7 @@ await configureSync({
 
 ## JS-Side Override (deferred to v0.2)
 
-A per-attempt `shouldRetry(ctx)` callback is on the roadmap for v0.2:
+A per-attempt `shouldRetry(ctx)` callback is planned for v0.2:
 
 ```ts
 type ShouldRetryFn = (ctx: {

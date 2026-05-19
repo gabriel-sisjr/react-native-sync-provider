@@ -47,9 +47,7 @@ final class BackgroundSyncManager: @unchecked Sendable {
     }
 
     var isEnabled: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return enabled
+        lock.withLock { enabled }
     }
 
     /// Register handlers for both task identifiers. Must be called before
@@ -58,10 +56,11 @@ final class BackgroundSyncManager: @unchecked Sendable {
     func registerHandlers() {
         #if canImport(BackgroundTasks)
         if #available(iOS 13.0, *) {
-            lock.lock()
-            let already = registered
-            registered = true
-            lock.unlock()
+            let already = lock.withLock { () -> Bool in
+                let wasRegistered = registered
+                registered = true
+                return wasRegistered
+            }
             guard !already else { return }
 
             let scheduler = BGTaskScheduler.shared
@@ -94,10 +93,10 @@ final class BackgroundSyncManager: @unchecked Sendable {
         if #available(iOS 13.0, *) {
             registerHandlers()
             try scheduleAppRefresh(options: options)
-            lock.lock()
-            enabled = true
-            lastOptions = options
-            lock.unlock()
+            lock.withLock {
+                enabled = true
+                lastOptions = options
+            }
             SyncLogger.info("Background sync enabled (interval=\(options.minimumIntervalMs)ms)", category: "background")
         } else {
             throw SyncProviderError.backgroundRegistrationFailed("iOS 13.0 or higher required")
@@ -115,9 +114,9 @@ final class BackgroundSyncManager: @unchecked Sendable {
             BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: kBackgroundProcessingIdentifier)
         }
         #endif
-        lock.lock()
-        enabled = false
-        lock.unlock()
+        lock.withLock {
+            enabled = false
+        }
         SyncLogger.info("Background sync disabled", category: "background")
     }
 

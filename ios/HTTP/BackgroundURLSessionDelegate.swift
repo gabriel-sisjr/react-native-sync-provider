@@ -38,25 +38,25 @@ final class BackgroundURLSessionDelegate: NSObject, URLSessionDelegate, URLSessi
     /// Register a per-task completion handler keyed by `task.taskDescription`
     /// (the `SyncItem.id`).
     func registerCompletion(itemId: String, handler: @escaping BackgroundCompletionHandler) {
-        lock.lock()
-        completions[itemId] = handler
-        lock.unlock()
+        lock.withLock {
+            completions[itemId] = handler
+        }
     }
 
     /// Park the system-supplied completion handler so we can fire it when the
     /// session reports `urlSessionDidFinishEvents(forBackgroundURLSession:)`.
     func storeEventsCompletionHandler(_ handler: @escaping BackgroundEventsCompletionHandler) {
-        lock.lock()
-        eventsCompletionHandler = handler
-        lock.unlock()
+        lock.withLock {
+            eventsCompletionHandler = handler
+        }
     }
 
     // MARK: - URLSessionDataDelegate
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        lock.lock()
-        responseData[dataTask.taskIdentifier, default: Data()].append(data)
-        lock.unlock()
+        lock.withLock {
+            responseData[dataTask.taskIdentifier, default: Data()].append(data)
+        }
     }
 
     // MARK: - URLSessionTaskDelegate
@@ -67,10 +67,11 @@ final class BackgroundURLSessionDelegate: NSObject, URLSessionDelegate, URLSessi
         let itemId = task.taskDescription ?? ""
         let statusCode = (task.response as? HTTPURLResponse)?.statusCode
 
-        lock.lock()
-        let handler = completions.removeValue(forKey: itemId)
-        responseData.removeValue(forKey: task.taskIdentifier)
-        lock.unlock()
+        let handler = lock.withLock { () -> BackgroundCompletionHandler? in
+            let removed = completions.removeValue(forKey: itemId)
+            responseData.removeValue(forKey: task.taskIdentifier)
+            return removed
+        }
 
         if itemId.isEmpty {
             SyncLogger.error("Background task completed with no taskDescription — cannot route outcome",
@@ -87,10 +88,11 @@ final class BackgroundURLSessionDelegate: NSObject, URLSessionDelegate, URLSessi
     // MARK: - URLSessionDelegate
 
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
-        lock.lock()
-        let handler = eventsCompletionHandler
-        eventsCompletionHandler = nil
-        lock.unlock()
+        let handler = lock.withLock { () -> BackgroundEventsCompletionHandler? in
+            let parked = eventsCompletionHandler
+            eventsCompletionHandler = nil
+            return parked
+        }
 
         if let handler = handler {
             DispatchQueue.main.async(execute: handler)

@@ -84,7 +84,7 @@ final class SyncItemDao {
         entity.priority = item.priority
         entity.createdAt = item.createdAt
         entity.attempts = item.attempts
-        entity.lastAttemptAt = item.lastAttemptAt.map { NSNumber(value: $0) }
+        entity.lastAttemptAt = item.lastAttemptAt ?? 0
         entity.lastErrorCode = item.lastErrorCode
         entity.status = item.status
         entity.metadataJSON = try encodeJSON(item.metadata)
@@ -160,7 +160,7 @@ final class SyncItemDao {
             guard let entity = try Self.fetchEntity(id: id, in: context) else { return }
             entity.status = SyncItemStatus.inFlight.rawValue
             entity.attempts += 1
-            entity.lastAttemptAt = Int64(Date().timeIntervalSince1970 * 1000)
+            entity.lastAttemptAt = Int64((Date().timeIntervalSince1970 * 1000).rounded())
         }
     }
 
@@ -178,7 +178,7 @@ final class SyncItemDao {
             guard let entity = try Self.fetchEntity(id: id, in: context) else { return }
             entity.status = SyncItemStatus.pending.rawValue
             entity.lastErrorCode = errorCode
-            entity.lastAttemptAt = Int64(Date().timeIntervalSince1970 * 1000)
+            entity.lastAttemptAt = Int64((Date().timeIntervalSince1970 * 1000).rounded())
         }
     }
 
@@ -291,7 +291,10 @@ final class SyncItemDao {
             priority: entity.priority ?? "NORMAL",
             createdAt: entity.createdAt,
             attempts: entity.attempts,
-            lastAttemptAt: entity.lastAttemptAt?.int64Value,
+            // Core Data stores `lastAttemptAt` as a scalar `Int64` with `0`
+            // sentinel meaning "never attempted"; map back to `Int64?` so the
+            // public-facing `StoredSyncItem` keeps nullable semantics.
+            lastAttemptAt: entity.lastAttemptAt == 0 ? nil : entity.lastAttemptAt,
             lastErrorCode: entity.lastErrorCode,
             status: entity.status ?? SyncItemStatus.pending.rawValue,
             metadata: metadata

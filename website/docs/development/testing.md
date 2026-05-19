@@ -108,19 +108,47 @@ For tests that only need pure JVM behavior (e.g. `RetryPolicyEvaluator`), `testO
 
 ## iOS (XCTest)
 
-Lives under `ios/Tests/`. Test target is wired via CocoaPods `s.test_spec 'Tests'` in `SyncProvider.podspec`. After `pod install`, CocoaPods generates the `SyncProvider-Unit-Tests` scheme.
+Lives under `ios/Tests/`. The test target is wired on the library side via `s.test_spec 'Tests'` in `SyncProvider.podspec`. CocoaPods 1.10+ defaults `:test_type` to `:unit` and auto-prefixes the resulting scheme with `Unit-`, so `pod install` generates the scheme **`SyncProvider-Unit-Tests`** (not `SyncProvider-Tests`). The library does not rename the test_spec — the segment is inserted by CocoaPods.
+
+`use_native_modules!` autolinking does **not** propagate `:testspecs` to the consuming app. `example/ios/Podfile` opts in explicitly:
+
+```ruby
+pod 'SyncProvider', :path => '../..', :testspecs => ['Tests']
+```
+
+Without this line, CocoaPods will never generate the test target and `xcodebuild` will fail to resolve `SyncProvider-Unit-Tests`. The `post_install` block also calls `installer.pods_project.recreate_user_schemes(false)` to defensively share the generated test scheme.
+
+### Setup order
+
+Always run `yarn nitrogen` before `pod install` — the podspec consumes `nitrogen/generated/ios/SyncProvider+autolinking.rb`, which is gitignored and regenerated on every spec change. From the repo root:
+
+```bash
+yarn nitrogen
+cd example && bundle install && bundle exec pod install --project-directory=ios
+```
 
 ### Running
+
+```bash
+yarn test:ios
+```
+
+This is a thin wrapper over `scripts/test-ios.sh`. It mirrors the CI invocation: it removes any stale `build/SyncProviderTests.xcresult` before each attempt (defends against the `"Existing file at -resultBundlePath"` failure mode) and walks a destination fallback list (`iPhone 16` → `iPhone 17` → `iPhone 16 Pro`, all `OS=latest`) so a missing simulator on a single machine does not block the run.
+
+The equivalent direct invocation:
 
 ```bash
 cd example/ios
 xcodebuild test \
   -workspace SyncProviderExample.xcworkspace \
   -scheme SyncProvider-Unit-Tests \
-  -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest'
+  -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest' \
+  -resultBundlePath build/SyncProviderTests.xcresult \
+  -skipPackagePluginValidation \
+  -skipMacroValidation
 ```
 
-CI runs the same command on `macos-latest` with `XCODE_VERSION=26` and uploads `.xcresult` artifacts. The scheme name is parameterized via the `IOS_TEST_SCHEME` env in the CI workflow — the discovery step (`xcodebuild -list`) prints the actual scheme to the log if defaults change.
+CI runs the same command on `macos-latest` with `XCODE_VERSION=26` (see the `test-ios` job in `.github/workflows/ci.yml`), walks the same destination fallback loop, and uploads `.xcresult` artifacts. A "Show available iOS simulators" diagnostic step prints the runtime list before the test step so destination drift is visible in the log.
 
 ### Test seams
 

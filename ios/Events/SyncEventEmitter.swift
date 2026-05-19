@@ -65,33 +65,33 @@ final class SyncEventEmitter: @unchecked Sendable {
                                     message: "Unknown event channel '\(channel)'. Use '\(kSyncEventChannel)'.")
         }
         let id = UUID().uuidString
-        lock.lock()
-        var bucket = listeners[channel] ?? [:]
-        bucket[id] = callback
-        listeners[channel] = bucket
-        lock.unlock()
+        lock.withLock {
+            var bucket = listeners[channel] ?? [:]
+            bucket[id] = callback
+            listeners[channel] = bucket
+        }
         return id
     }
 
     /// Remove a previously registered listener. No-op if the id is unknown.
     func removeListener(channel: String, id: String) {
-        lock.lock()
-        var bucket = listeners[channel] ?? [:]
-        bucket.removeValue(forKey: id)
-        if bucket.isEmpty {
-            listeners.removeValue(forKey: channel)
-        } else {
-            listeners[channel] = bucket
+        lock.withLock {
+            var bucket = listeners[channel] ?? [:]
+            bucket.removeValue(forKey: id)
+            if bucket.isEmpty {
+                listeners.removeValue(forKey: channel)
+            } else {
+                listeners[channel] = bucket
+            }
         }
-        lock.unlock()
     }
 
     /// Snapshot + invoke listeners on the main thread (consistent with React
     /// Native event delivery).
     func emit(_ payload: SyncEventPayload) {
-        lock.lock()
-        let snapshot = listeners[kSyncEventChannel] ?? [:]
-        lock.unlock()
+        let snapshot = lock.withLock {
+            listeners[kSyncEventChannel] ?? [:]
+        }
 
         guard !snapshot.isEmpty else { return }
 
@@ -109,8 +109,8 @@ final class SyncEventEmitter: @unchecked Sendable {
 
     /// Drop all listeners. Used during teardown / tests.
     func removeAll() {
-        lock.lock()
-        listeners.removeAll()
-        lock.unlock()
+        lock.withLock {
+            listeners.removeAll()
+        }
     }
 }

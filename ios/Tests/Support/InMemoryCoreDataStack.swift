@@ -23,7 +23,7 @@ enum InMemoryCoreDataStack {
             attribute("createdAt", type: .integer64AttributeType, optional: false, defaultValue: 0),
             attribute("headersJSON", type: .binaryDataAttributeType, optional: true),
             attribute("id", type: .stringAttributeType, optional: false),
-            attribute("lastAttemptAt", type: .integer64AttributeType, optional: true, usesScalar: false),
+            attribute("lastAttemptAt", type: .integer64AttributeType, optional: false, defaultValue: 0),
             attribute("lastErrorCode", type: .stringAttributeType, optional: true),
             attribute("metadataJSON", type: .binaryDataAttributeType, optional: true),
             attribute("method", type: .stringAttributeType, optional: false, defaultValue: "POST"),

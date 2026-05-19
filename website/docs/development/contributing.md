@@ -142,4 +142,4 @@ Skipping these masks real bugs. If a hook fails, fix the cause and re-stage.
 
 ## Releases
 
-Phase 8 of the roadmap (Release flow) wires up `release-it` + automated publishes. Until then, releases are manual: bump `package.json`, tag, and `npm publish`. Watch the changelog discipline — every release entry mirrors the Conventional Commits log.
+Automated release flow (`release-it` + publish workflows) is planned; until then, releases are manual: bump `package.json`, tag, and `npm publish`. Watch the changelog discipline — every release entry mirrors the Conventional Commits log.
