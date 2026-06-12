@@ -38,15 +38,17 @@ internal object RetryPolicyEvaluator {
       BackoffStrategy.EXPONENTIAL -> base * 2.0.pow((attempt - 1).toDouble())
       BackoffStrategy.FIBONACCI -> base * fibonacci(attempt).toDouble()
     }
-    val capped = min(raw, cap)
 
-    val withJitter = if (policy.jitter && capped > 0) {
-      // Full jitter [0, capped] (matches the JS-side default behavior).
-      capped * random.nextDouble()
+    val jittered = if (policy.jitter && raw > 0) {
+      // Equal jitter [0.75, 1.25]: spread the back-off ±25% around `raw`,
+      // matching JS (src/utils/retryBackoff.ts) and iOS
+      // (ios/Retry/RetryPolicyEvaluator.swift). Cap is applied AFTER jitter so
+      // the clamped value never exceeds maxDelayMs, exactly like both peers.
+      raw * (0.75 + random.nextDouble() * 0.5)
     } else {
-      capped
+      raw
     }
-    return withJitter.toLong()
+    return min(jittered, cap).toLong()
   }
 
   /**
