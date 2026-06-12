@@ -59,6 +59,29 @@ jobs:
       - name: Build package
         run: yarn prepare
 
+      # Report-only: surface the published tarball footprint in the job summary.
+      # Must run AFTER `yarn prepare` so the nitrogen/ output (listed in
+      # package.json "files") is included in the dry-run pack. No threshold gate.
+      - name: Report npm pack size
+        run: |
+          PACK_JSON=$(npm pack --dry-run --json)
+          node -e '
+            const fs = require("fs");
+            const data = JSON.parse(fs.readFileSync(0, "utf8"));
+            const pkg = Array.isArray(data) ? data[0] : data;
+            const fmt = (b) => (b / 1024).toFixed(1) + " KiB";
+            const lines = [
+              "### Package size (npm pack --dry-run)",
+              "",
+              "| Metric | Size |",
+              "|---|---:|",
+              `| Tarball (packed) | ${fmt(pkg.size)} (${pkg.size} bytes) |`,
+              `| Unpacked | ${fmt(pkg.unpackedSize)} (${pkg.unpackedSize} bytes) |`,
+              `| File count | ${pkg.entryCount} |`,
+            ];
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
+          ' <<< "$PACK_JSON"
+
   build-android:
     runs-on: ubuntu-latest
 
