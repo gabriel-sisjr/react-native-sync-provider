@@ -3,17 +3,6 @@
   "globalDependencies": [".nvmrc", ".yarnrc.yml"],
   "globalEnv": ["NODE_ENV"],
   "tasks": {
-    "test": {
-      "env": ["NODE_ENV", "CI"],
-      "inputs": [
-        "package.json",
-        "yarn.lock",
-        "tsconfig.json",
-        "src/**",
-        "!src/**/__snapshots__/**"
-      ],
-      "outputs": ["coverage/**"]
-    },
     "build:android": {
       "env": ["ANDROID_HOME", "ORG_GRADLE_PROJECT_newArchEnabled"],
       "inputs": [

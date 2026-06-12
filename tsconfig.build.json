@@ -1,4 +1,7 @@
 {
   "extends": "./tsconfig",
+  "compilerOptions": {
+    "incremental": false
+  },
   "exclude": ["example", "lib", "nitrogen"]
 }

@@ -9,6 +9,8 @@
     "customConditions": ["react-native-strict-api"],
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
+    "incremental": true,
+    "tsBuildInfoFile": "node_modules/.cache/tsbuildinfo.json",
     "jsx": "react-jsx",
     "lib": ["ESNext"],
     "module": "ESNext",
