@@ -47,4 +47,27 @@ Use the table at the bottom of each entry to enumerate every renamed, removed, o
 
 ## [Unreleased]
 
-No breaking changes yet -- the library is pre-1.0 and the public API surface is still being shaped. Upcoming breaking changes will be cataloged here before each release and moved into a dated section on publish.
+### iOS minimum deployment target `13.0` --> `15.0`
+
+> **Category:** platform-requirement change (**not** a JS/TS API break). Pre-1.0.
+>
+> **Changelog:** see the [`[Unreleased]` entry in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+
+The iOS minimum deployment target declared in `SyncProvider.podspec` is raised from `13.0` to `15.0`. This is a **platform-requirement change**: the public TypeScript surface (functions, hooks, types, enums, error codes) is unchanged, and no consumer JS code needs to be migrated. The blast radius is **install/compile-time on iOS only** — apps that pin an iOS deployment target below `15.0` must raise it.
+
+**Rationale:** `ios/HTTP/SyncDispatcher.swift` uses the async `URLSession.data(for:)` API, which requires **iOS 15+**. The previous `13.0` floor was latent: the build only passed because the example app overrode `IPHONEOS_DEPLOYMENT_TARGET` to `>= 15.x`, masking the mismatch. Any consumer honoring the declared `13.0` floor would have hit an availability compile error in `SyncDispatcher.swift`. Raising the podspec floor to `15.0` makes the declared requirement match the code. (`BGTaskScheduler`'s iOS 13+ requirement is comfortably covered by the higher floor.)
+
+#### Migration steps
+
+1. In your app's `ios/Podfile`, ensure the platform line is at least `platform :ios, '15.0'`.
+2. If you set `IPHONEOS_DEPLOYMENT_TARGET` anywhere (Podfile `post_install`, Xcode build settings), make sure it is `>= 15.0`.
+3. Run `cd ios && bundle exec pod install`.
+
+No JS/TS code changes are required.
+
+#### Affected symbols
+
+| Symbol / surface                                              | Change                      |
+| ------------------------------------------------------------- | --------------------------- |
+| `SyncProvider.podspec` (`s.platforms`, `test_spec.platforms`) | iOS floor `13.0` --> `15.0` |
+| Public TypeScript API                                         | none (no JS break)          |

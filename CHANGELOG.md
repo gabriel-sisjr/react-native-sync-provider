@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 > **Pre-1.0 notice:** while the library is on `0.x`, minor version bumps (`0.x.0`) may include breaking changes. Every breaking change is summarized in [`BREAKING_CHANGES.md`](./BREAKING_CHANGES.md) and ships with a dedicated migration guide under `website/docs/migration/`.
 
+## [Unreleased]
+
+### Changed
+
+- **iOS minimum deployment target raised `13.0` → `15.0`** (P7). `SyncProvider.podspec` (`s.platforms` and `test_spec.platforms`) now declares `ios 15.0`. The implementation already relied on `URLSession.data(for:)` (iOS 15+) in `ios/HTTP/SyncDispatcher.swift`; the previous `13.0` floor only compiled because the example app overrode `IPHONEOS_DEPLOYMENT_TARGET`, so any consumer honoring the declared floor would hit an availability compile error. The always-true `if #available(iOS 13.0, *)` / `@available(iOS 13.0, *)` guards in `ios/HTTP/SyncDispatcher.swift` and `ios/Background/BackgroundSyncManager.swift` were removed as dead code. This is a **platform-requirement change, not a JS/TS API break** — see [`BREAKING_CHANGES.md`](./BREAKING_CHANGES.md).
+
+### Fixed
+
+- **android:** retry jitter corrected to `[0.75, 1.25]` equal-jitter (P9b). The Android `RetryPolicyEvaluator` previously applied **full-jitter** over `[0, capped]` and capped the delay _before_ jittering, so delays collapsed toward `0` and never reflected the documented spread. It now jitters the raw delay by `[0.75, 1.25]` (`raw * (0.75 + random.nextDouble() * 0.5)`) and applies the cap _after_ jitter, matching the JS (`src/utils/retryBackoff.ts`) and iOS (`ios/Retry/RetryPolicyEvaluator.swift`) implementations and the documented behavior.
+
+### Internal
+
+- **iOS:** demoted the Core Data entity classes `SyncItemEntity` and `SyncResultEntity` (and their members) from `public` to internal (P-CI). The `public` access level leaked the entities into the generated `SyncProvider-Swift.h` bridging header, breaking Objective-C translation units (`Cannot find interface declaration for NSManagedObject`) and the iOS CI build. The entities are implementation-only, so this restores green iOS CI with **no public-API impact**. Also updated the example AppDelegate to call the renamed `HybridSyncProvider.handleBackgroundURLSessionEvents`.
+
 ## v0.1.1 - 2025-05-19
 
 ### Fixed

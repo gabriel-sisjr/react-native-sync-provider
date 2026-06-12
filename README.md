@@ -73,7 +73,7 @@ If `react-native-background-location` is what you reach for when you need GPS th
 
 |                              | Minimum                    |
 | ---------------------------- | -------------------------- |
-| iOS                          | 13.0 (BGTaskScheduler API) |
+| iOS                          | 15.0 (`URLSession.data(for:)`) |
 | Android `minSdkVersion`      | 24                         |
 | React Native                 | 0.73+                      |
 | React                        | 18.2+                      |
@@ -588,7 +588,7 @@ Browse the **[full documentation site](https://gabriel-sisjr.github.io/react-nat
 | Platform | Status    | Notes                                                                                 |
 | -------- | --------- | ------------------------------------------------------------------------------------- |
 | Android  | Supported | Kotlin native implementation. Min SDK 24, target SDK 36. Room + WorkManager + OkHttp. |
-| iOS      | Supported | Swift native implementation. iOS 13+. Core Data + URLSession + BGTaskScheduler.       |
+| iOS      | Supported | Swift native implementation. iOS 15+. Core Data + URLSession + BGTaskScheduler.       |
 
 > **New Architecture is required.** The library is built on [Nitro Modules](https://nitro.margelo.com/), which require Fabric + TurboModules. See the [Platform Comparison](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/architecture/overview) for the cross-platform behavior matrix.
 
