@@ -9,16 +9,16 @@ import CoreData
 import Foundation
 
 @objc(SyncResultEntity)
-public final class SyncResultEntity: NSManagedObject {
-    @nonobjc public class func fetchRequest() -> NSFetchRequest<SyncResultEntity> {
+final class SyncResultEntity: NSManagedObject {
+    @nonobjc class func fetchRequest() -> NSFetchRequest<SyncResultEntity> {
         return NSFetchRequest<SyncResultEntity>(entityName: "SyncResultEntity")
     }
 
-    @NSManaged public var errorMessage: String?
-    @NSManaged public var finishedAt: Int64
-    @NSManaged public var id: String?
-    @NSManaged public var itemsAttempted: Int32
-    @NSManaged public var itemsFailed: Int32
-    @NSManaged public var itemsSucceeded: Int32
-    @NSManaged public var startedAt: Int64
+    @NSManaged var errorMessage: String?
+    @NSManaged var finishedAt: Int64
+    @NSManaged var id: String?
+    @NSManaged var itemsAttempted: Int32
+    @NSManaged var itemsFailed: Int32
+    @NSManaged var itemsSucceeded: Int32
+    @NSManaged var startedAt: Int64
 }
