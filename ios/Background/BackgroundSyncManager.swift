@@ -55,33 +55,31 @@ final class BackgroundSyncManager: @unchecked Sendable {
     /// `BGTaskScheduler` contract. Idempotent — safe to call from `init`.
     func registerHandlers() {
         #if canImport(BackgroundTasks)
-        if #available(iOS 13.0, *) {
-            let already = lock.withLock { () -> Bool in
-                let wasRegistered = registered
-                registered = true
-                return wasRegistered
-            }
-            guard !already else { return }
-
-            let scheduler = BGTaskScheduler.shared
-            scheduler.register(forTaskWithIdentifier: kBackgroundRefreshIdentifier,
-                               using: nil) { [weak self] task in
-                guard let self = self, let appRefreshTask = task as? BGAppRefreshTask else {
-                    task.setTaskCompleted(success: false)
-                    return
-                }
-                self.handleAppRefresh(task: appRefreshTask)
-            }
-            scheduler.register(forTaskWithIdentifier: kBackgroundProcessingIdentifier,
-                               using: nil) { [weak self] task in
-                guard let self = self, let processingTask = task as? BGProcessingTask else {
-                    task.setTaskCompleted(success: false)
-                    return
-                }
-                self.handleProcessing(task: processingTask)
-            }
-            SyncLogger.info("Registered BGTaskScheduler handlers", category: "background")
+        let already = lock.withLock { () -> Bool in
+            let wasRegistered = registered
+            registered = true
+            return wasRegistered
         }
+        guard !already else { return }
+
+        let scheduler = BGTaskScheduler.shared
+        scheduler.register(forTaskWithIdentifier: kBackgroundRefreshIdentifier,
+                           using: nil) { [weak self] task in
+            guard let self = self, let appRefreshTask = task as? BGAppRefreshTask else {
+                task.setTaskCompleted(success: false)
+                return
+            }
+            self.handleAppRefresh(task: appRefreshTask)
+        }
+        scheduler.register(forTaskWithIdentifier: kBackgroundProcessingIdentifier,
+                           using: nil) { [weak self] task in
+            guard let self = self, let processingTask = task as? BGProcessingTask else {
+                task.setTaskCompleted(success: false)
+                return
+            }
+            self.handleProcessing(task: processingTask)
+        }
+        SyncLogger.info("Registered BGTaskScheduler handlers", category: "background")
         #endif
     }
 
@@ -90,17 +88,13 @@ final class BackgroundSyncManager: @unchecked Sendable {
     ///   OS rejects the submission (most commonly: missing `Info.plist` key).
     func enable(options: BackgroundSyncOptionsValue) throws {
         #if canImport(BackgroundTasks)
-        if #available(iOS 13.0, *) {
-            registerHandlers()
-            try scheduleAppRefresh(options: options)
-            lock.withLock {
-                enabled = true
-                lastOptions = options
-            }
-            SyncLogger.info("Background sync enabled (interval=\(options.minimumIntervalMs)ms)", category: "background")
-        } else {
-            throw SyncProviderError.backgroundRegistrationFailed("iOS 13.0 or higher required")
+        registerHandlers()
+        try scheduleAppRefresh(options: options)
+        lock.withLock {
+            enabled = true
+            lastOptions = options
         }
+        SyncLogger.info("Background sync enabled (interval=\(options.minimumIntervalMs)ms)", category: "background")
         #else
         throw SyncProviderError.backgroundRegistrationFailed("BackgroundTasks framework unavailable")
         #endif
@@ -109,10 +103,8 @@ final class BackgroundSyncManager: @unchecked Sendable {
     /// Cancel any pending submissions and mark disabled.
     func disable() {
         #if canImport(BackgroundTasks)
-        if #available(iOS 13.0, *) {
-            BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: kBackgroundRefreshIdentifier)
-            BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: kBackgroundProcessingIdentifier)
-        }
+        BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: kBackgroundRefreshIdentifier)
+        BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: kBackgroundProcessingIdentifier)
         #endif
         lock.withLock {
             enabled = false
@@ -122,7 +114,6 @@ final class BackgroundSyncManager: @unchecked Sendable {
 
     // MARK: - Submission
 
-    @available(iOS 13.0, *)
     private func scheduleAppRefresh(options: BackgroundSyncOptionsValue) throws {
         #if canImport(BackgroundTasks)
         let request = BGAppRefreshTaskRequest(identifier: kBackgroundRefreshIdentifier)
@@ -137,7 +128,6 @@ final class BackgroundSyncManager: @unchecked Sendable {
         #endif
     }
 
-    @available(iOS 13.0, *)
     private func scheduleProcessing(options: BackgroundSyncOptionsValue) {
         #if canImport(BackgroundTasks)
         let request = BGProcessingTaskRequest(identifier: kBackgroundProcessingIdentifier)
@@ -155,7 +145,6 @@ final class BackgroundSyncManager: @unchecked Sendable {
     // MARK: - Handlers
 
     #if canImport(BackgroundTasks)
-    @available(iOS 13.0, *)
     private func handleAppRefresh(task: BGAppRefreshTask) {
         SyncLogger.info("BGAppRefresh task fired", category: "background")
         emitter.emit(.now(type: "BACKGROUND_SYNC_STARTED"))
@@ -186,7 +175,6 @@ final class BackgroundSyncManager: @unchecked Sendable {
         }
     }
 
-    @available(iOS 13.0, *)
     private func handleProcessing(task: BGProcessingTask) {
         SyncLogger.info("BGProcessing task fired", category: "background")
         emitter.emit(.now(type: "BACKGROUND_SYNC_STARTED",

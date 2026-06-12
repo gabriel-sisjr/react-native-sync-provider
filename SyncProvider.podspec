@@ -10,9 +10,11 @@ Pod::Spec.new do |s|
   s.license      = package["license"]
   s.authors      = package["author"]
 
-  # BGTaskScheduler requires iOS 13.0+. We pin the floor explicitly rather than
-  # relying on the Cocoapods helper because this library has a strict minimum.
-  s.platforms    = { :ios => "13.0" }
+  # iOS 15.0 floor: `ios/HTTP/SyncDispatcher.swift` uses the async
+  # `URLSession.data(for:)` API, which is iOS 15+. We pin the floor explicitly
+  # rather than relying on the Cocoapods helper because this library has a
+  # strict minimum. (BGTaskScheduler, iOS 13+, is comfortably covered.)
+  s.platforms    = { :ios => "15.0" }
   s.source       = { :git => "https://github.com/gabriel-sisjr/react-native-sync-provider.git", :tag => "#{s.version}" }
 
   s.source_files = [
@@ -53,7 +55,7 @@ Pod::Spec.new do |s|
   #   Foundation       — stdlib
   #   CoreData         — queue + history persistence
   #   Network          — NWPathMonitor connectivity tracking
-  #   BackgroundTasks  — BGTaskScheduler (iOS 13+)
+  #   BackgroundTasks  — BGTaskScheduler (iOS 13+; library floor is 15.0)
   s.frameworks = "Foundation", "CoreData", "Network", "BackgroundTasks"
 
   s.dependency 'React-jsi'
@@ -72,7 +74,7 @@ Pod::Spec.new do |s|
   # `Unit-` segment for `:test_type => :unit` (the default). Sources live
   # under `ios/Tests/**` so they ship in the same git tree as production.
   s.test_spec 'Tests' do |test_spec|
-    test_spec.platforms = { :ios => "13.0" }
+    test_spec.platforms = { :ios => "15.0" }
     test_spec.source_files = "ios/Tests/**/*.swift"
     test_spec.requires_app_host = false
     test_spec.frameworks = "XCTest", "Foundation", "CoreData", "Network"
