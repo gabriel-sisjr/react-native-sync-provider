@@ -59,12 +59,9 @@ jobs:
       - name: Build package
         run: yarn prepare
 
-      # Report-only: surface the published tarball footprint in the job summary.
-      # Must run AFTER `yarn prepare` so the nitrogen/ output (listed in
-      # package.json "files") is included in the dry-run pack. No threshold gate.
       - name: Report npm pack size
         run: |
-          PACK_JSON=$(npm pack --dry-run --json)
+          PACK_JSON=$(npm pack --dry-run --json --ignore-scripts)
           node -e '
             const fs = require("fs");
             const data = JSON.parse(fs.readFileSync(0, "utf8"));

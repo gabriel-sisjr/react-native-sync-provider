@@ -77,7 +77,7 @@ internal class RetryPolicyEvaluatorTest {
   }
 
   @Test
-  fun `equal-jitter delay stays within [0_75, 1_25] of the base and respects the cap`() {
+  fun `equal-jitter delay stays within 0_75 to 1_25 of the base and respects the cap`() {
     val policy = TestData.retryPolicy(
       backoff = BackoffStrategy.EXPONENTIAL,
       baseDelayMs = 100L,
