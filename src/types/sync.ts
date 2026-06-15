@@ -118,7 +118,8 @@ export interface RetryPolicy {
   maxDelayMs: number;
   /**
    * If `true`, the computed delay is multiplied by a uniformly distributed
-   * factor in `[0.5, 1.5]` to avoid synchronized retry storms.
+   * equal-jitter factor in `[0.75, 1.25)` (i.e. ±25% around the base delay) to
+   * avoid synchronized retry storms.
    */
   jitter: boolean;
   /**

@@ -77,7 +77,7 @@ internal class RetryPolicyEvaluatorTest {
   }
 
   @Test
-  fun `full-jitter delay stays within zero and capped`() {
+  fun `equal-jitter delay stays within 0_75 to 1_25 of the base and respects the cap`() {
     val policy = TestData.retryPolicy(
       backoff = BackoffStrategy.EXPONENTIAL,
       baseDelayMs = 100L,
@@ -88,11 +88,32 @@ internal class RetryPolicyEvaluatorTest {
     val random = Random(42)
     repeat(50) { iteration ->
       val attempt = (iteration % 5) + 1
-      val capped = minOf(100.0 * Math.pow(2.0, (attempt - 1).toDouble()), 10_000.0).toLong()
+      val raw = 100.0 * Math.pow(2.0, (attempt - 1).toDouble())
+      // Equal jitter [0.75, 1.25] of `raw`, then capped at maxDelayMs.
+      val lowerBound = minOf(raw * 0.75, 10_000.0).toLong()
+      val upperBound = minOf(raw * 1.25, 10_000.0).toLong()
       val delay = RetryPolicyEvaluator.computeDelayMs(attempt, policy, random)
 
-      assertThat(delay).isAtLeast(0L)
-      assertThat(delay).isAtMost(capped)
+      assertThat(delay).isAtLeast(lowerBound)
+      assertThat(delay).isAtMost(upperBound)
+    }
+  }
+
+  @Test
+  fun `equal-jitter clamps to the cap when the high jitter factor overflows`() {
+    val policy = TestData.retryPolicy(
+      backoff = BackoffStrategy.EXPONENTIAL,
+      baseDelayMs = 1_000L,
+      maxDelayMs = 5_000L,
+      jitter = true,
+    )
+
+    val random = Random(7)
+    // raw for attempt 10 = 1000 * 2^9 = 512000; even the 1.25x factor stays
+    // far above the cap, so every sample must clamp exactly to maxDelayMs.
+    repeat(50) {
+      val delay = RetryPolicyEvaluator.computeDelayMs(10, policy, random)
+      assertThat(delay).isEqualTo(5_000L)
     }
   }
 

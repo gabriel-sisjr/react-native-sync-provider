@@ -90,10 +90,8 @@ actor SyncDispatcher {
         background.isDiscretionary = false
         background.sessionSendsLaunchEvents = true
         background.requestCachePolicy = .reloadIgnoringLocalCacheData
-        if #available(iOS 13.0, *) {
-            background.allowsConstrainedNetworkAccess = true
-            background.allowsExpensiveNetworkAccess = true
-        }
+        background.allowsConstrainedNetworkAccess = true
+        background.allowsExpensiveNetworkAccess = true
         self.backgroundSession = URLSession(configuration: background,
                                             delegate: backgroundDelegate,
                                             delegateQueue: nil)

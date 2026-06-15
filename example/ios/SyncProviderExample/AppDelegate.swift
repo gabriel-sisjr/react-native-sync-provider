@@ -40,7 +40,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     handleEventsForBackgroundURLSession identifier: String,
     completionHandler: @escaping () -> Void
   ) {
-    SyncProvider.handleBackgroundURLSessionEvents(
+    HybridSyncProvider.handleBackgroundURLSessionEvents(
       identifier: identifier,
       completionHandler: completionHandler
     )

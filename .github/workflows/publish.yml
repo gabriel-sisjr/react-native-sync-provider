@@ -64,6 +64,14 @@ jobs:
         if: steps.version-check.outputs.version_changed == 'true'
         run: yarn nitrogen
 
+      - name: Lint files
+        if: steps.version-check.outputs.version_changed == 'true'
+        run: yarn lint
+
+      - name: Typecheck files
+        if: steps.version-check.outputs.version_changed == 'true'
+        run: yarn typecheck
+
       - name: Build package
         if: steps.version-check.outputs.version_changed == 'true'
         run: yarn prepare

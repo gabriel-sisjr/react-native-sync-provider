@@ -10,8 +10,10 @@
  *   3. Update the Swift implementation at `ios/SyncProvider.swift`.
  *   4. Update the Kotlin implementation at
  *      `android/src/main/java/com/margelo/nitro/syncprovider/SyncProvider.kt`.
- *   5. Update the JS facade re-exports under `src/index.tsx` and the
- *      platform-extension files (`<method>.native.tsx` / `<method>.tsx`).
+ *   5. Update the JS facade in `src/index.tsx` (the entire facade lives
+ *      there) and the web fallback in `src/index.web.tsx`. The platform
+ *      split is at the entry level via the `"browser"` exports condition —
+ *      there is NO per-method `.native.tsx` / `.tsx` split.
  *
  * Hard rules for this file:
  *   - Type-only imports (`import type ...`) — no runtime values.
@@ -45,7 +47,10 @@ export type { SyncErrorCode };
  * The native HybridObject contract for the SyncProvider library.
  *
  * Implementations:
- *   - iOS / Swift   → `class SyncProvider: HybridSyncProviderSpec` (`ios/`).
+ *   - iOS / Swift   → `final class HybridSyncProvider: HybridSyncProviderSpec`
+ *     (`ios/SyncProvider.swift`) — named `HybridSyncProvider` (not
+ *     `SyncProvider`) to avoid a symbol collision with the C++ `SyncProvider`
+ *     class Nitro generates.
  *   - Android / Kotlin → `class SyncProvider : HybridSyncProviderSpec()` (`android/`).
  */
 export interface SyncProvider extends HybridObject<{
