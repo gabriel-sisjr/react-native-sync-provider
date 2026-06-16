@@ -353,6 +353,77 @@ interface UseSyncConfigResult {
 
 See [`useSyncConfig`](./hooks/useSyncConfig.md).
 
+### `UseSyncSnapshotResult`
+
+```ts
+interface UseSyncSnapshotResult {
+  connection: UseConnectionResult;
+  size: number;
+  items: SyncItem[];
+  isSyncing: boolean;
+  isPaused: boolean;
+  progress: number | null;
+  lastResult: SyncResult | null;
+  isWaitingForConnection: boolean;
+  error: SyncError | null;
+  // Forward fields (Block B / v0.3) -- ALWAYS undefined in v0.2:
+  networkQuality?: NetworkQuality;
+  deadLetter?: readonly SyncDeadLetterItem[];
+}
+```
+
+Read-only dashboard aggregator with no action methods. `networkQuality` and `deadLetter` are forward-looking fields that are **ALWAYS `undefined` in v0.2** -- see [Forward Types](#forward-types-block-b-v03) below.
+
+See [`useSyncSnapshot`](./hooks/useSyncSnapshot.md).
+
+---
+
+## Forward Types (Block B, v0.3) {#forward-types-block-b-v03}
+
+These types are part of the frozen public surface so consumer code can depend on their final shape, but in v0.2 they are surfaced **only** as the optional [`UseSyncSnapshotResult.networkQuality`](#usesyncsnapshotresult) and [`UseSyncSnapshotResult.deadLetter`](#usesyncsnapshotresult) fields, both **ALWAYS `undefined`** until the v0.3 features ship.
+
+### `SyncDeadLetterItem`
+
+An item that exhausted its retry budget and was moved to the dead-letter queue instead of being dropped. This is the **Gap #4** dead-letter item slated for Block B (v0.3); in v0.2 it is never produced.
+
+```ts
+interface SyncDeadLetterItem {
+  id: string;
+  method: HttpMethod;
+  url: string;
+  headers?: Record<string, string>;
+  body?: string;
+  contentType?: string;
+  priority?: SyncPriority;
+  createdAt: number;
+  metadata?: Record<string, string>;
+  attempts: number;
+  lastAttemptAt: number;
+  lastErrorCode: SyncErrorCode;
+  lastErrorMessage?: string;
+  deadLetteredAt: number;
+}
+```
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| `id` | `string` | Yes | ULID assigned by the native layer at enqueue time. |
+| `method` | [`HttpMethod`](./enums.md#httpmethod) | Yes | HTTP verb used to dispatch the request. |
+| `url` | `string` | Yes | Absolute URL of the request. |
+| `headers` | `Record<string, string>` | No | Request headers, mirroring what was enqueued. |
+| `body` | `string` | No | Pre-serialized request body. |
+| `contentType` | `string` | No | `Content-Type` shortcut; native prefers it over any value in `headers`. |
+| `priority` | [`SyncPriority`](./enums.md#syncpriority) | No | Dispatch lane (`NORMAL` if not supplied on enqueue). |
+| `createdAt` | `number` | Yes | Unix ms captured by the native layer at enqueue time. |
+| `metadata` | `Record<string, string>` | No | Opaque tags, mirroring what was enqueued. |
+| `attempts` | `number` | Yes | Total dispatch attempts made before dead-lettering. |
+| `lastAttemptAt` | `number` | Yes | Unix ms of the final (failing) dispatch attempt. |
+| `lastErrorCode` | [`SyncErrorCode`](./errors.md#syncerrorcode) | Yes | Failure code from the final attempt -- the reason it was dead-lettered. |
+| `lastErrorMessage` | `string` | No | Human-readable detail accompanying `lastErrorCode`. |
+| `deadLetteredAt` | `number` | Yes | Unix ms at which the item was moved to dead-letter. |
+
+See also [`NetworkQuality`](./enums.md#networkquality) -- the companion forward enum (Gap #2).
+
 ---
 
 ## See also

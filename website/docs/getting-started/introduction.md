@@ -29,9 +29,9 @@ keywords:
 - **Declarative retry policy** -- Linear, exponential, or Fibonacci backoff with jitter, configurable retry-on-status codes, and a per-item attempt budget.
 - **Per-item priority lanes** -- `HIGH` / `NORMAL` / `LOW` dispatch order, deterministic within a flush cycle.
 - **ULID idempotency** -- Every item carries a native-assigned ULID so retries are safe; mirror it into your `Idempotency-Key` header for exactly-once server semantics.
-- **First-class TypeScript** -- 19 facade functions, 7 React hooks, and a complete type / enum / error surface, all strict-mode clean.
+- **First-class TypeScript** -- 19 facade functions, 8 React hooks, and a complete type / enum / error surface, all strict-mode clean.
 - **Optional Provider** -- An optional `<SyncProvider>` Context wraps `configureSync` + `enableBackgroundSync` lifecycle for app-level setup.
-- **Unified hooks library** -- `useConnection`, `useSyncQueue`, `useSyncStatus`, `useOfflineQueue`, `useSyncEvents`, `useSyncConfig`, `useAutoSync`.
+- **Unified hooks library** -- `useConnection`, `useSyncQueue`, `useSyncStatus`, `useOfflineQueue`, `useSyncEvents`, `useSyncConfig`, `useAutoSync`, `useSyncSnapshot`.
 - **Battery-friendly defaults** -- Conservative interval clamps, metered-link awareness, and OS-respecting constraints out of the box.
 
 ## Platform Support

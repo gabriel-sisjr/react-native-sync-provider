@@ -111,7 +111,7 @@ if (isNativeModuleAvailable()) {
 }
 ```
 
-The 7 hooks already short-circuit safely when the module is missing — they return inert state instead of throwing.
+The 8 hooks already short-circuit safely when the module is missing — they return inert state instead of throwing.
 
 ### Symptom: Type errors in unrelated files after upgrading the library
 

@@ -212,7 +212,36 @@ enum SyncEventType {
 
 ---
 
+## `NetworkQuality`
+
+:::note Forward type (Block B / v0.3)
+`NetworkQuality` is the **Gap #2** network-quality classification slated for Block B (v0.3). It is introduced early so consumer types can depend on its final shape, but in v0.2 it is surfaced **only** as the optional [`UseSyncSnapshotResult.networkQuality`](./types.md#usesyncsnapshotresult) field and is **ALWAYS `undefined`** until the v0.3 classifier ships.
+:::
+
+Coarse network-quality classification. The value set is ordered **worst → best** so consumers can compare or threshold on it once the v0.3 classifier populates it.
+
+```ts
+enum NetworkQuality {
+  OFFLINE = 'OFFLINE',
+  POOR = 'POOR',
+  MODERATE = 'MODERATE',
+  GOOD = 'GOOD',
+  EXCELLENT = 'EXCELLENT',
+}
+```
+
+| Value | Description |
+|-------|-------------|
+| `OFFLINE` | No usable network path -- equivalent to [`ConnectionStatus.DISCONNECTED`](#connectionstatus). |
+| `POOR` | Connected but throughput/latency is poor -- sync should be conservative. |
+| `MODERATE` | Usable mid-tier link -- acceptable for most foreground sync. |
+| `GOOD` | Healthy link -- suitable for normal background and foreground sync. |
+| `EXCELLENT` | Best-tier link (typically unmetered Wi-Fi/ethernet) -- no constraints. |
+
+---
+
 ## See also
 
 - [`SyncEvent` type](./types.md#syncevent), [Listeners](./listeners.md), [`useSyncEvents`](./hooks/useSyncEvents.md).
 - [Errors](./errors.md) for `SyncErrorCode`.
+- [`useSyncSnapshot`](./hooks/useSyncSnapshot.md) and [`SyncDeadLetterItem`](./types.md#syncdeadletteritem) -- where the forward `NetworkQuality` is surfaced.

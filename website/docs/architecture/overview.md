@@ -32,7 +32,7 @@ graph TD
 
 ### Layer 1: TypeScript Facade
 
-Source of every public symbol: 19 functions, 7 hooks, the `SyncProvider` context, every type and enum, the `SyncError` class. Located under `src/`. Responsibilities:
+Source of every public symbol: 19 functions, 8 hooks, the `SyncProvider` context, every type and enum, the `SyncError` class. Located under `src/`. Responsibilities:
 
 - Validate inputs (`validateSyncItem`).
 - Translate the native sentinel `startedAt === 0 && finishedAt === 0` for `getLastSyncResult` into `undefined`.

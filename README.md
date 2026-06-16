@@ -62,7 +62,7 @@ If `react-native-background-location` is what you reach for when you need GPS th
 - Declarative retry policy with linear / exponential / fibonacci backoff, jitter, and a per-status-code allowlist
 - Priority lanes (`HIGH` / `NORMAL` / `LOW`) enforced by the native dispatcher
 - Three sync strategies: `AUTOMATIC` (flush on connectivity), `MANUAL` (consumer-driven), `OPPORTUNISTIC` (charging + unmetered)
-- 7 fully typed React hooks for connection, queue, status, events, config, and an opt-in orchestrator
+- 8 fully typed React hooks for connection, queue, status, events, config, a read-only dashboard snapshot, and an opt-in orchestrator
 - 15 typed event types streamed over a single `sync-event` channel for observability
 - `SyncError` + `SyncErrorCode` discriminated error surface for clean pattern matching
 - Idempotent by design — native-assigned ULIDs guarantee no duplicates across retries or restarts
@@ -194,6 +194,7 @@ For step-by-step setup, see the [Quick Start Guide](https://gabriel-sisjr.github
 | [`useSyncEvents`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncEvents)       | Typed event stream (15 `SyncEventType`s) with optional filtering.                             |
 | [`useSyncConfig`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncConfig)       | Read / update the live `SyncOptions`.                                                         |
 | [`useAutoSync`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useAutoSync)           | Orchestrator: periodic interval + reconnect flush + opt-in AppState foreground trigger.       |
+| [`useSyncSnapshot`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncSnapshot)   | Read-only dashboard aggregator (connection + queue + sync state) driven by one subscription.   |
 
 See the [Hooks API Reference](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncQueue) for complete documentation, options, and examples.
 
