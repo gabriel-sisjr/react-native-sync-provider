@@ -24,6 +24,7 @@ import type {
   UseSyncConfigResult,
   UseSyncEventsOptions,
   UseSyncQueueResult,
+  UseSyncSnapshotResult,
   UseSyncStatusResult,
 } from './types/hooks';
 import type {
@@ -259,6 +260,21 @@ export function useOfflineQueue(): UseOfflineQueueResult {
     flush: async () => {
       throw unavailable('flush');
     },
+  };
+}
+
+/** @public */
+export function useSyncSnapshot(): UseSyncSnapshotResult {
+  return {
+    connection: INERT_CONNECTION,
+    size: 0,
+    items: [],
+    isSyncing: false,
+    isPaused: false,
+    progress: null,
+    lastResult: null,
+    isWaitingForConnection: false,
+    error: null,
   };
 }
 

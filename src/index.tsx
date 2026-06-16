@@ -10,8 +10,9 @@
  *
  *   - 19 facade functions that wrap the Nitro `SyncProvider` HybridObject.
  *   - 2 listener helpers (`addSyncEventListener`, `removeSyncEventListener`).
- *   - 7 React hooks (`useConnection`, `useSyncQueue`, `useSyncStatus`,
- *     `useOfflineQueue`, `useSyncEvents`, `useSyncConfig`, `useAutoSync`).
+ *   - 8 React hooks (`useConnection`, `useSyncQueue`, `useSyncStatus`,
+ *     `useOfflineQueue`, `useSyncEvents`, `useSyncConfig`, `useAutoSync`,
+ *     `useSyncSnapshot`).
  *   - The optional {@link SyncProvider | SyncProvider Context} component.
  *   - Every public type, enum, and the `SyncError` / `SyncErrorCode` pair.
  *   - The `generateId` helper (UUID v4, Math.random-backed).
@@ -55,6 +56,7 @@ export {
   useSyncConfig,
   useSyncEvents,
   useSyncQueue,
+  useSyncSnapshot,
   useSyncStatus,
 } from './hooks';
 

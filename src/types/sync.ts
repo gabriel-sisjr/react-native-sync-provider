@@ -94,6 +94,58 @@ export interface SyncItem {
   metadata?: Record<string, string>;
 }
 
+/**
+ * An item that exhausted its retry budget and was moved to the dead-letter
+ * queue instead of being dropped.
+ *
+ * Derived from plan §B8/B9, this is the Gap #4 dead-letter item slated for
+ * Block B (v0.3). It mirrors {@link SyncItem} and adds the failure bookkeeping
+ * needed to inspect, re-drive, or discard a dead-lettered request.
+ *
+ * @remarks
+ * Introduced early so consumer types can depend on its final shape. In v0.2 it
+ * is never produced — {@link UseSyncSnapshotResult.deadLetter} is ALWAYS
+ * `undefined` until the v0.3 dead-letter store ships.
+ */
+export interface SyncDeadLetterItem {
+  /** ULID assigned by the native layer at enqueue time. */
+  id: string;
+  /** HTTP verb used to dispatch the request. */
+  method: HttpMethod;
+  /** Absolute URL of the request. */
+  url: string;
+  /** Optional request headers, mirroring what was enqueued. */
+  headers?: Record<string, string>;
+  /** Optional pre-serialized request body. */
+  body?: string;
+  /**
+   * Optional `Content-Type` header. When set, native will prefer it over any
+   * value already present in `headers`.
+   */
+  contentType?: string;
+  /**
+   * Optional dispatch priority — `NORMAL` if not supplied on enqueue.
+   */
+  priority?: SyncPriority;
+  /**
+   * Epoch-millisecond timestamp captured by the native layer at enqueue time.
+   * Monotonic with respect to enqueue order.
+   */
+  createdAt: number;
+  /** Optional opaque metadata, mirroring what was enqueued. */
+  metadata?: Record<string, string>;
+  /** Total number of dispatch attempts made before dead-lettering. */
+  attempts: number;
+  /** Epoch-millisecond timestamp of the final (failing) dispatch attempt. */
+  lastAttemptAt: number;
+  /** Failure code from the final attempt — the reason it was dead-lettered. */
+  lastErrorCode: SyncErrorCode;
+  /** Optional human-readable detail accompanying {@link lastErrorCode}. */
+  lastErrorMessage?: string;
+  /** Epoch-millisecond timestamp at which the item was moved to dead-letter. */
+  deadLetteredAt: number;
+}
+
 /* -------------------------------------------------------------------------- */
 /*                                Retry policy                                */
 /* -------------------------------------------------------------------------- */

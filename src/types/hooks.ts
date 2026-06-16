@@ -1,7 +1,13 @@
 import type { SyncError } from '../errors/SyncError';
-import type { ConnectionStatus, ConnectionType, SyncEventType } from './enums';
+import type {
+  ConnectionStatus,
+  ConnectionType,
+  NetworkQuality,
+  SyncEventType,
+} from './enums';
 import type {
   BackgroundSyncOptions,
+  SyncDeadLetterItem,
   SyncEvent,
   SyncItem,
   SyncItemInput,
@@ -223,4 +229,53 @@ export interface UseAutoSyncOptions {
    * `disableBackgroundSync()` on unmount.
    */
   backgroundSync?: BackgroundSyncOptions;
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              useSyncSnapshot                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Result returned by `useSyncSnapshot` — the read-only dashboard aggregator.
+ *
+ * Combines connection, queue, and sync-engine state into a single reactive
+ * object driven by ONE native subscription. Unlike {@link UseOfflineQueueResult}
+ * it exposes NO action methods (`enqueue`, `flush`, etc.) — it is a pure,
+ * render-friendly snapshot intended for status dashboards and badges.
+ */
+export interface UseSyncSnapshotResult {
+  /** Connection snapshot — same as {@link UseConnectionResult}. */
+  connection: UseConnectionResult;
+  /** Current queue size, mirroring `getQueueSize()`. */
+  size: number;
+  /** Pending items, mirroring `getPendingItems()`. */
+  items: SyncItem[];
+  /** `true` while a flush cycle is currently in progress. */
+  isSyncing: boolean;
+  /** `true` after `pauseSync()` and before `resumeSync()`. */
+  isPaused: boolean;
+  /** Current flush progress in `[0, 1]`, or `null` when idle. */
+  progress: number | null;
+  /** Most recent flush outcome, or `null` if no flush has run yet this session. */
+  lastResult: SyncResult | null;
+  /**
+   * `true` when there are pending items but the device is offline — useful
+   * for "Waiting for connection..." UI badges. Derived as
+   * `size > 0 && !connection.isOnline`.
+   */
+  isWaitingForConnection: boolean;
+  /** Last error captured by the hook, or `null` once cleared. */
+  error: SyncError | null;
+  /**
+   * Forward field (Block B / Gap #2): coarse {@link NetworkQuality}
+   * classification. ALWAYS `undefined` in v0.2 — populated once the v0.3
+   * network-quality classifier ships.
+   */
+  networkQuality?: NetworkQuality;
+  /**
+   * Forward field (Block B / Gap #4): items moved to the dead-letter queue
+   * after exhausting their retry budget. ALWAYS `undefined` in v0.2 —
+   * populated once the v0.3 dead-letter store ships.
+   */
+  deadLetter?: readonly SyncDeadLetterItem[];
 }

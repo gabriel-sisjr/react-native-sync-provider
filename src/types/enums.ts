@@ -134,6 +134,35 @@ export type BackoffStrategy =
   (typeof BackoffStrategy)[keyof typeof BackoffStrategy];
 
 /**
+ * Coarse network-quality classification (worst → best).
+ *
+ * This is the Gap #2 network-quality classification slated for Block B
+ * (v0.3). It is introduced early so consumer types can depend on its final
+ * shape, but in v0.2 it is surfaced ONLY as the optional
+ * {@link UseSyncSnapshotResult.networkQuality} field and is ALWAYS `undefined`
+ * until the v0.3 classifier ships and begins emitting real measurements.
+ *
+ * @remarks
+ * The ordering of the value set is significant (worst → best) so consumers can
+ * compare or threshold on it once the v0.3 classifier populates it.
+ */
+export const NetworkQuality = {
+  /** No usable network path — equivalent to {@link ConnectionStatus.DISCONNECTED}. */
+  OFFLINE: 'OFFLINE',
+  /** Connected but throughput/latency is poor — sync should be conservative. */
+  POOR: 'POOR',
+  /** Usable mid-tier link — acceptable for most foreground sync. */
+  MODERATE: 'MODERATE',
+  /** Healthy link — suitable for normal background and foreground sync. */
+  GOOD: 'GOOD',
+  /** Best-tier link (typically unmetered Wi-Fi/ethernet) — no constraints. */
+  EXCELLENT: 'EXCELLENT',
+} as const;
+/** See {@link NetworkQuality} value set. */
+export type NetworkQuality =
+  (typeof NetworkQuality)[keyof typeof NetworkQuality];
+
+/**
  * HTTP verb used to dispatch a {@link SyncItem}.
  *
  * Pulled out as its own alias so consumers can refer to it directly

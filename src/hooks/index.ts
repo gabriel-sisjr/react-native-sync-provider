@@ -14,4 +14,5 @@ export { useOfflineQueue } from './useOfflineQueue';
 export { useSyncConfig } from './useSyncConfig';
 export { useSyncEvents } from './useSyncEvents';
 export { useSyncQueue } from './useSyncQueue';
+export { useSyncSnapshot } from './useSyncSnapshot';
 export { useSyncStatus } from './useSyncStatus';

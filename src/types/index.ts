@@ -14,6 +14,7 @@ export {
   ConnectionStatus,
   ConnectionType,
   HttpMethod,
+  NetworkQuality,
   SyncEventType,
   SyncPriority,
   SyncStrategy,
@@ -26,6 +27,7 @@ export type { ConnectionState } from './connection';
 export type {
   BackgroundSyncOptions,
   RetryPolicy,
+  SyncDeadLetterItem,
   SyncEvent,
   SyncItem,
   SyncItemInput,
@@ -41,5 +43,6 @@ export type {
   UseSyncConfigResult,
   UseSyncEventsOptions,
   UseSyncQueueResult,
+  UseSyncSnapshotResult,
   UseSyncStatusResult,
 } from './hooks';
