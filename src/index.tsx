@@ -8,7 +8,8 @@
  *
  * This module re-exports the entire public surface:
  *
- *   - 19 facade functions that wrap the Nitro `SyncProvider` HybridObject.
+ *   - 21 facade functions: 19 wrap the Nitro `SyncProvider` HybridObject, plus
+ *     `drainUntilEmpty` and `cancelDrain`, which are JS-side.
  *   - 2 listener helpers (`addSyncEventListener`, `removeSyncEventListener`).
  *   - 9 React hooks (`useConnection`, `useSyncQueue`, `useSyncStatus`,
  *     `useOfflineQueue`, `useSyncEvents`, `useSyncConfig`, `useAutoSync`,
@@ -35,7 +36,9 @@ import type {
   SyncResult,
 } from './types/sync';
 import type { ConnectionState } from './types/connection';
+import type { DrainOptions, DrainResult } from './types/drain';
 import { assertNativeModuleAvailable } from './utils/assertNativeModuleAvailable';
+import { cancelActiveDrain, runDrain } from './utils/drainController';
 import { wrapNativeError } from './utils/errors';
 import { getNativeSyncProvider } from './utils/isNativeModuleAvailable';
 import {
@@ -318,6 +321,100 @@ export async function flush(): Promise<SyncResult> {
   } catch (err) {
     wrapNativeError(err, SyncErrorCode.NETWORK_ERROR);
   }
+}
+
+/**
+ * Flush the queue repeatedly until it is empty or a bound stops the loop.
+ *
+ * A JS-side loop over the existing bridge. It reports `EMPTY` only when
+ * {@link getQueueSize} is `0` and {@link isSyncing} is `false`, so an item still
+ * in flight in a running cycle keeps the loop waiting.
+ *
+ * The loop waits rather than spins, and these waits do not use up iterations:
+ *
+ * - While a cycle is running, it polls {@link isSyncing}.
+ * - After a cycle that made no progress with items cooling down, it sleeps until
+ *   the soonest `nextRetryAt`. If that moment is at or past the deadline, it
+ *   stops at once with `TIMEOUT`.
+ * - After a cycle that made no progress with nothing cooling (the engine is
+ *   paused, for example), it sleeps for at least 250 ms.
+ * - While the device is offline, it does not flush at all, so no retry attempt
+ *   is spent. It waits for the network until a bound stops it.
+ *
+ * `timeoutMs` and {@link cancelDrain} are hard stops. Every wait ends at the
+ * deadline or on cancel, including a `flush()` still in flight, and the single
+ * drain lock is released on every exit. A native cycle that is already running
+ * is not aborted: it keeps going after the drain returns.
+ *
+ * Only one drain may run per process; a concurrent call throws
+ * {@link SyncErrorCode.DRAIN_ALREADY_ACTIVE}. Await the previous drain before
+ * starting another. That applies after {@link cancelDrain} too, because a
+ * cancelled drain still has to settle.
+ *
+ * @param options — optional {@link DrainOptions} bounds.
+ * @returns a {@link DrainResult} describing how the loop ended.
+ * @throws {SyncError} {@link SyncErrorCode.DRAIN_ALREADY_ACTIVE} when a drain
+ *   is already in progress for this process.
+ * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when the
+ *   native module is not loaded.
+ * @throws {SyncError} any error from an underlying native call — see the
+ *   rejection note below.
+ *
+ * @remarks
+ * **Rejections:** if a `flush()` cycle or any other native call in the loop
+ * rejects, the loop stops, the lock is released and the error is re-thrown, so
+ * no {@link DrainResult} is returned. Items dispatched before the failure stay
+ * dispatched: re-read {@link getQueueSize} / {@link getPendingItems} for the
+ * remaining queue.
+ *
+ * @example
+ * const result = await drainUntilEmpty({ maxIterations: 10 });
+ * if (result.stoppedReason !== 'EMPTY') {
+ *   console.warn(`stopped early: ${result.stoppedReason}, ${result.queueRemaining} left`);
+ * }
+ *
+ * @public
+ */
+export async function drainUntilEmpty(
+  options?: DrainOptions
+): Promise<DrainResult> {
+  return runDrain(
+    { flush, getConnectionStatus, getPendingItems, getQueueSize, isSyncing },
+    options
+  );
+}
+
+/**
+ * Cancel the in-progress {@link drainUntilEmpty} loop.
+ *
+ * Takes effect at once: any wait in the loop ends, including a `flush()` still
+ * in flight, and the drain resolves with `stoppedReason: 'CANCELLED'`. A native
+ * cycle that is already running is not aborted.
+ *
+ * The drain settles asynchronously, so a drain started in the same tick still
+ * throws {@link SyncErrorCode.DRAIN_ALREADY_ACTIVE}: await the cancelled drain
+ * first.
+ *
+ * When no drain is active this is a harmless no-op, so it is safe to call
+ * unconditionally from cleanup paths (effect teardown, screen unmount, etc.). It
+ * never throws and performs no native call.
+ *
+ * @example
+ * // A remount can overlap a drain that is still settling, and StrictMode does
+ * // that on every mount. Chain on the previous drain instead of racing it.
+ * const previousDrain = useRef<Promise<unknown>>(Promise.resolve());
+ *
+ * useEffect(() => {
+ *   const drain = previousDrain.current.then(() => drainUntilEmpty());
+ *   previousDrain.current = drain.catch(() => undefined);
+ *   drain.catch(reportError);
+ *   return () => cancelDrain();
+ * }, []);
+ *
+ * @public
+ */
+export function cancelDrain(): void {
+  cancelActiveDrain();
 }
 
 /**

@@ -3,9 +3,10 @@
  *
  * Mirrors the public API surface of `src/index.tsx` but every facade
  * function throws `SyncError(NATIVE_MODULE_UNAVAILABLE)` and every hook
- * returns inert state (no throws on render). This keeps SSR and web bundles
- * importable while making it impossible to silently miss the lack of native
- * support.
+ * returns inert state (no throws on render). The exceptions are `cancelDrain`
+ * and the listener helpers, which no-op because they sit in cleanup paths. This
+ * keeps SSR and web bundles importable while making it impossible to silently
+ * miss the lack of native support.
  *
  * Re-exports types, enums, errors, and `generateId` (which works on web).
  *
@@ -36,6 +37,7 @@ import type {
   SyncResult,
 } from './types/sync';
 import type { ConnectionState } from './types/connection';
+import type { DrainOptions, DrainResult } from './types/drain';
 
 /* -------------------------------------------------------------------------- */
 /*                                  Re-exports                                */
@@ -108,6 +110,21 @@ export async function getPendingItems(): Promise<SyncItem[]> {
 /** @public */
 export async function flush(): Promise<SyncResult> {
   throw unavailable('flush');
+}
+/** @public */
+export async function drainUntilEmpty(
+  _options?: DrainOptions
+): Promise<DrainResult> {
+  throw unavailable('drainUntilEmpty');
+}
+/**
+ * Web no-op twin of `cancelDrain`. No drain ever runs on web, so this does
+ * nothing and never throws — safe to call from cleanup paths for parity.
+ *
+ * @public
+ */
+export function cancelDrain(): void {
+  // no-op
 }
 /** @public */
 export async function pauseSync(): Promise<void> {

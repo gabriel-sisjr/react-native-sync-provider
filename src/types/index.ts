@@ -23,6 +23,9 @@ export {
 /* --------------------------- connection types ---------------------------- */
 export type { ConnectionState } from './connection';
 
+/* ------------------------------ drain types ------------------------------ */
+export type { DrainOptions, DrainResult, DrainStoppedReason } from './drain';
+
 /* ------------------------------ sync types ------------------------------- */
 export type {
   BackgroundSyncOptions,
