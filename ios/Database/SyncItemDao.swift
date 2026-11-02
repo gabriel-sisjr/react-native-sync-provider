@@ -30,6 +30,10 @@ struct StoredSyncItem: Sendable, Equatable {
     let createdAt: Int64
     let attempts: Int32
     let lastAttemptAt: Int64?
+    /// Epoch-ms timestamp before which the item is **not** eligible for
+    /// dispatch (retry cooldown). `0` means "never attempted", which is
+    /// eligible now; any other value was written by a failed attempt.
+    let nextRetryAt: Int64
     let lastErrorCode: String?
     let status: String
     let metadata: [String: String]?
@@ -85,6 +89,7 @@ final class SyncItemDao {
         entity.createdAt = item.createdAt
         entity.attempts = item.attempts
         entity.lastAttemptAt = item.lastAttemptAt ?? 0
+        entity.nextRetryAt = item.nextRetryAt
         entity.lastErrorCode = item.lastErrorCode
         entity.status = item.status
         entity.metadataJSON = try encodeJSON(item.metadata)
@@ -295,6 +300,7 @@ final class SyncItemDao {
             // sentinel meaning "never attempted"; map back to `Int64?` so the
             // public-facing `StoredSyncItem` keeps nullable semantics.
             lastAttemptAt: entity.lastAttemptAt == 0 ? nil : entity.lastAttemptAt,
+            nextRetryAt: entity.nextRetryAt,
             lastErrorCode: entity.lastErrorCode,
             status: entity.status ?? SyncItemStatus.pending.rawValue,
             metadata: metadata

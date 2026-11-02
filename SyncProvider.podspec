@@ -81,6 +81,11 @@ Pod::Spec.new do |s|
     test_spec.platforms = { :ios => "15.1" }
     test_spec.source_files = "ios/Tests/**/*.swift"
     test_spec.requires_app_host = false
+    # Bundle the compiled `.momd` (momc emits every model version) into the
+    # XCTest bundle so the Core Data migration tests can load the v1 and v2
+    # `.mom` slices and exercise the v1->v2 mapping against tmp SQLite stores.
+    # Adding/removing test resources requires re-running `pod install`.
+    test_spec.resources = ["ios/Database/SyncProvider.xcdatamodeld"]
     test_spec.frameworks = "XCTest", "Foundation", "CoreData", "Network", "BackgroundTasks"
   end
 end

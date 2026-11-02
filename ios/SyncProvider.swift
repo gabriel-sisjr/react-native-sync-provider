@@ -443,7 +443,7 @@ extension HybridSyncProvider {
                         priority: priority,
                         createdAt: Double(stored.createdAt),
                         attempts: Double(stored.attempts),
-                        nextRetryAt: 0,
+                        nextRetryAt: Double(stored.nextRetryAt),
                         metadata: stored.metadata)
     }
 

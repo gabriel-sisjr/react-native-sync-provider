@@ -142,6 +142,8 @@ actor SyncQueueStorage {
             createdAt: nowMs,
             attempts: 0,
             lastAttemptAt: nil,
+            // `0` means "never attempted", which is eligible now.
+            nextRetryAt: 0,
             lastErrorCode: nil,
             status: SyncItemStatus.pending.rawValue,
             metadata: input.metadata

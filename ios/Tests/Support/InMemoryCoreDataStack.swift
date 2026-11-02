@@ -32,6 +32,9 @@ enum InMemoryCoreDataStack {
             attribute("lastErrorCode", type: .stringAttributeType, optional: true),
             attribute("metadataJSON", type: .binaryDataAttributeType, optional: true),
             attribute("method", type: .stringAttributeType, optional: false, defaultValue: "POST"),
+            // Mirrors Core Data model v2 (`SyncProvider 2.xcdatamodel`). Every
+            // schema change is made twice: real model + this test model.
+            attribute("nextRetryAt", type: .integer64AttributeType, optional: false, defaultValue: 0),
             attribute("priority", type: .stringAttributeType, optional: false, defaultValue: "NORMAL"),
             attribute("status", type: .stringAttributeType, optional: false, defaultValue: "PENDING"),
             attribute("url", type: .stringAttributeType, optional: false)

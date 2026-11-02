@@ -27,6 +27,7 @@ final class SyncItemEntity: NSManagedObject {
     @NSManaged var lastErrorCode: String?
     @NSManaged var metadataJSON: Data?
     @NSManaged var method: String?
+    @NSManaged var nextRetryAt: Int64
     @NSManaged var priority: String?
     @NSManaged var status: String?
     @NSManaged var url: String?
