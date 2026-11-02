@@ -10,6 +10,7 @@ import { isNativeModuleAvailable } from '../utils/isNativeModuleAvailable';
 import {
   addSyncEventListener,
   flush as facadeFlush,
+  getConnectionStatus as facadeGetConnectionStatus,
   isSyncing as facadeIsSyncing,
   removeSyncEventListener,
 } from '../index';
@@ -47,13 +48,23 @@ export interface UseAutoSyncExtraOptions extends UseAutoSyncOptions {
  * Inert until `enabled === true`. When enabled, on mount:
  *
  *   1. Sets up a periodic timer (`intervalMs`, default 60s) that calls
- *      `flush()` whenever a sync is not already in flight.
+ *      `flush()` unless the device is `DISCONNECTED` or a sync is already in
+ *      flight.
  *   2. Subscribes to `CONNECTION_CHANGED` events and triggers a flush when
  *      the device transitions to `CONNECTED` (subject to `flushOnReconnect`).
  *   3. If `flushOnAppForeground === true`, registers an `AppState.change`
- *      listener and flushes on `'active'`.
+ *      listener and flushes on `'active'`, unless the device is `DISCONNECTED`.
  *
  * All three are torn down on unmount or when `enabled` flips to `false`.
+ *
+ * The periodic tick and the foreground trigger read the connection status first
+ * and do nothing while it is `DISCONNECTED`, because a flush while offline can
+ * spend retry attempts and mark valid items `FAILED`. `UNKNOWN` and `METERED`
+ * still flush, and a status read that fails skips the flush. Neither trigger
+ * checks queue size, so on an empty queue a flush records a 0/0 result.
+ *
+ * The reconnect trigger does not read the status: it follows the
+ * `CONNECTION_CHANGED` event.
  *
  * @param options — see {@link UseAutoSyncExtraOptions}.
  *
@@ -101,8 +112,21 @@ export function useAutoSync(options: UseAutoSyncExtraOptions): void {
       }
     };
 
+    // Neither dispatcher checks connectivity, so a flush while offline would
+    // spend retry attempts and can mark valid items FAILED. A status read that
+    // rejects skips the flush too.
+    const flushUnlessOffline = async () => {
+      try {
+        const connection = await facadeGetConnectionStatus();
+        if (connection.status === ConnectionStatus.DISCONNECTED) return;
+        await safeFlush();
+      } catch {
+        // Swallow — orchestrator must never throw to consumer.
+      }
+    };
+
     const timer = setInterval(() => {
-      void safeFlush();
+      void flushUnlessOffline();
     }, period);
 
     (async () => {
@@ -132,7 +156,7 @@ export function useAutoSync(options: UseAutoSyncExtraOptions): void {
       appStateSubscription = AppState.addEventListener(
         'change',
         (next: AppStateStatus) => {
-          if (next === 'active') void safeFlush();
+          if (next === 'active') void flushUnlessOffline();
         }
       );
     }
