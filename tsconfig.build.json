@@ -3,5 +3,5 @@
   "compilerOptions": {
     "incremental": false
   },
-  "exclude": ["example", "lib", "nitrogen"]
+  "exclude": ["example", "lib", "nitrogen", "website"]
 }
