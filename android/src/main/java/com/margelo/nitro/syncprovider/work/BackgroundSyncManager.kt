@@ -51,6 +51,7 @@ internal class BackgroundSyncManager(context: Context) {
       } else {
         null
       },
+      foregroundOnly = null,
       taskIdentifier = prefs.getString(KEY_TASK_ID, null),
     )
   }

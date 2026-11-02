@@ -442,6 +442,8 @@ extension HybridSyncProvider {
                         contentType: stored.contentType,
                         priority: priority,
                         createdAt: Double(stored.createdAt),
+                        attempts: Double(stored.attempts),
+                        nextRetryAt: 0,
                         metadata: stored.metadata)
     }
 
@@ -521,6 +523,7 @@ extension HybridSyncProvider {
             requiresCharging: options.requiresCharging,
             requiresUnmeteredNetwork: options.requiresUnmeteredNetwork,
             requiresDeviceIdle: options.requiresDeviceIdle,
+            foregroundOnly: options.foregroundOnly,
             taskIdentifier: options.taskIdentifier
         )
     }

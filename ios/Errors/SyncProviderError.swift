@@ -54,6 +54,7 @@ struct SyncProviderError: LocalizedError, CustomNSError {
         case .timeout: return 9
         case .maxAttemptsExceeded: return 10
         case .duplicateItem: return 11
+        case .drainAlreadyActive: return 12
         @unknown default: return 0
         }
     }

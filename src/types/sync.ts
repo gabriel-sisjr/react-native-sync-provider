@@ -90,6 +90,41 @@ export interface SyncItem {
    * Monotonic with respect to enqueue order.
    */
   createdAt: number;
+  /**
+   * Number of dispatch attempts made for this item so far.
+   *
+   * `attempts === 0` means the item has **never been tried** — it is still
+   * awaiting its first dispatch. Any value `> 0` is the count of attempts
+   * already spent against {@link RetryPolicy.maxAttempts}.
+   *
+   * @remarks
+   * iOS counts an attempt when dispatch starts and Android when its outcome is
+   * recorded, so an attempt cut short by a process kill counts only on iOS.
+   *
+   * Surfaced **verbatim** by the facade. This is deliberately asymmetric with
+   * `getLastSyncResult`, which translates a native sentinel
+   * (`startedAt === 0 && finishedAt === 0`) into `undefined` via the facade's
+   * `isLastSyncSentinel` helper. `SyncItem.attempts` is **never** translated:
+   * the `0` here is a real value (`never tried`), not an "absent" marker.
+   */
+  attempts: number;
+  /**
+   * Epoch-millisecond timestamp at which this item becomes eligible for its
+   * next dispatch attempt — its retry-cooldown deadline. An item is eligible
+   * once `nextRetryAt <= now`.
+   *
+   * - `0` means the item was **never attempted** and is eligible now.
+   * - A positive value means a retry is pending. The native dispatcher skips the
+   *   item until the device clock reaches it, and the value stays in place
+   *   afterwards, so a timestamp in the past means the cooldown has elapsed.
+   *
+   * @remarks
+   * Surfaced **verbatim** by the facade. Unlike `getLastSyncResult`'s sentinel
+   * translation (`isLastSyncSentinel` → `undefined`), `SyncItem.nextRetryAt`'s
+   * `0` is a real value (`eligible now`) and is **never** translated to
+   * `undefined`.
+   */
+  nextRetryAt: number;
   /** Optional opaque metadata, mirroring what was enqueued. */
   metadata?: Record<string, string>;
 }
@@ -327,14 +362,33 @@ export interface BackgroundSyncOptions {
   /** If `true`, only run when the device is idle. */
   requiresDeviceIdle?: boolean;
   /**
-   * Override for the OS-level task identifier.
+   * Kill-switch for OS-scheduled background work.
    *
-   * - iOS: registered with `BGTaskScheduler.shared.register(forTaskWithIdentifier:)`.
-   *   Must also be present in `Info.plist` under `BGTaskSchedulerPermittedIdentifiers`.
-   * - Android: used as the unique work name passed to `WorkManager.enqueueUniquePeriodicWork`.
+   * When `true`, the library schedules **no** OS-level background sync work:
+   * neither the iOS `BGTaskScheduler` app-refresh / processing tasks nor the
+   * Android `WorkManager` periodic and one-time flush jobs are registered, and
+   * any work already scheduled by the library is cancelled. Sync then only
+   * progresses while the app process is alive: through `flush()`,
+   * `drainUntilEmpty()`, `useAutoSync`, and the in-process retry timer, which
+   * this flag does not disable.
    *
-   * When omitted, the library uses a stable default derived from the package
-   * name.
+   * Data-integrity launch recovery is intentionally **not** suppressed: in-app
+   * relaunch recovery and the Android boot-completed recovery pass still run so
+   * that items left mid-flight by an OS kill are reconciled. This flag gates
+   * *scheduled background dispatch only*, never crash/kill recovery.
+   *
+   * Useful for QA and development builds (where background dispatch interferes
+   * with logs and breakpoints) and for corporate policies that forbid
+   * background networking. Honored on both iOS and Android.
+   *
+   * Defaults to `false` — OS background work is scheduled as normal.
+   */
+  foregroundOnly?: boolean;
+  /**
+   * Stored but not used yet: both platforms use fixed identifiers. On iOS those
+   * are `com.gabriel-sisjr.syncprovider.background` and
+   * `com.gabriel-sisjr.syncprovider.processing`, and `Info.plist` must declare
+   * them under `BGTaskSchedulerPermittedIdentifiers` whatever this field says.
    */
   taskIdentifier?: string;
 }

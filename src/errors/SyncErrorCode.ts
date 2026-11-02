@@ -87,6 +87,15 @@ export const SyncErrorCode = {
    * Thrown by: `enqueue`, `enqueueBatch`.
    */
   DUPLICATE_ITEM: 'DUPLICATE_ITEM',
+  /**
+   * A `drainUntilEmpty()` loop is already running for this process. The drain
+   * controller is a process-wide singleton, so only one bounded drain may run
+   * at a time. Await the active drain before starting another; after
+   * `cancelDrain()` it still has to settle first. Permanent — not retried.
+   *
+   * Thrown by: `drainUntilEmpty`.
+   */
+  DRAIN_ALREADY_ACTIVE: 'DRAIN_ALREADY_ACTIVE',
 } as const;
 /** See {@link SyncErrorCode} value set. */
 export type SyncErrorCode = (typeof SyncErrorCode)[keyof typeof SyncErrorCode];

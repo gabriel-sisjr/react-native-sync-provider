@@ -49,16 +49,19 @@ final class BackgroundSyncManagerTests: XCTestCase {
                                             requiresCharging: true,
                                             requiresUnmeteredNetwork: false,
                                             requiresDeviceIdle: nil,
+                                            foregroundOnly: nil,
                                             taskIdentifier: "x")
         let b = BackgroundSyncOptionsValue(minimumIntervalMs: 60_000,
                                             requiresCharging: true,
                                             requiresUnmeteredNetwork: false,
                                             requiresDeviceIdle: nil,
+                                            foregroundOnly: nil,
                                             taskIdentifier: "x")
         let c = BackgroundSyncOptionsValue(minimumIntervalMs: 30_000,
                                             requiresCharging: true,
                                             requiresUnmeteredNetwork: false,
                                             requiresDeviceIdle: nil,
+                                            foregroundOnly: nil,
                                             taskIdentifier: "x")
         XCTAssertEqual(a, b)
         XCTAssertNotEqual(a, c)

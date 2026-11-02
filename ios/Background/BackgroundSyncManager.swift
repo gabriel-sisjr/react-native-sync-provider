@@ -29,6 +29,8 @@ struct BackgroundSyncOptionsValue: Sendable, Equatable {
     let requiresCharging: Bool?
     let requiresUnmeteredNetwork: Bool?
     let requiresDeviceIdle: Bool?
+    /// When `true`, the consumer opted out of OS-driven background sync.
+    let foregroundOnly: Bool?
     let taskIdentifier: String?
 }
 

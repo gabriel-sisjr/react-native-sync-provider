@@ -220,6 +220,8 @@ internal class SyncQueueStorage(
     contentType = entity.contentType,
     priority = parsePriority(entity.priority),
     createdAt = entity.createdAt.toDouble(),
+    attempts = entity.attempts.toDouble(),
+    nextRetryAt = 0.0,
     metadata = JsonMap.decode(entity.metadata),
   )
 
