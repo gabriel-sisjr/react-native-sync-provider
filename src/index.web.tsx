@@ -44,6 +44,7 @@ import type { ConnectionState } from './types/connection';
 export * from './types';
 export { SyncError } from './errors/SyncError';
 export { SyncErrorCode } from './errors/SyncErrorCode';
+export type { ValidationIssue } from './errors/ValidationIssue';
 export { generateId } from './utils/idGenerator';
 
 /* -------------------------------------------------------------------------- */

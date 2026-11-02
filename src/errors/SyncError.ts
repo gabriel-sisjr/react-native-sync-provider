@@ -1,4 +1,5 @@
 import { SyncErrorCode } from './SyncErrorCode';
+import type { ValidationIssue } from './ValidationIssue';
 
 /**
  * Domain error thrown by every public SyncProvider operation.
@@ -30,19 +31,38 @@ export class SyncError extends Error {
   readonly code: SyncErrorCode;
   /** Optional underlying error captured for diagnostics. */
   override readonly cause?: unknown;
+  /**
+   * Structured, machine-readable list of validation violations.
+   *
+   * Populated only for validation failures (`INVALID_URL` / `INVALID_PAYLOAD`
+   * raised by {@link enqueue} / {@link enqueueBatch}). Carries *every* issue
+   * detected — not just the first — so consumers can surface all problems at
+   * once. `undefined` for non-validation errors.
+   */
+  readonly validationErrors?: ValidationIssue[];
 
   /**
    * @param code — the {@link SyncErrorCode} value classifying this error.
    * @param message — human-readable description for logs / dev tooling.
    * @param cause — optional underlying error (forwarded native error,
    *   network exception, etc.).
+   * @param validationErrors — optional structured list of validation
+   *   violations. When supplied, `message` typically summarizes the list.
    */
-  constructor(code: SyncErrorCode, message: string, cause?: unknown) {
+  constructor(
+    code: SyncErrorCode,
+    message: string,
+    cause?: unknown,
+    validationErrors?: ValidationIssue[]
+  ) {
     super(message);
     this.name = 'SyncError';
     this.code = code;
     if (cause !== undefined) {
       this.cause = cause;
+    }
+    if (validationErrors !== undefined) {
+      this.validationErrors = validationErrors;
     }
     // Restore the prototype so `instanceof SyncError` survives transpilation
     // targets that strip `__proto__` and bridge boundaries that re-throw.

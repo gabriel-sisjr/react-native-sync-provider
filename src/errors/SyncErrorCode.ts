@@ -52,9 +52,10 @@ export const SyncErrorCode = {
   BACKGROUND_TASK_REGISTRATION_FAILED: 'BACKGROUND_TASK_REGISTRATION_FAILED',
   /**
    * `SyncItemInput.url` is not a valid absolute http(s) URL. Permanent — not
-   * retried.
+   * retried. `enqueueBatch` reports URL problems under `INVALID_PAYLOAD`, in
+   * `SyncError.validationErrors`.
    *
-   * Thrown by: `enqueue`, `enqueueBatch`.
+   * Thrown by: `enqueue`.
    */
   INVALID_URL: 'INVALID_URL',
   /**

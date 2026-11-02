@@ -25,6 +25,7 @@
 
 import { SyncError } from './errors/SyncError';
 import { SyncErrorCode } from './errors/SyncErrorCode';
+import type { ValidationIssue } from './errors/ValidationIssue';
 import type {
   BackgroundSyncOptions,
   SyncEvent,
@@ -37,7 +38,10 @@ import type { ConnectionState } from './types/connection';
 import { assertNativeModuleAvailable } from './utils/assertNativeModuleAvailable';
 import { wrapNativeError } from './utils/errors';
 import { getNativeSyncProvider } from './utils/isNativeModuleAvailable';
-import { validateSyncItem } from './utils/validateSyncItem';
+import {
+  collectSyncItemIssues,
+  validateSyncItem,
+} from './utils/validateSyncItem';
 
 /* -------------------------------------------------------------------------- */
 /*                                  Re-exports                                */
@@ -46,6 +50,7 @@ import { validateSyncItem } from './utils/validateSyncItem';
 export * from './types';
 export { SyncError } from './errors/SyncError';
 export { SyncErrorCode } from './errors/SyncErrorCode';
+export type { ValidationIssue } from './errors/ValidationIssue';
 
 export { isNativeModuleAvailable, generateId } from './utils';
 
@@ -137,11 +142,17 @@ export async function enqueue(item: SyncItemInput): Promise<string> {
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
  * @throws {SyncError} {@link SyncErrorCode.INVALID_PAYLOAD} when any item is
- *   malformed.
- * @throws {SyncError} {@link SyncErrorCode.INVALID_URL} when any item has an
- *   invalid URL.
- * @throws {SyncError} {@link SyncErrorCode.QUEUE_FULL} when accepting
- *   `items.length` would exceed `SyncOptions.maxQueueSize`.
+ *   malformed, including an invalid URL. Unlike {@link enqueue}, a batch always
+ *   reports one umbrella code; read {@link SyncError.validationErrors} for the
+ *   per-field detail. Also, with no `validationErrors`, when native rejects the
+ *   call. That includes a batch that would exceed `SyncOptions.maxQueueSize`:
+ *   native reports `QUEUE_FULL`, but native codes do not reach JS yet.
+ *
+ * @remarks
+ * Validation aggregates across the whole batch: instead of aborting on the
+ * first malformed item, every issue from every item is collected and surfaced
+ * together via {@link SyncError.validationErrors}, each tagged with its
+ * `itemIndex`. No items are enqueued when any validation issue is present.
  *
  * @example
  * const ids = await enqueueBatch([
@@ -158,7 +169,22 @@ export async function enqueueBatch(items: SyncItemInput[]): Promise<string[]> {
       'enqueueBatch(items) requires an array of SyncItemInput.'
     );
   }
-  for (const item of items) validateSyncItem(item);
+  const allIssues: ValidationIssue[] = [];
+  // `entries()` visits array holes, which `forEach` would silently skip.
+  for (const [index, item] of items.entries()) {
+    for (const issue of collectSyncItemIssues(item)) {
+      allIssues.push({ ...issue, itemIndex: index });
+    }
+  }
+  if (allIssues.length > 0) {
+    const itemCount = new Set(allIssues.map((issue) => issue.itemIndex)).size;
+    throw new SyncError(
+      SyncErrorCode.INVALID_PAYLOAD,
+      `enqueueBatch validation failed: ${allIssues.length} issue(s) across ${itemCount} item(s).`,
+      undefined,
+      allIssues
+    );
+  }
   const native = nativeOrThrow();
   try {
     return await native!.enqueueBatch(items);

@@ -10,3 +10,4 @@
 
 export { SyncError } from './SyncError';
 export { SyncErrorCode } from './SyncErrorCode';
+export type { ValidationIssue } from './ValidationIssue';
