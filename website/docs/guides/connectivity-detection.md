@@ -16,6 +16,8 @@ keywords:
 
 The library tracks connectivity natively and exposes both a snapshot reader (`getConnectionStatus`) and a reactive hook (`useConnection`). Connection changes also surface as `CONNECTION_CHANGED` events on the `'sync-event'` channel.
 
+Reporting connectivity is not the same as acting on it: see [What Acts on Connectivity](#what-acts-on-connectivity).
+
 ## Native Sources
 
 | Platform | Source |
@@ -81,23 +83,42 @@ The `e.connectionStatus` field carries the coarse [`ConnectionStatus`](../api-re
 
 ## Auto-Flush on Reconnect
 
-`useAutoSync` wires the common patterns for you:
+`useAutoSync` wires the common patterns for you. It is inert until `enabled` is `true`:
 
 ```tsx
 import { useAutoSync } from '@gabriel-sisjr/react-native-sync-provider';
 
 useAutoSync({
+  enabled: true,
   flushOnReconnect: true,
   flushOnMetered: false,
-  flushOnForeground: true,
+  flushOnAppForeground: true,
 });
 ```
 
 | Option | Default | Behavior |
 |---|---|---|
+| `enabled` | `false` | Master switch. |
 | `flushOnReconnect` | `true` | Flush when the device transitions to `CONNECTED`. |
-| `flushOnMetered` | `false` | Also flush on `METERED`. Disabled to avoid surprise cellular usage. |
-| `flushOnForeground` | `true` | Flush when the app returns to the foreground. |
+| `flushOnMetered` | `false` | Also flush on a transition to `METERED`. It gates this trigger only. |
+| `flushOnAppForeground` | `false` | Flush when the app returns to the foreground, unless the status is `DISCONNECTED`. |
+
+The interval tick and the foreground trigger skip while the status is `DISCONNECTED`, so leave `enabled` on while offline: see [Skip flushes while offline](../api-reference/hooks/useAutoSync.md#skip-the-interval-while-offline).
+
+## What Acts on Connectivity
+
+Neither native dispatcher checks connectivity, so a flush while offline fails its requests and spends retry attempts. What protects you depends on who starts the flush:
+
+| Flush started by | Offline behavior |
+|---|---|
+| [Retry timer](./retry-policy.md#who-wakes-the-queue-and-when) | Does not flush. It remembers the wake and flushes when connectivity returns. On iOS, `UNKNOWN` counts as offline here; on Android, only `DISCONNECTED` does. |
+| [`drainUntilEmpty`](../api-reference/functions.md#drainuntilempty) | Does not flush while `DISCONNECTED`, and waits for the network until a bound stops it. `UNKNOWN` and `METERED` still flush. |
+| `useAutoSync` reconnect trigger | Fires only on the transition to online. |
+| `useAutoSync` interval tick and foreground trigger | Do not flush while `DISCONNECTED`, or if the status cannot be read. `UNKNOWN` and `METERED` still flush. |
+| [`flush()`](../api-reference/functions.md#flush) | **Flushes anyway.** |
+| Android workers | WorkManager runs them only when their network constraint is met. |
+
+There is no native flush on reconnect by itself. The retry timer's owed wake is the only one.
 
 ## Metered Network Caveats
 

@@ -1,7 +1,7 @@
 ---
 sidebar_position: 4
 title: useOfflineQueue
-description: Convenience hook composing useConnection, useSyncQueue, and a slice of useSyncStatus — ideal for offline-aware UI.
+description: Convenience hook combining connection, queue, and a slice of sync state from one subscription — ideal for offline-aware UI.
 keywords:
   - react-native
   - sync-provider
@@ -14,7 +14,7 @@ keywords:
 
 # `useOfflineQueue`
 
-Convenience composition of [`useConnection`](./useConnection.md), [`useSyncQueue`](./useSyncQueue.md), and a slice of [`useSyncStatus`](./useSyncStatus.md). Use it when you want a single hook that powers an offline-first UI -- "X items pending, waiting for connection..." badges, retry buttons, etc.
+Connection state, queue state and a slice of sync state from a single subscription, the same data [`useConnection`](./useConnection.md), [`useSyncQueue`](./useSyncQueue.md) and [`useSyncStatus`](./useSyncStatus.md) expose separately. Use it when you want a single hook that powers an offline-first UI -- "X items pending, waiting for connection..." badges, retry buttons, etc.
 
 ```ts
 import { useOfflineQueue } from '@gabriel-sisjr/react-native-sync-provider';
@@ -38,27 +38,27 @@ function useOfflineQueue(): UseOfflineQueueResult
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `connection` | [`ConnectionState`](../types.md#connectionstate) | Mirrored from `useConnection`. Includes `status`, `type`, `isInternetReachable`, `isExpensive`. |
-| `size` | `number` | Pending queue size. |
-| `items` | [`SyncItem[]`](../types.md#syncitem) | Pending items snapshot. |
+| `connection` | [`UseConnectionResult`](../types.md#useconnectionresult) | Same shape as `useConnection`: `status`, `type`, `isOnline`, `isMetered`. |
+| `size` | `number` | `PENDING` items, cooling ones included, mirroring [`getQueueSize`](../functions.md#getqueuesize). |
+| `items` | [`SyncItem[]`](../types.md#syncitem) | The same items, mirroring [`getPendingItems`](../functions.md#getpendingitems). |
 | `isSyncing` | `boolean` | Whether a flush is in flight. |
-| `isWaitingForConnection` | `boolean` | `size > 0 && connection.status !== CONNECTED && connection.status !== METERED`. The "Waiting for connection..." sentinel. |
-| `error` | [`SyncError`](../errors.md) `\| null` | Last error from `enqueue` or `flush`. |
+| `isWaitingForConnection` | `boolean` | `size > 0 && !connection.isOnline`. The "Waiting for connection..." sentinel. `true` while the status is still `UNKNOWN`. |
+| `error` | [`SyncError`](../errors.md) `\| null` | Last failure refreshing the queue. `enqueue` and `flush` reject instead of setting it. |
 
 ### Methods
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `enqueue` | `(item: SyncItemInput) => Promise<string \| null>` | Same as `useSyncQueue().enqueue`. |
-| `flush` | `() => Promise<SyncResult \| null>` | Same as `useSyncStatus().flush`. |
+| `enqueue` | `(input: SyncItemInput) => Promise<string>` | Same as the top-level [`enqueue`](../functions.md#enqueue). Rejects on failure. |
+| `flush` | `() => Promise<SyncResult>` | Same as the top-level [`flush`](../functions.md#flush). Rejects on failure. |
 
 ---
 
 ## Behavior
 
-This hook does not own any state -- it composes the three primitive hooks and projects a smaller, opinionated surface. Re-renders trigger whenever any of the underlying hooks would re-render.
+The hook owns its state and drives it from one [`addSyncEventListener`](../listeners.md#addsynceventlistener) subscription. On mount it reads the queue, the connection and `isSyncing()`. The queue is re-read on `ITEM_ENQUEUED`, `ITEM_REMOVED`, `QUEUE_CLEARED`, `ITEM_SUCCEEDED`, `ITEM_FAILED`, `SYNC_SUCCEEDED` and `SYNC_FAILED`, and the connection on `CONNECTION_CHANGED`. It unsubscribes on unmount.
 
-For finer-grained access (priority lanes, per-item removal, sync history), reach for the primitive hooks directly.
+For finer-grained access (per-item removal, sync history), use [`useSyncQueue`](./useSyncQueue.md), [`useSyncStatus`](./useSyncStatus.md) or the facade directly.
 
 ---
 
@@ -90,7 +90,11 @@ function OfflineStatusBar() {
         {size} pending on {connection.type}
         {isSyncing ? ' (syncing...)' : ''}
       </Text>
-      <Button title="Sync now" onPress={flush} disabled={isSyncing} />
+      <Button
+        title="Sync now"
+        onPress={() => flush().catch(console.warn)}
+        disabled={isSyncing}
+      />
     </View>
   );
 }
@@ -100,6 +104,6 @@ function OfflineStatusBar() {
 
 ## See also
 
-- [`useConnection`](./useConnection.md), [`useSyncQueue`](./useSyncQueue.md), [`useSyncStatus`](./useSyncStatus.md) -- the three hooks composed here.
+- [`useConnection`](./useConnection.md), [`useSyncQueue`](./useSyncQueue.md), [`useSyncStatus`](./useSyncStatus.md) -- the focused hooks for the same data.
 - [Offline queue guide](../../guides/offline-queue.md).
 - [Connectivity detection guide](../../guides/connectivity-detection.md).

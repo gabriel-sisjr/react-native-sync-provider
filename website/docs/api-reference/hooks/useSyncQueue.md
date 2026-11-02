@@ -14,13 +14,13 @@ keywords:
 
 # `useSyncQueue`
 
-Reactive view of the native pending queue. Auto-refreshes on every queue mutation: `ITEM_ENQUEUED`, `ITEM_REMOVED`, `QUEUE_CLEARED`, every `SYNC_*` event, and every per-item `ITEM_*` event.
+Reactive view of the native pending queue, plus the write operations. Refreshes on the events that can change the queue.
 
 ```ts
 import { useSyncQueue } from '@gabriel-sisjr/react-native-sync-provider';
 ```
 
-**Platform:** Android and iOS. On web / SSR returns the `UNKNOWN` defaults with `isLoading: false`.
+**Platform:** Android and iOS. On web / SSR returns an empty, inert result, and its methods reject with `NATIVE_MODULE_UNAVAILABLE`.
 
 ---
 
@@ -38,19 +38,19 @@ function useSyncQueue(): UseSyncQueueResult
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `size` | `number` | Number of pending items. |
-| `items` | [`SyncItem[]`](../types.md#syncitem) | Snapshot of pending items, ordered by priority desc + `createdAt` asc. |
+| `size` | `number` | `PENDING` items, cooling ones included. Items in flight and items that failed permanently are not counted. |
+| `items` | [`SyncItem[]`](../types.md#syncitem) | The same items, in dispatch order. |
 | `isLoading` | `boolean` | `true` while the initial fetch / a refresh is in flight. |
-| `error` | [`SyncError`](../errors.md) `\| null` | Last error from a hook-issued mutation, or `null`. |
+| `error` | [`SyncError`](../errors.md) `\| null` | Last failure refreshing the queue, or `null`. The methods reject instead of setting it. |
 
 ### Methods
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `enqueue` | `(item: SyncItemInput) => Promise<string \| null>` | Enqueue a single item. Returns the ULID, or `null` on failure (error captured in state). |
-| `enqueueBatch` | `(items: SyncItemInput[]) => Promise<string[] \| null>` | Atomic batch. Returns ULIDs, or `null` on failure. |
-| `removeItem` | `(id: string) => Promise<boolean>` | Remove a single item. Returns `false` if unknown / drained. |
-| `clearQueue` | `() => Promise<void>` | Drop every pending item. |
+| `enqueue` | `(input: SyncItemInput) => Promise<string>` | Same as the top-level [`enqueue`](../functions.md#enqueue). Rejects on failure. |
+| `enqueueBatch` | `(inputs: SyncItemInput[]) => Promise<string[]>` | Same as the top-level [`enqueueBatch`](../functions.md#enqueuebatch). Rejects on failure. |
+| `removeItem` | `(id: string) => Promise<boolean>` | Remove a single item. Returns `false` if unknown or already delivered. |
+| `clearQueue` | `() => Promise<void>` | Drop every item, in any status. |
 | `refresh` | `() => Promise<void>` | Force a re-fetch from native. Rarely needed -- the hook auto-refreshes on events. |
 
 ---
@@ -60,9 +60,10 @@ function useSyncQueue(): UseSyncQueueResult
 - **Initial fetch** -- on mount, the hook calls [`getQueueSize`](../functions.md#getqueuesize) and [`getPendingItems`](../functions.md#getpendingitems) in parallel.
 - **Auto-refresh** -- subscribes via [`addSyncEventListener`](../listeners.md#addsynceventlistener) and re-fetches on:
   - `ITEM_ENQUEUED`, `ITEM_REMOVED`, `QUEUE_CLEARED`
-  - `SYNC_STARTED`, `SYNC_PROGRESS`, `SYNC_SUCCEEDED`, `SYNC_FAILED`
-  - `ITEM_SUCCEEDED`, `ITEM_FAILED`, `ITEM_RETRYING`
-- **Error capture** -- mutations (`enqueue`, `enqueueBatch`, `removeItem`, `clearQueue`) catch and surface errors in the `error` state. They also `console.warn` so the failure is visible in dev tools.
+  - `SYNC_SUCCEEDED`, `SYNC_FAILED`
+  - `ITEM_SUCCEEDED`, `ITEM_FAILED`
+- **Cooldown fields** -- `ITEM_RETRYING` is not on that list, so an item's `attempts` and `nextRetryAt` update when the cycle ends.
+- **Errors** -- the methods pass through to the facade and reject on failure, so catch them yourself. `error` only holds a failed refresh.
 - **Cleanup** -- unsubscribes on unmount.
 
 ---
@@ -99,19 +100,23 @@ function EventComposer() {
   const { enqueue, error } = useSyncQueue();
 
   const submit = async () => {
-    const id = await enqueue({
-      method: HttpMethod.POST,
-      url: 'https://api.example.com/events',
-      contentType: 'application/json',
-      body: JSON.stringify({ event: 'tap' }),
-    });
-    if (id) console.log('Queued', id);
+    try {
+      const id = await enqueue({
+        method: HttpMethod.POST,
+        url: 'https://api.example.com/events',
+        contentType: 'application/json',
+        body: JSON.stringify({ event: 'tap' }),
+      });
+      console.log('Queued', id);
+    } catch (err) {
+      console.warn('Could not enqueue', err);
+    }
   };
 
   return (
     <View>
       <Button title="Send" onPress={submit} />
-      {error && <Text>Error: {error.message}</Text>}
+      {error && <Text>Could not read the queue: {error.message}</Text>}
     </View>
   );
 }

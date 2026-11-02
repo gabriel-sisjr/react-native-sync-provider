@@ -69,7 +69,8 @@ final class RetryPolicyEvaluatorTests: XCTestCase {
 
     func test_jitter_keepsResultWithin75to125PercentOfRaw() {
         // Raw exponential value at attempt 3 with base 1000 = 4000ms.
-        // Jitter factor is in [0.75, 1.25), so result must be in [3000, 5000) — capped at maxDelay.
+        // Jitter factor is in [0.75, 1.25), and the result is rounded to whole
+        // milliseconds, so it lands in [3000, 5000].
         let policy = RetryPolicyValue(maxAttempts: 5,
                                       backoff: .exponential,
                                       baseDelayMs: 1_000,
@@ -79,8 +80,21 @@ final class RetryPolicyEvaluatorTests: XCTestCase {
         for _ in 0..<200 {
             let delay = RetryPolicyEvaluator.nextDelayMs(attempt: 3, policy: policy)
             XCTAssertGreaterThanOrEqual(delay, 3_000)
-            XCTAssertLessThan(delay, 5_000)
+            XCTAssertLessThanOrEqual(delay, 5_000)
         }
+    }
+
+    func test_jitter_mapsTheSampleOntoTheFactorRange() {
+        let policy = RetryPolicyValue(maxAttempts: 5,
+                                      backoff: .exponential,
+                                      baseDelayMs: 1_000,
+                                      maxDelayMs: 60_000,
+                                      jitter: true,
+                                      retryOnStatusCodes: [])
+
+        XCTAssertEqual(RetryPolicyEvaluator.nextDelayMs(attempt: 3, policy: policy, random: { 0 }), 3_000)
+        XCTAssertEqual(RetryPolicyEvaluator.nextDelayMs(attempt: 3, policy: policy, random: { 0.5 }), 4_000)
+        XCTAssertEqual(RetryPolicyEvaluator.nextDelayMs(attempt: 3, policy: policy, random: { 0.999_999_9 }), 5_000)
     }
 
     func test_jitter_withCap_clampsHighEnd() {
@@ -149,6 +163,52 @@ final class RetryPolicyEvaluatorTests: XCTestCase {
             for i in 1...10 {
                 _ = RetryPolicyEvaluator.nextDelayMs(attempt: i, policy: policy)
             }
+        }
+    }
+
+    // MARK: - Large attempts
+
+    /// `Int` overflows at Fibonacci(93), which a long outage reaches with a
+    /// large `maxAttempts`. This path runs on every retriable failure.
+    func test_fibonacci_pastIntOverflow_stillRespectsTheCap() {
+        let policy = RetryPolicyValue(maxAttempts: 10_000,
+                                      backoff: .fibonacci,
+                                      baseDelayMs: 1_000,
+                                      maxDelayMs: 60_000,
+                                      jitter: false,
+                                      retryOnStatusCodes: [503])
+
+        for attempt in [92, 93, 94, 200, 1_476, 1_477, 5_000] {
+            XCTAssertEqual(RetryPolicyEvaluator.nextDelayMs(attempt: attempt, policy: policy), 60_000, "attempt \(attempt)")
+        }
+    }
+
+    func test_uncappedPolicy_atAHugeAttempt_staysAValidDelay() {
+        for backoff in [RetryPolicyValue.Backoff.exponential, .fibonacci, .linear] {
+            let policy = RetryPolicyValue(maxAttempts: 10_000,
+                                          backoff: backoff,
+                                          baseDelayMs: 1_000,
+                                          maxDelayMs: 0,
+                                          jitter: true,
+                                          retryOnStatusCodes: [503])
+
+            let delay = RetryPolicyEvaluator.nextDelayMs(attempt: 5_000, policy: policy)
+
+            XCTAssertGreaterThan(delay, 0, "\(backoff)")
+            XCTAssertLessThanOrEqual(delay, 9_007_199_254_740_991, "\(backoff)")
+        }
+    }
+
+    func test_zeroBase_atAHugeAttempt_isZero() {
+        for backoff in [RetryPolicyValue.Backoff.exponential, .fibonacci] {
+            let policy = RetryPolicyValue(maxAttempts: 10_000,
+                                          backoff: backoff,
+                                          baseDelayMs: 0,
+                                          maxDelayMs: 0,
+                                          jitter: false,
+                                          retryOnStatusCodes: [503])
+
+            XCTAssertEqual(RetryPolicyEvaluator.nextDelayMs(attempt: 5_000, policy: policy), 0, "\(backoff)")
         }
     }
 }

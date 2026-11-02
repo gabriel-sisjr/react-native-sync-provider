@@ -54,11 +54,11 @@ flowchart LR
     B --> C{valid?}
     C -- no --> D[throw SyncError INVALID_PAYLOAD or INVALID_URL]
     C -- yes --> E[Nitro HybridObject.enqueue]
-    E --> F[native: generate ULID]
+    E --> H{under maxQueueSize?}
+    H -- no --> I[reject: QUEUE_FULL, reaches JS as INVALID_PAYLOAD]
+    H -- yes --> F[native: generate ULID]
     F --> G[native: persist row]
-    G --> H{persisted?}
-    H -- no --> I[throw SyncError QUEUE_FULL]
-    H -- yes --> J[emit ITEM_ENQUEUED on SYNC_EVENT_CHANNEL]
+    G --> J[emit ITEM_ENQUEUED on SYNC_EVENT_CHANNEL]
     J --> K[return id to JS]
 ```
 
@@ -66,10 +66,12 @@ Steps:
 
 1. **Validate (JS)**. `validateSyncItem` ensures `method` is in [`HttpMethod`](../api-reference/enums.md#httpmethod) and `url` parses. Failures throw `SyncError` synchronously inside the awaited call.
 2. **Cross JSI**. Nitro dispatches the `enqueue` call. The item object is passed through as a typed JS object -- no JSON marshalling.
-3. **Generate ULID (native)**. The native `Ulid` / `ULID` utility produces a 26-character monotonic id.
-4. **Persist (native)**. The item is inserted into Core Data (iOS) or Room (Android) inside a transaction. If the queue is at `maxQueueSize`, the insert fails and the dispatcher throws `QUEUE_FULL`.
-5. **Emit (native)**. `SyncEventEmitter` fires `ITEM_ENQUEUED` with the id and metadata.
+3. **Check the cap (native)**. If the queue is at `maxQueueSize`, native rejects with `QUEUE_FULL`, which [reaches JS as `INVALID_PAYLOAD`](../api-reference/errors.md#native-rejections).
+4. **Persist (native)**. The native `Ulid` / `ULID` utility produces a 26-character monotonic id, and the item is inserted into Core Data (iOS) or Room (Android) inside a transaction.
+5. **Emit (native)**. `SyncEventEmitter` fires `ITEM_ENQUEUED` with the id.
 6. **Resolve (JS)**. The promise resolves to the id.
+
+Nothing is dispatched yet. A flush does that.
 
 `enqueueBatch` follows the same flow but inside a single native transaction, so the entire batch is atomic.
 
@@ -77,28 +79,38 @@ Steps:
 
 ```mermaid
 flowchart TD
-    A["flush()"] --> B[native: claim 'in flight' lock]
-    B --> C[emit SYNC_STARTED]
-    C --> D[read up to batchSize pending items]
+    A["flush()"] --> B{paused, or headers unreadable?}
+    B -- yes --> Z[return an empty result: no cycle runs]
+    B -- no --> C[emit SYNC_STARTED]
+    C --> D[take one batch: up to batchSize eligible items]
     D --> E{items?}
-    E -- no --> F[emit SYNC_SUCCEEDED, persist SyncResult]
-    E -- yes --> G[for each item: HTTP request]
+    E -- no --> F[persist 0/0 SyncResult, emit SYNC_SUCCEEDED]
+    E -- yes --> G[for each item: one HTTP request]
     G --> H{response?}
     H -- 2xx --> I[delete row, emit ITEM_SUCCEEDED]
-    H -- retry status --> J[increment attempt, emit ITEM_RETRYING]
-    H -- terminal status --> K[delete row, emit ITEM_FAILED]
-    I --> L[emit SYNC_PROGRESS]
+    H -- retriable, attempts left --> J[keep PENDING, write nextRetryAt, emit ITEM_RETRYING]
+    H -- permanent --> K[mark FAILED, emit ITEM_FAILED]
+    I --> L[persist SyncResult]
     J --> L
     K --> L
-    L --> D
-    F --> M[release lock, return SyncResult]
+    L --> M{any item FAILED?}
+    M -- no --> N[emit SYNC_SUCCEEDED]
+    M -- yes --> O[emit SYNC_FAILED]
+    F --> P[arm the next retry wake, return SyncResult]
+    N --> P
+    O --> P
 ```
 
 Notes:
 
-- The flush is **single-flight** per process. Concurrent `flush()` calls reuse the same in-flight run; the second `Promise` resolves with the same `SyncResult`.
+- A cycle takes **one batch** and makes **at most one attempt per item**. It does not loop: items left over wait for the next flush. Use [`drainUntilEmpty`](../api-reference/functions.md#drainuntilempty) to loop.
+- "Eligible" means `PENDING` with `nextRetryAt <= now`, so cooling items are skipped. Priority orders the batch.
+- Android sends a batch concurrently. iOS sends it one item at a time, and emits `SYNC_PROGRESS` after each one.
+- The dispatcher does not check connectivity.
+- Cycles do not overlap. On Android, a concurrent `flush()` waits for the running cycle and then runs its own. On iOS, it returns the last result at once.
 - HTTP requests run on the native dispatcher's executor (`URLSession` on iOS, OkHttp + `Dispatchers.IO` on Android). The JS thread is never blocked.
 - The `SyncResult` is persisted to history before the promise resolves.
+- A cycle that dies emits `SYNC_FAILED` and rejects, so every cycle ends with a terminal event.
 
 ## Background Flush Flow
 
@@ -110,18 +122,18 @@ sequenceDiagram
     participant Storage as Core Data / Room
 
     OS->>Native: launch background task
-    Native->>Native: check constraints (network, charging)
+    Native->>Native: check foregroundOnly, and pause on Android
+    Native->>Native: submit next BGTaskRequest (iOS only)
     Native->>Disp: flush()
-    Disp->>Storage: read pending items
-    Disp->>Native: HTTP requests in batches
+    Disp->>Storage: read one batch of eligible items
+    Disp->>Native: HTTP requests, using the persisted configuration
     Native->>OS: setTaskCompleted(success: true)
-    Native->>Native: schedule next BGTaskRequest (iOS only)
 ```
 
 Per-platform specifics:
 
-- **iOS**. `BGTaskScheduler` wakes a registered handler. The handler must complete (or call `setTaskCompleted(success:)`) before the OS-imposed deadline (typically 30s for `BGAppRefreshTaskRequest`, longer for `BGProcessingTaskRequest`). After completion, the handler reschedules itself.
-- **Android**. WorkManager's `CoroutineWorker` is dispatched at most every 15 minutes (the platform floor). The worker calls `flush()` and returns `Result.success()` / `Result.retry()`. WorkManager handles re-attempt scheduling.
+- **iOS**. `BGTaskScheduler` wakes a handler that was registered at process start. The handler re-submits the next request first, so the chain continues if the process is killed, then waits for launch recovery and flushes. It works with no JS loaded. A task that fires under `foregroundOnly` or after `disableBackgroundSync` completes inert. While paused, it completes without dispatching.
+- **Android**. WorkManager runs `SyncWorker`, at most every 15 minutes for the periodic job, and also for the opt-in retry kick. WorkManager enforces the constraints. The worker stays inert under `foregroundOnly` or a persisted pause. Otherwise, with no JS engine attached, it first resets rows a dead process left `IN_FLIGHT`. It then flushes and returns `Result.success()` on any completed flush, including one with failed items, so that WorkManager's backoff cannot race the persisted cooldowns. `Result.retry()` is reserved for a worker that fails as a whole.
 
 ## Connectivity Change Flow
 
@@ -135,21 +147,28 @@ flowchart LR
     D --> G[React re-render]
 ```
 
-The native monitor is a singleton per process. It debounces transient flaps (a brief loss + restore) and emits at most one event per real transition.
+The native monitor is a singleton per process. It emits an event only when the snapshot changes.
 
-## Recovery Flow (App Launch)
+The event does not start a native flush. `useAutoSync` does that from JS. Natively, a reconnect only delivers a wake the [retry timer](../guides/retry-policy.md#who-wakes-the-queue-and-when) owes from firing offline.
+
+## Recovery Flow
 
 ```mermaid
 flowchart TD
-    A[App launches] --> B[native module init]
+    A[App launch or background run with no JS] --> B[native runtime init]
     B --> C[scan SyncItem table]
-    C --> D[items in 'in_flight' state]
-    D --> E[atomic UPDATE state = pending, attempt unchanged]
-    E --> F[no event emitted]
+    C --> D[items in IN_FLIGHT state]
+    D --> E[atomic UPDATE status = PENDING, attempts and nextRetryAt unchanged]
+    E --> F[arm the next retry wake]
     F --> G[next flush trigger picks them up]
 ```
 
-Recovery handles the "process killed mid-dispatch" case. Without it, items would be stuck `in_flight` forever. The reset is **transactional and idempotent** -- safe to run on every launch.
+Recovery handles the "process killed mid-dispatch" case. Without it, items would be stuck `IN_FLIGHT` forever. The reset is **transactional and idempotent** -- safe to run on every launch. It sends no request itself.
+
+What starts it differs by platform:
+
+- **iOS**: every engine start, including a BGTask launch with no JS. If it reset any item, it emits `RESUMED` with `metadata.recovered`.
+- **Android**: when a JS engine attaches, and on boot and app update through `BootCompletedReceiver`. `SyncWorker` runs the same reset before it flushes when no JS engine is attached, unless a persisted pause or `foregroundOnly` blocks it. No event is emitted.
 
 ## See also
 

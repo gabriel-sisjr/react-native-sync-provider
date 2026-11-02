@@ -13,16 +13,19 @@ import Foundation
 /// Errors thrown by the SyncProvider native layer.
 ///
 /// All thrown errors that cross the JS bridge are converted to instances of
-/// this type by the dispatch helpers — JS receives a real `SyncError` with a
-/// `code` matching `SyncErrorCode` and a localized message.
+/// this type by `wrapAsSyncProviderError`. Nitro then reduces the error to a
+/// single string, so `code` does not reach JS as a value. The facade's
+/// `wrapNativeError` keeps that string as the message and assigns the
+/// `SyncErrorCode` chosen at the call site, without parsing the string.
 struct SyncProviderError: LocalizedError, CustomNSError {
-    /// Stable error code understood by the JS facade.
+    /// Stable error code. JS reads it from sync events, never from a thrown error.
     let code: SyncErrorCode
 
-    /// Human-readable message. Forwarded to JS as the error description.
+    /// Human-readable message, returned by `errorDescription`.
     let message: String
 
-    /// Optional underlying error for debugging (not forwarded across bridge).
+    /// Optional underlying error for debugging. JS gets no separate value for
+    /// it, but its text is part of the string Nitro sends across the bridge.
     let underlying: Error?
 
     init(code: SyncErrorCode, message: String, underlying: Error? = nil) {
@@ -35,13 +38,13 @@ struct SyncProviderError: LocalizedError, CustomNSError {
         return message
     }
 
-    // MARK: CustomNSError — controls how Nitro/JS sees the bridged NSError.
+    // MARK: CustomNSError — affects native `NSError` observers only, not Nitro or JS.
 
     static var errorDomain: String { "com.gabriel-sisjr.syncprovider" }
 
     var errorCode: Int {
-        // Stable per-case integers. Values are not part of the public API —
-        // consumers should use `SyncErrorCode` strings instead.
+        // Stable per-case integers, visible only to native `NSError` observers.
+        // Values are not part of the public API.
         switch code {
         case .networkError: return 1
         case .serverError: return 2
@@ -54,8 +57,18 @@ struct SyncProviderError: LocalizedError, CustomNSError {
         case .timeout: return 9
         case .maxAttemptsExceeded: return 10
         case .duplicateItem: return 11
+        case .drainAlreadyActive: return 12
         @unknown default: return 0
         }
+    }
+
+    /// `code` as its wire string (for example `"QUEUE_FULL"`).
+    ///
+    /// `SyncErrorCode` is a Nitro C++ enum, so `code` itself is invisible to
+    /// modules without the generated bridge headers, the XCTest bundle among
+    /// them. This is the Swift-only view of the same value.
+    var codeName: String {
+        code.stringValue
     }
 
     var errorUserInfo: [String: Any] {
@@ -90,7 +103,7 @@ struct SyncProviderError: LocalizedError, CustomNSError {
 }
 
 /// Map an arbitrary Swift / NSError thrown anywhere in the iOS implementation
-/// onto a `SyncProviderError` understood by the JS layer.
+/// onto a `SyncProviderError`.
 ///
 /// This is the single conversion point used by `SyncProvider.swift` — every
 /// public bridge method runs its body inside a `do/catch` that funnels
@@ -99,6 +112,14 @@ struct SyncProviderError: LocalizedError, CustomNSError {
 func wrapAsSyncProviderError(_ error: Error) -> SyncProviderError {
     if let already = error as? SyncProviderError {
         return already
+    }
+
+    // The queue store could not be opened: no operation can succeed, so this
+    // is "module unavailable", not a bad payload.
+    if let storeError = error as? CoreDataStackError {
+        return SyncProviderError(code: .nativeModuleUnavailable,
+                                 message: storeError.localizedDescription,
+                                 underlying: error)
     }
 
     if let urlError = error as? URLError {

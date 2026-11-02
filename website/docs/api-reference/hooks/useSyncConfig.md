@@ -14,7 +14,7 @@ keywords:
 
 # `useSyncConfig`
 
-Reactive view of the active [`SyncOptions`](../types.md#syncoptions) plus a setter that round-trips through [`configureSync`](../functions.md#configuresync). Reads from the `SyncProvider` context if one is mounted; otherwise falls back to a one-shot `getSyncConfig()` on the native singleton.
+Reactive view of the active [`SyncOptions`](../types.md#syncoptions) plus a setter that round-trips through [`configureSync`](../functions.md#configuresync). Mirrors the `SyncProvider` context if one is mounted. Otherwise it reads `getSyncConfig()` from native on mount and again on every `RESUMED` event.
 
 ```ts
 import { useSyncConfig } from '@gabriel-sisjr/react-native-sync-provider';
@@ -38,25 +38,29 @@ function useSyncConfig(): UseSyncConfigResult
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `config` | [`SyncOptions`](../types.md#syncoptions) `\| undefined` | Active configuration. `undefined` until the first read resolves. |
-| `isLoading` | `boolean` | `true` while the initial fetch is in flight. |
-| `error` | [`SyncError`](../errors.md) `\| null` | Last error from `setConfig` or the initial read. |
+| `config` | [`SyncOptions`](../types.md#syncoptions) `\| null` | Active configuration. `null` until the first read resolves. |
+| `isLoading` | `boolean` | `true` while a read of the native config is in flight. |
+| `error` | [`SyncError`](../errors.md) `\| null` | Last error reading the config. `setConfig` rejects instead of setting it, if `configureSync` fails. |
 
 ### Methods
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `setConfig` | `(options: SyncOptions) => Promise<void>` | Apply new options via `configureSync`. Updates local state on success. |
-| `refresh` | `() => Promise<void>` | Re-read from native. Useful when external code (another tab, a background task) has called `configureSync`. |
+| `setConfig` | `(next: SyncOptions) => Promise<void>` | Apply new options via `configureSync`, then re-read them. Only the calling hook updates: see below. |
+| `refresh` | `() => Promise<void>` | Re-read from native. Useful when other code has called `configureSync`. |
 
 ---
 
 ## Behavior
 
-- **Source of truth** -- if a [`SyncProvider`](../context.md) is mounted higher in the tree, the hook reads `config` directly from `SyncProviderContext` and skips the native call.
-- **Fallback** -- without a provider, the hook calls [`getSyncConfig`](../functions.md#getsyncconfig) once on mount.
-- **`setConfig`** -- always calls `configureSync`. The native layer is the source of truth; local state mirrors it.
-- **No event subscription** -- config changes do not fire a sync event, so the hook does not auto-refresh on external mutations. Call `refresh()` explicitly if needed.
+- **With a Provider** -- if a [`SyncProvider`](../context.md) is mounted higher in the tree, the hook mirrors the context `config` and makes no probe of its own, even while the Provider is still loading. A context value that carries a `config` counts as a Provider, so a test wrapper rendering `SyncProviderContext.Provider` directly works without setting `hasProvider`.
+- **Without a Provider** -- the hook calls [`getSyncConfig`](../functions.md#getsyncconfig) on mount and on every `RESUMED` event.
+- **`setConfig`** -- always calls `configureSync`, then re-reads the config. Only the calling hook updates: other `useSyncConfig` instances and the Provider's context value catch up on their next read. It is a full replace, so spread the current config and keep `defaultHeaders`.
+- **External changes** -- `configureSync` fires no sync event, so the hook does not see changes made elsewhere. Call `refresh()` if needed.
+
+:::warning `setConfig({ ...config })` can log the user out
+While stored `defaultHeaders` cannot be read, `config` carries none, so a spread of it deletes them. See [Troubleshooting](../../troubleshooting.md#symptom-items-stay-pending-and-flush-returns-00).
+:::
 
 ---
 

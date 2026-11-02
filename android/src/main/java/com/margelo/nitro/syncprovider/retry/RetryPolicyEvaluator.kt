@@ -36,7 +36,7 @@ internal object RetryPolicyEvaluator {
     val raw = when (policy.backoff) {
       BackoffStrategy.LINEAR -> base * attempt
       BackoffStrategy.EXPONENTIAL -> base * 2.0.pow((attempt - 1).toDouble())
-      BackoffStrategy.FIBONACCI -> base * fibonacci(attempt).toDouble()
+      BackoffStrategy.FIBONACCI -> base * fibonacci(attempt)
     }
 
     val jittered = if (policy.jitter && raw > 0) {
@@ -73,11 +73,17 @@ internal object RetryPolicyEvaluator {
     return attempt < policy.maxAttempts.toInt().coerceAtLeast(1)
   }
 
-  private fun fibonacci(n: Int): Long {
-    if (n <= 1) return n.toLong()
-    var a = 1L
-    var b = 1L
+  /**
+   * Computed as a [Double] because a `Long` overflows at F(93), which would turn
+   * the delay negative. Doubles saturate at infinity, and `maxDelayMs` then caps
+   * the result; precision is irrelevant at magnitudes that far above any cap.
+   */
+  private fun fibonacci(n: Int): Double {
+    if (n <= 1) return n.toDouble()
+    var a = 1.0
+    var b = 1.0
     for (i in 3..n) {
+      if (b.isInfinite()) break
       val sum = a + b
       a = b
       b = sum

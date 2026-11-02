@@ -6,12 +6,11 @@ import com.margelo.nitro.syncprovider.SyncErrorCode
  * Native-side counterpart of the JS `SyncError`.
  *
  * Every error that escapes a `Promise<T>` rejection from the SyncProvider
- * native module SHOULD be wrapped in a [SyncException]. The JS facade reads
- * the `code` from `error.message` (Nitro encodes the throwable's message into
- * the rejection) and re-instantiates a `SyncError` instance.
+ * native module SHOULD be wrapped in a [SyncException]. Its message is
+ * `"<code>: <message>"`, and Nitro carries that message into the rejection.
  *
- * The serialized payload is: `"<code>: <message>"`. This convention matches
- * the iOS implementation so JS-side parsing is platform-agnostic.
+ * JS does not read the code back: `wrapNativeError` throws a `SyncError` with
+ * the failing call's fallback code and keeps this text as its message.
  */
 internal class SyncException(
   val code: SyncErrorCode,

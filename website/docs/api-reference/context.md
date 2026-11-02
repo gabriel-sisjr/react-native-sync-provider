@@ -25,11 +25,11 @@ The provider is **optional**: every hook works without it. Use it when you have 
 
 ## Props
 
-| Prop | Type | Required | Description |
-|------|------|----------|-------------|
-| `options` | [`SyncOptions`](./types.md#syncoptions) | Yes | Configuration applied via `configureSync` on mount and on every prop change. |
-| `backgroundSync` | [`BackgroundSyncOptions`](./types.md#backgroundsyncoptions) | No | When provided, the provider calls `enableBackgroundSync` on mount and `disableBackgroundSync` on unmount. Tracked via an internal ref so duplicate enable/disable calls are skipped. |
-| `children` | `ReactNode` | Yes | Subtree that receives the context. |
+| Prop             | Type                                                        | Required | Description                                                                                                                                                                          |
+| ---------------- | ----------------------------------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `options`        | [`SyncOptions`](./types.md#syncoptions)                     | Yes      | Configuration applied via `configureSync` on mount and on every prop change. Each apply replaces the whole configuration, so leaving out `defaultHeaders` deletes the stored copy.  |
+| `backgroundSync` | [`BackgroundSyncOptions`](./types.md#backgroundsyncoptions) | No       | When provided, the provider calls `enableBackgroundSync` on mount and `disableBackgroundSync` on unmount. Tracked via an internal ref so duplicate enable/disable calls are skipped. |
+| `children`       | `ReactNode`                                                 | Yes      | Subtree that receives the context.                                                                                                                                                   |
 
 ---
 
@@ -38,25 +38,41 @@ The provider is **optional**: every hook works without it. Use it when you have 
 ```ts
 interface SyncProviderContextValue {
   config: SyncOptions | undefined;
+  hasProvider: boolean;
 }
 ```
 
-| Property | Type | Description |
-|----------|------|-------------|
-| `config` | `SyncOptions \| undefined` | The most recent `options` prop, after `configureSync` has resolved. `undefined` between mount and first ack. |
+| Property      | Type                       | Description                                                                                                                                                                                                                                                                            |
+| ------------- | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `config`      | `SyncOptions \| undefined` | The native config as of the Provider's last read, which happens on mount, when `options` or `backgroundSync` change, and on a `RESUMED` event. It does not follow `configureSync` or `setConfig` calls made elsewhere. `undefined` until the first read finishes, **and** when no Provider is mounted. |
+| `hasProvider` | `boolean`                  | `true` only when a `<SyncProvider>` is mounted above the consumer (even while its first config round-trip is still in flight); `false` for the default context value used outside any Provider. Lets consumers tell "no Provider" apart from "Provider mounted, config still loading". |
 
-[`useSyncConfig`](./hooks/useSyncConfig.md) reads from this context when it is available.
+Read this value with the [`useSyncContext`](./hooks/useSyncContext.md) hook (sugar over `useContext(SyncProviderContext)`). [`useSyncConfig`](./hooks/useSyncConfig.md) reads from this context when it is available and otherwise falls back to the native singleton.
+
+:::tip Disambiguating `config === undefined`
+`config` is `undefined` in two distinct situations. Gate on `hasProvider` to tell them apart:
+
+```tsx
+const { config, hasProvider } = useSyncContext();
+if (!hasProvider) {
+  // Rendered outside <SyncProvider> — fall back to direct facade calls.
+} else if (config === undefined) {
+  // Provider mounted, initial getSyncConfig() round-trip still loading.
+}
+```
+
+:::
 
 ---
 
 ## Lifecycle
 
-| Phase | Behavior |
-|-------|----------|
-| Mount | Calls `configureSync(options)`. If `backgroundSync` is set, calls `enableBackgroundSync(backgroundSync)`. |
-| `options` prop change | Calls `configureSync(newOptions)`. |
-| `backgroundSync` prop change | If a previous `backgroundSync` was active, the provider re-runs `enableBackgroundSync` with the new options. The internal ref tracks whether ownership has been claimed so unmount cleanup runs exactly once. |
-| Unmount | If the provider claimed background-sync ownership, calls `disableBackgroundSync()`. Does **not** revert `configureSync` -- the engine keeps running with the last applied config. |
+| Phase                                    | Behavior                                                                                                                                                                                                                                    |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Mount                                    | Calls `configureSync(options)`, then reads the native config with `getSyncConfig()`. If `backgroundSync` is set, calls `enableBackgroundSync(backgroundSync)`.                                                                                |
+| `configureSync` rejects                  | The Provider still reads the native config, so consumers see what the engine kept instead of waiting forever. It skips `enableBackgroundSync` and the `RESUMED` subscription, and does not retry. The rejection is swallowed, because the Provider is best-effort.          |
+| `options` or `backgroundSync` prop change | Runs the unmount step, then the mount step again. So a change to either one disables background sync, if the Provider owned it, and enables it again.                                                                                       |
+| Unmount                                  | If the provider claimed background-sync ownership, calls `disableBackgroundSync()`. Does **not** revert `configureSync` -- the engine keeps running with the last applied config.                                                            |
 
 ---
 
@@ -111,12 +127,13 @@ function ConfiguredApp({ env }: { env: 'dev' | 'prod' }) {
 }
 ```
 
-The provider re-applies `configureSync` whenever `options` changes identity, so memoize the value if it is constructed inline.
+The provider re-applies `configureSync` whenever `options` changes identity, so memoize the value if it is constructed inline. If the options carry a token, rebuild them when the token changes, and keep `defaultHeaders` in them.
 
 ---
 
 ## See also
 
 - [`configureSync`](./functions.md#configuresync), [`enableBackgroundSync`](./functions.md#enablebackgroundsync) -- the underlying facade calls.
+- [`useSyncContext`](./hooks/useSyncContext.md) -- typed sugar for reading this context.
 - [`useSyncConfig`](./hooks/useSyncConfig.md) -- consumes the context.
 - [Background sync guide](../guides/background-sync.md).

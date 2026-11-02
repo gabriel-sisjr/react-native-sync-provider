@@ -18,11 +18,14 @@ interface SyncMock {
 const getMock = (): SyncMock =>
   (globalThis as unknown as { __syncMock: SyncMock }).__syncMock;
 
-const makeItem = (id: string): SyncItem => ({
+const makeItem = (id: string, overrides: Partial<SyncItem> = {}): SyncItem => ({
   id,
   method: HttpMethod.POST,
   url: 'https://api.example.com/events',
   createdAt: Date.now(),
+  attempts: 0,
+  nextRetryAt: 0,
+  ...overrides,
 });
 
 describe('useSyncQueue', () => {

@@ -55,32 +55,35 @@ The library reacts to OS-level connectivity. Forcing JavaScript-side `fetch` to 
 | Android  | adb: `adb shell svc wifi disable && adb shell svc data disable`    |
 | Both     | Toggle airplane mode in the system tray / Quick Settings          |
 
-After toggling, watch for `CONNECTION_CHANGED` events emitted by the library — they appear in the JS console when subscribed via `useSyncEvents`. The native logs should show `ConnectivityMonitor: status=DISCONNECTED`.
+After toggling, watch for `CONNECTION_CHANGED` events emitted by the library — they appear in the JS console when subscribed via `useSyncEvents`.
 
 ## Android logcat tag filters
 
 ```bash
-adb logcat *:S SyncProvider:V WM-WorkerWrapper:V WorkerLifecycle:V ConnectivityManager:V
+adb logcat *:S SyncProvider:V SyncDispatcher:V SyncWorker:V RecoveryWorker:V RetryTimer:V BackgroundSyncManager:V WM-WorkerWrapper:V
 ```
 
 Useful tags:
 
 | Tag                  | What it tells you                                                   |
 | -------------------- | ------------------------------------------------------------------- |
-| `SyncProvider`       | Library's own log lines (queue ops, dispatcher state, retries).     |
+| `SyncProvider`, `SyncDispatcher` | Library's own log lines (bridge errors, dispatcher state, skipped cycles). |
+| `SyncWorker`, `RecoveryWorker`, `RetryTimer`, `BackgroundSyncManager` | Background work and retry wakes. |
 | `WM-WorkerWrapper`   | WorkManager scheduling decisions and `Result.success/retry/failure`.|
 | `WorkerLifecycle`    | Worker start/stop transitions.                                      |
 | `JobScheduler`       | Underlying job scheduling state — useful if work seems "stuck".     |
 
 ## Xcode console subsystem filters
 
-The library logs through `os.Logger` with subsystem `com.gabriel-sisjr.syncprovider`. In the Xcode console, set the filter to:
+The library logs through `os.log` with subsystem `com.gabriel-sisjr.syncprovider`. Turn on Info messages. In the Xcode console, set the filter to:
 
 ```
 subsystem:com.gabriel-sisjr.syncprovider
 ```
 
-Categories used: `database`, `dispatcher`, `connectivity`, `background`, `events`.
+Categories used: `core-data`, `dispatcher`, `queue`, `background`, `events`, `connectivity`, `recovery`, `general`.
+
+Do not treat a log line as proof of dispatch: check the request log on your endpoint.
 
 ## Inspecting the persisted queue
 
@@ -103,7 +106,7 @@ cd databases
 ls
 # Pull the database off the device
 exit
-adb exec-out run-as com.your.app cat databases/sync_provider.db > sync.db
+adb exec-out run-as com.your.app cat databases/syncprovider.db > sync.db
 ```
 
 Open `sync.db` with DB Browser. Tables: `sync_items`, `sync_results`.
@@ -112,13 +115,13 @@ Open `sync.db` with DB Browser. Tables: `sync_items`, `sync_results`.
 
 ### iOS
 
-With the app paused in the Xcode debugger:
+On a physical device, after calling `enableBackgroundSync`, with the app paused in the Xcode debugger:
 
 ```
 e -l objc -- (void)[[BGTaskScheduler sharedScheduler] _simulateLaunchForTaskWithIdentifier:@"com.gabriel-sisjr.syncprovider.background"]
 ```
 
-Resume execution and watch for `BACKGROUND_SYNC_STARTED` / `BACKGROUND_SYNC_COMPLETED` events.
+Resume execution and watch for `BACKGROUND_SYNC_STARTED` / `BACKGROUND_SYNC_COMPLETED` events. Simulators do not accept `BGTaskScheduler` requests. See [iOS Setup](../getting-started/ios-setup.md#7-test-the-background-handler) for the processing task.
 
 ### Android
 
@@ -133,19 +136,19 @@ adb shell cmd jobscheduler run -f com.your.app <jobid>
 
 ## When `flush()` resolves but `failureCount > 0`
 
-This is intentional. `flush()` rejects only on cycle-level errors (no native module, network completely unreachable, etc.). Per-item failures are reported in the `SyncResult`:
+This is intentional. `flush()` rejects only when the native module is missing or the cycle itself dies. A network failure is a per-item failure, not a rejection. Per-item failures are reported in the `SyncResult`, on Android only:
 
 ```ts
 const result = await flush();
 if (result.failureCount > 0) {
+  // failedIds and errors are always empty on iOS.
   for (const id of result.failedIds) {
-    const code = result.errors[id]; // SyncErrorCode as string
-    console.warn(`Item ${id} failed: ${code}`);
+    console.warn(`Item ${id} failed: ${result.errors[id]}`);
   }
 }
 ```
 
-Pair this with `useSyncEvents({ types: ['ITEM_FAILED'] })` if you want push-style reporting.
+Use `useSyncEvents({ types: ['ITEM_FAILED'] })` for reporting that works on both platforms.
 
 ## `SyncError.cause` is your friend
 

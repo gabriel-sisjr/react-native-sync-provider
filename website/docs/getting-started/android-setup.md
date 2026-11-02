@@ -62,7 +62,7 @@ The library declares the required permissions in its own `AndroidManifest.xml`. 
 |---|---|
 | `INTERNET` | OkHttp uses it to dispatch every queued request. |
 | `ACCESS_NETWORK_STATE` | `ConnectivityManager` reports online/offline state to `useConnection`. |
-| `RECEIVE_BOOT_COMPLETED` | The `BootCompletedReceiver` reschedules pending work after a reboot. |
+| `RECEIVE_BOOT_COMPLETED` | The `BootCompletedReceiver` schedules recovery after a reboot. |
 
 You may copy the declarations into your app's manifest for visibility, but it is not required.
 
@@ -76,22 +76,24 @@ The library's manifest registers:
 
 ```xml
 <receiver
-  android:name="com.margelo.nitro.syncprovider.boot.BootCompletedReceiver"
+  android:name="com.margelo.nitro.syncprovider.work.BootCompletedReceiver"
   android:enabled="true"
   android:exported="true">
   <intent-filter>
     <action android:name="android.intent.action.BOOT_COMPLETED" />
+    <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+    <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
   </intent-filter>
 </receiver>
 ```
 
-On boot, the receiver enqueues a one-time `RecoveryWorker` that:
+On any of these, the receiver enqueues a one-time `RecoveryWorker` that:
 
-1. Reads any persisted `BackgroundSyncOptions` from MMKV.
-2. Re-registers the periodic `WorkManager` job.
-3. Triggers a one-shot drain if pending items exist and connectivity is available.
+1. Resets items left in flight back to `PENDING`.
+2. Re-registers the periodic `WorkManager` job from the persisted `BackgroundSyncOptions`, unless `foregroundOnly` is set.
+3. Arms the next retry wake, which with no JS running means the opt-in [retry kick](../guides/retry-policy.md#who-wakes-the-queue-and-when).
 
-No app-side code is required.
+It sends no request of its own. No app-side code is required.
 
 ## 4. ProGuard / R8
 
@@ -108,10 +110,10 @@ You do not need to add rules to your app. If you have custom ProGuard rules that
 The library uses `PeriodicWorkRequest` for OS-scheduled background sync. Android imposes a hard floor:
 
 :::warning 15-minute floor
-`PeriodicWorkRequest.MIN_PERIODIC_INTERVAL_MILLIS` is **15 minutes**. Passing a smaller `minimumIntervalMs` to `enableBackgroundSync` is silently clamped by the OS.
+`PeriodicWorkRequest.MIN_PERIODIC_INTERVAL_MILLIS` is **15 minutes**. A smaller `minimumIntervalMs` passed to `enableBackgroundSync` is silently raised to it.
 :::
 
-For tighter cadences, use `OPPORTUNISTIC` or `AUTOMATIC` strategy plus `useAutoSync({ flushOnReconnect: true })` -- the library will drain the queue the moment connectivity returns, regardless of WorkManager's schedule.
+For tighter cadences while the app runs, mount `useAutoSync({ enabled: true, flushOnReconnect: true })` -- it flushes from JS on an interval and when connectivity returns, regardless of WorkManager's schedule. Failed items also come back on their own, through the [retry timer and kick](../guides/retry-policy.md#who-wakes-the-queue-and-when).
 
 ## 6. Doze Mode and Battery Optimizations
 
@@ -145,7 +147,11 @@ Check that the user has not Force Stopped your app. Android disables `RECEIVE_BO
 :::
 
 :::tip Periodic sync runs at random times
-This is expected. WorkManager batches periodic work to honor Doze and Adaptive Battery. Use `useSyncEvents` and listen for `BACKGROUND_SYNC_STARTED` to log actual fire times during development.
+This is expected. WorkManager batches periodic work to honor Doze and Adaptive Battery. Use `useSyncEvents` and listen for `BACKGROUND_SYNC_STARTED` to log actual fire times during development. The event reaches you only if JS is running.
+:::
+
+:::tip Items wait after a backup restore
+`defaultHeaders` are encrypted under a Keystore key that never leaves the device. With `allowBackup`, a restore onto another device brings the ciphertext back but not the key, so items wait until `configureSync` runs. See [Troubleshooting](../troubleshooting.md#symptom-items-stay-pending-and-flush-returns-00).
 :::
 
 For the full list of issues, see [Troubleshooting](../troubleshooting.md).

@@ -1,7 +1,13 @@
 import type { SyncError } from '../errors/SyncError';
-import type { ConnectionStatus, ConnectionType, SyncEventType } from './enums';
+import type {
+  ConnectionStatus,
+  ConnectionType,
+  NetworkQuality,
+  SyncEventType,
+} from './enums';
 import type {
   BackgroundSyncOptions,
+  SyncDeadLetterItem,
   SyncEvent,
   SyncItem,
   SyncItemInput,
@@ -12,10 +18,8 @@ import type {
 /**
  * Public hook return-type contracts.
  *
- * This module is types-only — no React imports, no runtime exports. The
- * actual hook implementations land in Phase 2 under `src/hooks/`. These
- * shapes are frozen here so consumer code (and the documentation site) can
- * depend on them without waiting for the implementations.
+ * This module is types-only — no React imports, no runtime exports. The hook
+ * implementations live under `src/hooks/`.
  */
 
 /* -------------------------------------------------------------------------- */
@@ -84,15 +88,21 @@ export interface UseSyncQueueResult {
  * Tracks the live sync engine state plus the most recent flush outcome.
  */
 export interface UseSyncStatusResult {
-  /** `true` while a flush cycle is currently in progress. */
+  /**
+   * `true` between `SYNC_STARTED` and the end of the cycle. Starts `false` and
+   * follows events only, so a cycle already running at mount is not reflected.
+   */
   isSyncing: boolean;
-  /** `true` after `pauseSync()` and before `resumeSync()`. */
+  /** `true` after a `PAUSED` event, until `RESUMED`. Starts `false`. */
   isPaused: boolean;
-  /** Current flush progress in `[0, 1]`, or `null` when idle. */
+  /**
+   * Current flush progress in `[0, 1]`, or `null` when idle. `SYNC_PROGRESS` is
+   * iOS-only, so on Android this stays `0` for the whole cycle.
+   */
   progress: number | null;
-  /** Most recent flush outcome, or `null` if no flush has run yet this session. */
+  /** Most recent persisted flush outcome, or `null` if none exists. */
   lastResult: SyncResult | null;
-  /** Last error captured by the hook, or `null` once cleared. */
+  /** Failure of the initial read, or `null`. Actions reject instead. */
   error: SyncError | null;
   /** Equivalent to the top-level `flush()`. */
   flush: () => Promise<SyncResult>;
@@ -192,13 +202,12 @@ export interface UseSyncConfigResult {
 
 /**
  * Options accepted by `useAutoSync` — the orchestrator hook that wires
- * connectivity, foreground state, and (optionally) background sync into a
- * single declarative API.
+ * periodic and connectivity-driven flushes into a single declarative API.
  */
 export interface UseAutoSyncOptions {
   /**
    * If `false`, the orchestrator is inert (no flushes are triggered, no
-   * subscriptions are created). Defaults to `true`.
+   * subscriptions are created). Defaults to `false`: pass `true` to turn it on.
    */
   enabled?: boolean;
   /**
@@ -208,19 +217,67 @@ export interface UseAutoSyncOptions {
    */
   flushOnReconnect?: boolean;
   /**
-   * If `true`, the orchestrator may flush over metered links. Defaults to
-   * `false` to avoid unintended cellular usage.
+   * If `true`, a transition to `METERED` also triggers a flush. Defaults to
+   * `false`. It gates the reconnect trigger only: the periodic tick flushes on
+   * any connection.
    */
   flushOnMetered?: boolean;
   /**
-   * If `true`, the orchestrator triggers a flush when the app returns to the
-   * foreground. Defaults to `true`.
+   * Reserved: `useAutoSync` ignores it. Use `flushOnAppForeground` instead.
    */
   flushOnForeground?: boolean;
   /**
-   * Optional background sync configuration. When supplied, the orchestrator
-   * calls `enableBackgroundSync(options)` on mount and
-   * `disableBackgroundSync()` on unmount.
+   * Reserved: `useAutoSync` ignores it. Call `enableBackgroundSync`, or pass
+   * `backgroundSync` to `SyncProvider`.
    */
   backgroundSync?: BackgroundSyncOptions;
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              useSyncSnapshot                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Result returned by `useSyncSnapshot` — the read-only dashboard aggregator.
+ *
+ * Combines connection, queue, and sync-engine state into a single reactive
+ * object driven by ONE native subscription. Unlike {@link UseOfflineQueueResult}
+ * it exposes NO action methods (`enqueue`, `flush`, etc.) — it is a pure,
+ * render-friendly snapshot intended for status dashboards and badges.
+ */
+export interface UseSyncSnapshotResult {
+  /** Connection snapshot — same as {@link UseConnectionResult}. */
+  connection: UseConnectionResult;
+  /** Current queue size, mirroring `getQueueSize()`. */
+  size: number;
+  /** Pending items, mirroring `getPendingItems()`. */
+  items: SyncItem[];
+  /** `true` while a flush cycle is currently in progress. */
+  isSyncing: boolean;
+  /** `true` after `pauseSync()` and before `resumeSync()`. */
+  isPaused: boolean;
+  /** Current flush progress in `[0, 1]`, or `null` when idle. */
+  progress: number | null;
+  /** Most recent flush outcome, or `null` if no flush has run yet this session. */
+  lastResult: SyncResult | null;
+  /**
+   * `true` when there are pending items but the device is offline — useful
+   * for "Waiting for connection..." UI badges. Derived as
+   * `size > 0 && !connection.isOnline`.
+   */
+  isWaitingForConnection: boolean;
+  /** Last error captured by the hook, or `null` once cleared. */
+  error: SyncError | null;
+  /**
+   * Forward field: coarse {@link NetworkQuality}
+   * classification. ALWAYS `undefined` in v0.2 — populated once the v0.3
+   * network-quality classifier ships.
+   */
+  networkQuality?: NetworkQuality;
+  /**
+   * Forward field: items moved to the dead-letter queue
+   * after exhausting their retry budget. ALWAYS `undefined` in v0.2 —
+   * populated once the v0.3 dead-letter store ships.
+   */
+  deadLetter?: readonly SyncDeadLetterItem[];
 }

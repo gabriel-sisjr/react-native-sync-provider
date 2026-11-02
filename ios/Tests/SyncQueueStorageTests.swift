@@ -77,7 +77,7 @@ final class SyncQueueStorageTests: XCTestCase {
             _ = try await storage.enqueue(input: makeInput())
             XCTFail("Expected QUEUE_FULL")
         } catch let error as SyncProviderError {
-            XCTAssertEqual(error.code, .queueFull)
+            XCTAssertEqual(error.codeName, "QUEUE_FULL")
         } catch {
             XCTFail("Unexpected error type: \(error)")
         }
@@ -91,7 +91,7 @@ final class SyncQueueStorageTests: XCTestCase {
             _ = try await storage.enqueueBatch(inputs: [makeInput(), makeInput()])
             XCTFail("Expected QUEUE_FULL on batch insert")
         } catch let error as SyncProviderError {
-            XCTAssertEqual(error.code, .queueFull)
+            XCTAssertEqual(error.codeName, "QUEUE_FULL")
         }
 
         let sizeAfter = try await storage.getSize()
@@ -136,7 +136,7 @@ final class SyncQueueStorageTests: XCTestCase {
     func test_markPendingForRetry_resetsStatus_andRecordsErrorCode() async throws {
         let id = try await storage.enqueue(input: makeInput())
         try await storage.markInFlight(id: id)
-        try await storage.markPendingForRetry(id: id, errorCode: "NETWORK_ERROR")
+        try await storage.markPendingForRetry(id: id, errorCode: "NETWORK_ERROR", retryDelayMs: 0)
 
         let items = try await storage.getAll()
         let item = try XCTUnwrap(items.first(where: { $0.id == id }))

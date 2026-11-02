@@ -130,6 +130,7 @@ internal class SyncItemDaoTest {
       attempts = 3,
       lastAttemptAt = 99_999L,
       lastErrorCode = "TIMEOUT",
+      nextRetryAt = 12_345L,
     )
 
     assertThat(rows).isEqualTo(1)
@@ -138,6 +139,62 @@ internal class SyncItemDaoTest {
     assertThat(updated.attempts).isEqualTo(3)
     assertThat(updated.lastAttemptAt).isEqualTo(99_999L)
     assertThat(updated.lastErrorCode).isEqualTo("TIMEOUT")
+    assertThat(updated.nextRetryAt).isEqualTo(12_345L)
+  }
+
+  @Test
+  fun `claimPending flips only eligible rows and skips cooling ones`() = runTest {
+    val now = 5_000L
+    dao.insert(TestData.entity("high", priority = "HIGH", createdAt = 1L, nextRetryAt = 0L))
+    dao.insert(TestData.entity("cooling", priority = "HIGH", createdAt = 2L, nextRetryAt = now + 1L))
+    dao.insert(TestData.entity("normal", priority = "NORMAL", createdAt = 3L, nextRetryAt = now))
+
+    val claimed = dao.claimPending(now = now, limit = 10)
+
+    // Eligible rows only, ordered by priority then createdAt; cooling row skipped.
+    assertThat(claimed.map { it.id }).containsExactly("high", "normal").inOrder()
+    assertThat(dao.countByStatus(SyncItemEntity.STATUS_IN_FLIGHT)).isEqualTo(2)
+    assertThat(dao.findById("cooling")!!.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+  }
+
+  @Test
+  fun `claimPending stays under the bind limit of old SQLite versions, whatever the batch`() = runTest {
+    val recording = StatementRecordingDao(dao, claimableRows = 2_100)
+
+    val claimed = recording.claimPending(now = 5_000L, limit = 2_100)
+
+    assertThat(claimed).hasSize(2_100)
+    assertThat(recording.statementSizes.sum()).isEqualTo(2_100)
+    assertThat(recording.statementSizes.max()).isAtMost(OLD_SQLITE_MAX_BIND_PARAMETERS)
+  }
+
+  @Test
+  fun `nextRetryDeadline reports the soonest deadline, even one already in the past`() = runTest {
+    assertThat(dao.nextRetryDeadline()).isNull()
+    dao.insert(TestData.entity("later", nextRetryAt = 9_000L))
+    assertThat(dao.nextRetryDeadline()).isEqualTo(9_000L)
+
+    dao.insert(TestData.entity("overdue", nextRetryAt = 1L))
+    assertThat(dao.nextRetryDeadline()).isEqualTo(1L)
+  }
+
+  @Test
+  fun `nextRetryDeadline ignores never-attempted rows and rows that are not pending`() = runTest {
+    dao.insert(TestData.entity("never-attempted", nextRetryAt = 0L))
+    dao.insert(TestData.entity("in-flight", status = SyncItemEntity.STATUS_IN_FLIGHT, nextRetryAt = 5L))
+    dao.insert(TestData.entity("failed", status = SyncItemEntity.STATUS_FAILED, nextRetryAt = 5L))
+
+    assertThat(dao.nextRetryDeadline()).isNull()
+  }
+
+  @Test
+  fun `nextPendingDeadline sees never-attempted rows too`() = runTest {
+    assertThat(dao.nextPendingDeadline()).isNull()
+    dao.insert(TestData.entity("cooling", nextRetryAt = 9_000L))
+    assertThat(dao.nextPendingDeadline()).isEqualTo(9_000L)
+
+    dao.insert(TestData.entity("never-attempted", nextRetryAt = 0L))
+    assertThat(dao.nextPendingDeadline()).isEqualTo(0L)
   }
 
   @Test
@@ -156,10 +213,49 @@ internal class SyncItemDaoTest {
   }
 
   @Test
+  fun `resetInFlight keeps the cooldown of the rows it requeues`() = runTest {
+    dao.insert(TestData.entity("01A", status = SyncItemEntity.STATUS_IN_FLIGHT, nextRetryAt = 42_000L))
+
+    dao.resetInFlight()
+
+    assertThat(dao.findById("01A")!!.nextRetryAt).isEqualTo(42_000L)
+  }
+
+  @Test
   fun `priorityWeight maps HIGH NORMAL LOW`() {
     assertThat(SyncItemEntity.priorityWeight("HIGH")).isEqualTo(0)
     assertThat(SyncItemEntity.priorityWeight("normal")).isEqualTo(1)
     assertThat(SyncItemEntity.priorityWeight("LOW")).isEqualTo(2)
     assertThat(SyncItemEntity.priorityWeight("anything-else")).isEqualTo(1)
+  }
+
+  /**
+   * Records how many ids each `markInFlight` statement binds. Robolectric's SQLite
+   * allows 32,766 parameters, so a real database here could not reveal a breach of the
+   * 999 that older Android releases allow.
+   *
+   * Do not replace this with a real claim of that size. A claim of 12,000 rows under
+   * Robolectric's SQLite leaves the JVM unable to attach MockK's agent, which fails
+   * every later MockK test in the run, in a different class.
+   */
+  private class StatementRecordingDao(
+    real: SyncItemDao,
+    private val claimableRows: Int,
+  ) : SyncItemDao by real {
+    val statementSizes = mutableListOf<Int>()
+
+    override suspend fun selectClaimable(now: Long, limit: Int): List<SyncItemEntity> =
+      List(claimableRows) { TestData.entity("row-$it") }
+
+    override suspend fun markInFlight(ids: List<String>) {
+      statementSizes += ids.size
+    }
+
+    override suspend fun claimPending(now: Long, limit: Int): List<SyncItemEntity> =
+      super<SyncItemDao>.claimPending(now, limit)
+  }
+
+  private companion object {
+    const val OLD_SQLITE_MAX_BIND_PARAMETERS = 999
   }
 }

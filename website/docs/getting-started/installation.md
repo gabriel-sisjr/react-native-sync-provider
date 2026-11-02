@@ -51,7 +51,7 @@ yarn add react-native-nitro-modules
 cd ios && pod install && cd ..
 ```
 
-This pulls in the `SyncProvider` pod (the iOS module name -- not the npm package name) and its native dependencies (`Foundation`, `CoreData`, `Network`, `BackgroundTasks`).
+This pulls in the `SyncProvider` pod (the iOS module name -- not the npm package name) and its native dependencies (`Foundation`, `CoreData`, `Network`, `BackgroundTasks`, `Security`).
 
 ### 2. Enable Background Modes
 
@@ -60,26 +60,29 @@ In Xcode, open your app target -> **Signing & Capabilities** -> **+ Capability**
 - **Background fetch**
 - **Background processing**
 
-### 3. Register the Background Task Identifier
+### 3. Declare the Background Task Identifiers
 
-Add the background sync identifier to your app's `Info.plist`:
+Add both of the library's identifiers to your app's `Info.plist`. They are fixed:
 
 ```xml
 <key>BGTaskSchedulerPermittedIdentifiers</key>
 <array>
   <string>com.gabriel-sisjr.syncprovider.background</string>
+  <string>com.gabriel-sisjr.syncprovider.processing</string>
 </array>
 ```
 
-The identifier `com.gabriel-sisjr.syncprovider.background` is the library default. If you override it via `BackgroundSyncOptions.taskIdentifier`, replace the string above with your custom value.
+### 4. Forward Background URLSession Events
 
-### 4. Privacy Manifest
+Forward `handleEventsForBackgroundURLSession` from your `AppDelegate`, as shown in [iOS Setup](./ios-setup.md#5-forward-background-urlsession-events). The library registers its BGTask handlers by itself, so do not register them yourself.
 
-The library ships its own `PrivacyInfo.xcprivacy` (declared as a `resource_bundles` entry in `SyncProvider.podspec`). Consumers do **not** need to add anything for Core Data usage -- Apple's required reasons are already declared. See [Privacy Manifest](../production/privacy-manifest.md) for full details.
+### 5. Privacy Manifest
 
-### 5. Minimum iOS Version
+The library ships its own `PrivacyInfo.xcprivacy` (declared as a `resource_bundles` entry in `SyncProvider.podspec`). Consumers do **not** need to add anything for the library -- Apple's required reasons are already declared. See [Privacy Manifest](../production/privacy-manifest.md) for full details.
 
-Set `IPHONEOS_DEPLOYMENT_TARGET = 13.0` (or higher) in your project. The library's podspec enforces this floor.
+### 6. Minimum iOS Version
+
+Set `IPHONEOS_DEPLOYMENT_TARGET = 15.0` (or higher) in your project. The library's podspec enforces this floor, and React Native 0.85 raises the built pod to 15.1.
 
 ## Android Setup
 
@@ -125,7 +128,7 @@ buildscript {
 
 ### 3. Boot Receiver
 
-The library's `BootCompletedReceiver` is already registered in the merged manifest. It schedules a `RecoveryWorker` at boot to resume any in-flight items. No action required.
+The library's `BootCompletedReceiver` is already registered in the merged manifest. It schedules a `RecoveryWorker` at boot to reset in-flight items and re-arm background work. No action required.
 
 ### 4. ProGuard / R8
 

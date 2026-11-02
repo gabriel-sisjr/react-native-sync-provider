@@ -57,17 +57,9 @@ This is documented inline in `src/__tests__/hooks/useSyncStatus.test.tsx` and is
 
 ### Coverage
 
-Targets after Phase 5 (measured, not enforced):
+The `coverageThreshold` is set to 0 % globally — same convention as the sibling lib. CI emits the report and enforces no minimum.
 
-| Path                      | Lines % | Notes                                                                     |
-| ------------------------- | ------- | ------------------------------------------------------------------------- |
-| `src/utils/`              | 90 %    | Validation, retry math, ULID generator, serialize/deserialize.           |
-| `src/errors/`             | 100 %   | Trivial — both files are covered by the facade tests.                    |
-| `src/index.tsx` (facade)  | 80 %    | Sentinel translation, error wrapping, listener wrappers.                 |
-| `src/hooks/` (avg)        | 62 %    | `useOfflineQueue` + `useSyncConfig` still uncovered (known follow-up).   |
-| `src/index.web.tsx`       | 0 %     | Stub — every export throws. Out of scope until v1.x ships web support.   |
-
-The `coverageThreshold` is set to 0 % globally — same convention as the sibling lib. CI emits the report; gates are added later when the hooks gap closes.
+`src/__tests__/webParity.test.ts` also runs here: it uses the TypeScript compiler to assert that `src/index.tsx` and `src/index.web.tsx` export the same names, each with the same kind and shape.
 
 ## Android (JUnit + Robolectric)
 
@@ -86,14 +78,23 @@ CI runs the same command on `ubuntu-latest` with JDK 17 (Zulu) and uploads the H
 
 | Suite                                  | Cases | What it exercises                                                                       |
 | -------------------------------------- | ----- | --------------------------------------------------------------------------------------- |
-| `database/SyncItemDaoTest`             | 10    | Room in-memory + Robolectric SDK 30. Insert/batch/count/delete, ordering, status flips. |
+| `SyncProviderRuntimeTest`              | 54    | Configuration, pause, retry wake and cold workers against a fresh runtime.              |
+| `database/SyncItemDaoTest`             | 16    | Room in-memory + Robolectric SDK 30. Insert/batch/count/delete, ordering, status flips. |
 | `database/SyncResultDaoTest`           | 5     | History persistence, ordering DESC.                                                     |
-| `storage/SyncQueueStorageTest`         | 15    | enqueue + INVALID_URL + QUEUE_FULL + claim atomicity + roundtrip.                       |
-| `http/SyncDispatcherTest`              | 7     | MockWebServer 4.12.0 — 200/503/500/401/404 paths + isSyncing flip.                       |
-| `retry/RetryPolicyEvaluatorTest`       | 12    | Linear/exp/fib + cap + full-jitter `[0, capped]` with seeded `Random`.                  |
-| `connectivity/ConnectivityMonitorTest` | 5     | Lifecycle, idempotency, StateFlow initial UNKNOWN.                                      |
-| `work/SyncWorkerTest`                  | 4     | `TestListenableWorkerBuilder` + `mockkObject(SyncProviderRuntime.Companion)`.           |
-| `work/RecoveryWorkerTest`              | 3     | Reset-in-flight + reschedule + failure → retry.                                         |
+| `database/SyncDatabaseMigrationTest`   | 4     | Room v1→v2 migration.                                                                   |
+| `storage/SyncQueueStorageTest`         | 28    | enqueue + INVALID_URL + QUEUE_FULL + claim atomicity + roundtrip.                       |
+| `http/SyncDispatcherTest`              | 30    | MockWebServer 4.12.0 — success, retry, terminal codes, credential hold, cancellation.   |
+| `retry/RetryPolicyEvaluatorTest`       | 18    | Linear/exp/fib + cap + equal jitter `[0.75, 1.25)` with seeded `Random`.                |
+| `retry/RetryTimerTest`                 | 13    | Single-shot arming, cancel, a wake owed to the network.                                 |
+| `retry/RetryWakeTest`                  | 13    | When the timer and the kick arm, and what suppresses them.                              |
+| `retry/OfflineRetryTest`               | 4     | No attempt is spent while offline.                                                      |
+| `config/SyncConfigStoreTest`           | 16    | Round trip of every option, and the secret lifecycle.                                   |
+| `config/KeystoreSecretStoreTest`       | 4     | Encryption behind the `SecretStore` seam.                                               |
+| `connectivity/ConnectivityMonitorTest` | 7     | Lifecycle, idempotency, StateFlow initial UNKNOWN.                                      |
+| `work/BackgroundSyncManagerTest`       | 24    | Periodic work, the retry kick, `foregroundOnly`.                                        |
+| `work/BootCompletedReceiverTest`       | 5     | Boot and package-replaced actions.                                                      |
+| `work/SyncWorkerTest`                  | 7     | `TestListenableWorkerBuilder` + `mockkObject(SyncProviderRuntime.Companion)`.           |
+| `work/RecoveryWorkerTest`              | 5     | Reset-in-flight + reschedule + failure → retry.                                         |
 
 ### Robolectric SDK 30 (the sweet spot)
 
@@ -130,32 +131,27 @@ cd example && bundle install && bundle exec pod install --project-directory=ios
 ### Running
 
 ```bash
-yarn test:ios
-```
-
-This is a thin wrapper over `scripts/test-ios.sh`. It mirrors the CI invocation: it removes any stale `build/SyncProviderTests.xcresult` before each attempt (defends against the `"Existing file at -resultBundlePath"` failure mode) and walks a destination fallback list (`iPhone 16` → `iPhone 17` → `iPhone 16 Pro`, all `OS=latest`) so a missing simulator on a single machine does not block the run.
-
-The equivalent direct invocation:
-
-```bash
 cd example/ios
 xcodebuild test \
   -workspace SyncProviderExample.xcworkspace \
   -scheme SyncProvider-Unit-Tests \
-  -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest' \
+  -destination 'platform=iOS Simulator,name=iPhone 17,OS=latest' \
   -resultBundlePath build/SyncProviderTests.xcresult \
   -skipPackagePluginValidation \
   -skipMacroValidation
 ```
 
-CI runs the same command on `macos-latest` with `XCODE_VERSION=26` (see the `test-ios` job in `.github/workflows/ci.yml`), walks the same destination fallback loop, and uploads `.xcresult` artifacts. A "Show available iOS simulators" diagnostic step prints the runtime list before the test step so destination drift is visible in the log.
+Remove any stale `build/SyncProviderTests.xcresult` first: `xcodebuild` refuses to overwrite one. There is no `yarn` script for this.
+
+CI runs the same command on `macos-latest` with `XCODE_VERSION=26` (see the `test-ios` job in `.github/workflows/ci.yml`) and uploads `.xcresult` artifacts. It picks the simulator automatically, preferring an iPhone 17, through `.github/scripts/pick-ios-simulator.mjs`, so the next runner image cannot leave the job without a device. A "Show available iOS simulators" diagnostic step prints the runtime list before the test step so destination drift is visible in the log.
 
 ### Test seams
 
-Two `internal init(...)` overloads exist solely for tests (do not appear in the public HybridObject surface):
+These `internal init(...)` overloads exist solely for tests (they do not appear in the public HybridObject surface):
 
-- `CoreDataStack(container:)` — `internal init` accepting an injected `NSPersistentContainer`. Backed by `InMemoryCoreDataStack` which programmatically rebuilds the model (the `.xcdatamodeld` is not embedded in the test bundle — when the production model changes, mirror the change in `InMemoryCoreDataStack.makeModel()`).
-- `SyncDispatcher(... session:)` — `internal init` accepting an injected `URLSession` so `URLProtocolStub` can drive every request.
+- `CoreDataStack(container:)` — `internal init` accepting an injected `NSPersistentContainer`. Backed by `InMemoryCoreDataStack`, which programmatically rebuilds the model — when the production model changes, mirror the change in `InMemoryCoreDataStack.makeModel()`. The compiled `.momd` is bundled into the test target for the migration tests only.
+- `SyncDispatcher(... foregroundSession:backgroundSession:)` — `internal init` accepting injected sessions so `URLProtocolStub` can drive every request.
+- `SyncEngine(...)` — injectable stores, clock, retry timer and scheduler. `InMemorySecretStore` stands in for the Keychain, which hostless XCTest does not have, and `FakeBackgroundTasks` for `BGTaskScheduler`.
 
 `MockSyncEventEmitter` is a subclass that captures every emitted payload for assertion.
 
@@ -163,13 +159,23 @@ Two `internal init(...)` overloads exist solely for tests (do not appear in the 
 
 | Suite                            | Cases | Notes                                                                                              |
 | -------------------------------- | ----- | -------------------------------------------------------------------------------------------------- |
-| `SyncQueueStorageTests`          | 15    | enqueue / batch / QUEUE_FULL / sort / status transitions / history.                                |
-| `SyncDispatcherTests`            | 16    | URLProtocolStub-driven; 200/500/408/429/400/401 paths + transport errors + paused skip.            |
-| `RetryPolicyEvaluatorTests`      | 12    | linear/exp/fib + cap + jitter `[3000, 5000)` over 200 samples + perf measure baseline.             |
-| `ConnectivityMonitorTests`       | 8     | Singleton lifecycle + replay sync + raw enum values.                                                |
-| `BackgroundSyncManagerTests`     | 3     | Defaults `isEnabled=false`, idempotency `disable()`, `BackgroundSyncOptionsValue` Equatable.        |
+| `SyncEngineRetryTimerTests`      | 37    | When the timer arms, offline wakes, credential holds, hybrid attach and detach.                    |
+| `SyncEngineConfigTests`          | 35    | Configuration across engine restarts, pause lifetime, stale credentials.                           |
+| `SyncQueueStorageTests`          | 14    | enqueue / batch / QUEUE_FULL / sort / status transitions / history.                                |
+| `SyncDispatcherTests`            | 17    | URLProtocolStub-driven; 200/500/408/429/400/401 paths + transport errors + paused skip.            |
+| `SyncDispatcherCooldownTests`    | 10    | Cooldown written from the end of the attempt, and skipped items.                                   |
+| `SyncRetryCooldownTests`         | 14    | Cooldowns in storage, recovery, and the predicate.                                                 |
+| `RetryPolicyEvaluatorTests`      | 15    | linear/exp/fib + cap + jitter `[3000, 5000)` over 200 samples + perf measure baseline.             |
+| `RetryWakeTimerTests`            | 8     | Single-shot arming and cancel.                                                                     |
+| `SyncConfigStoreTests`           | 11    | Persistence, logout, orphaned secrets.                                                             |
+| `BackgroundSyncManagerTests`     | 17    | Scheduling decisions and handlers, with a fake scheduler.                                          |
+| `BackgroundSyncPersistenceTests` | 7     | Options and enabled state across relaunches.                                                       |
+| `BackgroundTaskRegistrarTests`   | 6     | Registration, and identifiers missing from `Info.plist`.                                           |
+| `CoreDataMigrationV1ToV2Tests`   | 5     | Model v1→v2 migration.                                                                             |
+| `CoreDataStackTests`             | 5     | Store loading and failure.                                                                         |
+| `ConnectivityMonitorTests`       | 7     | Singleton lifecycle + replay sync + raw enum values.                                                |
 
-`URLSessionConfiguration.background` is not exercised in unit tests — it is OS-resumable and cannot be driven from a test host. That coverage lives in the example app's integration scheme (planned for a future phase).
+`URLSessionConfiguration.background` and a real `BGTaskScheduler` launch are not exercised in unit tests: they are OS-driven and cannot be run from a test host. That coverage needs a physical device: see [iOS Setup](../getting-started/ios-setup.md#7-test-the-background-handler).
 
 ## Local validation gotcha
 

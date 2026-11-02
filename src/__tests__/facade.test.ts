@@ -105,6 +105,47 @@ describe('facade — queue ops', () => {
     expect(await getQueueSize()).toBe(7);
     expect(await getPendingItems()).toEqual([]);
   });
+
+  it('getPendingItems surfaces attempts/nextRetryAt verbatim (no sentinel translation)', async () => {
+    const mock = getMock();
+    const item = {
+      id: 'item-1',
+      method: HttpMethod.POST,
+      url: 'https://api.example.com/x',
+      createdAt: 1_700_000_000_000,
+      attempts: 2,
+      nextRetryAt: 1_717_000_000_000,
+    };
+    mock.getPendingItems.mockResolvedValueOnce([item]);
+
+    const pending = await getPendingItems();
+
+    // Unlike getLastSyncResult, the facade does NOT translate SyncItem 0s —
+    // here the values are non-zero and must pass through entirely unchanged.
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.attempts).toBe(2);
+    expect(pending[0]?.nextRetryAt).toBe(1_717_000_000_000);
+    expect(pending[0]).toEqual(item);
+  });
+
+  it('getPendingItems returns attempts: 0 / nextRetryAt: 0 unchanged (0 is not a sentinel)', async () => {
+    const mock = getMock();
+    const item = {
+      id: 'item-zero',
+      method: HttpMethod.GET,
+      url: 'https://api.example.com/z',
+      createdAt: 1_700_000_000_000,
+      attempts: 0,
+      nextRetryAt: 0,
+    };
+    mock.getPendingItems.mockResolvedValueOnce([item]);
+
+    const pending = await getPendingItems();
+
+    expect(pending[0]?.attempts).toBe(0);
+    expect(pending[0]?.nextRetryAt).toBe(0);
+    expect(pending[0]).toEqual(item);
+  });
 });
 
 describe('facade — sync ops', () => {
@@ -237,6 +278,21 @@ describe('facade — config + history + connection + bg', () => {
 
     mock.isBackgroundSyncEnabled.mockResolvedValueOnce(true);
     expect(await isBackgroundSyncEnabled()).toBe(true);
+  });
+
+  it('enableBackgroundSync forwards foregroundOnly to the native layer unchanged', async () => {
+    const mock = getMock();
+    await enableBackgroundSync({
+      minimumIntervalMs: 60_000,
+      foregroundOnly: true,
+    });
+    expect(mock.enableBackgroundSync).toHaveBeenCalledTimes(1);
+    const forwarded = mock.enableBackgroundSync.mock.calls[0]?.[0];
+    expect(forwarded).toMatchObject({
+      minimumIntervalMs: 60_000,
+      foregroundOnly: true,
+    });
+    expect(forwarded?.foregroundOnly).toBe(true);
   });
 });
 

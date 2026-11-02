@@ -94,32 +94,51 @@ internal class SyncQueueStorage(
   }
 
   /**
-   * Atomically claim the next [limit] pending rows, marking them `IN_FLIGHT`.
-   * Returned rows are ordered by priority then `createdAt`.
+   * Atomically claim the next [limit] **eligible** pending rows, marking them
+   * `IN_FLIGHT`. A row is eligible only when its retry cooldown has elapsed
+   * (`nextRetryAt <= now`); cooling rows are skipped. Returned rows are
+   * ordered by priority then `createdAt`.
+   *
+   * The select-then-flip runs in a single Room `@Transaction`
+   * ([SyncItemDao.claimPending]) so concurrent cycles cannot double-claim.
+   *
+   * @param now epoch-millis clock; defaults to wall-clock, injectable for tests.
    */
-  suspend fun claimPending(limit: Int): List<SyncItemEntity> = withContext(Dispatchers.IO) {
-    val rows = itemDao.findByStatusesLimit(listOf(SyncItemEntity.STATUS_PENDING), limit)
-    rows.forEach { entity ->
-      itemDao.updateStatus(
-        id = entity.id,
-        status = SyncItemEntity.STATUS_IN_FLIGHT,
-        attempts = entity.attempts,
-        lastAttemptAt = entity.lastAttemptAt,
-        lastErrorCode = entity.lastErrorCode,
-      )
-    }
-    rows
+  suspend fun claimPending(
+    limit: Int,
+    now: Long = System.currentTimeMillis(),
+  ): List<SyncItemEntity> = withContext(Dispatchers.IO) {
+    itemDao.claimPending(now, limit)
   }
+
+  /**
+   * Earliest retry deadline among attempted `PENDING` rows, or `null` when none
+   * exist. A deadline in the past means a retry is due now.
+   */
+  suspend fun nextRetryDeadline(): Long? =
+    withContext(Dispatchers.IO) { itemDao.nextRetryDeadline() }
+
+  /**
+   * Earliest deadline across every `PENDING` row, or `null` when the queue has
+   * none. `0` means at least one row was never attempted.
+   */
+  suspend fun nextPendingDeadline(): Long? =
+    withContext(Dispatchers.IO) { itemDao.nextPendingDeadline() }
 
   suspend fun markSucceeded(id: String): Unit = withContext(Dispatchers.IO) {
     itemDao.deleteById(id)
   }
 
+  /**
+   * Re-queue a retriable item as `PENDING` and persist its cooldown deadline.
+   * The row is excluded from [claimPending] until `nextRetryAt <= now`.
+   */
   suspend fun markRetry(
     id: String,
     attempts: Int,
     lastAttemptAt: Long,
     lastErrorCode: SyncErrorCode,
+    nextRetryAt: Long,
   ): Unit = withContext(Dispatchers.IO) {
     itemDao.updateStatus(
       id = id,
@@ -127,6 +146,7 @@ internal class SyncQueueStorage(
       attempts = attempts,
       lastAttemptAt = lastAttemptAt,
       lastErrorCode = lastErrorCode.name,
+      nextRetryAt = nextRetryAt,
     )
   }
 
@@ -142,6 +162,8 @@ internal class SyncQueueStorage(
       attempts = attempts,
       lastAttemptAt = lastAttemptAt,
       lastErrorCode = lastErrorCode.name,
+      // Terminal rows are never claimed; reset the cooldown sentinel for clarity.
+      nextRetryAt = 0L,
     )
   }
 
@@ -208,6 +230,8 @@ internal class SyncQueueStorage(
       lastErrorCode = null,
       status = SyncItemEntity.STATUS_PENDING,
       metadata = JsonMap.encode(input.metadata),
+      // 0 = never attempted, and therefore eligible now.
+      nextRetryAt = 0L,
     )
   }
 
@@ -220,6 +244,8 @@ internal class SyncQueueStorage(
     contentType = entity.contentType,
     priority = parsePriority(entity.priority),
     createdAt = entity.createdAt.toDouble(),
+    attempts = entity.attempts.toDouble(),
+    nextRetryAt = entity.nextRetryAt.toDouble(),
     metadata = JsonMap.decode(entity.metadata),
   )
 
@@ -256,7 +282,7 @@ internal class SyncQueueStorage(
   }
 
   companion object {
-    /** Default cap from the ux-researcher decisions brief. */
+    /** Queue cap used when `SyncOptions.maxQueueSize` is not set. */
     const val DEFAULT_MAX_QUEUE_SIZE: Int = 10_000
 
     fun from(

@@ -1,6 +1,6 @@
 # React Native Sync Provider — Full API Reference
 
-> Cross-platform React Native Nitro Module that turns every HTTP request into a durable, offline-first job with native persistence and OS-scheduled background sync.
+> React Native Nitro Module for offline-first HTTP sync. Requests are persisted natively (Core Data on iOS, Room on Android), retried with a persisted backoff, and flushed from JS or in OS-scheduled background windows (BGTaskScheduler, WorkManager).
 > npm: @gabriel-sisjr/react-native-sync-provider
 > Documentation: https://gabriel-sisjr.github.io/react-native-sync-provider/
 
@@ -12,55 +12,78 @@ yarn add @gabriel-sisjr/react-native-sync-provider react-native-nitro-modules
 npm install @gabriel-sisjr/react-native-sync-provider react-native-nitro-modules
 ```
 
-Optional peers (recommended):
-
-```bash
-yarn add @react-native-community/netinfo react-native-mmkv
-```
-
 Requirements:
 - React Native >= 0.74.0 with the New Architecture (Fabric + concurrent root) enabled.
 - React >= 18.2.0.
 - react-native-nitro-modules ^0.35.6.
 - Android: minSdk 24, targetSdk 36, Kotlin 2.0+.
-- iOS: 15+. Background Modes capability with `fetch` and `processing` selected.
+- iOS: 15+.
 
-iOS post-install:
+### iOS setup
 
-```bash
-cd ios && bundle exec pod install
+1. Enable Background Modes `fetch` and `processing`.
+2. Declare both fixed identifiers in Info.plist:
+
+```xml
+<key>BGTaskSchedulerPermittedIdentifiers</key>
+<array>
+  <string>com.gabriel-sisjr.syncprovider.background</string>
+  <string>com.gabriel-sisjr.syncprovider.processing</string>
+</array>
 ```
+
+3. Forward background URLSession events from a Swift AppDelegate:
+
+```swift
+import SyncProvider
+
+func application(
+  _ application: UIApplication,
+  handleEventsForBackgroundURLSession identifier: String,
+  completionHandler: @escaping () -> Void
+) {
+  HybridSyncProvider.handleBackgroundURLSessionEvents(
+    identifier: identifier,
+    completionHandler: completionHandler
+  )
+}
+```
+
+4. Run `cd ios && bundle exec pod install`.
+
+The library registers its BGTask handlers at process start through +load. Do not call `BGTaskScheduler.shared.register` for its identifiers: iOS traps on a second registration.
+
+### Android setup
+
+Nothing to add. The manifest merger brings in INTERNET, ACCESS_NETWORK_STATE, RECEIVE_BOOT_COMPLETED and BootCompletedReceiver.
+
+## How dispatch works
+
+- `enqueue` stores an item. It does not dispatch it, under any strategy.
+- A flush dispatches. It comes from `useAutoSync`, `flush()`, `drainUntilEmpty()`, the retry timer, or an OS background window.
+- A cycle takes one batch of eligible items, up to `batchSize`, ordered by priority and then age, and makes at most one attempt per item. Android sends a batch concurrently, iOS one item at a time.
+- An item is eligible when it is PENDING and `nextRetryAt <= now`.
+- On a retriable failure with attempts left, the item goes back to PENDING with `nextRetryAt` measured from the end of the attempt.
+- A permanent failure leaves the item as a FAILED row. It is not returned by `getPendingItems()`, and nothing retries it.
+- `AUTOMATIC` means the engine retries on its own: an in-process timer flushes when the soonest cooldown ends. It does not flush on enqueue or on reconnect.
+- The timer never flushes offline. It remembers the wake and flushes when connectivity returns.
+- Delivery is at least once.
 
 ## Quick Start
 
 ```typescript
+import { useMemo } from 'react';
 import {
   SyncProvider,
+  useAutoSync,
   useSyncQueue,
   useSyncStatus,
-  useAutoSync,
   type SyncOptions,
 } from '@gabriel-sisjr/react-native-sync-provider';
 
-const options: SyncOptions = {
-  strategy: 'AUTOMATIC',
-  requestTimeoutMs: 30_000,
-  maxQueueSize: 10_000,
-  persistResults: true,
-  historyLimit: 100,
-  retryPolicy: {
-    maxAttempts: 5,
-    backoff: 'EXPONENTIAL',
-    baseDelayMs: 1_000,
-    maxDelayMs: 60_000,
-    jitter: true,
-    retryOnStatusCodes: [408, 425, 429, 500, 502, 503, 504],
-  },
-};
-
 function Outbox() {
-  useAutoSync({ flushOnReconnect: true, flushOnFocus: true });
-  const { items, enqueue, remove, clear } = useSyncQueue();
+  useAutoSync({ enabled: true, flushOnAppForeground: true });
+  const { items, enqueue } = useSyncQueue();
   const { lastResult, isSyncing } = useSyncStatus();
 
   return (
@@ -76,7 +99,6 @@ function Outbox() {
             url: 'https://api.example.com/events',
             contentType: 'application/json',
             body: JSON.stringify({ kind: 'login' }),
-            idempotencyKey: 'login-2026-05-05',
           })
         }
       />
@@ -84,7 +106,23 @@ function Outbox() {
   );
 }
 
-export default function App() {
+export default function App({ token }: { token: string }) {
+  const options = useMemo<SyncOptions>(
+    () => ({
+      strategy: 'AUTOMATIC',
+      retryPolicy: {
+        maxAttempts: 5,
+        backoff: 'EXPONENTIAL',
+        baseDelayMs: 1_000,
+        maxDelayMs: 60_000,
+        jitter: true,
+        retryOnStatusCodes: [408, 425, 429, 500, 502, 503, 504],
+      },
+      defaultHeaders: { Authorization: `Bearer ${token}` },
+    }),
+    [token]
+  );
+
   return (
     <SyncProvider options={options}>
       <Outbox />
@@ -95,120 +133,56 @@ export default function App() {
 
 ## Queue Functions
 
-### enqueue
-
 ```typescript
 function enqueue(item: SyncItemInput): Promise<string>;
-```
-
-Persists a single request and returns its assigned ULID. The native layer assigns `id` and `createdAt`. Throws SyncError with code QUEUE_FULL, INVALID_PAYLOAD, or INVALID_URL.
-
-### enqueueBatch
-
-```typescript
 function enqueueBatch(items: SyncItemInput[]): Promise<string[]>;
-```
-
-Atomic batch enqueue. All items are persisted together or none are. Returns ULIDs parallel to the input array.
-
-### removeItem
-
-```typescript
 function removeItem(id: string): Promise<boolean>;
-```
-
-Removes a pending item by ULID. Returns `true` on success, `false` if no item with that id exists.
-
-### clearQueue
-
-```typescript
 function clearQueue(): Promise<void>;
-```
-
-Drops every pending item. Does not affect history.
-
-### getQueueSize
-
-```typescript
 function getQueueSize(): Promise<number>;
-```
-
-### getPendingItems
-
-```typescript
 function getPendingItems(): Promise<SyncItem[]>;
 ```
 
-Returns pending items in dispatch order with `id`, `createdAt`, `attemptCount`, and optional `lastAttemptAt` / `lastErrorCode` populated.
+- `enqueue` persists a request and returns its native ULID. Throws INVALID_URL, or INVALID_PAYLOAD with `validationErrors`, or INVALID_PAYLOAD with no `validationErrors` when native rejects, most often because the queue is full.
+- `enqueueBatch` is atomic. On invalid input it throws one INVALID_PAYLOAD with every issue in `validationErrors`, each with `itemIndex`.
+- `removeItem` and `clearQueue` act on items in any status, FAILED rows included.
+- `getQueueSize` and `getPendingItems` cover PENDING items only, cooling ones included. Items in flight and FAILED rows are excluded. `getPendingItems` returns dispatch order.
 
 ## Sync Functions
 
-### flush
-
 ```typescript
 function flush(): Promise<SyncResult>;
-```
-
-Forces a flush cycle. Returns the cycle outcome. May throw SyncError with NETWORK_ERROR, SERVER_ERROR, TIMEOUT, MAX_ATTEMPTS_EXCEEDED, or UNAUTHORIZED. Per-item failures are also surfaced via `result.errors`.
-
-### pauseSync / resumeSync
-
-```typescript
+function drainUntilEmpty(options?: DrainOptions): Promise<DrainResult>;
+function cancelDrain(): void;
 function pauseSync(): Promise<void>;
 function resumeSync(): Promise<void>;
-```
-
-Pause the dispatcher (enqueues still accepted). Resume schedules a flush if strategy is AUTOMATIC and items are pending.
-
-### isSyncing
-
-```typescript
 function isSyncing(): Promise<boolean>;
 ```
 
-## Configuration Functions
+- `flush` runs one cycle. The strategy plays no part. It does not check connectivity, so calling it offline can spend attempts. Per-item failures never reject: it rejects with NETWORK_ERROR only when the cycle itself dies. With nothing eligible it resolves 0/0 and emits SYNC_SUCCEEDED. While a cycle is running, iOS returns the last result and Android waits and runs its own.
+- `drainUntilEmpty` flushes until `getQueueSize() === 0 && isSyncing() === false`. It sleeps until the soonest cooldown by itself, and stops at once with TIMEOUT if that is past the deadline. It does not flush while `getConnectionStatus()` is DISCONNECTED. `timeoutMs` and `cancelDrain()` are hard stops. A native cycle already running keeps going after the drain returns. Only one drain may run: a concurrent call throws DRAIN_ALREADY_ACTIVE, so await the previous drain, also after `cancelDrain()`.
+- `pauseSync` persists. Workers and BGTasks stay inert while the app is dead. It lasts until `resumeSync()` or the next launch that reaches the library, including a JS reload. A launch clears it without emitting RESUMED.
+- `resumeSync` dispatches pending items unless the strategy is MANUAL. If offline, the flush waits for connectivity.
 
-### configureSync
+## Configuration Functions
 
 ```typescript
 function configureSync(options: SyncOptions): Promise<void>;
-```
-
-Replaces the active config. Takes effect on the next flush cycle; in-flight requests honor the previous config.
-
-### getSyncConfig
-
-```typescript
 function getSyncConfig(): Promise<SyncOptions>;
 ```
 
-## History Functions
+`configureSync` replaces the whole configuration and persists it, so a worker or BGTask with no JS honors it. Android applies it from the next cycle, iOS from the next item. Omitting `defaultHeaders` deletes the stored copy: that is the logout path. Call it whenever the token changes: the library does not refresh tokens.
 
-### getLastSyncResult
+## History Functions
 
 ```typescript
 function getLastSyncResult(): Promise<SyncResult | undefined>;
-```
-
-JS facade returns `undefined` when no flush has run; the underlying spec returns a sentinel with `startedAt === 0`.
-
-### getSyncHistory
-
-```typescript
 function getSyncHistory(limit?: number): Promise<SyncResult[]>;
-```
-
-Returns persisted results, most recent first. `0` (or omitted) means no limit.
-
-### clearSyncHistory
-
-```typescript
 function clearSyncHistory(): Promise<void>;
 ```
 
-## Connection
+History is most recent first, includes 0/0 cycles, and is not trimmed automatically.
 
-### getConnectionStatus
+## Connection
 
 ```typescript
 function getConnectionStatus(): Promise<ConnectionState>;
@@ -216,284 +190,295 @@ function getConnectionStatus(): Promise<ConnectionState>;
 
 ## Background Sync
 
-### enableBackgroundSync
-
 ```typescript
 function enableBackgroundSync(options: BackgroundSyncOptions): Promise<void>;
-```
-
-Registers the OS-level periodic task (`BGTaskScheduler` on iOS, `WorkManager` on Android). May throw BACKGROUND_TASK_REGISTRATION_FAILED or NATIVE_MODULE_UNAVAILABLE.
-
-### disableBackgroundSync / isBackgroundSyncEnabled
-
-```typescript
 function disableBackgroundSync(): Promise<void>;
 function isBackgroundSyncEnabled(): Promise<boolean>;
 ```
 
+- `enableBackgroundSync` schedules BGTaskScheduler or WorkManager work. Throws BACKGROUND_TASK_REGISTRATION_FAILED, for example on an iOS simulator or with `com.gabriel-sisjr.syncprovider.background` missing from Info.plist.
+- The OS decides when a window runs. iOS does not launch a force-quit app for background work.
+- Each window runs one cycle.
+- `isBackgroundSyncEnabled` reports intent: it stays true with `foregroundOnly`.
+
 ## Events
 
-### addListener / removeListener
-
 ```typescript
-function addListener(
-  event: 'sync-event',
-  callback: (event: SyncEvent) => void
-): Promise<string>;
-
-function removeListener(
-  event: 'sync-event',
-  subscriptionId: string
-): Promise<void>;
+function addSyncEventListener(callback: (event: SyncEvent) => void): Promise<string>;
+function removeSyncEventListener(subscriptionId: string): Promise<void>;
+const SYNC_EVENT_CHANNEL = 'sync-event';
 ```
 
-The only supported channel today is `'sync-event'`. The native layer validates the channel name and throws INVALID_PAYLOAD on unknown values.
+Events reach a running JS engine only.
+
+## Utilities
+
+```typescript
+function generateId(): string; // UUID v4, Math.random-backed
+function isNativeModuleAvailable(): boolean;
+```
 
 ## React Hooks
 
-### useConnection
-
 ```typescript
-function useConnection(): { state: ConnectionState; isLoading: boolean };
-```
+function useConnection(): {
+  status: ConnectionStatus;
+  type: ConnectionType;
+  isOnline: boolean;
+  isMetered: boolean;
+};
 
-Live ConnectionState that reacts to OS connectivity changes via the `CONNECTION_CHANGED` event.
-
-### useSyncQueue
-
-```typescript
 function useSyncQueue(): {
+  size: number;
   items: SyncItem[];
+  isLoading: boolean;
+  error: SyncError | null; // failed refresh only: methods reject
   enqueue(input: SyncItemInput): Promise<string>;
   enqueueBatch(inputs: SyncItemInput[]): Promise<string[]>;
-  remove(id: string): Promise<boolean>;
-  clear(): Promise<void>;
+  removeItem(id: string): Promise<boolean>;
+  clearQueue(): Promise<void>;
   refresh(): Promise<void>;
-  isLoading: boolean;
-  error: SyncError | null;
 };
-```
 
-### useSyncStatus
-
-```typescript
 function useSyncStatus(): {
   isSyncing: boolean;
-  lastResult: SyncResult | undefined;
-  history(limit?: number): Promise<SyncResult[]>;
-  clearHistory(): Promise<void>;
+  isPaused: boolean;
+  progress: number | null; // SYNC_PROGRESS is iOS-only
+  lastResult: SyncResult | null;
+  error: SyncError | null;
+  flush(): Promise<SyncResult>;
+  pause(): Promise<void>;
+  resume(): Promise<void>;
+};
+
+function useOfflineQueue(): {
+  connection: UseConnectionResult;
+  size: number;
+  items: SyncItem[];
+  isSyncing: boolean;
+  isWaitingForConnection: boolean;
+  error: SyncError | null;
+  enqueue(input: SyncItemInput): Promise<string>;
+  flush(): Promise<SyncResult>;
+};
+
+function useSyncEvents(options: {
+  onEvent: (event: SyncEvent) => void;
+  types?: SyncEventType[];
+  enabled?: boolean; // default true
+}): void;
+
+function useSyncConfig(): {
+  config: SyncOptions | null;
+  isLoading: boolean;
+  error: SyncError | null;
+  setConfig(next: SyncOptions): Promise<void>; // updates the calling hook only
   refresh(): Promise<void>;
 };
-```
 
-### useOfflineQueue
-
-```typescript
-function useOfflineQueue(): {
-  isOffline: boolean;
-  isPaused: boolean;
-  pendingCount: number;
-};
-```
-
-Pauses dispatch automatically when connectivity drops and resumes (with a flush) on reconnect.
-
-### useSyncEvents
-
-```typescript
-function useSyncEvents(handler: (event: SyncEvent) => void): void;
-```
-
-Subscribes to the `sync-event` channel for the lifetime of the component. Unsubscribes on unmount.
-
-### useSyncConfig
-
-```typescript
-function useSyncConfig(): {
-  config: SyncOptions | undefined;
-  update(next: SyncOptions): Promise<void>;
-  isLoading: boolean;
-};
-```
-
-### useAutoSync
-
-```typescript
-function useAutoSync(options?: {
-  flushOnFocus?: boolean;          // default: true
-  flushOnReconnect?: boolean;      // default: true
-  intervalMs?: number;             // optional periodic flush from JS
+function useAutoSync(options: {
+  enabled?: boolean;              // default false: the hook is inert until true
+  intervalMs?: number;            // default 60000; not positive falls back to it
+  flushOnReconnect?: boolean;     // default true
+  flushOnMetered?: boolean;       // default false; reconnect trigger only
+  flushOnAppForeground?: boolean; // default false
+  flushOnForeground?: boolean;    // reserved, ignored
+  backgroundSync?: BackgroundSyncOptions; // reserved, ignored
 }): void;
+
+function useSyncSnapshot(): UseSyncSnapshotResult;
+
+function useSyncContext(): {
+  config: SyncOptions | undefined;
+  hasProvider: boolean;
+};
 ```
+
+`useAutoSync`'s interval checks neither connectivity nor queue size: offline ticks can spend attempts. Gate `enabled` on `useConnection().isOnline` to stop ticking offline.
 
 ## Context
 
-### SyncProvider
-
-```typescript
-<SyncProvider options={syncOptions}>
+```tsx
+<SyncProvider options={syncOptions} backgroundSync={backgroundOptions}>
   <App />
 </SyncProvider>
 ```
 
-Wraps the app, calls `configureSync(options)` on mount, exposes the singleton hybrid object via React context, and is the required ancestor for every hook in this library.
+Optional. It calls `configureSync(options)` on mount and on every change to `options`, reads the native config even if that rejects, and calls `enableBackgroundSync` when `backgroundSync` is passed, with a matching `disableBackgroundSync` on unmount. Keep `options` stable. Every hook works without it.
 
 ## Types
 
-### SyncItemInput
-
 ```typescript
 interface SyncItemInput {
-  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
-  url: string;                          // absolute http(s)
+  method: HttpMethod;
+  url: string;                       // absolute http(s)
+  headers?: Record<string, string>;  // stored in plain text
+  body?: string;                     // sent as UTF-8; stored in plain text
+  contentType?: string;              // set here, not in headers
+  priority?: SyncPriority;           // default NORMAL
+  metadata?: Record<string, string>; // not sent, not echoed on events
+}
+
+interface SyncItem {
+  id: string;           // native ULID; not sent with the request
+  method: HttpMethod;
+  url: string;
   headers?: Record<string, string>;
-  body?: string;                        // pre-serialized
-  contentType?: string;                 // e.g. 'application/json'
-  priority?: number;                    // higher dispatched first
-  idempotencyKey?: string;              // dedupe + safe-replay key
-  metadata?: Record<string, string>;    // user-defined tags
+  body?: string;
+  contentType?: string;
+  priority?: SyncPriority;
+  createdAt: number;
+  attempts: number;     // 0 = never tried
+  nextRetryAt: number;  // 0 = never attempted; eligible when <= now
+  metadata?: Record<string, string>;
 }
-```
 
-### SyncItem
-
-```typescript
-interface SyncItem extends SyncItemInput {
-  id: string;                           // ULID, native-assigned
-  createdAt: number;                    // epoch ms
-  attemptCount: number;
-  lastAttemptAt?: number;
-  lastErrorCode?: SyncErrorCode;
-}
-```
-
-### SyncOptions
-
-```typescript
 interface SyncOptions {
   strategy: SyncStrategy;
   retryPolicy: RetryPolicy;
-  requestTimeoutMs: number;
-  maxQueueSize: number;
-  persistResults: boolean;
-  historyLimit: number;
-  defaultHeaders?: Record<string, string>;
-  defaultPriority?: number;
+  batchSize?: number;                      // default 25
+  requestTimeoutMs?: number;               // default 30000
+  maxQueueSize?: number;                   // default 10000; below 1 means 1
+  persistQueue?: boolean;                  // stored, not used
+  defaultHeaders?: Record<string, string>; // encrypted at rest
 }
-```
 
-### RetryPolicy
-
-```typescript
 interface RetryPolicy {
-  maxAttempts: number;
+  maxAttempts: number;          // the first attempt counts as one
   backoff: BackoffStrategy;
   baseDelayMs: number;
   maxDelayMs: number;
-  jitter: boolean;
-  retryOnStatusCodes: number[];
+  jitter: boolean;              // factor in [0.75, 1.25)
+  retryOnStatusCodes: number[]; // 401 and 403 stay permanent even if listed
 }
-```
 
-### SyncResult
-
-```typescript
 interface SyncResult {
-  startedAt: number;                    // epoch ms (0 = sentinel)
-  finishedAt: number;                   // epoch ms (0 = sentinel)
-  attemptedCount: number;
+  startedAt: number;
+  finishedAt: number;
   successCount: number;
-  failureCount: number;
-  errors: Array<{
-    itemId: string;
-    code: SyncErrorCode;
-    message: string;
-    statusCode?: number;
-  }>;
+  failureCount: number;           // permanent failures only
+  succeededIds: string[];         // always empty on iOS
+  failedIds: string[];            // always empty on iOS
+  errors: Record<string, string>; // "<CODE>: <detail>"; always empty on iOS
 }
-```
 
-### BackgroundSyncOptions
+interface DrainOptions {
+  maxIterations?: number;        // default 32; counts real flushes
+  timeoutMs?: number;            // default 60000; hard deadline
+  delayBetweenCyclesMs?: number;
+}
 
-```typescript
+interface DrainResult {
+  iterations: number;
+  itemsDispatched: number;       // best effort; not a success count
+  queueRemaining: number;
+  stoppedReason: 'EMPTY' | 'MAX_ITERATIONS' | 'TIMEOUT' | 'CANCELLED';
+}
+
 interface BackgroundSyncOptions {
-  minimumIntervalMs: number;            // OS may schedule less often
-  requiresUnmeteredNetwork?: boolean;
-  requiresCharging?: boolean;
-  requiresDeviceIdle?: boolean;
+  minimumIntervalMs: number;          // Android floor 15 min; iOS soft hint
+  requiresCharging?: boolean;         // iOS: processing task only
+  requiresUnmeteredNetwork?: boolean; // Android only
+  requiresDeviceIdle?: boolean;       // Android only
+  foregroundOnly?: boolean;           // schedule no OS background work
+  taskIdentifier?: string;            // stored, not used
 }
-```
 
-### ConnectionState
-
-```typescript
 interface ConnectionState {
   status: ConnectionStatus;
   type: ConnectionType;
-  isInternetReachable: boolean;
+  isInternetReachable?: boolean;
+  isExpensive?: boolean;
 }
-```
 
-### SyncEvent (discriminated union)
+interface SyncEvent {
+  type: SyncEventType;
+  timestamp: number;
+  itemId?: string;
+  progress?: number;
+  errorCode?: SyncErrorCode;
+  statusCode?: number;
+  attempt?: number;
+  connectionStatus?: ConnectionStatus;
+  metadata?: Record<string, string>; // iOS diagnostics, not the item's metadata
+}
 
-```typescript
-type SyncEvent =
-  | { type: 'ITEM_ADDED';        itemId: string }
-  | { type: 'ITEM_REMOVED';      itemId: string }
-  | { type: 'FLUSH_STARTED';     pendingCount: number }
-  | { type: 'ITEM_DISPATCHED';   itemId: string; attempt: number }
-  | { type: 'ITEM_SUCCEEDED';    itemId: string; statusCode: number }
-  | { type: 'ITEM_FAILED';       itemId: string; errorCode: SyncErrorCode; statusCode?: number; willRetry: boolean }
-  | { type: 'ITEM_RETRYING';     itemId: string; attempt: number; nextAttemptAt: number }
-  | { type: 'FLUSH_COMPLETED';   result: SyncResult }
-  | { type: 'CONNECTION_CHANGED';state: ConnectionState }
-  | { type: 'CONFIG_CHANGED';    config: SyncOptions };
+class SyncError extends Error {
+  readonly code: SyncErrorCode;
+  readonly cause?: unknown;
+  readonly validationErrors?: ValidationIssue[];
+}
+
+type ValidationIssue = {
+  field: string;
+  reason: string;
+  value?: unknown; // only for method, priority and contentType
+  itemIndex?: number;
+};
 ```
 
 ## Enums
 
 ### SyncStrategy
-- `MANUAL` — Only `flush()` triggers dispatch.
-- `AUTOMATIC` — Library schedules flushes after enqueue, on reconnect, on resume.
-- `BACKGROUND` — Same as AUTOMATIC plus OS-scheduled background work.
+- `AUTOMATIC` — The engine retries on its own, and dispatches pending items on `resumeSync()`.
+- `MANUAL` — The engine schedules nothing on its own: no retry timer, no Android retry kick. Background windows still run if you called `enableBackgroundSync`.
+- `OPPORTUNISTIC` — Reserved. Behaves like `AUTOMATIC`.
+
+### SyncPriority
+`HIGH`, `NORMAL`, `LOW`.
 
 ### BackoffStrategy
-- `LINEAR` — `delay = baseDelayMs * attempt` (capped at `maxDelayMs`).
-- `EXPONENTIAL` — `delay = baseDelayMs * 2^(attempt-1)` (capped at `maxDelayMs`).
+- `LINEAR` — `delay = baseDelayMs * attempt`.
+- `EXPONENTIAL` — `delay = baseDelayMs * 2^(attempt-1)`.
+- `FIBONACCI` — `delay = baseDelayMs * fib(attempt)`.
+
+All capped at `maxDelayMs`.
 
 ### SyncEventType
-`ITEM_ADDED`, `ITEM_REMOVED`, `FLUSH_STARTED`, `ITEM_DISPATCHED`, `ITEM_SUCCEEDED`, `ITEM_FAILED`, `ITEM_RETRYING`, `FLUSH_COMPLETED`, `CONNECTION_CHANGED`, `CONFIG_CHANGED`.
+- `ITEM_ENQUEUED`, `ITEM_REMOVED` (from `removeItem` only).
+- `SYNC_STARTED`, `SYNC_PROGRESS` (iOS only).
+- `SYNC_SUCCEEDED` — No permanent failure, including 0/0 cycles.
+- `SYNC_FAILED` — A permanent failure, or the cycle died. `errorCode` is set only when it died.
+- `ITEM_SUCCEEDED`, `ITEM_FAILED`, `ITEM_RETRYING`.
+- `QUEUE_CLEARED`, `CONNECTION_CHANGED`, `PAUSED`, `RESUMED`.
+- `BACKGROUND_SYNC_STARTED`, `BACKGROUND_SYNC_COMPLETED`.
 
 ### ConnectionStatus
-`CONNECTED`, `DISCONNECTED`, `UNKNOWN`.
+`CONNECTED`, `DISCONNECTED`, `METERED`, `UNKNOWN`.
 
 ### ConnectionType
-`WIFI`, `CELLULAR`, `ETHERNET`, `NONE`, `UNKNOWN`.
+`WIFI`, `CELLULAR`, `ETHERNET`, `BLUETOOTH`, `VPN`, `OTHER`, `NONE`, `UNKNOWN`.
 
 ### SyncErrorCode
-- `QUEUE_FULL` — Refused enqueue; capacity at `maxQueueSize`.
-- `INVALID_PAYLOAD` — Item shape invalid (missing field, bad type, unknown channel).
-- `INVALID_URL` — `url` is not an absolute http(s) URL.
-- `NETWORK_ERROR` — Transport-level failure (DNS, TLS, socket).
-- `SERVER_ERROR` — Non-retriable server status.
-- `TIMEOUT` — Request exceeded `requestTimeoutMs`.
-- `MAX_ATTEMPTS_EXCEEDED` — Item exhausted its retry budget.
-- `UNAUTHORIZED` — 401 / 403 response.
-- `BACKGROUND_TASK_REGISTRATION_FAILED` — OS rejected `enableBackgroundSync`.
-- `NATIVE_MODULE_UNAVAILABLE` — `BGTaskScheduler` / `WorkManager` not available.
-- `ITEM_NOT_FOUND` — Operation referenced an unknown id.
-- `INVALID_CONFIG` — `SyncOptions` failed validation.
-- `PERSISTENCE_FAILURE` — Core Data / Room I/O failed.
-- `UNKNOWN` — Unclassified native error.
+- `NETWORK_ERROR` — Transport failure, on item events. Also what `flush` rejects with when its cycle dies.
+- `SERVER_ERROR` — A response outside 2xx, other than 401/403, on item events.
+- `TIMEOUT` — `requestTimeoutMs` exceeded, on item events.
+- `UNAUTHORIZED` — 401 or 403, on item events.
+- `MAX_ATTEMPTS_EXCEEDED` — A retriable failure with no attempts left, on ITEM_FAILED.
+- `INVALID_PAYLOAD` — Validation failure with `validationErrors`, or a native rejection without them in most functions.
+- `INVALID_URL` — From `enqueue`. `enqueueBatch` reports it under INVALID_PAYLOAD.
+- `QUEUE_FULL` — Raised by native, but reaches JS as INVALID_PAYLOAD for now.
+- `DUPLICATE_ITEM` — Reserved. Neither platform raises it.
+- `BACKGROUND_TASK_REGISTRATION_FAILED` — From the background functions.
+- `NATIVE_MODULE_UNAVAILABLE` — Web, SSR, or the native module is not linked.
+- `DRAIN_ALREADY_ACTIVE` — A drain is already running or settling.
+
+## Credentials in a process with no JS
+
+- `defaultHeaders` are encrypted at rest: Android Keystore AES-256-GCM, iOS Keychain (`AfterFirstUnlockThisDeviceOnly`).
+- On a 401 or 403 in a process that has not called `configureSync`, the item stays PENDING, no attempt is spent, the next try waits at least 60 seconds, and the cycle stops.
+- If stored headers cannot be read, nothing is dispatched and items wait. `configureSync` ends the wait. While they are unreadable, `getSyncConfig()` returns none, so re-applying it deletes them.
 
 ## Platform Support
 
-| Feature                | iOS                             | Android                                  |
-|------------------------|---------------------------------|------------------------------------------|
-| Persistence            | Core Data                       | Room                                     |
-| Background sync        | BGTaskScheduler (`processing`)  | WorkManager (`PeriodicWorkRequest`)      |
-| Foreground dispatcher  | URLSession (background config)  | OkHttp + Coroutines                      |
-| Connectivity           | NWPathMonitor                   | ConnectivityManager + NetworkCallback    |
-| Boot recovery          | OS task replay                  | BootCompletedReceiver + WorkManager      |
-| Privacy Manifest       | Required (PrivacyInfo.xcprivacy)| n/a                                      |
-| Min OS                 | iOS 15                          | Android 7.0 (API 24)                     |
+| Feature               | iOS                                      | Android                                        |
+|-----------------------|------------------------------------------|------------------------------------------------|
+| Persistence           | Core Data                                | Room                                           |
+| Background sync       | BGTaskScheduler (refresh + processing)   | WorkManager (periodic + opt-in retry kick)     |
+| Dispatcher            | URLSession (foreground + background)     | OkHttp + Coroutines                            |
+| Batch dispatch        | One item at a time                       | Concurrent                                     |
+| Connectivity          | NWPathMonitor                            | ConnectivityManager + NetworkCallback          |
+| Recovery              | RecoveryManager, on every engine start   | RecoveryWorker, on JS attach, boot, app update |
+| Persisted config      | UserDefaults + Keychain                  | SharedPreferences + Android Keystore           |
+| Privacy Manifest      | Shipped (PrivacyInfo.xcprivacy)          | n/a                                            |
+| Min OS                | iOS 15                                   | Android 7.0 (API 24)                           |

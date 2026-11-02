@@ -121,6 +121,14 @@ jobs:
             echo "No coverage summary found." >> $GITHUB_STEP_SUMMARY
           fi
 
+      # Directly before the publish, so nothing can change the tree after this
+      # check. A failure here skips the publish, the tag and the release.
+      - name: Assert npm pack contents
+        if: steps.version-check.outputs.version_changed == 'true'
+        run: |
+          set -o pipefail
+          npm pack --dry-run --ignore-scripts --json | node .github/scripts/assert-pack-contents.mjs
+
       - name: Publish to NPM
         if: steps.version-check.outputs.version_changed == 'true'
         run: |

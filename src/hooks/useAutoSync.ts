@@ -10,6 +10,7 @@ import { isNativeModuleAvailable } from '../utils/isNativeModuleAvailable';
 import {
   addSyncEventListener,
   flush as facadeFlush,
+  getConnectionStatus as facadeGetConnectionStatus,
   isSyncing as facadeIsSyncing,
   removeSyncEventListener,
 } from '../index';
@@ -20,22 +21,21 @@ const DEFAULT_INTERVAL_MS = 60_000;
  * Extended {@link UseAutoSyncOptions} accepted by `useAutoSync`.
  *
  * Adds `intervalMs` (poll period) and `flushOnAppForeground` (opt-in
- * AppState integration), neither of which is part of the frozen Phase 1
- * type because they are JS-only orchestration concerns.
+ * AppState integration), which are JS-only orchestration concerns.
  */
 export interface UseAutoSyncExtraOptions extends UseAutoSyncOptions {
   /**
-   * Interval (in ms) at which the orchestrator polls and triggers a flush
-   * when the queue is non-empty and not currently syncing. Defaults to
-   * `60_000` (60s). Ignored when `enabled !== true`.
+   * Interval (in ms) at which the orchestrator triggers a flush when not
+   * offline and not currently syncing. Defaults to `60_000` (60s), and a value
+   * that is not positive falls back to that default, so the tick cannot be
+   * turned off. Ignored when `enabled !== true`.
    */
   intervalMs?: number;
   /**
    * If `true`, the orchestrator listens to `AppState.change` and triggers a
-   * flush when the app returns to `'active'`. Defaults to `false` to avoid
-   * unintended foreground sync battery cost. Distinct from the frozen
-   * `flushOnForeground` option which is reserved for a future event-based
-   * implementation.
+   * flush when the app returns to `'active'`, unless the device is
+   * `DISCONNECTED`. Defaults to `false` to avoid unintended foreground sync
+   * battery cost.
    */
   flushOnAppForeground?: boolean;
 }
@@ -47,13 +47,23 @@ export interface UseAutoSyncExtraOptions extends UseAutoSyncOptions {
  * Inert until `enabled === true`. When enabled, on mount:
  *
  *   1. Sets up a periodic timer (`intervalMs`, default 60s) that calls
- *      `flush()` whenever a sync is not already in flight.
+ *      `flush()` unless the device is `DISCONNECTED` or a sync is already in
+ *      flight.
  *   2. Subscribes to `CONNECTION_CHANGED` events and triggers a flush when
  *      the device transitions to `CONNECTED` (subject to `flushOnReconnect`).
  *   3. If `flushOnAppForeground === true`, registers an `AppState.change`
- *      listener and flushes on `'active'`.
+ *      listener and flushes on `'active'`, unless the device is `DISCONNECTED`.
  *
  * All three are torn down on unmount or when `enabled` flips to `false`.
+ *
+ * The periodic tick and the foreground trigger read the connection status first
+ * and do nothing while it is `DISCONNECTED`, because a flush while offline can
+ * spend retry attempts and mark valid items `FAILED`. `UNKNOWN` and `METERED`
+ * still flush, and a status read that fails skips the flush. Neither trigger
+ * checks queue size, so on an empty queue a flush records a 0/0 result.
+ *
+ * The reconnect trigger does not read the status: it follows the
+ * `CONNECTION_CHANGED` event.
  *
  * @param options — see {@link UseAutoSyncExtraOptions}.
  *
@@ -101,8 +111,21 @@ export function useAutoSync(options: UseAutoSyncExtraOptions): void {
       }
     };
 
+    // Neither dispatcher checks connectivity, so a flush while offline would
+    // spend retry attempts and can mark valid items FAILED. A status read that
+    // rejects skips the flush too.
+    const flushUnlessOffline = async () => {
+      try {
+        const connection = await facadeGetConnectionStatus();
+        if (connection.status === ConnectionStatus.DISCONNECTED) return;
+        await safeFlush();
+      } catch {
+        // Swallow — orchestrator must never throw to consumer.
+      }
+    };
+
     const timer = setInterval(() => {
-      void safeFlush();
+      void flushUnlessOffline();
     }, period);
 
     (async () => {
@@ -132,7 +155,7 @@ export function useAutoSync(options: UseAutoSyncExtraOptions): void {
       appStateSubscription = AppState.addEventListener(
         'change',
         (next: AppStateStatus) => {
-          if (next === 'active') void safeFlush();
+          if (next === 'active') void flushUnlessOffline();
         }
       );
     }

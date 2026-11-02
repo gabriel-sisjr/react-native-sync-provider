@@ -1,16 +1,13 @@
 # React Native Sync Provider
 
-> Cross-platform React Native Nitro Module that turns every HTTP request into a durable, offline-first job with native persistence and OS-scheduled background sync.
+> React Native Nitro Module for offline-first HTTP sync. Requests are persisted natively (Core Data on iOS, Room on Android), retried with a persisted backoff, and flushed from JS or in OS-scheduled background windows (BGTaskScheduler, WorkManager).
 
 ## Package
 
 - npm: @gabriel-sisjr/react-native-sync-provider
 - Repository: https://github.com/gabriel-sisjr/react-native-sync-provider
 - Documentation: https://gabriel-sisjr.github.io/react-native-sync-provider/
-
-## Overview
-
-A React Native library that exposes a native HTTP request queue with offline-first semantics. Built on Nitro Modules (New Architecture). Persistence uses Core Data on iOS and Room on Android. Background sync is scheduled by the OS via BGTaskScheduler (iOS) and WorkManager (Android), so the queue keeps draining even when the app is closed. Includes configurable retry policy, connectivity awareness, sync events, and 7 React hooks.
+- Full reference for tools: /llms-full.txt
 
 ## Requirements
 
@@ -22,77 +19,100 @@ A React Native library that exposes a native HTTP request queue with offline-fir
 - Android: minSdk 24, targetSdk 36, Kotlin 2.0+
 - iOS: 15+
 
+## Facts that are easy to get wrong
+
+- enqueue stores an item. It does not dispatch it, under any strategy. A flush does, from useAutoSync, flush(), or an OS background window.
+- AUTOMATIC means the engine retries failed items on its own. There is no native flush on enqueue or on reconnect.
+- Each cycle dispatches one batch of eligible items, up to batchSize (default 25). Use drainUntilEmpty() to loop.
+- flush() does not check connectivity. useAutoSync's interval does not either. The native retry timer and drainUntilEmpty() do not flush offline.
+- Per-item failures never reject. Read them from ITEM_FAILED events.
+- Native error codes do not reach JS through a rejection. A full queue rejects with INVALID_PAYLOAD and no validationErrors, not QUEUE_FULL.
+- configureSync replaces the whole configuration and persists it. Omitting defaultHeaders deletes the stored copy.
+- Delivery is at least once. The native ULID is not sent with the request: send an Idempotency-Key in headers, built with generateId() before enqueue.
+- iOS: the library registers its BGTask handlers itself. Do not call BGTaskScheduler.shared.register for its identifiers.
+
 ## Public API — Functions
 
 Queue ops:
-- enqueue(item) — Add a single request. Returns the assigned ULID.
-- enqueueBatch(items) — Add multiple requests atomically. Returns ULIDs.
-- removeItem(id) — Remove a pending item by ULID.
-- clearQueue() — Drop all pending items.
-- getQueueSize() — Pending-item count.
-- getPendingItems() — Read every pending item in dispatch order.
+- enqueue(item) — Persist one request. Returns the assigned ULID.
+- enqueueBatch(items) — Persist several atomically. Returns ULIDs in input order.
+- removeItem(id) — Remove one item, in any status.
+- clearQueue() — Remove every item, in any status.
+- getQueueSize() — PENDING items, cooling ones included.
+- getPendingItems() — PENDING items in dispatch order.
 
 Sync ops:
-- flush() — Force a flush cycle. Returns SyncResult.
-- pauseSync() — Pause the engine; queue still accepts enqueues.
-- resumeSync() — Resume after pauseSync. Schedules a flush if AUTOMATIC.
-- isSyncing() — true while a flush cycle is in flight.
+- flush() — Run one cycle. Returns SyncResult.
+- drainUntilEmpty(options?) — Flush until empty or a bound stops it. Returns DrainResult.
+- cancelDrain() — Hard stop for a running drain.
+- pauseSync() — Pause until resumeSync() or the next launch.
+- resumeSync() — Resume. Dispatches pending items unless the strategy is MANUAL.
+- isSyncing() — true while a cycle is running.
 
 Config ops:
-- configureSync(options) — Replace the active SyncOptions.
-- getSyncConfig() — Read current SyncOptions.
+- configureSync(options) — Replace and persist the active SyncOptions.
+- getSyncConfig() — Read the active SyncOptions.
 
 History ops:
-- getLastSyncResult() — Most recent persisted SyncResult, or sentinel.
-- getSyncHistory(limit) — Persisted flush results, most recent first.
+- getLastSyncResult() — Most recent persisted SyncResult, or undefined.
+- getSyncHistory(limit?) — Persisted results, most recent first.
 - clearSyncHistory() — Drop persisted history.
 
 Connection:
 - getConnectionStatus() — Current ConnectionState snapshot.
 
 Background sync:
-- enableBackgroundSync(options) — Register OS-level periodic task.
-- disableBackgroundSync() — Cancel registration.
-- isBackgroundSyncEnabled() — Registration status.
+- enableBackgroundSync(options) — Schedule OS background work.
+- disableBackgroundSync() — Cancel it, including the Android retry kick.
+- isBackgroundSyncEnabled() — Reports intent, not OS state.
 
 Events:
-- addListener('sync-event', cb) — Subscribe to SyncEvent. Returns subId.
-- removeListener('sync-event', subId) — Unsubscribe.
+- addSyncEventListener(callback) — Subscribe. Returns a subscription id.
+- removeSyncEventListener(subscriptionId) — Unsubscribe.
+
+Utilities:
+- generateId() — UUID v4 backed by Math.random. For Idempotency-Key headers.
+- isNativeModuleAvailable() — true when the native module resolves.
 
 ## Public API — React Hooks
 
-- useConnection() — Live ConnectionState reactive to OS connectivity changes.
-- useSyncQueue() — Live pending list with enqueue / remove / clear actions.
-- useSyncStatus() — Last result, isSyncing flag, history accessor.
-- useOfflineQueue() — Auto-pauses on offline, auto-resumes on reconnect.
-- useSyncEvents(handler) — Subscribe to sync-event channel; auto-cleanup.
-- useSyncConfig() — Read and update active SyncOptions.
-- useAutoSync(options) — Flush on app focus, reconnect, and on a timer.
+- useConnection() — { status, type, isOnline, isMetered }.
+- useSyncQueue() — { size, items, isLoading, error, enqueue, enqueueBatch, removeItem, clearQueue, refresh }.
+- useSyncStatus() — { isSyncing, isPaused, progress, lastResult, error, flush, pause, resume }.
+- useOfflineQueue() — { connection, size, items, isSyncing, isWaitingForConnection, error, enqueue, flush }.
+- useSyncEvents({ onEvent, types?, enabled? }) — Subscribe with auto-cleanup.
+- useSyncConfig() — { config, isLoading, error, setConfig, refresh }.
+- useAutoSync({ enabled, intervalMs?, flushOnReconnect?, flushOnMetered?, flushOnAppForeground? }) — Flush on an interval, on reconnect, and on foreground. Inert unless enabled is true.
+- useSyncSnapshot() — Read-only aggregate of connection, queue and sync state.
+- useSyncContext() — { config, hasProvider }.
 
 ## Context
 
-- SyncProvider — React context provider. Wraps the app and supplies the singleton hybrid object plus shared options to all hooks.
+- SyncProvider — Optional provider. Applies configureSync on mount, and enableBackgroundSync when backgroundSync is passed. Every hook works without it.
 
 ## Enums
 
-- SyncStrategy: MANUAL, AUTOMATIC, BACKGROUND
-- BackoffStrategy: LINEAR, EXPONENTIAL
-- SyncEventType: ITEM_ADDED, ITEM_REMOVED, FLUSH_STARTED, ITEM_DISPATCHED, ITEM_SUCCEEDED, ITEM_FAILED, ITEM_RETRYING, FLUSH_COMPLETED, CONNECTION_CHANGED, CONFIG_CHANGED
-- ConnectionStatus: CONNECTED, DISCONNECTED, UNKNOWN
-- ConnectionType: WIFI, CELLULAR, ETHERNET, NONE, UNKNOWN
-- SyncErrorCode: QUEUE_FULL, INVALID_PAYLOAD, INVALID_URL, NETWORK_ERROR, SERVER_ERROR, TIMEOUT, MAX_ATTEMPTS_EXCEEDED, UNAUTHORIZED, BACKGROUND_TASK_REGISTRATION_FAILED, NATIVE_MODULE_UNAVAILABLE, ITEM_NOT_FOUND, INVALID_CONFIG, PERSISTENCE_FAILURE, UNKNOWN
+- SyncStrategy: AUTOMATIC, MANUAL, OPPORTUNISTIC (reserved; behaves like AUTOMATIC)
+- SyncPriority: HIGH, NORMAL, LOW
+- BackoffStrategy: LINEAR, EXPONENTIAL, FIBONACCI
+- HttpMethod: GET, POST, PUT, PATCH, DELETE
+- SyncEventType: ITEM_ENQUEUED, ITEM_REMOVED, SYNC_STARTED, SYNC_PROGRESS, SYNC_SUCCEEDED, SYNC_FAILED, ITEM_SUCCEEDED, ITEM_FAILED, ITEM_RETRYING, QUEUE_CLEARED, CONNECTION_CHANGED, PAUSED, RESUMED, BACKGROUND_SYNC_STARTED, BACKGROUND_SYNC_COMPLETED
+- ConnectionStatus: CONNECTED, DISCONNECTED, METERED, UNKNOWN
+- ConnectionType: WIFI, CELLULAR, ETHERNET, BLUETOOTH, VPN, OTHER, NONE, UNKNOWN
+- SyncErrorCode: NETWORK_ERROR, SERVER_ERROR, INVALID_PAYLOAD, QUEUE_FULL, NATIVE_MODULE_UNAVAILABLE, BACKGROUND_TASK_REGISTRATION_FAILED, INVALID_URL, UNAUTHORIZED, TIMEOUT, MAX_ATTEMPTS_EXCEEDED, DUPLICATE_ITEM, DRAIN_ALREADY_ACTIVE
 
 ## Quick Start
 
 ```typescript
 import {
   SyncProvider,
-  useSyncQueue,
   useAutoSync,
+  useSyncQueue,
+  type SyncOptions,
 } from '@gabriel-sisjr/react-native-sync-provider';
 
 function Outbox() {
-  useAutoSync({ flushOnReconnect: true, flushOnFocus: true });
+  useAutoSync({ enabled: true, flushOnAppForeground: true });
   const { items, enqueue } = useSyncQueue();
 
   return (
@@ -113,21 +133,21 @@ function Outbox() {
   );
 }
 
+const OPTIONS: SyncOptions = {
+  strategy: 'AUTOMATIC',
+  retryPolicy: {
+    maxAttempts: 5,
+    backoff: 'EXPONENTIAL',
+    baseDelayMs: 1000,
+    maxDelayMs: 60000,
+    jitter: true,
+    retryOnStatusCodes: [408, 425, 429, 500, 502, 503, 504],
+  },
+};
+
 export default function App() {
   return (
-    <SyncProvider
-      options={{
-        strategy: 'AUTOMATIC',
-        retryPolicy: {
-          maxAttempts: 5,
-          backoff: 'EXPONENTIAL',
-          baseDelayMs: 1000,
-          maxDelayMs: 60000,
-          jitter: true,
-          retryOnStatusCodes: [408, 425, 429, 500, 502, 503, 504],
-        },
-      }}
-    >
+    <SyncProvider options={OPTIONS}>
       <Outbox />
     </SyncProvider>
   );
@@ -136,15 +156,18 @@ export default function App() {
 
 ## Key Types
 
-- SyncItemInput — what you enqueue: { method, url, headers?, body?, contentType?, priority?, idempotencyKey?, metadata? }
-- SyncItem — persisted item: SyncItemInput + { id, createdAt, attemptCount, lastAttemptAt?, lastErrorCode? }
-- SyncOptions — library-wide config: { strategy, retryPolicy, requestTimeoutMs, maxQueueSize, persistResults, historyLimit, ... }
+- SyncItemInput — what you enqueue: { method, url, headers?, body?, contentType?, priority?, metadata? }
+- SyncItem — SyncItemInput + { id, createdAt, attempts, nextRetryAt }
+- SyncOptions — { strategy, retryPolicy, batchSize?, requestTimeoutMs?, maxQueueSize?, persistQueue?, defaultHeaders? }
 - RetryPolicy — { maxAttempts, backoff, baseDelayMs, maxDelayMs, jitter, retryOnStatusCodes }
-- SyncResult — flush outcome: { startedAt, finishedAt, attemptedCount, successCount, failureCount, errors }
-- BackgroundSyncOptions — { minimumIntervalMs, requiresUnmeteredNetwork?, requiresCharging?, requiresDeviceIdle? }
-- ConnectionState — { status, type, isInternetReachable }
-- SyncEvent — discriminated union keyed by `type` (see SyncEventType enum)
-- SyncError — Error subclass with `.code: SyncErrorCode`, `.itemId?`, `.cause?`
+- SyncResult — { startedAt, finishedAt, successCount, failureCount, succeededIds, failedIds, errors }
+- DrainOptions — { maxIterations?, timeoutMs?, delayBetweenCyclesMs? }
+- DrainResult — { iterations, itemsDispatched, queueRemaining, stoppedReason }
+- BackgroundSyncOptions — { minimumIntervalMs, requiresCharging?, requiresUnmeteredNetwork?, requiresDeviceIdle?, foregroundOnly?, taskIdentifier? }
+- ConnectionState — { status, type, isInternetReachable?, isExpensive? }
+- SyncEvent — flat object: { type, timestamp, itemId?, progress?, errorCode?, statusCode?, attempt?, connectionStatus?, metadata? }
+- SyncError — Error subclass with .code, .cause?, .validationErrors?
+- ValidationIssue — { field, reason, value?, itemIndex? }
 
 ## Documentation Pages
 
@@ -158,6 +181,8 @@ export default function App() {
 - Retry Policy Guide: /docs/guides/retry-policy
 - Connectivity Detection Guide: /docs/guides/connectivity-detection
 - Error Handling Guide: /docs/guides/error-handling
+- Priority and Ordering Guide: /docs/guides/priority-and-ordering
+- Idempotency Guide: /docs/guides/idempotency
 - API Reference: /docs/api-reference/functions
 - Hooks Reference: /docs/api-reference/hooks/useSyncQueue
 - Context: /docs/api-reference/context
@@ -166,3 +191,5 @@ export default function App() {
 - Errors: /docs/api-reference/errors
 - Architecture Overview: /docs/architecture/overview
 - Production Checklist: /docs/production/production-checklist
+- Troubleshooting: /docs/troubleshooting
+- Migration: /docs/migration

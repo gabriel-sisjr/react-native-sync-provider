@@ -23,25 +23,40 @@ import {
 /**
  * Value exposed by {@link SyncProviderContext}.
  *
- * `config` mirrors the live native configuration — it is `undefined` until
- * the Provider has finished its initial `getSyncConfig()` round-trip, and
- * also when no Provider is mounted (consumers using `useSyncConfig` outside
- * a Provider get `undefined` here and the hook falls back to the singleton).
+ * `config` is the native configuration as of the Provider's last read, which
+ * happens on mount, when `options` or `backgroundSync` change, and on a
+ * `RESUMED` event. It does not follow `configureSync` or `setConfig` calls made
+ * elsewhere. It is `undefined` until the first read finishes, and also when no
+ * Provider is mounted (consumers using `useSyncConfig` outside a Provider get
+ * `undefined` here and the hook falls back to the singleton).
+ *
+ * `hasProvider` disambiguates the two `config: undefined` cases: it is `true`
+ * only when a {@link SyncProvider} is actually mounted above the consumer
+ * (even while its initial config round-trip is still in flight), and `false`
+ * for the default context value used outside any Provider.
  */
 export interface SyncProviderContextValue {
-  /** Live native config, or `undefined` until first round-trip. */
+  /** Native config as of the last read, or `undefined` until the first one. */
   config: SyncOptions | undefined;
+  /**
+   * `true` when a {@link SyncProvider} is mounted above the consumer, `false`
+   * for the default (no-Provider) context value. Lets consumers tell "no
+   * Provider" apart from "Provider mounted, config still loading".
+   */
+  hasProvider: boolean;
 }
 
 /**
- * Context backing {@link SyncProvider}. Defaults to `{ config: undefined }`
- * so that `useSyncConfig` can detect "no Provider mounted" via the
- * `undefined` config field and fall back to a direct facade call.
+ * Context backing {@link SyncProvider}. Defaults to
+ * `{ config: undefined, hasProvider: false }` so consumers can detect
+ * "no Provider mounted" via `hasProvider === false` and fall back to a direct
+ * facade call.
  *
  * @public
  */
 export const SyncProviderContext = createContext<SyncProviderContextValue>({
   config: undefined,
+  hasProvider: false,
 });
 
 /**
@@ -119,8 +134,13 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({
 
     (async () => {
       try {
-        await configureSync(options);
-        await refresh();
+        try {
+          await configureSync(options);
+        } finally {
+          // Also on rejection: the engine keeps running on its previous config,
+          // and consumers must still see it rather than wait forever.
+          await refresh();
+        }
         if (backgroundSync !== undefined) {
           await enableBackgroundSync(backgroundSync);
           ownsBackgroundRef.current = true;
@@ -145,7 +165,10 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({
     };
   }, [options, backgroundSync]);
 
-  const value = useMemo<SyncProviderContextValue>(() => ({ config }), [config]);
+  const value = useMemo<SyncProviderContextValue>(
+    () => ({ config, hasProvider: true }),
+    [config]
+  );
 
   return (
     <SyncProviderContext.Provider value={value}>

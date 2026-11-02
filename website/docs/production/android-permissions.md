@@ -27,7 +27,7 @@ The library declares its required permissions in its own `AndroidManifest.xml`. 
 | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | `INTERNET`                            | OkHttp dispatch of every queued request.                                                                                       |
 | `ACCESS_NETWORK_STATE`                | `ConnectivityMonitor` reads `NetworkCapabilities` to drive the metered/unmetered discriminator and emit `CONNECTION_CHANGED`.  |
-| `RECEIVE_BOOT_COMPLETED`              | `BootCompletedReceiver` re-arms the periodic `SyncWorker` and runs `RecoveryWorker` after a device reboot.                     |
+| `RECEIVE_BOOT_COMPLETED`              | `BootCompletedReceiver` schedules `RecoveryWorker` after a device reboot, which resets in-flight items and re-arms the periodic `SyncWorker`. |
 
 None of these are runtime ("dangerous") permissions on Android 6+ — they are install-time and require no permission prompt.
 
@@ -59,13 +59,13 @@ None of these are runtime ("dangerous") permissions on Android 6+ — they are i
 
 The Android scheduler is the source of truth for when a flush actually runs. Important constraints to plan around:
 
-- **15-minute floor**: `PeriodicWorkRequest` cannot be scheduled at less than a 15-minute interval. The library rejects (clamps) `BackgroundSyncOptions.minimumIntervalMs < 15 * 60 * 1000`.
+- **15-minute floor**: `PeriodicWorkRequest` cannot be scheduled at less than a 15-minute interval. The library clamps `BackgroundSyncOptions.minimumIntervalMs < 15 * 60 * 1000` up to it.
 - **Doze mode** (Android 6+): if the device is idle, periodic work is deferred to the next maintenance window (which can be hours away). Test by running `adb shell dumpsys deviceidle force-idle` against your device.
 - **App standby buckets** (Android 9+): apps the user rarely opens get put into restrictive buckets. Periodic work cadence drops accordingly.
 - **Manufacturer auto-start whitelisting**: Xiaomi MIUI, Huawei EMUI, OPPO ColorOS, and a handful of other ROMs aggressively kill WorkManager unless the user manually allows your app to "auto-start". Document this in your support docs if those markets are in scope.
 
 :::tip
-For latency-sensitive payloads, schedule a `OneTimeWorkRequest` opportunistically (for example, on `CONNECTION_CHANGED` to `CONNECTED`) instead of relying on the periodic cadence. The library's `useAutoSync` + `enableBackgroundSync` combo does this automatically.
+For latency-sensitive payloads while the app runs, mount `useAutoSync`, which flushes from JS on an interval and on reconnect, instead of relying on the periodic cadence. Failed items also come back through the [retry timer and the opt-in retry kick](../guides/retry-policy.md#who-wakes-the-queue-and-when).
 :::
 
 ## Verifying the merged manifest

@@ -41,13 +41,13 @@ final class ConnectivityMonitorTests: XCTestCase {
     // MARK: - Subscribe replay
 
     func test_subscribe_replaysCurrentSnapshot_synchronously() {
-        var captured: ConnectionSnapshot?
-        let token = monitor.subscribe { snapshot in
-            captured = snapshot
+        let replays = RequestLog()
+        let token = monitor.subscribe { _ in
+            replays.record()
         }
         // Replay must have fired synchronously — `subscribe` does not return until
         // the listener has been invoked once with the current snapshot.
-        XCTAssertNotNil(captured)
+        XCTAssertFalse(replays.times.isEmpty)
         monitor.unsubscribe(token)
     }
 
@@ -57,12 +57,9 @@ final class ConnectivityMonitorTests: XCTestCase {
         let exp = expectation(description: "Listener fires at most once")
         exp.assertForOverFulfill = false
 
-        var fireCount = 0
-        let lock = NSLock()
+        let fired = RequestLog()
         let token = monitor.subscribe { _ in
-            lock.lock()
-            fireCount += 1
-            lock.unlock()
+            fired.record()
             exp.fulfill()
         }
         wait(for: [exp], timeout: 1.0)
@@ -71,10 +68,7 @@ final class ConnectivityMonitorTests: XCTestCase {
 
         // We can't deterministically trigger a path update from a unit-test host,
         // so we only assert the replay-driven baseline fired before unsubscribe.
-        lock.lock()
-        let countBeforeReSubscribe = fireCount
-        lock.unlock()
-        XCTAssertGreaterThanOrEqual(countBeforeReSubscribe, 1)
+        XCTAssertGreaterThanOrEqual(fired.times.count, 1)
     }
 
     // MARK: - Snapshot enum invariants

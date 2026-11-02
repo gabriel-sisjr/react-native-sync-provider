@@ -38,12 +38,30 @@ struct ConnectionSnapshot: Sendable, Equatable {
                                             type: .unknown,
                                             isInternetReachable: nil,
                                             isExpensive: nil)
+
+    /// `true` only when a path is known to be usable. `.unknown` is not online:
+    /// it lasts until the first path update, and treating it as online would
+    /// let a background wake spend retry attempts with no network.
+    var isOnline: Bool {
+        status == .connected || status == .metered
+    }
+}
+
+/// The part of ``ConnectivityMonitor`` the engine depends on. `NWPathMonitor`
+/// cannot be driven from a test, so this seam is what lets the offline rule be
+/// proven deterministically.
+protocol ConnectivityProviding: AnyObject, Sendable {
+    var current: ConnectionSnapshot { get }
+    func start()
+    @discardableResult
+    func subscribe(_ listener: @escaping @Sendable (ConnectionSnapshot) -> Void) -> UUID
+    func unsubscribe(_ token: UUID)
 }
 
 /// Singleton-style monitor. Starts on first instantiation; consumers get the
 /// latest snapshot via `current` and subscribe via `subscribe(_:)` for change
 /// callbacks.
-final class ConnectivityMonitor: @unchecked Sendable {
+final class ConnectivityMonitor: ConnectivityProviding, @unchecked Sendable {
     static let shared = ConnectivityMonitor()
 
     private let monitor: NWPathMonitor
@@ -109,7 +127,7 @@ final class ConnectivityMonitor: @unchecked Sendable {
 
     func unsubscribe(_ token: UUID) {
         lock.withLock {
-            listeners.removeValue(forKey: token)
+            _ = listeners.removeValue(forKey: token)
         }
     }
 

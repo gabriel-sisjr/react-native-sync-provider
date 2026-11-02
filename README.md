@@ -17,7 +17,7 @@
 ![Platform iOS](https://img.shields.io/badge/platform-iOS-blue)
 ![TypeScript](https://img.shields.io/badge/TypeScript-Ready-blue)
 
-A cross-platform React Native library for offline-first HTTP sync built on Nitro Modules (New Architecture). Persists outbound requests on the native side, drains them when connectivity returns, and keeps flushing even when the app is killed — with retry, priority lanes, and OS-scheduled background dispatch on both Android and iOS.
+A cross-platform React Native library for offline-first HTTP sync built on Nitro Modules (New Architecture). Persists outbound requests on the native side, retries them on a persisted backoff, and can dispatch them in OS-scheduled background windows while the app is not running, on both Android and iOS.
 
 **[Read the full documentation](https://gabriel-sisjr.github.io/react-native-sync-provider/)**
 
@@ -57,28 +57,29 @@ If `react-native-background-location` is what you reach for when you need GPS th
 
 - Cross-platform offline-first HTTP queue (Android and iOS)
 - Native persistence: Room (Android) / Core Data (iOS) — queue survives force-close and device reboot
-- OS-scheduled background sync: `WorkManager` (Android) / `BGTaskScheduler` (iOS) flush even with app closed
-- Connectivity-aware dispatch via `ConnectivityManager.NetworkCallback` (Android) and `NWPathMonitor` (iOS)
-- Declarative retry policy with linear / exponential / fibonacci backoff, jitter, and a per-status-code allowlist
+- OS-scheduled background sync: `WorkManager` (Android) / `BGTaskScheduler` (iOS) flush while the app is not running. The OS decides when, and iOS does not launch an app the user force-quit
+- Connectivity monitoring via `ConnectivityManager.NetworkCallback` (Android) and `NWPathMonitor` (iOS), used by the retry timer, `drainUntilEmpty` and `useAutoSync`
+- Declarative retry policy with linear / exponential / fibonacci backoff, jitter, and a per-status-code allowlist. Cooldowns persist across restarts, and a timer brings items back while the app runs
+- Persisted configuration, so a worker or BGTask with no JS honors it. `defaultHeaders` are encrypted at rest (Android Keystore / iOS Keychain)
 - Priority lanes (`HIGH` / `NORMAL` / `LOW`) enforced by the native dispatcher
-- Three sync strategies: `AUTOMATIC` (flush on connectivity), `MANUAL` (consumer-driven), `OPPORTUNISTIC` (charging + unmetered)
-- 7 fully typed React hooks for connection, queue, status, events, config, and an opt-in orchestrator
+- Two sync strategies: `AUTOMATIC` (the engine retries on its own) and `MANUAL` (it schedules nothing). `OPPORTUNISTIC` is reserved and currently behaves like `AUTOMATIC`
+- 9 fully typed React hooks for connection, queue, status, events, config, a read-only dashboard snapshot, an opt-in orchestrator, and Provider-context access
 - 15 typed event types streamed over a single `sync-event` channel for observability
-- `SyncError` + `SyncErrorCode` discriminated error surface for clean pattern matching
-- Idempotent by design — native-assigned ULIDs guarantee no duplicates across retries or restarts
+- `SyncError` + `SyncErrorCode` discriminated error surface — with structured `validationErrors` — for clean pattern matching
+- At-least-once delivery. A request can be sent twice after a crash, so endpoints must be idempotent. See the [Idempotency guide](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/guides/idempotency)
 - Nitro-powered JSI bridge — no JSON marshalling tax, ~15× faster than legacy native modules
 - Fully typed TypeScript API (`verbatimModuleSyntax`, `noUncheckedIndexedAccess`) with types shipped from the Nitro spec
 
 ## Requirements
 
-|                              | Minimum                    |
-| ---------------------------- | -------------------------- |
+|                              | Minimum                        |
+| ---------------------------- | ------------------------------ |
 | iOS                          | 15.0 (`URLSession.data(for:)`) |
-| Android `minSdkVersion`      | 24                         |
-| React Native                 | 0.73+                      |
-| React                        | 18.2+                      |
-| New Architecture             | **required**               |
-| `react-native-nitro-modules` | ^0.35.6                    |
+| Android `minSdkVersion`      | 24                             |
+| React Native                 | 0.74+                          |
+| React                        | 18.2+                          |
+| New Architecture             | **required**                   |
+| `react-native-nitro-modules` | ^0.35.6                        |
 
 ## Installation
 
@@ -102,18 +103,36 @@ yarn add @gabriel-sisjr/react-native-sync-provider react-native-nitro-modules
 
 ### iOS Setup
 
-1. Declare the BGTaskScheduler identifier in `ios/<YourApp>/Info.plist`:
+1. Declare both BGTask identifiers in `ios/<YourApp>/Info.plist`:
 
 ```xml
 <key>BGTaskSchedulerPermittedIdentifiers</key>
 <array>
   <string>com.gabriel-sisjr.syncprovider.background</string>
+  <string>com.gabriel-sisjr.syncprovider.processing</string>
 </array>
 ```
 
 2. In Xcode, enable the **Background fetch** and **Background processing** modes in **Signing & Capabilities → + Capability → Background Modes**.
 
-3. Run `pod install` in your `ios/` directory:
+3. Forward background `URLSession` events from your `AppDelegate`. The library registers its BGTask handlers by itself, so do not register them yourself.
+
+```swift
+import SyncProvider
+
+func application(
+  _ application: UIApplication,
+  handleEventsForBackgroundURLSession identifier: String,
+  completionHandler: @escaping () -> Void
+) {
+  HybridSyncProvider.handleBackgroundURLSessionEvents(
+    identifier: identifier,
+    completionHandler: completionHandler
+  )
+}
+```
+
+4. Run `pod install` in your `ios/` directory:
 
 ```sh
 cd ios && bundle install && bundle exec pod install
@@ -128,6 +147,7 @@ import {
   configureSync,
   enqueue,
   enableBackgroundSync,
+  useAutoSync,
   useConnection,
   useSyncQueue,
   useSyncStatus,
@@ -136,7 +156,8 @@ import {
   BackoffStrategy,
 } from '@gabriel-sisjr/react-native-sync-provider';
 
-// 1. Configure once on app boot
+// 1. Configure on app boot, and again whenever the token changes.
+//    defaultHeaders are encrypted at rest and available to background workers.
 await configureSync({
   strategy: SyncStrategy.AUTOMATIC,
   retryPolicy: {
@@ -147,6 +168,7 @@ await configureSync({
     jitter: true,
     retryOnStatusCodes: [408, 425, 429, 500, 502, 503, 504],
   },
+  defaultHeaders: { Authorization: 'Bearer ...' },
 });
 
 await enableBackgroundSync({
@@ -154,19 +176,20 @@ await enableBackgroundSync({
   requiresUnmeteredNetwork: false,
 });
 
-// 2. Enqueue a request — works offline, online, foreground or background
+// 2. Enqueue a request. It is stored at once and sent on the next flush.
 await enqueue({
   method: 'POST',
   url: 'https://api.example.com/events',
-  headers: { Authorization: 'Bearer ...' },
   contentType: 'application/json',
   body: JSON.stringify({ event: 'screen_view', screen: 'Home' }),
   priority: SyncPriority.HIGH,
 });
 
-// 3. React to queue + connection state
+// 3. Flush while the app runs, and react to queue + connection state
 function StatusBar() {
-  const { isOnline, isMetered } = useConnection();
+  const { isOnline } = useConnection();
+  useAutoSync({ enabled: true, flushOnAppForeground: true });
+
   const { size: pending } = useSyncQueue();
   const { isSyncing, lastResult } = useSyncStatus();
 
@@ -179,21 +202,23 @@ function StatusBar() {
 }
 ```
 
-Force-close the app, toggle airplane mode on, enqueue more items via a deep link or push, turn airplane mode off — `BGTaskScheduler`/`WorkManager` will flush the queue without the app being opened.
+Enqueueing does not dispatch: a flush does, from `useAutoSync`, `flush()`, or an OS background window. The queue survives a force-quit, but background windows do not: iOS does not launch an app the user force-quit, and Android stops its work after a Force Stop, until the user opens the app again.
 
 For step-by-step setup, see the [Quick Start Guide](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/getting-started/quick-start).
 
 ## Hooks
 
-| Hook                                                                                                                       | Purpose                                                                                       |
-| -------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| [`useConnection`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useConnection)       | Live connectivity snapshot (`status`, `type`, `isOnline`, `isMetered`).                       |
-| [`useSyncQueue`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncQueue)         | Queue contents + write operations (`enqueue`, `enqueueBatch`, `removeItem`, `clearQueue`).    |
-| [`useSyncStatus`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncStatus)       | Sync engine state, progress, last result, `flush`/`pause`/`resume`.                           |
-| [`useOfflineQueue`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useOfflineQueue)   | Convenience hook combining connection + queue + sync state for offline-first UIs.             |
-| [`useSyncEvents`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncEvents)       | Typed event stream (15 `SyncEventType`s) with optional filtering.                             |
-| [`useSyncConfig`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncConfig)       | Read / update the live `SyncOptions`.                                                         |
-| [`useAutoSync`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useAutoSync)           | Orchestrator: periodic interval + reconnect flush + opt-in AppState foreground trigger.       |
+| Hook                                                                                                                     | Purpose                                                                                        |
+| ------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
+| [`useConnection`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useConnection)     | Live connectivity snapshot (`status`, `type`, `isOnline`, `isMetered`).                        |
+| [`useSyncQueue`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncQueue)       | Queue contents + write operations (`enqueue`, `enqueueBatch`, `removeItem`, `clearQueue`).     |
+| [`useSyncStatus`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncStatus)     | Sync engine state, progress, last result, `flush`/`pause`/`resume`.                            |
+| [`useOfflineQueue`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useOfflineQueue) | Convenience hook combining connection + queue + sync state for offline-first UIs.              |
+| [`useSyncEvents`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncEvents)     | Typed event stream (15 `SyncEventType`s) with optional filtering.                              |
+| [`useSyncConfig`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncConfig)     | Read / update the live `SyncOptions`.                                                          |
+| [`useAutoSync`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useAutoSync)         | Orchestrator: periodic interval + reconnect flush + opt-in AppState foreground trigger.        |
+| [`useSyncSnapshot`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncSnapshot) | Read-only dashboard aggregator (connection + queue + sync state) driven by one subscription.   |
+| [`useSyncContext`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncContext)   | Read the `<SyncProvider>` context (`config` + `hasProvider`); never throws outside a Provider. |
 
 See the [Hooks API Reference](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncQueue) for complete documentation, options, and examples.
 
@@ -209,75 +234,80 @@ import {
   enableBackgroundSync,
 } from '@gabriel-sisjr/react-native-sync-provider';
 
-await configureSync({ /* ... */ });
+await configureSync(options);
 await enableBackgroundSync({ minimumIntervalMs: 15 * 60 * 1000 });
-const id = await enqueue({ method: 'POST', url: 'https://api.example.com/events' });
+const id = await enqueue({
+  method: 'POST',
+  url: 'https://api.example.com/events',
+});
 const result = await flush();
 ```
 
 ### Queue operations
 
-| Method            | Signature                                              | Description                                                  |
-| ----------------- | ------------------------------------------------------ | ------------------------------------------------------------ |
-| `enqueue`         | `(item: SyncItemInput) => Promise<string>`             | Persist a single HTTP request; returns its native ULID.      |
-| `enqueueBatch`    | `(items: SyncItemInput[]) => Promise<string[]>`        | Atomic batch enqueue; returns ULIDs in input order.          |
-| `removeItem`      | `(id: string) => Promise<boolean>`                     | Remove a queued item by ULID. `false` if not found.          |
-| `clearQueue`      | `() => Promise<void>`                                  | Drop every pending item.                                     |
-| `getQueueSize`    | `() => Promise<number>`                                | Current number of pending items.                             |
-| `getPendingItems` | `() => Promise<SyncItem[]>`                            | List pending items, sorted by priority + `createdAt`.        |
+| Method            | Signature                                       | Description                                             |
+| ----------------- | ----------------------------------------------- | ------------------------------------------------------- |
+| `enqueue`         | `(item: SyncItemInput) => Promise<string>`      | Persist a single HTTP request; returns its native ULID. |
+| `enqueueBatch`    | `(items: SyncItemInput[]) => Promise<string[]>` | Atomic batch enqueue; returns ULIDs in input order.     |
+| `removeItem`      | `(id: string) => Promise<boolean>`              | Remove a queued item by ULID. `false` if not found.     |
+| `clearQueue`      | `() => Promise<void>`                           | Drop every item, including failed ones.                 |
+| `getQueueSize`    | `() => Promise<number>`                         | `PENDING` items, cooling ones included.                 |
+| `getPendingItems` | `() => Promise<SyncItem[]>`                     | `PENDING` items, cooling included, in dispatch order.   |
 
 ### Sync operations
 
-| Method        | Signature                          | Description                                                    |
-| ------------- | ---------------------------------- | -------------------------------------------------------------- |
-| `flush`       | `() => Promise<SyncResult>`        | Force a flush cycle; resolves with the outcome.                |
-| `pauseSync`   | `() => Promise<void>`              | Pause the engine. Enqueues still accepted; no flushes.         |
-| `resumeSync`  | `() => Promise<void>`              | Resume after `pauseSync()`. Auto-flushes if strategy allows.   |
-| `isSyncing`   | `() => Promise<boolean>`           | `true` while a flush cycle is in progress.                     |
+| Method            | Signature                                          | Description                                                                                                             |
+| ----------------- | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `flush`           | `() => Promise<SyncResult>`                        | Run one cycle: one batch of eligible items. Per-item failures never reject. Does not check connectivity.                |
+| `drainUntilEmpty` | `(options?: DrainOptions) => Promise<DrainResult>` | Flush until the queue is empty or a bound stops it. Sleeps through cooldowns and does not flush offline.                |
+| `cancelDrain`     | `() => void`                                       | Hard stop for a running `drainUntilEmpty()`. No-op when none is running.                                                |
+| `pauseSync`       | `() => Promise<void>`                              | Pause the engine until `resumeSync()` or the next launch. Enqueues still accepted; no flushes.                          |
+| `resumeSync`      | `() => Promise<void>`                              | Resume after `pauseSync()`. Unless the strategy is `MANUAL`, pending items are dispatched, offline ones on reconnect.   |
+| `isSyncing`       | `() => Promise<boolean>`                           | `true` while a flush cycle is in progress.                                                                              |
 
 ### Configuration
 
-| Method            | Signature                                | Description                                                      |
-| ----------------- | ---------------------------------------- | ---------------------------------------------------------------- |
-| `configureSync`   | `(options: SyncOptions) => Promise<void>`| Replace the active configuration; takes effect next flush cycle. |
-| `getSyncConfig`   | `() => Promise<SyncOptions>`             | Read the currently active configuration.                         |
+| Method          | Signature                                 | Description                                                                                  |
+| --------------- | ----------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `configureSync` | `(options: SyncOptions) => Promise<void>` | Replace and persist the configuration. Omitting `defaultHeaders` deletes the stored copy.    |
+| `getSyncConfig` | `() => Promise<SyncOptions>`              | Read the currently active configuration.                                                     |
 
 ### History
 
-| Method               | Signature                                       | Description                                                   |
-| -------------------- | ----------------------------------------------- | ------------------------------------------------------------- |
-| `getLastSyncResult`  | `() => Promise<SyncResult \| undefined>`        | Most recent flush result, or `undefined` if no flush yet.     |
-| `getSyncHistory`     | `(limit?: number) => Promise<SyncResult[]>`     | Persisted flush results, most recent first. `0`/omitted = all.|
-| `clearSyncHistory`   | `() => Promise<void>`                           | Clear persisted history (does not affect the queue).          |
+| Method              | Signature                                   | Description                                                    |
+| ------------------- | ------------------------------------------- | -------------------------------------------------------------- |
+| `getLastSyncResult` | `() => Promise<SyncResult \| undefined>`    | Most recent flush result, or `undefined` if no flush yet.      |
+| `getSyncHistory`    | `(limit?: number) => Promise<SyncResult[]>` | Persisted flush results, most recent first. `0`/omitted = all. |
+| `clearSyncHistory`  | `() => Promise<void>`                       | Clear persisted history (does not affect the queue).           |
 
 ### Connectivity
 
-| Method                | Signature                              | Description                                |
-| --------------------- | -------------------------------------- | ------------------------------------------ |
-| `getConnectionStatus` | `() => Promise<ConnectionState>`       | One-shot read of the OS connectivity state. |
+| Method                | Signature                        | Description                                 |
+| --------------------- | -------------------------------- | ------------------------------------------- |
+| `getConnectionStatus` | `() => Promise<ConnectionState>` | One-shot read of the OS connectivity state. |
 
 ### Background sync
 
-| Method                    | Signature                                              | Description                                                          |
-| ------------------------- | ------------------------------------------------------ | -------------------------------------------------------------------- |
-| `enableBackgroundSync`    | `(options: BackgroundSyncOptions) => Promise<void>`    | Register the OS-level background task (`BGTaskScheduler`/`WorkManager`). |
-| `disableBackgroundSync`   | `() => Promise<void>`                                  | Cancel the OS-level background task registration.                    |
-| `isBackgroundSyncEnabled` | `() => Promise<boolean>`                               | Status of the background registration.                               |
+| Method                    | Signature                                           | Description                                                              |
+| ------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------ |
+| `enableBackgroundSync`    | `(options: BackgroundSyncOptions) => Promise<void>` | Register the OS-level background task (`BGTaskScheduler`/`WorkManager`). |
+| `disableBackgroundSync`   | `() => Promise<void>`                               | Cancel the OS-level task and any pending Android retry kick.             |
+| `isBackgroundSyncEnabled` | `() => Promise<boolean>`                            | Reports intent: `true` from enable to disable, even with `foregroundOnly`. |
 
 ### Event listeners
 
-| Symbol                    | Signature                                                          | Description                                                                |
-| ------------------------- | ------------------------------------------------------------------ | -------------------------------------------------------------------------- |
-| `addSyncEventListener`    | `(cb: (e: SyncEvent) => void) => Promise<string>`                  | Subscribe to the `'sync-event'` channel; returns the subscription id.      |
-| `removeSyncEventListener` | `(id: string) => Promise<void>`                                    | Unsubscribe.                                                               |
-| `SYNC_EVENT_CHANNEL`      | `const SYNC_EVENT_CHANNEL = 'sync-event'`                          | Channel constant for advanced consumers using the underlying Nitro API.    |
+| Symbol                    | Signature                                         | Description                                                             |
+| ------------------------- | ------------------------------------------------- | ----------------------------------------------------------------------- |
+| `addSyncEventListener`    | `(cb: (e: SyncEvent) => void) => Promise<string>` | Subscribe to the `'sync-event'` channel; returns the subscription id.   |
+| `removeSyncEventListener` | `(id: string) => Promise<void>`                   | Unsubscribe.                                                            |
+| `SYNC_EVENT_CHANNEL`      | `const SYNC_EVENT_CHANNEL = 'sync-event'`         | Channel constant for advanced consumers using the underlying Nitro API. |
 
 ### Utilities
 
-| Method                    | Signature                              | Description                                                       |
-| ------------------------- | -------------------------------------- | ----------------------------------------------------------------- |
-| `generateId`              | `() => string`                         | UUID v4 helper (Math.random-backed) for `Idempotency-Key` headers.|
-| `isNativeModuleAvailable` | `() => boolean`                        | `true` when the Nitro HybridObject is resolvable.                 |
+| Method                    | Signature       | Description                                                        |
+| ------------------------- | --------------- | ------------------------------------------------------------------ |
+| `generateId`              | `() => string`  | UUID v4 helper (Math.random-backed) for `Idempotency-Key` headers. |
+| `isNativeModuleAvailable` | `() => boolean` | `true` when the Nitro HybridObject is resolvable.                  |
 
 ## Types
 
@@ -309,9 +339,13 @@ interface SyncItem {
   contentType?: string;
   priority?: SyncPriority;
   createdAt: number;
+  attempts: number;
+  nextRetryAt: number;
   metadata?: Record<string, string>;
 }
 ```
+
+> `attempts` and `nextRetryAt` are the per-item retry bookkeeping (added in v0.2). `attempts === 0` means never attempted. `nextRetryAt === 0` means never attempted and eligible now; a positive value means a retry is pending, and the item is eligible once `nextRetryAt <= now`. Both are returned verbatim, never translated to `undefined`.
 
 ### RetryPolicy
 
@@ -326,7 +360,7 @@ interface RetryPolicy {
 }
 ```
 
-> Network errors and timeouts are always retried regardless of `retryOnStatusCodes`. Non-listed 4xx/5xx responses are treated as permanent failures. The optional per-attempt `shouldRetry(error)` callback is deferred to v0.2 — it requires a JS-alive bridge round-trip on every retry decision.
+> Network errors and timeouts are always retried regardless of `retryOnStatusCodes`. Non-listed 4xx/5xx responses are permanent failures, and 401/403 stay permanent even when listed. The optional per-attempt `shouldRetry(error)` callback is deferred to v0.4 — it requires a JS-alive bridge round-trip on every retry decision.
 
 ### SyncOptions
 
@@ -342,6 +376,8 @@ interface SyncOptions {
 }
 ```
 
+> `batchSize` defaults to `25` and `maxQueueSize` to `10000`. `persistQueue` is stored but not used yet: the queue is always persisted. `defaultHeaders` are encrypted at rest, and calling `configureSync` without them deletes the stored copy, which makes it the logout path.
+
 ### SyncResult
 
 ```typescript
@@ -356,6 +392,27 @@ interface SyncResult {
 }
 ```
 
+> `successCount` and `failureCount` are set on both platforms. An item waiting for a retry counts as neither. `succeededIds`, `failedIds` and `errors` are always empty on iOS. On Android, `errors` values read `"<SyncErrorCode>: <detail>"`.
+
+### DrainOptions / DrainResult
+
+```typescript
+interface DrainOptions {
+  maxIterations?: number; // default 32
+  timeoutMs?: number; // default 60000
+  delayBetweenCyclesMs?: number;
+}
+
+interface DrainResult {
+  iterations: number;
+  itemsDispatched: number;
+  queueRemaining: number;
+  stoppedReason: 'EMPTY' | 'MAX_ITERATIONS' | 'TIMEOUT' | 'CANCELLED';
+}
+```
+
+> Bounds and outcome for [`drainUntilEmpty`](#sync-operations). Every option has a safe default, so a no-arg `drainUntilEmpty()` always ends, even under concurrent enqueues. `timeoutMs` and `cancelDrain()` are hard stops: every wait races them, and a native cycle already running keeps going after the drain returns. `maxIterations` counts real flushes, and `iterations` means cycles started. Starting a drain while another is finishing throws `DRAIN_ALREADY_ACTIVE`, so await the previous drain first.
+
 ### SyncEvent
 
 ```typescript
@@ -363,12 +420,12 @@ interface SyncEvent {
   type: SyncEventType;
   timestamp: number;
   itemId?: string;
-  progress?: number;          // SYNC_PROGRESS only
-  errorCode?: SyncErrorCode;  // SYNC_FAILED, ITEM_FAILED, ITEM_RETRYING
-  statusCode?: number;        // ITEM_SUCCEEDED, ITEM_FAILED
-  attempt?: number;           // ITEM_RETRYING (1-based)
+  progress?: number; // SYNC_PROGRESS only (iOS)
+  errorCode?: SyncErrorCode; // ITEM_FAILED, ITEM_RETRYING; SYNC_FAILED only if the cycle died
+  statusCode?: number; // ITEM_SUCCEEDED, ITEM_FAILED, ITEM_RETRYING
+  attempt?: number; // ITEM_SUCCEEDED, ITEM_FAILED, ITEM_RETRYING (1-based)
   connectionStatus?: ConnectionStatus; // CONNECTION_CHANGED
-  metadata?: Record<string, string>;
+  metadata?: Record<string, string>; // iOS engine diagnostics, not the item's metadata
 }
 ```
 
@@ -380,11 +437,12 @@ interface BackgroundSyncOptions {
   requiresCharging?: boolean;
   requiresUnmeteredNetwork?: boolean;
   requiresDeviceIdle?: boolean;
+  foregroundOnly?: boolean;
   taskIdentifier?: string;
 }
 ```
 
-> Android `WorkManager` clamps `minimumIntervalMs` to a minimum of 15 minutes for periodic work. iOS `BGTaskScheduler` treats it as a soft hint and schedules at its discretion.
+> Android `WorkManager` clamps `minimumIntervalMs` to a minimum of 15 minutes for periodic work. iOS `BGTaskScheduler` treats it as a soft hint and schedules at its discretion. `requiresUnmeteredNetwork` and `requiresDeviceIdle` apply on Android only, and on iOS `requiresCharging` applies to the processing task only. `taskIdentifier` is stored but not used yet: both platforms use fixed identifiers. Set `foregroundOnly: true` (added in v0.2, default `false`) to schedule **no** OS-level background dispatch — sync then runs only while the app is alive; launch/boot data-integrity recovery is never suppressed.
 
 ### ConnectionState
 
@@ -403,46 +461,60 @@ interface ConnectionState {
 class SyncError extends Error {
   readonly code: SyncErrorCode;
   readonly cause?: unknown;
+  readonly validationErrors?: ValidationIssue[];
 }
 ```
 
-> Every public function rejects with a `SyncError` carrying a stable `code: SyncErrorCode`. Pattern-match on `error.code` for typed error handling — the `instanceof` check is preserved across the native bridge.
+> Every public function rejects with a `SyncError` carrying a stable `code: SyncErrorCode`. Pattern-match on `error.code` for typed error handling. Validation failures (`INVALID_URL` / `INVALID_PAYLOAD`) also populate `validationErrors` with every detected issue (added in v0.2). Native codes do not reach JS through a rejection yet: each function maps a native rejection to one fallback code, so a full queue rejects with `INVALID_PAYLOAD` and no `validationErrors`, not `QUEUE_FULL`. See [Errors](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/errors).
+
+### ValidationIssue
+
+```typescript
+type ValidationIssue = {
+  field: string; // e.g. "url", "headers.Authorization", "input"
+  reason: string;
+  value?: unknown;
+  itemIndex?: number; // batch position; omitted for single-item enqueue
+};
+```
+
+> Attached to `SyncError.validationErrors`. `enqueueBatch` collects issues across all items (each tagged with `itemIndex`) and throws **one** `INVALID_PAYLOAD`; `enqueue` throws the first issue's specific code with the full list still attached. `value` is set only for `method`, `priority` and `contentType`, because errors end up in logs and the other fields can hold credentials. `reason` never contains the URL, but the `message` of a single-item `enqueue` can.
 
 ## Enums
 
 ### SyncStrategy
 
-| Value           | Description                                                                                                |
-| --------------- | ---------------------------------------------------------------------------------------------------------- |
-| `AUTOMATIC`     | Flush as soon as the queue is non-empty and connectivity allows.                                           |
-| `MANUAL`        | Queue is only drained when the consumer explicitly calls `flush()`.                                        |
-| `OPPORTUNISTIC` | Like `AUTOMATIC`, but only on opportunistic windows (foreground resume, charging, unmetered network).      |
+| Value           | Description                                                                                                                                                       |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `AUTOMATIC`     | The engine retries on its own: a failed item is dispatched again when its cooldown ends, and pending items on `resumeSync()`. Enqueueing does not trigger a flush. |
+| `MANUAL`        | The engine schedules nothing on its own: no retry timer and no Android retry kick. Items go on `flush()`, plus any OS windows enabled by `enableBackgroundSync`.   |
+| `OPPORTUNISTIC` | Reserved. Currently behaves like `AUTOMATIC`.                                                                                                                     |
 
 ### SyncPriority
 
-| Value     | Description                                                          |
-| --------- | -------------------------------------------------------------------- |
-| `HIGH`    | Drains before `NORMAL`/`LOW`. Use sparingly to avoid starvation.     |
-| `NORMAL`  | Default bucket.                                                      |
-| `LOW`     | Drains after `HIGH`/`NORMAL`. Suitable for telemetry and analytics.  |
+| Value    | Description                                                         |
+| -------- | ------------------------------------------------------------------- |
+| `HIGH`   | Drains before `NORMAL`/`LOW`. Use sparingly to avoid starvation.    |
+| `NORMAL` | Default bucket.                                                     |
+| `LOW`    | Drains after `HIGH`/`NORMAL`. Suitable for telemetry and analytics. |
 
 ### BackoffStrategy
 
-| Value         | Formula                                                  |
-| ------------- | -------------------------------------------------------- |
-| `LINEAR`      | `delay = baseDelayMs * attempt` (capped at `maxDelayMs`).|
-| `EXPONENTIAL` | `delay = baseDelayMs * 2^(attempt - 1)` (capped).        |
-| `FIBONACCI`   | `delay = baseDelayMs * fib(attempt)` (capped).           |
+| Value         | Formula                                                   |
+| ------------- | --------------------------------------------------------- |
+| `LINEAR`      | `delay = baseDelayMs * attempt` (capped at `maxDelayMs`). |
+| `EXPONENTIAL` | `delay = baseDelayMs * 2^(attempt - 1)` (capped).         |
+| `FIBONACCI`   | `delay = baseDelayMs * fib(attempt)` (capped).            |
 
 ### HttpMethod
 
-| Value     | Notes                                                  |
-| --------- | ------------------------------------------------------ |
-| `GET`     | Must not carry a body.                                 |
-| `POST`    | Typically carries a body.                              |
-| `PUT`     | Full-resource replace.                                 |
-| `PATCH`   | Partial update.                                        |
-| `DELETE`  | Body is optional and discouraged.                      |
+| Value    | Notes                             |
+| -------- | --------------------------------- |
+| `GET`    | Must not carry a body.            |
+| `POST`   | Typically carries a body.         |
+| `PUT`    | Full-resource replace.            |
+| `PATCH`  | Partial update.                   |
+| `DELETE` | Body is optional and discouraged. |
 
 ### ConnectionStatus
 
@@ -450,7 +522,7 @@ class SyncError extends Error {
 | -------------- | ---------------------------------------------------------------------------- |
 | `CONNECTED`    | Device has an active internet path (Wi-Fi, cellular, ethernet, etc.).        |
 | `DISCONNECTED` | Device is offline — no usable network path is available.                     |
-| `METERED`      | Online but the active link is metered. Background sync is more conservative. |
+| `METERED`      | Online but the active link is metered (cellular, hotspot).                   |
 | `UNKNOWN`      | Connectivity could not be determined yet.                                    |
 
 ### ConnectionType
@@ -468,51 +540,52 @@ class SyncError extends Error {
 
 ### SyncEventType
 
-| Value                       | Triggered when                                                                  |
-| --------------------------- | ------------------------------------------------------------------------------- |
-| `ITEM_ENQUEUED`             | A new item was accepted into the queue.                                         |
-| `ITEM_REMOVED`              | An item was removed (manual or post-success).                                   |
-| `SYNC_STARTED`              | A flush cycle has begun.                                                        |
-| `SYNC_PROGRESS`             | Coarse progress update for the current flush (`progress` in `[0, 1]`).          |
-| `SYNC_SUCCEEDED`            | The current flush cycle finished with no failures.                              |
-| `SYNC_FAILED`               | The current flush cycle finished with at least one failure.                     |
-| `ITEM_SUCCEEDED`            | A single item dispatched successfully.                                          |
-| `ITEM_FAILED`               | A single item failed permanently (retry budget exhausted).                      |
-| `ITEM_RETRYING`             | A single item was scheduled for retry.                                          |
-| `QUEUE_CLEARED`             | The queue was cleared (`clearQueue()` or `maxQueueSize` reached).               |
-| `CONNECTION_CHANGED`        | Network connectivity changed.                                                   |
-| `PAUSED`                    | Sync was paused via `pauseSync()`.                                              |
-| `RESUMED`                   | Sync was resumed via `resumeSync()`.                                            |
-| `BACKGROUND_SYNC_STARTED`   | OS-scheduled background sync window started.                                    |
-| `BACKGROUND_SYNC_COMPLETED` | OS-scheduled background sync window finished.                                   |
+| Value                       | Triggered when                                                         |
+| --------------------------- | ---------------------------------------------------------------------- |
+| `ITEM_ENQUEUED`             | A new item was accepted into the queue.                                |
+| `ITEM_REMOVED`              | An item was removed by `removeItem()`.                                 |
+| `SYNC_STARTED`              | A flush cycle has begun.                                               |
+| `SYNC_PROGRESS`             | Coarse progress update for the current flush. iOS only.                |
+| `SYNC_SUCCEEDED`            | The cycle finished with no permanent failure, including 0/0 cycles.    |
+| `SYNC_FAILED`               | The cycle finished with a permanent failure, or died.                  |
+| `ITEM_SUCCEEDED`            | A single item dispatched successfully.                                 |
+| `ITEM_FAILED`               | A single item failed permanently.                                      |
+| `ITEM_RETRYING`             | A single item went back to wait for a retry.                           |
+| `QUEUE_CLEARED`             | The queue was cleared by `clearQueue()`.                               |
+| `CONNECTION_CHANGED`        | Network connectivity changed.                                          |
+| `PAUSED`                    | Sync was paused via `pauseSync()`.                                     |
+| `RESUMED`                   | Sync was resumed via `resumeSync()`, or iOS recovered items at launch. |
+| `BACKGROUND_SYNC_STARTED`   | OS-scheduled background sync window started.                           |
+| `BACKGROUND_SYNC_COMPLETED` | OS-scheduled background sync window finished.                          |
 
 ### SyncErrorCode
 
-| Value                                 | Permanent? | Thrown by                                       |
-| ------------------------------------- | :--------: | ----------------------------------------------- |
-| `NETWORK_ERROR`                       |     no     | `flush`                                         |
-| `SERVER_ERROR`                        |     no     | `flush`                                         |
-| `TIMEOUT`                             |     no     | `flush`                                         |
-| `MAX_ATTEMPTS_EXCEEDED`               |    yes     | `flush` (per-item; surfaced in `SyncResult.errors`) |
-| `UNAUTHORIZED`                        |    yes     | `flush`                                         |
-| `INVALID_PAYLOAD`                     |    yes     | `enqueue`, `enqueueBatch`                       |
-| `INVALID_URL`                         |    yes     | `enqueue`, `enqueueBatch`                       |
-| `QUEUE_FULL`                          |    yes     | `enqueue`, `enqueueBatch`                       |
-| `DUPLICATE_ITEM`                      |    yes     | `enqueue`, `enqueueBatch`                       |
-| `BACKGROUND_TASK_REGISTRATION_FAILED` |    yes     | `enableBackgroundSync`                          |
-| `NATIVE_MODULE_UNAVAILABLE`           |    yes     | every facade method when the native module is missing |
+| Value                                 | Permanent?      | Where you see it                                                       |
+| ------------------------------------- | :-------------: | ---------------------------------------------------------------------- |
+| `NETWORK_ERROR`                       |       no        | Item events. Also what `flush` rejects with when its cycle dies.       |
+| `SERVER_ERROR`                        | if not retried  | Item events.                                                           |
+| `TIMEOUT`                             |       no        | Item events.                                                           |
+| `MAX_ATTEMPTS_EXCEEDED`               |       yes       | `ITEM_FAILED`, for a retriable failure with no attempts left.          |
+| `UNAUTHORIZED`                        |       yes       | Item events, on a 401 or 403.                                          |
+| `INVALID_PAYLOAD`                     |       yes       | `enqueue`, `enqueueBatch`, and most functions when native rejects.     |
+| `INVALID_URL`                         |       yes       | `enqueue`. `enqueueBatch` reports URLs under `INVALID_PAYLOAD`.        |
+| `QUEUE_FULL`                          |       yes       | Raised by native; reaches JS as `INVALID_PAYLOAD` for now.             |
+| `DUPLICATE_ITEM`                      |       yes       | Reserved. Neither platform raises it.                                  |
+| `BACKGROUND_TASK_REGISTRATION_FAILED` |       yes       | `enableBackgroundSync`, `disableBackgroundSync`, `isBackgroundSyncEnabled`. |
+| `NATIVE_MODULE_UNAVAILABLE`           |       yes       | Every function when the native module is missing.                      |
+| `DRAIN_ALREADY_ACTIVE`                |       yes       | `drainUntilEmpty`, when a drain is already running.                    |
 
 ## How it compares
 
 | Concern                                   | `react-native-sync-provider` | `@tanstack/react-query` (offline mutations) | `redux-offline` | `react-native-queue` (legacy) |
 | ----------------------------------------- | :--------------------------: | :-----------------------------------------: | :-------------: | :---------------------------: |
-| Native persistence (survives force-close) |              yes             |                     no                      |     partial     |            partial            |
-| Background sync (app closed)              |              yes             |                     no                      |       no        |              no               |
-| New Architecture / JSI                    |              yes             |                     n/a                     |       n/a       |              no               |
-| Configurable retry + jitter               |              yes             |                     yes                     |     partial     |             yes               |
-| Priority lanes                            |              yes             |                     no                      |       no        |             yes               |
-| Connectivity-aware flush                  |              yes             |                   partial                   |       yes       |            partial            |
-| TypeScript-first                          |              yes             |                     yes                     |     partial     |            partial            |
+| Native persistence (survives force-close) |             yes              |                     no                      |     partial     |            partial            |
+| Background sync (app closed)              |             yes              |                     no                      |       no        |              no               |
+| New Architecture / JSI                    |             yes              |                     n/a                     |       n/a       |              no               |
+| Configurable retry + jitter               |             yes              |                     yes                     |     partial     |              yes              |
+| Priority lanes                            |             yes              |                     no                      |       no        |              yes              |
+| Connectivity-aware flush                  |             yes              |                   partial                   |       yes       |            partial            |
+| TypeScript-first                          |             yes              |                     yes                     |     partial     |            partial            |
 
 `yes` first-class · `partial` requires plugins / not the default · `no` not supported
 
@@ -530,8 +603,8 @@ Use them independently or together — for example, pipe `useLocationUpdates()` 
 ## Performance notes
 
 - The bridge is **Nitro Modules**, not TurboModules. Object payloads (e.g. `SyncItem`) cross the JSI boundary as native objects — no JSON `parse`/`stringify` tax.
-- The native dispatcher runs on a dedicated background queue. Hooks subscribe via Nitro callbacks; React renders are debounced.
-- Default batch size is `10`. Tunable via `configureSync({ batchSize })`.
+- The native dispatcher runs off the JS thread. Hooks subscribe via Nitro callbacks.
+- Default batch size is `25`. Tunable via `configureSync({ batchSize })`. Android sends a batch concurrently, iOS one item at a time.
 - Background dispatch on iOS uses `URLSessionConfiguration.background` so uploads continue if the OS suspends the app mid-flight.
 
 ## Documentation
@@ -582,6 +655,7 @@ Browse the **[full documentation site](https://gabriel-sisjr.github.io/react-nat
 ### Help
 
 - [Troubleshooting Guide](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/troubleshooting) — Symptom → cause → fix for common integration issues
+- [Migration Guides](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/migration) — Upgrade procedure between versions
 
 ## Platform Support
 
@@ -601,16 +675,19 @@ No. The library is built on Nitro Modules, which require Fabric + TurboModules.
 Yes, via Expo Dev Client / EAS Build (custom native code). It will not run on Expo Go.
 
 **Q. How is this different from just calling `fetch` inside a `BackgroundFetch` task?**
-You'd be writing all of this yourself: native persistence, retry policy, priority ordering, connectivity reaction, idempotency, recovery from interrupted in-flight items, queue inspection from JS, and React bindings. This library packages that.
+You'd be writing all of this yourself: native persistence, retry policy, priority ordering, recovery from interrupted in-flight items, queue inspection from JS, and React bindings. This library packages that.
 
-**Q. Can I send multipart/form-data uploads?**
-Yes — set `metadata.contentType = 'multipart/form-data'` and provide the body either as Base64 in `body` or as a file URL via `metadata.bodyFileUri`. See the [multipart uploads guide](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/guides/offline-queue) for the full recipe.
+**Q. Does `enqueue` send the request?**
+No. It stores the item. A flush sends it, from `useAutoSync`, `flush()`, or an OS background window. `AUTOMATIC` retries failed items on its own, but it does not flush on enqueue.
+
+**Q. Can I send file uploads?**
+No. `body` is a string sent as UTF-8 text, and there is no file-based body. You can send text-based formats by setting `contentType`, but binary multipart uploads are not supported.
 
 **Q. What happens to in-flight items if the OS kills the process mid-upload?**
-On next launch (or next `WorkManager` tick), the recovery layer atomically marks orphaned items as `pending` and they re-enter the queue. Combined with the ULID `id` and a server-side `Idempotency-Key` header (set via `metadata`), duplicates are eliminated.
+On the next launch, the recovery layer marks orphaned items as `PENDING` and they re-enter the queue. With no JS loaded, an iOS BGTask or an Android worker does the same before it flushes, unless a pause or `foregroundOnly` blocks the Android worker. Android also runs it after a reboot or an app update. Their attempt counters and cooldowns are kept, and the server may already have processed the request, so delivery is at least once. Send an `Idempotency-Key` header, set through `headers` with a key you generate before enqueueing, and dedupe on the server.
 
 **Q. Is the queue encrypted at rest?**
-Not by default — encrypted storage at rest is a future enhancement under consideration.
+No. Per-item `headers` and `body` are stored in plain text. Put credentials in `SyncOptions.defaultHeaders`, which are encrypted at rest (Android Keystore / iOS Keychain).
 
 ## Contributing
 

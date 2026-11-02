@@ -1,5 +1,6 @@
 package com.margelo.nitro.syncprovider.testutil
 
+import com.margelo.nitro.syncprovider.BackgroundSyncOptions
 import com.margelo.nitro.syncprovider.BackoffStrategy
 import com.margelo.nitro.syncprovider.HttpMethod
 import com.margelo.nitro.syncprovider.RetryPolicy
@@ -8,6 +9,7 @@ import com.margelo.nitro.syncprovider.SyncOptions
 import com.margelo.nitro.syncprovider.SyncPriority
 import com.margelo.nitro.syncprovider.SyncStrategy
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
+import com.margelo.nitro.syncprovider.work.BackgroundSyncManager
 
 internal object TestData {
 
@@ -45,6 +47,22 @@ internal object TestData {
     defaultHeaders = defaultHeaders,
   )
 
+  fun backgroundSyncOptions(
+    minimumIntervalMs: Long = BackgroundSyncManager.MIN_INTERVAL_MS,
+    requiresCharging: Boolean? = null,
+    requiresUnmeteredNetwork: Boolean? = null,
+    requiresDeviceIdle: Boolean? = null,
+    foregroundOnly: Boolean? = null,
+    taskIdentifier: String? = null,
+  ): BackgroundSyncOptions = BackgroundSyncOptions(
+    minimumIntervalMs = minimumIntervalMs.toDouble(),
+    requiresCharging = requiresCharging,
+    requiresUnmeteredNetwork = requiresUnmeteredNetwork,
+    requiresDeviceIdle = requiresDeviceIdle,
+    foregroundOnly = foregroundOnly,
+    taskIdentifier = taskIdentifier,
+  )
+
   fun input(
     url: String = "https://api.example.com/v1/test",
     method: HttpMethod = HttpMethod.POST,
@@ -73,6 +91,7 @@ internal object TestData {
     status: String = SyncItemEntity.STATUS_PENDING,
     body: String? = """{"hello":"world"}""",
     contentType: String? = "application/json",
+    nextRetryAt: Long = 0L,
   ): SyncItemEntity = SyncItemEntity(
     id = id,
     method = method,
@@ -88,5 +107,6 @@ internal object TestData {
     lastErrorCode = null,
     status = status,
     metadata = null,
+    nextRetryAt = nextRetryAt,
   )
 }

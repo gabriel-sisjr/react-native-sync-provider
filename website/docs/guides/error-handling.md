@@ -15,12 +15,15 @@ keywords:
 
 Every public function in `react-native-sync-provider` throws `SyncError` -- a typed `Error` subclass carrying a stable `SyncErrorCode`. Consumers should branch on `error.code`, never on the message string.
 
+Failures reach you in two places. A call that cannot run rejects. A request that fails is reported per item, on events: a failed request never rejects.
+
 ## The `SyncError` Class
 
 ```ts
 class SyncError extends Error {
   readonly code: SyncErrorCode;
   readonly cause?: unknown;
+  readonly validationErrors?: ValidationIssue[];
   readonly name: 'SyncError';
 }
 ```
@@ -43,12 +46,15 @@ try {
   if (!(e instanceof SyncError)) throw e;
 
   switch (e.code) {
-    case SyncErrorCode.QUEUE_FULL:
-      // back off and retry once the queue drains
-      break;
     case SyncErrorCode.INVALID_URL:
-    case SyncErrorCode.INVALID_PAYLOAD:
       // surface to UX -- this will not succeed on retry
+      break;
+    case SyncErrorCode.INVALID_PAYLOAD:
+      if (e.validationErrors) {
+        // surface to UX -- this will not succeed on retry
+      } else {
+        // rejected by native, most often a full queue: back off and retry
+      }
       break;
     case SyncErrorCode.NATIVE_MODULE_UNAVAILABLE:
       // running on web/SSR or before the native module loaded
@@ -59,25 +65,30 @@ try {
 }
 ```
 
+:::warning `QUEUE_FULL` does not reach JS yet
+Each facade function maps a native rejection to one fallback code, so a full queue rejects with `INVALID_PAYLOAD` and no `validationErrors`. See [Native rejections](../api-reference/errors.md#native-rejections).
+:::
+
 ## Full `SyncErrorCode` Matrix
 
-| Code | Retryable? | Typically thrown by | Suggested action |
+| Code | Retryable? | Where you see it | Suggested action |
 |---|---|---|---|
-| `NETWORK_ERROR` | Yes | `flush` | Wait for connectivity; the engine retries automatically. |
-| `SERVER_ERROR` | Yes (subject to `retryOnStatusCodes`) | `flush` | The engine retries; surface only if persistent. |
-| `INVALID_PAYLOAD` | No | `enqueue`, `enqueueBatch` | Fix the input shape; the request will never succeed. |
-| `QUEUE_FULL` | No (until drained) | `enqueue`, `enqueueBatch` | Drain via `flush()` or raise `maxQueueSize`. |
+| `NETWORK_ERROR` | Yes | Item events. `flush()` also rejects with it when its cycle dies. | Wait for connectivity; the engine retries automatically. |
+| `SERVER_ERROR` | If in `retryOnStatusCodes` | Item events | The engine retries a listed status; surface only if persistent. |
+| `INVALID_PAYLOAD` | No | `enqueue`, `enqueueBatch`, and most functions when native rejects | Fix the input shape. With no `validationErrors`, native rejected the call. |
+| `QUEUE_FULL` | No (until drained) | Reaches JS as `INVALID_PAYLOAD` for now | Flush or raise `maxQueueSize`. |
 | `NATIVE_MODULE_UNAVAILABLE` | No | every facade method | Verify New Architecture; rebuild native app. |
-| `BACKGROUND_TASK_REGISTRATION_FAILED` | No | `enableBackgroundSync`, `disableBackgroundSync`, `isBackgroundSyncEnabled` | Check Background Modes capability and Info.plist identifier. |
-| `INVALID_URL` | No | `enqueue`, `enqueueBatch` | Pass an absolute http(s) URL. |
-| `UNAUTHORIZED` | No | `flush` | Refresh credentials and re-enqueue. |
-| `TIMEOUT` | Yes | `flush` | Engine retries; raise `requestTimeoutMs` if requests legitimately take longer. |
-| `MAX_ATTEMPTS_EXCEEDED` | No | `flush` (per-item, surfaced via `SyncResult.errors`) | Raise `maxAttempts` or expand `retryOnStatusCodes`. |
-| `DUPLICATE_ITEM` | No | `enqueue`, `enqueueBatch` | The item is already queued; do not re-enqueue. |
+| `BACKGROUND_TASK_REGISTRATION_FAILED` | No | `enableBackgroundSync`, `disableBackgroundSync`, `isBackgroundSyncEnabled` | Check the `Info.plist` identifiers, and that you are on a physical device. |
+| `INVALID_URL` | No | `enqueue` | Pass an absolute http(s) URL. |
+| `UNAUTHORIZED` | No | Item events | Call `configureSync` with a fresh token, and enqueue a failed item again. |
+| `TIMEOUT` | Yes | Item events | Engine retries; raise `requestTimeoutMs` if requests legitimately take longer. |
+| `MAX_ATTEMPTS_EXCEEDED` | No | `ITEM_FAILED` | Raise `maxAttempts` or expand `retryOnStatusCodes`. |
+| `DUPLICATE_ITEM` | No | Never: reserved | None. |
+| `DRAIN_ALREADY_ACTIVE` | No | `drainUntilEmpty` | Await the previous drain. |
 
 ## Wrapping Your Own Calls
 
-A common pattern is to wrap `flush()` in your own helper so callers see a uniform error surface:
+A common pattern is to wrap `flush()` in your own helper so callers see a uniform error surface. `flush()` rejects only when its cycle dies or the native module is missing, so there are few cases to handle:
 
 ```ts
 import {
@@ -94,11 +105,7 @@ export async function safeFlush(): Promise<SyncResult | null> {
     if (e instanceof SyncError) {
       switch (e.code) {
         case SyncErrorCode.NETWORK_ERROR:
-        case SyncErrorCode.TIMEOUT:
-          // Transient -- swallow; AUTOMATIC strategy will re-fire.
-          return null;
-        case SyncErrorCode.UNAUTHORIZED:
-          await refreshAuthToken();
+          // The cycle died. Items are still queued, so swallow and flush later.
           return null;
         default:
           throw e;
@@ -111,19 +118,24 @@ export async function safeFlush(): Promise<SyncResult | null> {
 
 ## Per-Item Failures via `SyncResult`
 
-`flush()` returns a `SyncResult` whose `errors` field maps each failed item to the dominant `SyncErrorCode` value (as a string):
+`failureCount` works on both platforms. The per-item detail does not: `failedIds` and `errors` are always empty on iOS. On Android, `errors` maps each failed item to `"<SyncErrorCode>: <detail>"`:
 
 ```ts
 const result = await flush();
 
-for (const [itemId, code] of Object.entries(result.errors)) {
-  console.warn(`item ${itemId} failed: ${code}`);
+if (result.failureCount > 0) {
+  // Android only. On iOS, use the events below.
+  for (const [itemId, error] of Object.entries(result.errors)) {
+    console.warn(`item ${itemId} failed: ${error}`);
+  }
 }
 ```
 
-This lets you process partial failures without a try/catch around each item.
+An item that went back to wait for a retry counts as neither a success nor a failure, so a cycle whose items all failed retriably is 0/0.
 
 ## Listening for Failures via Events
+
+Events carry the same detail on both platforms, and work for cycles you did not start:
 
 ```tsx
 import { useSyncEvents } from '@gabriel-sisjr/react-native-sync-provider';
@@ -136,7 +148,9 @@ useSyncEvents({
 });
 ```
 
-`ITEM_FAILED` is emitted when an item exhausts its retry budget. `SYNC_FAILED` is emitted when the entire flush cycle aborts (e.g., a transport-level failure during the cycle).
+`ITEM_FAILED` is emitted when an item fails permanently, with a real `errorCode`. `SYNC_FAILED` is emitted when a cycle ends with at least one permanent failure, or dies. Its `errorCode` is set only when the cycle died, so read per-item codes from `ITEM_FAILED`.
+
+An item that fails permanently stays in the store as a `FAILED` row: see [Permanent Failures](./retry-policy.md#permanent-failures).
 
 ## Next Steps
 

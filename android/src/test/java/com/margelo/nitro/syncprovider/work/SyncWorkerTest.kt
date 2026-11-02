@@ -10,12 +10,16 @@ import com.margelo.nitro.syncprovider.SyncProviderRuntime
 import com.margelo.nitro.syncprovider.SyncResult
 import com.margelo.nitro.syncprovider.http.SyncDispatcher
 import io.mockk.coEvery
+import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.mockkObject
 import io.mockk.unmockkObject
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import org.junit.After
+import org.junit.Assert.assertThrows
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -78,13 +82,15 @@ internal class SyncWorkerTest {
   }
 
   @Test
-  fun `doWork returns retry when flush has failures`() = runTest {
+  fun `doWork returns success even when flush reports terminal failures`() = runTest {
+    // Terminal item failures must not drive WorkManager's exponential backoff: it
+    // would race the retry wake. Worker-level retry is reserved for thrown workers.
     coEvery { dispatcher.flush() } returns failureResult()
     val worker = TestListenableWorkerBuilder<SyncWorker>(context).build()
 
     val result = worker.doWork()
 
-    assertThat(result).isEqualTo(ListenableWorker.Result.retry())
+    assertThat(result).isEqualTo(ListenableWorker.Result.success())
   }
 
   @Test
@@ -95,6 +101,39 @@ internal class SyncWorkerTest {
     val result = worker.doWork()
 
     assertThat(result).isEqualTo(ListenableWorker.Result.retry())
+  }
+
+  @Test
+  fun `doWork returns retry when recovery throws`() = runTest {
+    coEvery { dispatcher.resetInFlight() } throws RuntimeException("db gone")
+    val worker = TestListenableWorkerBuilder<SyncWorker>(context).build()
+
+    val result = worker.doWork()
+
+    assertThat(result).isEqualTo(ListenableWorker.Result.retry())
+    coVerify(exactly = 0) { dispatcher.flush() }
+  }
+
+  @Test
+  fun `doWork does not turn a stopped worker into a retry`() {
+    coEvery { dispatcher.flush() } throws CancellationException("stopped")
+    val worker = TestListenableWorkerBuilder<SyncWorker>(context).build()
+
+    assertThrows(CancellationException::class.java) { runBlocking { worker.doWork() } }
+  }
+
+  @Test
+  fun `doWork is inert when background dispatch is blocked`() = runTest {
+    every { runtime.isBackgroundDispatchBlocked() } returns true
+    val input = Data.Builder().putBoolean(SyncWorker.KEY_PERIODIC, true).build()
+    val worker = TestListenableWorkerBuilder<SyncWorker>(context)
+      .setInputData(input)
+      .build()
+
+    val result = worker.doWork()
+
+    assertThat(result).isEqualTo(ListenableWorker.Result.success())
+    coVerify(exactly = 0) { dispatcher.flush() }
   }
 
   @Test

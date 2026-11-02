@@ -3,27 +3,29 @@
  *
  * Mirrors the public API surface of `src/index.tsx` but every facade
  * function throws `SyncError(NATIVE_MODULE_UNAVAILABLE)` and every hook
- * returns inert state (no throws on render). This keeps SSR and web bundles
- * importable while making it impossible to silently miss the lack of native
- * support.
+ * returns inert state (no throws on render). The exceptions are `cancelDrain`
+ * and the listener helpers, which no-op because they sit in cleanup paths. This
+ * keeps SSR and web bundles importable while making it impossible to silently
+ * miss the lack of native support.
  *
  * Re-exports types, enums, errors, and `generateId` (which works on web).
  *
  * @packageDocumentation
  */
 
-import React, { createContext } from 'react';
+import React, { createContext, useContext } from 'react';
 
 import { SyncError } from './errors/SyncError';
 import { SyncErrorCode } from './errors/SyncErrorCode';
+import type { UseAutoSyncExtraOptions } from './hooks';
 import { ConnectionStatus, ConnectionType } from './types/enums';
 import type {
-  UseAutoSyncOptions,
   UseConnectionResult,
   UseOfflineQueueResult,
   UseSyncConfigResult,
   UseSyncEventsOptions,
   UseSyncQueueResult,
+  UseSyncSnapshotResult,
   UseSyncStatusResult,
 } from './types/hooks';
 import type {
@@ -35,6 +37,7 @@ import type {
   SyncResult,
 } from './types/sync';
 import type { ConnectionState } from './types/connection';
+import type { DrainOptions, DrainResult } from './types/drain';
 
 /* -------------------------------------------------------------------------- */
 /*                                  Re-exports                                */
@@ -43,7 +46,9 @@ import type { ConnectionState } from './types/connection';
 export * from './types';
 export { SyncError } from './errors/SyncError';
 export { SyncErrorCode } from './errors/SyncErrorCode';
+export type { ValidationIssue } from './errors/ValidationIssue';
 export { generateId } from './utils/idGenerator';
+export type { UseAutoSyncExtraOptions } from './hooks';
 
 /* -------------------------------------------------------------------------- */
 /*                                  Helpers                                   */
@@ -106,6 +111,21 @@ export async function getPendingItems(): Promise<SyncItem[]> {
 /** @public */
 export async function flush(): Promise<SyncResult> {
   throw unavailable('flush');
+}
+/** @public */
+export async function drainUntilEmpty(
+  _options?: DrainOptions
+): Promise<DrainResult> {
+  throw unavailable('drainUntilEmpty');
+}
+/**
+ * Web no-op twin of `cancelDrain`. No drain ever runs on web, so this does
+ * nothing and never throws — safe to call from cleanup paths for parity.
+ *
+ * @public
+ */
+export function cancelDrain(): void {
+  // no-op
 }
 /** @public */
 export async function pauseSync(): Promise<void> {
@@ -263,6 +283,21 @@ export function useOfflineQueue(): UseOfflineQueueResult {
 }
 
 /** @public */
+export function useSyncSnapshot(): UseSyncSnapshotResult {
+  return {
+    connection: INERT_CONNECTION,
+    size: 0,
+    items: [],
+    isSyncing: false,
+    isPaused: false,
+    progress: null,
+    lastResult: null,
+    isWaitingForConnection: false,
+    error: null,
+  };
+}
+
+/** @public */
 export function useSyncEvents(_options: UseSyncEventsOptions): void {
   // no-op
 }
@@ -283,7 +318,7 @@ export function useSyncConfig(): UseSyncConfigResult {
 }
 
 /** Mirrors `useAutoSync` from the native bundle. No-op on web. @public */
-export function useAutoSync(_options: UseAutoSyncOptions): void {
+export function useAutoSync(_options: UseAutoSyncExtraOptions): void {
   // no-op
 }
 
@@ -294,11 +329,13 @@ export function useAutoSync(_options: UseAutoSyncOptions): void {
 /** @public */
 export interface SyncProviderContextValue {
   config: SyncOptions | undefined;
+  hasProvider: boolean;
 }
 
 /** @public */
 export const SyncProviderContext = createContext<SyncProviderContextValue>({
   config: undefined,
+  hasProvider: false,
 });
 
 /** @public */
@@ -308,16 +345,32 @@ export interface SyncProviderProps {
   children: React.ReactNode;
 }
 
+/** One shared value, so a re-render does not re-render every consumer. */
+const WEB_PROVIDER_VALUE: SyncProviderContextValue = {
+  config: undefined,
+  hasProvider: true,
+};
+
 /**
  * Web no-op {@link SyncProviderContext} wrapper. Renders children with
- * `{ config: undefined }` and performs no native calls.
+ * `{ config: undefined, hasProvider: true }` and performs no native calls.
  *
  * @public
  */
 export const SyncProvider: React.FC<SyncProviderProps> = ({ children }) => {
   return (
-    <SyncProviderContext.Provider value={{ config: undefined }}>
+    <SyncProviderContext.Provider value={WEB_PROVIDER_VALUE}>
       {children}
     </SyncProviderContext.Provider>
   );
 };
+
+/**
+ * Web twin of `useSyncContext`. Returns the inert web context value; outside a
+ * `<SyncProvider>` that is `{ config: undefined, hasProvider: false }`.
+ *
+ * @public
+ */
+export function useSyncContext(): SyncProviderContextValue {
+  return useContext(SyncProviderContext);
+}

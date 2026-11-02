@@ -1,7 +1,7 @@
 ---
 sidebar_position: 7
 title: useAutoSync
-description: Orchestrator hook that triggers flushes on interval, reconnect, AppState foreground, and (optionally) registers background sync.
+description: Orchestrator hook that triggers JS-side flushes on an interval, on reconnect, and when the app returns to the foreground.
 keywords:
   - react-native
   - sync-provider
@@ -9,33 +9,27 @@ keywords:
   - useAutoSync
   - auto-sync
   - flush
-  - background-sync
+  - reconnect
 ---
 
 # `useAutoSync`
 
-Orchestrator hook that wires up the most common auto-flush triggers in one place: periodic interval, connectivity reconnect, metered-network gating, AppState foreground, and (optionally) registering background sync. Inert until `enabled` is `true`. Every trigger is wrapped in an `isSyncing()` guard so concurrent flushes do not stack.
+Orchestrator hook that wires up the common flush triggers in one place: a periodic interval, a connectivity reconnect, and, opt-in, the app returning to the foreground. Inert until `enabled` is `true`. Every trigger is guarded by `isSyncing()`, so flushes do not stack.
+
+This hook is what dispatches new items while the app runs. The `AUTOMATIC` strategy does not flush on enqueue or on reconnect, so without this hook, a `flush()` call, or an OS background window, a new item stays in the queue.
 
 ```ts
 import { useAutoSync } from '@gabriel-sisjr/react-native-sync-provider';
 ```
 
-**Platform:** Android and iOS.
+**Platform:** Android and iOS. A no-op on web.
 
 ---
 
 ## Signature
 
 ```ts
-function useAutoSync(options: {
-  enabled?: boolean;
-  flushOnReconnect?: boolean;
-  flushOnMetered?: boolean;
-  flushOnForeground?: boolean;
-  backgroundSync?: BackgroundSyncOptions;
-  intervalMs?: number;
-  flushOnAppForeground?: boolean;
-}): void
+function useAutoSync(options: UseAutoSyncExtraOptions): void
 ```
 
 ---
@@ -44,16 +38,18 @@ function useAutoSync(options: {
 
 | Property | Type | Required | Default | Description |
 |----------|------|----------|---------|-------------|
-| `enabled` | `boolean` | No | `false` | Master switch. When `false`, no triggers fire. |
-| `intervalMs` | `number` | No | `60_000` | Periodic interval between auto-flushes. Set to `0` to disable. |
+| `enabled` | `boolean` | No | `false` | Master switch. When `false`, no triggers fire and nothing is subscribed. |
+| `intervalMs` | `number` | No | `60_000` | Period of the tick. A value that is not positive falls back to the default, so the tick cannot be turned off while the hook is enabled. |
 | `flushOnReconnect` | `boolean` | No | `true` | Flush when `CONNECTION_CHANGED` reports a transition to `CONNECTED`. |
-| `flushOnMetered` | `boolean` | No | `false` | Allow flushes triggered by reconnect / interval to run when the only available connection is `METERED`. |
-| `flushOnForeground` | `boolean` | No | `false` | **Reserved for a future event-based foreground hook.** No-op today. Use `flushOnAppForeground` instead. |
-| `flushOnAppForeground` | `boolean` | No | `false` | When `true`, the hook subscribes to React Native's `AppState` and flushes on every `active` transition. JS-only extension. |
-| `backgroundSync` | [`BackgroundSyncOptions`](../types.md#backgroundsyncoptions) | No | -- | When provided, calls [`enableBackgroundSync`](../functions.md#enablebackgroundsync) on mount and [`disableBackgroundSync`](../functions.md#disablebackgroundsync) on unmount. |
+| `flushOnMetered` | `boolean` | No | `false` | Also flush on a transition to `METERED`. Needs `flushOnReconnect`. It gates this trigger only: the interval flushes on any connection. |
+| `flushOnAppForeground` | `boolean` | No | `false` | Flush whenever React Native's `AppState` changes to `active`, unless the connection status is `DISCONNECTED`. |
+| `flushOnForeground` | `boolean` | No | -- | **Reserved.** The hook ignores it. Use `flushOnAppForeground`. |
+| `backgroundSync` | [`BackgroundSyncOptions`](../types.md#backgroundsyncoptions) | No | -- | **Reserved.** The hook ignores it. Call [`enableBackgroundSync`](../functions.md#enablebackgroundsync), or pass `backgroundSync` to [`<SyncProvider>`](../context.md). |
 
-:::warning Conservative defaults
-By default the hook is inert (`enabled: false`). Once enabled, it will not flush on metered networks unless you opt in with `flushOnMetered: true`. If your traffic is small (telemetry, analytics, control-plane events), turning it on is safe; if your queue carries large payloads, leave it off to avoid burning user data.
+:::info Flushes are skipped while offline
+The interval and the foreground trigger read the connection status first and do nothing while it is `DISCONNECTED`, because a flush while offline can spend retry attempts and mark valid items `FAILED`. `UNKNOWN` and `METERED` still flush. See [Skip flushes while offline](#skip-the-interval-while-offline).
+
+Neither trigger checks queue size: on an empty queue each flush runs a 0/0 cycle that adds a row to the sync history.
 :::
 
 ---
@@ -66,12 +62,13 @@ By default the hook is inert (`enabled: false`). Once enabled, it will not flush
 
 ## Behavior
 
-- **`enabled` toggle** -- when `enabled` flips to `false`, all subscriptions tear down. Flipping back recreates them.
-- **Interval** -- a `setInterval(intervalMs)` calls `flush()` if the queue is non-empty and not already syncing.
-- **Reconnect** -- subscribes to `CONNECTION_CHANGED` events. On transition to `CONNECTED` (or to `METERED` when `flushOnMetered` is `true`), fires a guarded flush.
-- **AppState foreground** -- when `flushOnAppForeground` is `true`, subscribes to React Native `AppState` and flushes on every `'background' -> 'active'` transition.
-- **Background sync** -- if `backgroundSync` is provided, the hook owns the lifecycle: `enableBackgroundSync(options)` on mount, `disableBackgroundSync()` on unmount.
-- **Idempotent flushes** -- every trigger calls `isSyncing()` first; concurrent flush calls are skipped.
+- **`enabled` toggle** -- when `enabled` flips to `false`, all subscriptions tear down. Flipping back recreates them, with no immediate flush.
+- **Interval** -- a `setInterval(intervalMs)` calls `flush()` unless the status is `DISCONNECTED` or a cycle is already running. If the status cannot be read, the flush is skipped. It runs in JS, so it stops while the OS suspends the app.
+- **Reconnect** -- subscribes to `CONNECTION_CHANGED`. On a transition to `CONNECTED`, or to `METERED` when `flushOnMetered` is `true`, it fires a guarded flush. It follows the event, so it does not read the status.
+- **AppState foreground** -- when `flushOnAppForeground` is `true`, it flushes on every change to `active`, with the same status check as the interval.
+- **Guarded flushes** -- every trigger calls `isSyncing()` before it flushes, and a call made during a cycle is skipped.
+- **Errors** -- a failed flush is swallowed. The hook never throws to the consumer.
+- **Unmount** -- clears the interval and removes both subscriptions.
 
 ---
 
@@ -91,24 +88,43 @@ function App() {
 }
 ```
 
-### Full orchestration with background sync
+### Skip flushes while offline {#skip-the-interval-while-offline}
+
+The hook does this for you: keep `enabled` on while the device is offline. The interval and the foreground trigger resume by themselves, and the reconnect trigger flushes as soon as the device is back.
+
+Do not gate `enabled` on the connection. While `enabled` is `false` the hook is not subscribed, so its reconnect trigger cannot fire.
 
 ```tsx
 import { useAutoSync } from '@gabriel-sisjr/react-native-sync-provider';
 
 function App() {
-  useAutoSync({
-    enabled: true,
-    intervalMs: 30_000,
-    flushOnReconnect: true,
-    flushOnMetered: false,
-    flushOnAppForeground: true,
-    backgroundSync: {
-      minimumIntervalMs: 15 * 60 * 1000,
-      requiresUnmeteredNetwork: true,
-    },
-  });
+  useAutoSync({ enabled: true, intervalMs: 30_000 });
   return <RootNavigator />;
+}
+```
+
+### Together with background sync
+
+`useAutoSync` covers the running app, and [`enableBackgroundSync`](../functions.md#enablebackgroundsync) covers the windows the OS gives you while it is not running. They are set up separately.
+
+```tsx
+import {
+  SyncProvider,
+  useAutoSync,
+} from '@gabriel-sisjr/react-native-sync-provider';
+
+function AutoSync() {
+  useAutoSync({ enabled: true, flushOnAppForeground: true });
+  return null;
+}
+
+export default function App() {
+  return (
+    <SyncProvider options={SYNC_OPTIONS} backgroundSync={BACKGROUND_OPTIONS}>
+      <AutoSync />
+      <RootNavigator />
+    </SyncProvider>
+  );
 }
 ```
 
@@ -116,6 +132,6 @@ function App() {
 
 ## See also
 
-- [`flush`](../functions.md#flush), [`enableBackgroundSync`](../functions.md#enablebackgroundsync), [`disableBackgroundSync`](../functions.md#disablebackgroundsync).
-- [`useConnection`](./useConnection.md) -- the underlying connection signal.
+- [`flush`](../functions.md#flush), [`enableBackgroundSync`](../functions.md#enablebackgroundsync).
+- [`useConnection`](./useConnection.md) -- read the connection status in your UI.
 - [Background sync guide](../../guides/background-sync.md), [Connectivity detection guide](../../guides/connectivity-detection.md).

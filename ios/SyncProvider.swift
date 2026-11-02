@@ -3,10 +3,9 @@
 //  SyncProvider
 //
 //  Concrete implementation of the Nitro-generated `HybridSyncProviderSpec`.
-//  This file is the JS↔native bridge surface — it owns the singletons (Core
-//  Data stack, queue storage, dispatcher, connectivity monitor, event
-//  emitter, background sync manager, recovery manager) and translates every
-//  generated type to and from the internal Sendable representations.
+//  This file is the JS<->native bridge surface: it translates every generated
+//  type to and from the internal Sendable representations and delegates to
+//  `SyncEngine`, which owns the runtime and works with or without JS.
 //
 
 import Foundation
@@ -27,65 +26,38 @@ import NitroModules
 public final class HybridSyncProvider: HybridSyncProviderSpec {
     // MARK: - Components
 
-    private let storage: SyncQueueStorage
-    private let dispatcher: SyncDispatcher
-    private let connectivity: ConnectivityMonitor
-    private let emitter: SyncEventEmitter
-    private let backgroundManager: BackgroundSyncManager
-    private let recovery: RecoveryManager
+    private let engine: SyncEngine
 
-    // MARK: - In-memory snapshot of the active config
+    // MARK: - Listeners
 
-    private let configLock = NSLock()
-    private var lastSyncOptions: SyncOptionsSnapshot
+    /// Subscriptions made through this instance. The engine outlives the JS
+    /// runtime, so a reload would otherwise leave it calling into a dead one.
+    private let listenerLock = NSLock()
+    private var listenerIds: [String: Set<String>] = [:]
 
     // MARK: - Init
 
-    public override init() {
-        let storage = SyncQueueStorage()
-        let emitter = SyncEventEmitter()
-        let connectivity = ConnectivityMonitor.shared
+    public override convenience init() {
+        self.init(engine: .shared)
+    }
 
-        self.storage = storage
-        self.emitter = emitter
-        self.connectivity = connectivity
-        self.dispatcher = SyncDispatcher(storage: storage,
-                                         emitter: emitter,
-                                         connectivity: connectivity,
-                                         config: .default)
-        self.backgroundManager = BackgroundSyncManager(dispatcher: dispatcher, emitter: emitter)
-        self.recovery = RecoveryManager(storage: storage, emitter: emitter)
-        self.lastSyncOptions = SyncOptionsSnapshot.default
-
+    init(engine: SyncEngine) {
+        self.engine = engine
         super.init()
+        engine.attachHybrid()
 
         // Make this instance reachable from the AppDelegate hook.
         HybridSyncProvider.weakInstance = self
+    }
 
-        // Eagerly start the connectivity monitor so the first read returns a
-        // real snapshot rather than the .unknown default.
-        connectivity.start()
-
-        // Forward connectivity changes to the JS layer as `CONNECTION_CHANGED`
-        // events. The `ConnectivityMonitor` replays the current snapshot
-        // synchronously on subscribe, but that snapshot is `.unknown` until
-        // the first NWPathMonitor update — emitting it once primes the JS
-        // layer with the same baseline as `getConnectionStatus()`.
-        connectivity.subscribe { [weak self] snapshot in
-            self?.emitter.emit(.now(type: "CONNECTION_CHANGED",
-                                    connectionStatus: snapshot.status.rawValue))
+    deinit {
+        let channels = listenerLock.withLock { listenerIds }
+        for (channel, ids) in channels {
+            for id in ids {
+                engine.emitter.removeListener(channel: channel, id: id)
+            }
         }
-
-        // Register BGTask handlers as early as possible. `enableBackgroundSync`
-        // is the consumer-controlled toggle; registering only flips on the
-        // dispatch slot, it does not schedule anything.
-        backgroundManager.registerHandlers()
-
-        // Recovery on launch: detached so we do not block the bridge init.
-        let recoveryRef = recovery
-        Task.detached {
-            await recoveryRef.recoverPendingItems()
-        }
+        engine.detachHybrid()
     }
 
     // MARK: - Queue ops
@@ -97,8 +69,8 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
             }
             do {
                 let input = try Self.translate(input: item)
-                let id = try await self.storage.enqueue(input: input)
-                self.emitter.emit(.now(type: "ITEM_ENQUEUED", itemId: id))
+                let id = try await self.engine.storage.enqueue(input: input)
+                self.engine.emitter.emit(.now(type: "ITEM_ENQUEUED", itemId: id))
                 return id
             } catch {
                 throw wrapAsSyncProviderError(error)
@@ -113,9 +85,9 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
             }
             do {
                 let inputs = try items.map(Self.translate(input:))
-                let ids = try await self.storage.enqueueBatch(inputs: inputs)
+                let ids = try await self.engine.storage.enqueueBatch(inputs: inputs)
                 for id in ids {
-                    self.emitter.emit(.now(type: "ITEM_ENQUEUED", itemId: id))
+                    self.engine.emitter.emit(.now(type: "ITEM_ENQUEUED", itemId: id))
                 }
                 return ids
             } catch {
@@ -128,9 +100,9 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
         return Promise.async { [weak self] in
             guard let self = self else { return false }
             do {
-                let removed = try await self.storage.remove(id: id)
+                let removed = try await self.engine.storage.remove(id: id)
                 if removed {
-                    self.emitter.emit(.now(type: "ITEM_REMOVED", itemId: id))
+                    self.engine.emitter.emit(.now(type: "ITEM_REMOVED", itemId: id))
                 }
                 return removed
             } catch {
@@ -143,8 +115,8 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
         return Promise.async { [weak self] in
             guard let self = self else { return }
             do {
-                try await self.storage.clear()
-                self.emitter.emit(.now(type: "QUEUE_CLEARED"))
+                try await self.engine.storage.clear()
+                self.engine.emitter.emit(.now(type: "QUEUE_CLEARED"))
             } catch {
                 throw wrapAsSyncProviderError(error)
             }
@@ -155,7 +127,7 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
         return Promise.async { [weak self] in
             guard let self = self else { return 0 }
             do {
-                let size = try await self.storage.getSize()
+                let size = try await self.engine.storage.getSize()
                 return Double(size)
             } catch {
                 throw wrapAsSyncProviderError(error)
@@ -167,7 +139,7 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
         return Promise.async { [weak self] in
             guard let self = self else { return [] }
             do {
-                let stored = try await self.storage.getAll()
+                let stored = try await self.engine.storage.getQueued()
                 return stored.map(Self.translate(stored:))
             } catch {
                 throw wrapAsSyncProviderError(error)
@@ -183,7 +155,7 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
                 return Self.emptySyncResult()
             }
             do {
-                let result = try await self.dispatcher.flush()
+                let result = try await self.engine.dispatcher.flush()
                 return Self.translate(result: result)
             } catch {
                 throw wrapAsSyncProviderError(error)
@@ -194,23 +166,23 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
     public func pauseSync() throws -> Promise<Void> {
         return Promise.async { [weak self] in
             guard let self = self else { return }
-            await self.dispatcher.setPaused(true)
-            self.emitter.emit(.now(type: "PAUSED"))
+            await self.engine.pause()
+            self.engine.emitter.emit(.now(type: "PAUSED"))
         }
     }
 
     public func resumeSync() throws -> Promise<Void> {
         return Promise.async { [weak self] in
             guard let self = self else { return }
-            await self.dispatcher.setPaused(false)
-            self.emitter.emit(.now(type: "RESUMED"))
+            await self.engine.resume()
+            self.engine.emitter.emit(.now(type: "RESUMED"))
         }
     }
 
     public func isSyncing() throws -> Promise<Bool> {
         return Promise.async { [weak self] in
             guard let self = self else { return false }
-            return await self.dispatcher.cycleRunning()
+            return await self.engine.dispatcher.cycleRunning()
         }
     }
 
@@ -219,13 +191,7 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
     public func configureSync(options: SyncOptions) throws -> Promise<Void> {
         return Promise.async { [weak self] in
             guard let self = self else { return }
-            let snapshot = Self.translate(options: options)
-            self.configLock.withLock {
-                self.lastSyncOptions = snapshot
-            }
-
-            await self.storage.updateCapacity(Int(snapshot.maxQueueSize))
-            await self.dispatcher.updateConfig(snapshot.toDispatcherConfig())
+            await self.engine.configure(Self.translate(options: options))
         }
     }
 
@@ -234,10 +200,7 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
             guard let self = self else {
                 return Self.translate(snapshot: .default)
             }
-            let snapshot = self.configLock.withLock {
-                self.lastSyncOptions
-            }
-            return Self.translate(snapshot: snapshot)
+            return Self.translate(snapshot: self.engine.currentOptions())
         }
     }
 
@@ -247,7 +210,7 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
         return Promise.async { [weak self] in
             guard let self = self else { return Self.emptySyncResult() }
             do {
-                let history = try await self.storage.getHistory(limit: 1)
+                let history = try await self.engine.storage.getHistory(limit: 1)
                 if let latest = history.first {
                     return Self.translate(result: latest)
                 }
@@ -263,7 +226,7 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
             guard let self = self else { return [] }
             do {
                 let safeLimit = Int(max(0, limit))
-                let history = try await self.storage.getHistory(limit: safeLimit)
+                let history = try await self.engine.storage.getHistory(limit: safeLimit)
                 return history.map(Self.translate(result:))
             } catch {
                 throw wrapAsSyncProviderError(error)
@@ -275,7 +238,7 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
         return Promise.async { [weak self] in
             guard let self = self else { return }
             do {
-                try await self.storage.clearHistory()
+                try await self.engine.storage.clearHistory()
             } catch {
                 throw wrapAsSyncProviderError(error)
             }
@@ -289,7 +252,7 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
             guard let self = self else {
                 return Self.translate(snapshot: .unknown)
             }
-            return Self.translate(snapshot: self.connectivity.current)
+            return Self.translate(snapshot: self.engine.connectivity.current)
         }
     }
 
@@ -300,7 +263,7 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
             guard let self = self else { return }
             let value = Self.translate(options: options)
             do {
-                try self.backgroundManager.enable(options: value)
+                try self.engine.background.enable(options: value)
             } catch {
                 throw wrapAsSyncProviderError(error)
             }
@@ -309,13 +272,13 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
 
     public func disableBackgroundSync() throws -> Promise<Void> {
         return Promise.async { [weak self] in
-            self?.backgroundManager.disable()
+            self?.engine.background.disable()
         }
     }
 
     public func isBackgroundSyncEnabled() throws -> Promise<Bool> {
         return Promise.async { [weak self] in
-            return self?.backgroundManager.isEnabled ?? false
+            return self?.engine.background.isEnabled ?? false
         }
     }
 
@@ -328,8 +291,11 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
                 throw SyncProviderError(code: .nativeModuleUnavailable, message: "SyncProvider deallocated")
             }
             do {
-                let id = try self.emitter.addListener(channel: event) { payload in
+                let id = try self.engine.emitter.addListener(channel: event) { payload in
                     callback(Self.translate(payload: payload))
+                }
+                self.listenerLock.withLock {
+                    _ = self.listenerIds[event, default: []].insert(id)
                 }
                 return id
             } catch {
@@ -340,7 +306,11 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
 
     public func removeListener(event: String, subscriptionId: String) throws -> Promise<Void> {
         return Promise.async { [weak self] in
-            self?.emitter.removeListener(channel: event, id: subscriptionId)
+            guard let self = self else { return }
+            self.listenerLock.withLock {
+                _ = self.listenerIds[event]?.remove(subscriptionId)
+            }
+            self.engine.emitter.removeListener(channel: event, id: subscriptionId)
         }
     }
 
@@ -361,7 +331,7 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
         completionHandler: @escaping () -> Void
     ) {
         if let live = HybridSyncProvider.weakInstance {
-            live.dispatcher.handleBackgroundURLSessionEvents(
+            live.engine.dispatcher.handleBackgroundURLSessionEvents(
                 identifier: identifier,
                 completionHandler: completionHandler
             )
@@ -380,35 +350,6 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
 // MARK: - Translation helpers
 
 extension HybridSyncProvider {
-    /// Sendable mirror of `SyncOptions` used to keep the Nitro C++ struct out
-    /// of the `actor` boundary.
-    struct SyncOptionsSnapshot: Sendable, Equatable {
-        var strategy: String
-        var retryPolicy: RetryPolicyValue
-        var batchSize: Double
-        var requestTimeoutMs: Double
-        var maxQueueSize: Double
-        var persistQueue: Bool
-        var defaultHeaders: [String: String]
-
-        static let `default` = SyncOptionsSnapshot(
-            strategy: "AUTOMATIC",
-            retryPolicy: .default,
-            batchSize: 25,
-            requestTimeoutMs: 30_000,
-            maxQueueSize: Double(kDefaultQueueCapacity),
-            persistQueue: true,
-            defaultHeaders: [:]
-        )
-
-        func toDispatcherConfig() -> DispatcherConfig {
-            DispatcherConfig(retryPolicy: retryPolicy,
-                             requestTimeoutMs: Int(requestTimeoutMs),
-                             batchSize: Int(batchSize),
-                             defaultHeaders: defaultHeaders)
-        }
-    }
-
     static func translate(input: SyncItemInput) throws -> SyncQueueStorage.SyncItemInputData {
         let url = input.url
         if url.isEmpty {
@@ -442,6 +383,8 @@ extension HybridSyncProvider {
                         contentType: stored.contentType,
                         priority: priority,
                         createdAt: Double(stored.createdAt),
+                        attempts: Double(stored.attempts),
+                        nextRetryAt: Double(stored.nextRetryAt),
                         metadata: stored.metadata)
     }
 
@@ -521,6 +464,7 @@ extension HybridSyncProvider {
             requiresCharging: options.requiresCharging,
             requiresUnmeteredNetwork: options.requiresUnmeteredNetwork,
             requiresDeviceIdle: options.requiresDeviceIdle,
+            foregroundOnly: options.foregroundOnly,
             taskIdentifier: options.taskIdentifier
         )
     }

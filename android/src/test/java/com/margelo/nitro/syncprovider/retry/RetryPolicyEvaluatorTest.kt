@@ -179,4 +179,57 @@ internal class RetryPolicyEvaluatorTest {
     assertThat(RetryPolicyEvaluator.hasBudget(0, policy)).isTrue()
     assertThat(RetryPolicyEvaluator.hasBudget(1, policy)).isFalse()
   }
+
+  @Test
+  fun `fibonacci stays exact where a Long could still represent it`() {
+    val policy = TestData.retryPolicy(
+      backoff = BackoffStrategy.FIBONACCI,
+      baseDelayMs = 1L,
+      maxDelayMs = Long.MAX_VALUE,
+      jitter = false,
+    )
+
+    // F(70), well inside a Double's 53 bits of exact integers.
+    assertThat(RetryPolicyEvaluator.computeDelayMs(70, policy)).isEqualTo(190_392_490_709_135L)
+  }
+
+  @Test
+  fun `fibonacci does not overflow into a negative delay at attempt 93 and beyond`() {
+    val policy = TestData.retryPolicy(
+      backoff = BackoffStrategy.FIBONACCI,
+      baseDelayMs = 1_000L,
+      maxDelayMs = 60_000L,
+      jitter = false,
+    )
+
+    // F(93) is the first value past Long.MAX_VALUE. 2000 is past a Double's range too.
+    for (attempt in listOf(92, 93, 94, 150, 300, 2_000)) {
+      assertThat(RetryPolicyEvaluator.computeDelayMs(attempt, policy)).isEqualTo(60_000L)
+    }
+  }
+
+  @Test
+  fun `a huge attempt stays capped under jitter for every strategy`() {
+    for (strategy in BackoffStrategy.values()) {
+      val policy = TestData.retryPolicy(
+        backoff = strategy,
+        baseDelayMs = 1_000L,
+        maxDelayMs = 60_000L,
+        jitter = true,
+      )
+
+      val delay = RetryPolicyEvaluator.computeDelayMs(2_000, policy, Random(7))
+
+      assertThat(delay).isIn(com.google.common.collect.Range.closed(1L, 60_000L))
+    }
+  }
+
+  @Test
+  fun `a zero base stays zero instead of becoming NaN at a huge attempt`() {
+    for (strategy in BackoffStrategy.values()) {
+      val policy = TestData.retryPolicy(backoff = strategy, baseDelayMs = 0L, maxDelayMs = 0L, jitter = true)
+
+      assertThat(RetryPolicyEvaluator.computeDelayMs(2_000, policy, Random(7))).isEqualTo(0L)
+    }
+  }
 }

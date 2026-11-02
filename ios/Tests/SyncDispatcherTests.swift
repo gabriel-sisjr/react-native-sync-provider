@@ -253,7 +253,7 @@ final class SyncDispatcherTests: XCTestCase {
         // Drive attempts to maxAttempts - 1 so the next dispatch is the final try
         // and the 503 below should mark the item FAILED with MAX_ATTEMPTS_EXCEEDED.
         try await storage.markInFlight(id: id)
-        try await storage.markPendingForRetry(id: id, errorCode: "NETWORK_ERROR")
+        try await storage.markPendingForRetry(id: id, errorCode: "NETWORK_ERROR", retryDelayMs: 0)
 
         URLProtocolStub.setHandler { request in
             return (self.httpResponse(request.url!.absoluteString, status: 503), Data())

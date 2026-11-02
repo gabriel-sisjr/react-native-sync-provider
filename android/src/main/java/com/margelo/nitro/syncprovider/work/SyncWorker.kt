@@ -7,10 +7,15 @@ import androidx.work.WorkerParameters
 import com.margelo.nitro.syncprovider.SyncEventType
 import com.margelo.nitro.syncprovider.SyncProviderRuntime
 import com.margelo.nitro.syncprovider.events.SyncEventEmitter
+import kotlinx.coroutines.CancellationException
 
 /**
- * WorkManager-driven flush worker. Always runs against the singleton
- * [SyncProviderRuntime] so configuration set via the JS facade is honored.
+ * WorkManager-driven flush worker. Runs against the singleton [SyncProviderRuntime],
+ * which restores the persisted configuration when this is a cold start with no JS.
+ * With no JS engine attached, it also recovers rows a dead process left `IN_FLIGHT`.
+ *
+ * Inert when dispatch is blocked, recovery included.
+ * See [SyncProviderRuntime.isBackgroundDispatchBlocked].
  */
 internal class SyncWorker(
   context: Context,
@@ -21,6 +26,8 @@ internal class SyncWorker(
     val runtime = SyncProviderRuntime.getOrNull(applicationContext)
       ?: SyncProviderRuntime.bootstrap(applicationContext)
 
+    if (runtime.isBackgroundDispatchBlocked()) return Result.success()
+
     val emitter = runtime.emitter
     val isPeriodic = inputData.getBoolean(KEY_PERIODIC, false)
     if (isPeriodic) {
@@ -30,11 +37,22 @@ internal class SyncWorker(
     }
 
     return try {
-      val result = runtime.dispatcher.flush()
+      // Recovery otherwise needs an engine to attach, a boot or an app update, and until
+      // then flush cannot see a row a dead process left IN_FLIGHT. The reset takes the
+      // flush mutex, so it cannot catch a running cycle. It sends nothing, so unlike
+      // dispatch it does not wait for headers that cannot be recovered.
+      if (!runtime.isEngineAttached) runtime.dispatcher.resetInFlight()
+      runtime.dispatcher.flush()
       if (isPeriodic) {
         emitter.emit(SyncEventEmitter.event(SyncEventType.BACKGROUND_SYNC_COMPLETED))
       }
-      if (result.failureCount > 0) Result.retry() else Result.success()
+      // A completed flush is always a worker success: retriable items are re-driven
+      // by their persisted cooldowns and terminal failures are done. Returning
+      // Result.retry() on `failureCount > 0` would make WorkManager's own backoff
+      // race the retry wake, so it stays reserved for whole-worker failures.
+      Result.success()
+    } catch (e: CancellationException) {
+      throw e
     } catch (t: Throwable) {
       Log.e(TAG, "SyncWorker failed", t)
       Result.retry()

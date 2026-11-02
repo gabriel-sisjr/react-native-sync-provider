@@ -53,7 +53,7 @@ You MUST run `yarn nitrogen` after every edit to `src/SyncProvider.nitro.ts` —
 1. Edit the interface in `src/SyncProvider.nitro.ts`.
 2. Run `yarn nitrogen` (regenerates the spec base classes — old method signatures will fail to compile).
 3. Implement the new method in **both** `ios/SyncProvider.swift` and `android/src/main/java/com/margelo/nitro/syncprovider/SyncProvider.kt`.
-4. Surface it in the JS facade: re-export from `src/index.tsx`. If the method is JSI-incompatible by itself (e.g. needs platform-specific shims), add a wrapper in `src/<name>.native.tsx` and a throwing fallback in `src/<name>.tsx`.
+4. Surface it in the JS facade by adding the wrapper directly in `src/index.tsx` (via `nativeOrThrow()`), plus a throwing twin in `src/index.web.tsx`. The platform split is at the entry level: there is no per-method `.native.tsx` / `.tsx` split.
 5. Run `yarn typecheck && yarn lint && yarn test`.
 6. Rebuild the example app (`yarn example android` / `ios`) — JS-only changes hot-reload, native changes require a rebuild.
 
@@ -126,8 +126,8 @@ test(facade): cover sentinel-translation in getLastSyncResult
 
 `lefthook.yml` runs on every commit:
 
-- **`pre-commit`** (parallel) — `npx eslint {staged_files}` + `npx tsc`.
-- **`commit-msg`** — `npx commitlint --edit`.
+- **`pre-commit`** (parallel) — `yarn eslint {staged_files}` + `yarn tsc --noEmit`.
+- **`commit-msg`** — `yarn commitlint --edit`.
 
 Skipping these masks real bugs. If a hook fails, fix the cause and re-stage.
 
@@ -142,4 +142,4 @@ Skipping these masks real bugs. If a hook fails, fix the cause and re-stage.
 
 ## Releases
 
-Automated release flow (`release-it` + publish workflows) is planned; until then, releases are manual: bump `package.json`, tag, and `npm publish`. Watch the changelog discipline — every release entry mirrors the Conventional Commits log.
+Releases use `release-it` plus the publish workflows, and every published artifact goes through CI. See the Releasing section of the root [`CONTRIBUTING.md`](https://github.com/gabriel-sisjr/react-native-sync-provider/blob/develop/CONTRIBUTING.md#releasing). Watch the changelog discipline — every release entry mirrors the Conventional Commits log.

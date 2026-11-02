@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <model type="com.apple.IDECoreDataModeler.DataModel" documentVersion="1.0" lastSavedToolsVersion="22504" systemVersion="23F79" minimumToolsVersion="Automatic" sourceLanguage="Swift" userDefinedModelVersionIdentifier="">
-    <entity name="SyncItemEntity" representedClassName="SyncItemEntity" syncable="YES" codeGenerationType="manual/none">
+    <entity name="SyncItemEntity" representedClassName="SyncItemEntity" syncable="YES">
         <attribute name="attempts" optional="NO" attributeType="Integer 32" defaultValueString="0" usesScalarValueType="YES"/>
         <attribute name="body" optional="YES" attributeType="String"/>
         <attribute name="contentType" optional="YES" attributeType="String"/>
@@ -20,7 +20,7 @@
             </uniquenessConstraint>
         </uniquenessConstraints>
     </entity>
-    <entity name="SyncResultEntity" representedClassName="SyncResultEntity" syncable="YES" codeGenerationType="manual/none">
+    <entity name="SyncResultEntity" representedClassName="SyncResultEntity" syncable="YES">
         <attribute name="errorMessage" optional="YES" attributeType="String"/>
         <attribute name="finishedAt" optional="NO" attributeType="Integer 64" defaultValueString="0" usesScalarValueType="YES"/>
         <attribute name="id" optional="NO" attributeType="String"/>

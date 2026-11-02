@@ -84,7 +84,7 @@ enum ConnectionType {
 
 ## `SyncStrategy`
 
-When the engine flushes the queue.
+What the engine schedules on its own. `flush()` works the same under every strategy, and enqueueing never triggers a flush under any of them: mount [`useAutoSync`](./hooks/useAutoSync.md) or call `flush()`.
 
 ```ts
 enum SyncStrategy {
@@ -96,15 +96,15 @@ enum SyncStrategy {
 
 | Value | Description |
 |-------|-------------|
-| `AUTOMATIC` | Flush whenever the queue is non-empty and connectivity allows. The default. |
-| `MANUAL` | Never flush implicitly -- only when [`flush()`](./functions.md#flush) is called. |
-| `OPPORTUNISTIC` | Flush only on opportunistic windows (foreground resume, charging, unmetered). |
+| `AUTOMATIC` | The engine retries on its own: a failed item is dispatched again when its cooldown ends, and pending items are dispatched on `resumeSync()`. The default. |
+| `MANUAL` | The engine schedules nothing on its own: no retry timer and no Android retry kick. Items are dispatched by [`flush()`](./functions.md#flush), plus any OS windows enabled through [`enableBackgroundSync`](./functions.md#enablebackgroundsync): use `foregroundOnly` to stop those. |
+| `OPPORTUNISTIC` | Reserved for flushing only on opportunistic windows. Not implemented yet: it currently behaves like `AUTOMATIC`. |
 
 ---
 
 ## `SyncPriority`
 
-Dispatch lane assigned to each item. Higher priorities drain before lower priorities of the same age.
+Dispatch lane assigned to each item. Priority is ordered first, then age: a `HIGH` item goes before any older `NORMAL` item.
 
 ```ts
 enum SyncPriority {
@@ -116,9 +116,9 @@ enum SyncPriority {
 
 | Value | Description | Native mapping |
 |-------|-------------|----------------|
-| `HIGH` | Drained first. Use for user-blocking actions (form submits). | Stored as integer `2` in Core Data / Room for ORDER BY. |
+| `HIGH` | Drained first. Use for user-blocking actions (form submits). | Room `priorityWeight` `0`. iOS ranks the stored string in memory. |
 | `NORMAL` | Default lane. | `1` |
-| `LOW` | Drained last. Use for telemetry, analytics. | `0` |
+| `LOW` | Drained last. Use for telemetry, analytics. | `2` |
 
 ---
 
@@ -134,11 +134,11 @@ enum BackoffStrategy {
 }
 ```
 
-| Value | Description | Native mapping |
-|-------|-------------|----------------|
-| `LINEAR` | `delay = baseDelayMs * attempt`. Bounded by `maxDelayMs`. | `RetryBackoff.linear()` |
-| `EXPONENTIAL` | `delay = baseDelayMs * 2^(attempt-1)`. Default. | `RetryBackoff.exponential()` |
-| `FIBONACCI` | `delay = baseDelayMs * fib(attempt)`. Slower growth than exponential. | `RetryBackoff.fibonacci()` |
+| Value | Description |
+|-------|-------------|
+| `LINEAR` | `delay = baseDelayMs * attempt`. Bounded by `maxDelayMs`. |
+| `EXPONENTIAL` | `delay = baseDelayMs * 2^(attempt-1)`. Bounded by `maxDelayMs`. Default. |
+| `FIBONACCI` | `delay = baseDelayMs * fib(attempt)`. Bounded by `maxDelayMs`. Slower growth than exponential. |
 
 See [Retry policy guide](../guides/retry-policy.md) for tuning advice.
 
@@ -160,11 +160,11 @@ enum HttpMethod {
 
 | Value | Description |
 |-------|-------------|
-| `GET` | Read. Body is ignored. |
+| `GET` | Read. Send no body: Android drops one. |
 | `POST` | Create. |
 | `PUT` | Replace. |
 | `PATCH` | Partial update. |
-| `DELETE` | Remove. |
+| `DELETE` | Remove. Send no body: Android drops one. |
 
 ---
 
@@ -194,21 +194,53 @@ enum SyncEventType {
 
 | Value | When it fires | Notable payload fields |
 |-------|---------------|------------------------|
-| `ITEM_ENQUEUED` | After `enqueue` / `enqueueBatch` persists an item. | `itemId`, `metadata` |
-| `ITEM_REMOVED` | After `removeItem` succeeds. | `itemId` |
-| `SYNC_STARTED` | A flush begins. | -- |
-| `SYNC_PROGRESS` | Per-batch progress during a flush. | `progress` (0..1) |
-| `SYNC_SUCCEEDED` | A flush finishes with no failures. | -- |
-| `SYNC_FAILED` | A flush finishes with one or more failures. | -- |
-| `ITEM_SUCCEEDED` | A single item dispatched successfully. | `itemId`, `statusCode`, `metadata` |
-| `ITEM_FAILED` | A single item exhausted retries or hit a terminal status. | `itemId`, `errorCode`, `statusCode`, `attempt`, `metadata` |
-| `ITEM_RETRYING` | A single item failed but will be retried. | `itemId`, `errorCode`, `attempt`, `metadata` |
+| `ITEM_ENQUEUED` | After `enqueue` / `enqueueBatch` persists an item. | `itemId` |
+| `ITEM_REMOVED` | After `removeItem` removes an item. A delivered item leaves the queue with `ITEM_SUCCEEDED` instead. | `itemId` |
+| `SYNC_STARTED` | A flush cycle begins. | -- |
+| `SYNC_PROGRESS` | After each item in a cycle. **iOS only.** | `progress` (0..1) |
+| `SYNC_SUCCEEDED` | A cycle finishes with no permanent failure. That includes a 0/0 cycle with nothing eligible, and a cycle whose items all went back to wait for a retry. | -- |
+| `SYNC_FAILED` | A cycle finishes with one or more permanent failures, or dies. | `errorCode`, only when the cycle died |
+| `ITEM_SUCCEEDED` | A single item dispatched successfully. | `itemId`, `statusCode`, `attempt` |
+| `ITEM_FAILED` | A single item failed permanently: a non-retryable failure, or a retriable one with no attempts left. | `itemId`, `errorCode`, `statusCode`, `attempt` |
+| `ITEM_RETRYING` | A single item failed and went back to wait, including a [credential hold](../guides/background-sync.md#cold-start-configuration). | `itemId`, `errorCode`, `statusCode`, `attempt` |
 | `QUEUE_CLEARED` | After `clearQueue`. | -- |
 | `CONNECTION_CHANGED` | The native monitor reported a transition. | `connectionStatus` |
 | `PAUSED` | After `pauseSync`. | -- |
-| `RESUMED` | After `resumeSync`. | -- |
-| `BACKGROUND_SYNC_STARTED` | A `BGTaskScheduler` / `WorkManager` run starts. | -- |
-| `BACKGROUND_SYNC_COMPLETED` | The same run finishes. | -- |
+| `RESUMED` | After `resumeSync`. iOS also emits it at launch when recovery put interrupted items back in the queue. A pause cleared by a launch emits nothing. | -- |
+| `BACKGROUND_SYNC_STARTED` | A background window starts: a BGTask on iOS, the periodic worker on Android. | -- |
+| `BACKGROUND_SYNC_COMPLETED` | The same window finishes. | -- |
+
+Events reach only listeners in a running JS engine. A worker or BGTask with no JS still dispatches, but nobody receives its events.
+
+The `metadata` field on these events is never the item's `metadata`. See [`SyncEvent`](./types.md#syncevent).
+
+---
+
+## `NetworkQuality`
+
+:::note Forward type for v0.3
+`NetworkQuality` is the network-quality classification slated for v0.3. It is introduced early so consumer types can depend on its final shape, but in v0.2 it is surfaced **only** as the optional [`UseSyncSnapshotResult.networkQuality`](./types.md#usesyncsnapshotresult) field and is **ALWAYS `undefined`** until the v0.3 classifier ships.
+:::
+
+Coarse network-quality classification. The value set is ordered **worst → best** so consumers can compare or threshold on it once the v0.3 classifier populates it.
+
+```ts
+enum NetworkQuality {
+  OFFLINE = 'OFFLINE',
+  POOR = 'POOR',
+  MODERATE = 'MODERATE',
+  GOOD = 'GOOD',
+  EXCELLENT = 'EXCELLENT',
+}
+```
+
+| Value | Description |
+|-------|-------------|
+| `OFFLINE` | No usable network path -- equivalent to [`ConnectionStatus.DISCONNECTED`](#connectionstatus). |
+| `POOR` | Connected but throughput/latency is poor -- sync should be conservative. |
+| `MODERATE` | Usable mid-tier link -- acceptable for most foreground sync. |
+| `GOOD` | Healthy link -- suitable for normal background and foreground sync. |
+| `EXCELLENT` | Best-tier link (typically unmetered Wi-Fi/ethernet) -- no constraints. |
 
 ---
 
@@ -216,3 +248,4 @@ enum SyncEventType {
 
 - [`SyncEvent` type](./types.md#syncevent), [Listeners](./listeners.md), [`useSyncEvents`](./hooks/useSyncEvents.md).
 - [Errors](./errors.md) for `SyncErrorCode`.
+- [`useSyncSnapshot`](./hooks/useSyncSnapshot.md) and [`SyncDeadLetterItem`](./types.md#syncdeadletteritem) -- where the forward `NetworkQuality` is surfaced.

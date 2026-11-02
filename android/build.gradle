@@ -161,6 +161,9 @@ android {
   }
 }
 
+// migrations folder
+android.sourceSets.test.assets.srcDirs += files("$projectDir/schemas")
+
 ksp {
   arg("room.schemaLocation", "$projectDir/schemas")
   arg("room.incremental", "true")

@@ -4,6 +4,11 @@ import Foundation
 
 /// Test helper. Constructs a fresh in-memory Core Data stack on every call so
 /// XCTest cases stay independent.
+///
+/// The store is SQLite at `/dev/null`, which SQLite keeps in memory.
+/// `NSInMemoryStoreType` is not an option: it crashes on `NSBatchDeleteRequest`,
+/// which production uses to clear the queue and the history, and it evaluates
+/// predicates in Swift-side code rather than in SQL.
 enum InMemoryCoreDataStack {
     /// Build the `NSManagedObjectModel` programmatically. We mirror the model
     /// declared in `ios/Database/SyncProvider.xcdatamodeld/.../contents` — the
@@ -27,6 +32,9 @@ enum InMemoryCoreDataStack {
             attribute("lastErrorCode", type: .stringAttributeType, optional: true),
             attribute("metadataJSON", type: .binaryDataAttributeType, optional: true),
             attribute("method", type: .stringAttributeType, optional: false, defaultValue: "POST"),
+            // Mirrors Core Data model v2 (`SyncProvider 2.xcdatamodel`). Every
+            // schema change is made twice: real model + this test model.
+            attribute("nextRetryAt", type: .integer64AttributeType, optional: false, defaultValue: 0),
             attribute("priority", type: .stringAttributeType, optional: false, defaultValue: "NORMAL"),
             attribute("status", type: .stringAttributeType, optional: false, defaultValue: "PENDING"),
             attribute("url", type: .stringAttributeType, optional: false)
@@ -58,7 +66,7 @@ enum InMemoryCoreDataStack {
         let container = NSPersistentContainer(name: "SyncProvider", managedObjectModel: model)
 
         let description = NSPersistentStoreDescription()
-        description.type = NSInMemoryStoreType
+        description.type = NSSQLiteStoreType
         description.url = URL(fileURLWithPath: "/dev/null")
         description.shouldAddStoreAsynchronously = false
         container.persistentStoreDescriptions = [description]
@@ -93,7 +101,6 @@ enum InMemoryCoreDataStack {
         }
         // Match the model file: most numeric attrs use scalar getters/setters.
         attr.allowsExternalBinaryDataStorage = false
-        attr.isIndexed = false
         if !usesScalar && type == .integer64AttributeType {
             attr.attributeValueClassName = "NSNumber"
         }

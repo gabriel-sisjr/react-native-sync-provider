@@ -77,8 +77,26 @@ actor SyncQueueStorage {
         try await dao.fetchPending(limit: limit)
     }
 
+    /// Items waiting to be dispatched: every `PENDING` row, cooling or not.
+    func getQueued() async throws -> [StoredSyncItem] {
+        try await dao.fetchQueued()
+    }
+
+    /// Every row, in any status.
     func getAll() async throws -> [StoredSyncItem] {
         try await dao.fetchAll()
+    }
+
+    /// When the retry timer must wake for rows already attempted, or `nil`
+    /// when none is waiting.
+    func earliestRetryAt() async throws -> Int64? {
+        try await dao.earliestRetryAt()
+    }
+
+    /// The earliest due time across every `PENDING` row, or `nil` for an empty
+    /// queue. `0` means a never-attempted row is waiting.
+    func earliestPendingAt() async throws -> Int64? {
+        try await dao.earliestPendingAt()
     }
 
     // MARK: - Status mutations
@@ -91,8 +109,29 @@ actor SyncQueueStorage {
         try await dao.markFailed(id: id, errorCode: errorCode)
     }
 
-    func markPendingForRetry(id: String, errorCode: String?) async throws {
-        try await dao.markPendingForRetry(id: id, errorCode: errorCode)
+    /// Reset an item to PENDING for retry and persist its backoff cooldown.
+    ///
+    /// - Parameters:
+    ///   - errorCode: the failure code to record on the item.
+    ///   - retryDelayMs: delay (ms) before the item is dispatchable again,
+    ///     computed by ``RetryPolicyEvaluator`` so a degraded server cannot
+    ///     hot-loop. There is no default: a caller must not be able to skip the
+    ///     cooldown by omission.
+    func markPendingForRetry(id: String, errorCode: String?, retryDelayMs: Int) async throws {
+        try await dao.markPendingForRetry(id: id, errorCode: errorCode, retryDelayMs: retryDelayMs)
+    }
+
+    /// Put back an item rejected for a stale persisted credential, refunding
+    /// its attempt. See ``SyncItemDao/markCredentialRejected(id:errorCode:retryDelayMs:attempts:)``.
+    @discardableResult
+    func markCredentialRejected(id: String,
+                                errorCode: String?,
+                                retryDelayMs: Int,
+                                attempts: Int32) async throws -> Int64 {
+        try await dao.markCredentialRejected(id: id,
+                                             errorCode: errorCode,
+                                             retryDelayMs: retryDelayMs,
+                                             attempts: attempts)
     }
 
     @discardableResult
@@ -142,6 +181,10 @@ actor SyncQueueStorage {
             createdAt: nowMs,
             attempts: 0,
             lastAttemptAt: nil,
+            // `0` means "never attempted", which is eligible now.
+            // `markPendingForRetry` writes a positive deadline on retriable
+            // failure (the persisted retry cooldown).
+            nextRetryAt: 0,
             lastErrorCode: nil,
             status: SyncItemStatus.pending.rawValue,
             metadata: input.metadata

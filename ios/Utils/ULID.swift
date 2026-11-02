@@ -87,14 +87,8 @@ enum ULID {
         }
         output.append(contentsOf: tsChars)
 
-        // Random: 80 bits as 16 chars (5 bits per char).
-        // Pack the 10 random bytes into a 80-bit big-endian buffer, then chunk by 5 bits.
-        var bits: UInt64 = 0
-        var bitsHigh: UInt64 = 0
-
-        // Build a 128-bit conceptual buffer where the top 80 bits are the random bytes.
-        // We'll iterate the 10 bytes and pull 5-bit groups.
-        // Simpler: emit 16 chars by reading bit positions [0..80).
+        // Random: 80 bits as 16 chars (5 bits per char), read as a big-endian
+        // bit stream over the 10 random bytes.
         var randomChars = [Character](repeating: "0", count: 16)
         for i in 0..<16 {
             let bitOffset = i * 5
@@ -102,10 +96,6 @@ enum ULID {
             randomChars[i] = crockfordAlphabet[Int(value & 0x1F)]
         }
         output.append(contentsOf: randomChars)
-
-        // Silence unused warnings from the placeholder bits buffer above.
-        _ = bits
-        _ = bitsHigh
 
         return String(output)
     }

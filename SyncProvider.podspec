@@ -56,7 +56,8 @@ Pod::Spec.new do |s|
   #   CoreData         — queue + history persistence
   #   Network          — NWPathMonitor connectivity tracking
   #   BackgroundTasks  — BGTaskScheduler (iOS 13+; library floor is 15.0)
-  s.frameworks = "Foundation", "CoreData", "Network", "BackgroundTasks"
+  #   Security         — Keychain storage for `defaultHeaders`
+  s.frameworks = "Foundation", "CoreData", "Network", "BackgroundTasks", "Security"
 
   s.dependency 'React-jsi'
   s.dependency 'React-callinvoker'
@@ -74,9 +75,18 @@ Pod::Spec.new do |s|
   # `Unit-` segment for `:test_type => :unit` (the default). Sources live
   # under `ios/Tests/**` so they ship in the same git tree as production.
   s.test_spec 'Tests' do |test_spec|
-    test_spec.platforms = { :ios => "15.0" }
+    # Must not be lower than the deployment target CocoaPods gives the library
+    # target, which comes from the Podfile (`min_ios_version_supported`, 15.1).
+    # Otherwise `@testable import SyncProvider` fails: "compiling for iOS 15.0,
+    # but module 'SyncProvider' has a minimum deployment target of iOS 15.1".
+    test_spec.platforms = { :ios => "15.1" }
     test_spec.source_files = "ios/Tests/**/*.swift"
     test_spec.requires_app_host = false
-    test_spec.frameworks = "XCTest", "Foundation", "CoreData", "Network"
+    # Bundle the compiled `.momd` (momc emits every model version) into the
+    # XCTest bundle so the Core Data migration tests can load the v1 and v2
+    # `.mom` slices and exercise the v1->v2 mapping against tmp SQLite stores.
+    # Adding/removing test resources requires re-running `pod install`.
+    test_spec.resources = ["ios/Database/SyncProvider.xcdatamodeld"]
+    test_spec.frameworks = "XCTest", "Foundation", "CoreData", "Network", "BackgroundTasks"
   end
 end
