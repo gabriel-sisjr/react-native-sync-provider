@@ -29,12 +29,48 @@ struct BackgroundSyncOptionsValue: Sendable, Equatable {
     let requiresCharging: Bool?
     let requiresUnmeteredNetwork: Bool?
     let requiresDeviceIdle: Bool?
-    /// When `true`, the consumer opted out of OS-driven background sync.
+    /// When `true`, the consumer opted out of OS-driven background sync: no
+    /// `BGTask` is scheduled and any already-submitted request is cancelled.
+    /// `nil`/`false` preserve the historical (background-enabled) behavior.
     let foregroundOnly: Bool?
     let taskIdentifier: String?
 }
 
-/// Owns BGTaskScheduler interactions. Single instance per `SyncProvider`.
+#if canImport(BackgroundTasks)
+/// Seam over the `BGTask` members the handlers touch. `BGTask` and its
+/// subclasses have no public initializer, so tests cannot construct one; this
+/// protocol lets a fake stand in to assert completion/re-schedule behavior.
+protocol BackgroundTaskHandle: AnyObject {
+    var expirationHandler: (() -> Void)? { get set }
+    func setTaskCompleted(success: Bool)
+}
+
+extension BGTask: BackgroundTaskHandle {}
+
+/// Seam over the subset of `BGTaskScheduler` this library uses. Lets unit tests
+/// inject a fake and verify scheduling decisions without touching the
+/// process-wide system scheduler, which rejects identifiers absent from
+/// `Info.plist` and traps on a duplicate `register` for the same identifier.
+protocol BackgroundTaskScheduling: AnyObject {
+    @discardableResult
+    func registerHandler(forTaskWithIdentifier identifier: String,
+                         launchHandler: @escaping (BackgroundTaskHandle) -> Void) -> Bool
+    func submit(_ taskRequest: BGTaskRequest) throws
+    func cancel(taskRequestWithIdentifier identifier: String)
+}
+
+extension BGTaskScheduler: BackgroundTaskScheduling {
+    @discardableResult
+    func registerHandler(forTaskWithIdentifier identifier: String,
+                         launchHandler: @escaping (BackgroundTaskHandle) -> Void) -> Bool {
+        register(forTaskWithIdentifier: identifier, using: nil) { task in
+            launchHandler(task)
+        }
+    }
+}
+#endif
+
+/// Owns BGTaskScheduler interactions. Single instance per engine.
 final class BackgroundSyncManager: @unchecked Sendable {
     private weak var dispatcher: SyncDispatcher?
     private let emitter: SyncEventEmitter
@@ -42,14 +78,35 @@ final class BackgroundSyncManager: @unchecked Sendable {
     private var registered = false
     private var enabled = false
     private var lastOptions: BackgroundSyncOptionsValue?
+    #if canImport(BackgroundTasks)
+    private let scheduler: BackgroundTaskScheduling
+    #endif
 
+    #if canImport(BackgroundTasks)
+    init(dispatcher: SyncDispatcher,
+         emitter: SyncEventEmitter,
+         scheduler: BackgroundTaskScheduling = BGTaskScheduler.shared) {
+        self.dispatcher = dispatcher
+        self.emitter = emitter
+        self.scheduler = scheduler
+    }
+    #else
     init(dispatcher: SyncDispatcher, emitter: SyncEventEmitter) {
         self.dispatcher = dispatcher
         self.emitter = emitter
     }
+    #endif
 
     var isEnabled: Bool {
         lock.withLock { enabled }
+    }
+
+    /// `true` when the active options requested foreground-only sync. The
+    /// background task handlers consult this and become inert when it is set:
+    /// a `BGTask` submitted before the flag flipped can still be launched by the
+    /// OS, so suppressing scheduling alone is not enough.
+    var isForegroundOnly: Bool {
+        lock.withLock { lastOptions?.foregroundOnly == true }
     }
 
     /// Register handlers for both task identifiers. Must be called before
@@ -64,22 +121,20 @@ final class BackgroundSyncManager: @unchecked Sendable {
         }
         guard !already else { return }
 
-        let scheduler = BGTaskScheduler.shared
-        scheduler.register(forTaskWithIdentifier: kBackgroundRefreshIdentifier,
-                           using: nil) { [weak self] task in
-            guard let self = self, let appRefreshTask = task as? BGAppRefreshTask else {
+        let scheduler = self.scheduler
+        scheduler.registerHandler(forTaskWithIdentifier: kBackgroundRefreshIdentifier) { [weak self] task in
+            guard let self = self else {
                 task.setTaskCompleted(success: false)
                 return
             }
-            self.handleAppRefresh(task: appRefreshTask)
+            self.handleAppRefresh(task: task)
         }
-        scheduler.register(forTaskWithIdentifier: kBackgroundProcessingIdentifier,
-                           using: nil) { [weak self] task in
-            guard let self = self, let processingTask = task as? BGProcessingTask else {
+        scheduler.registerHandler(forTaskWithIdentifier: kBackgroundProcessingIdentifier) { [weak self] task in
+            guard let self = self else {
                 task.setTaskCompleted(success: false)
                 return
             }
-            self.handleProcessing(task: processingTask)
+            self.handleProcessing(task: task)
         }
         SyncLogger.info("Registered BGTaskScheduler handlers", category: "background")
         #endif
@@ -91,22 +146,43 @@ final class BackgroundSyncManager: @unchecked Sendable {
     func enable(options: BackgroundSyncOptionsValue) throws {
         #if canImport(BackgroundTasks)
         registerHandlers()
-        try scheduleAppRefresh(options: options)
-        lock.withLock {
-            enabled = true
-            lastOptions = options
+        if options.foregroundOnly == true {
+            // Foreground-only: schedule no OS-driven work, and cancel any request
+            // a previous (background-enabled) `enable` may have submitted so it
+            // cannot fire. We still mark the feature `enabled`: the flag, not
+            // `enabled`, governs whether background work runs, and `disable()`
+            // remains the way to turn the feature off entirely.
+            //
+            // The flag is published before cancelling. A handler already running
+            // submits under `lock`, so it either finishes first and its request
+            // is cancelled here, or it sees the flag and submits nothing.
+            publish(options)
+            scheduler.cancel(taskRequestWithIdentifier: kBackgroundRefreshIdentifier)
+            scheduler.cancel(taskRequestWithIdentifier: kBackgroundProcessingIdentifier)
+        } else {
+            try scheduleAppRefresh(options: options)
+            publish(options)
         }
-        SyncLogger.info("Background sync enabled (interval=\(options.minimumIntervalMs)ms)", category: "background")
+        SyncLogger.info("Background sync enabled (interval=\(options.minimumIntervalMs)ms, foregroundOnly=\(options.foregroundOnly == true))",
+                        category: "background")
         #else
         throw SyncProviderError.backgroundRegistrationFailed("BackgroundTasks framework unavailable")
         #endif
     }
 
+    private func publish(_ options: BackgroundSyncOptionsValue) {
+        lock.withLock {
+            enabled = true
+            lastOptions = options
+        }
+        dispatcher?.hooks.foregroundOnly = options.foregroundOnly == true
+    }
+
     /// Cancel any pending submissions and mark disabled.
     func disable() {
         #if canImport(BackgroundTasks)
-        BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: kBackgroundRefreshIdentifier)
-        BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: kBackgroundProcessingIdentifier)
+        scheduler.cancel(taskRequestWithIdentifier: kBackgroundRefreshIdentifier)
+        scheduler.cancel(taskRequestWithIdentifier: kBackgroundProcessingIdentifier)
         #endif
         lock.withLock {
             enabled = false
@@ -122,7 +198,7 @@ final class BackgroundSyncManager: @unchecked Sendable {
         let intervalSeconds = max(options.minimumIntervalMs / 1000.0, 60)
         request.earliestBeginDate = Date(timeIntervalSinceNow: intervalSeconds)
         do {
-            try BGTaskScheduler.shared.submit(request)
+            try scheduler.submit(request)
         } catch {
             SyncLogger.error("BGAppRefresh submit failed: \(error.localizedDescription)", category: "background")
             throw SyncProviderError.backgroundRegistrationFailed(error.localizedDescription)
@@ -134,10 +210,13 @@ final class BackgroundSyncManager: @unchecked Sendable {
         #if canImport(BackgroundTasks)
         let request = BGProcessingTaskRequest(identifier: kBackgroundProcessingIdentifier)
         request.requiresExternalPower = options.requiresCharging ?? false
+        // FIXME: `requiresNetworkConnectivity` is hardcoded `true`, and
+        // `options.requiresUnmeteredNetwork` / `options.requiresDeviceIdle` are
+        // never mapped onto the request.
         request.requiresNetworkConnectivity = true
         // `earliestBeginDate` nil means "as soon as possible".
         do {
-            try BGTaskScheduler.shared.submit(request)
+            try scheduler.submit(request)
         } catch {
             SyncLogger.error("BGProcessing submit failed: \(error.localizedDescription)", category: "background")
         }
@@ -147,15 +226,20 @@ final class BackgroundSyncManager: @unchecked Sendable {
     // MARK: - Handlers
 
     #if canImport(BackgroundTasks)
-    private func handleAppRefresh(task: BGAppRefreshTask) {
-        SyncLogger.info("BGAppRefresh task fired", category: "background")
-        emitter.emit(.now(type: "BACKGROUND_SYNC_STARTED"))
+    func handleAppRefresh(task: BackgroundTaskHandle) {
         // Re-schedule the next window before doing any work so the chain
         // continues even if we get terminated.
-        if let opts = lastOptions {
-            try? scheduleAppRefresh(options: opts)
-            scheduleProcessing(options: opts)
+        let shouldRun = continueChain { options in
+            try? scheduleAppRefresh(options: options)
+            scheduleProcessing(options: options)
         }
+        guard shouldRun else {
+            SyncLogger.info("BGAppRefresh fired while background sync is off; completing inert", category: "background")
+            task.setTaskCompleted(success: true)
+            return
+        }
+        SyncLogger.info("BGAppRefresh task fired", category: "background")
+        emitter.emit(.now(type: "BACKGROUND_SYNC_STARTED"))
 
         let dispatchTask = Task { [weak self] in
             do {
@@ -177,13 +261,20 @@ final class BackgroundSyncManager: @unchecked Sendable {
         }
     }
 
-    private func handleProcessing(task: BGProcessingTask) {
+    func handleProcessing(task: BackgroundTaskHandle) {
+        let shouldRun = continueChain { options in
+            scheduleProcessing(options: options)
+        }
+        guard shouldRun else {
+            // Same rationale as `handleAppRefresh`: a previously submitted
+            // processing task must become inert once background sync is off.
+            SyncLogger.info("BGProcessing fired while background sync is off; completing inert", category: "background")
+            task.setTaskCompleted(success: true)
+            return
+        }
         SyncLogger.info("BGProcessing task fired", category: "background")
         emitter.emit(.now(type: "BACKGROUND_SYNC_STARTED",
                           metadata: ["kind": "processing"]))
-        if let opts = lastOptions {
-            scheduleProcessing(options: opts)
-        }
 
         let dispatchTask = Task { [weak self] in
             do {
@@ -202,6 +293,23 @@ final class BackgroundSyncManager: @unchecked Sendable {
         task.expirationHandler = {
             dispatchTask.cancel()
             SyncLogger.error("BGProcessing expired", category: "background")
+        }
+    }
+
+    /// Runs `submit` unless background sync is off, and reports which.
+    ///
+    /// The check and the submission share `lock`. `enable(foregroundOnly: true)`
+    /// publishes under the same lock before it cancels, so a submission can
+    /// never land after that cancel.
+    private func continueChain(submit: (BackgroundSyncOptionsValue) -> Void) -> Bool {
+        lock.withLock {
+            guard lastOptions?.foregroundOnly != true else {
+                return false
+            }
+            if let options = lastOptions {
+                submit(options)
+            }
+            return true
         }
     }
     #endif

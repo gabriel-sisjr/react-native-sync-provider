@@ -45,6 +45,20 @@ struct ItemDispatchOutcome: Sendable {
     let errorMessage: String?
 }
 
+/// Collaborators of ``SyncDispatcher`` that are set and read from outside the
+/// actor, synchronously. `BackgroundSyncManager` publishes `foregroundOnly`
+/// from a lock-protected, non-async path, so this cannot be actor state.
+final class DispatcherHooks: @unchecked Sendable {
+    private let lock = NSLock()
+    private var foregroundOnlyValue = false
+
+    /// When `true`, uploads never go through the background `URLSession`.
+    var foregroundOnly: Bool {
+        get { lock.withLock { foregroundOnlyValue } }
+        set { lock.withLock { foregroundOnlyValue = newValue } }
+    }
+}
+
 /// The dispatcher coordinates queue draining, retries, and result/event
 /// publication. Marked `actor` so the in-flight set + cycle flag are
 /// serialized without explicit locks.
@@ -57,6 +71,10 @@ actor SyncDispatcher {
     private let foregroundSession: URLSession
     private let backgroundSession: URLSession
     private let backgroundDelegate: BackgroundURLSessionDelegate
+    private let isAppActive: @Sendable () async -> Bool
+
+    /// See ``DispatcherHooks``.
+    nonisolated let hooks = DispatcherHooks()
 
     // MARK: - State
 
@@ -76,6 +94,7 @@ actor SyncDispatcher {
         self.emitter = emitter
         self.connectivity = connectivity
         self.config = config
+        self.isAppActive = Self.applicationIsActive
 
         let foreground = URLSessionConfiguration.default
         foreground.timeoutIntervalForRequest = TimeInterval(config.requestTimeoutMs) / 1000.0
@@ -108,7 +127,8 @@ actor SyncDispatcher {
                   config: DispatcherConfig,
                   foregroundSession: URLSession,
                   backgroundSession: URLSession,
-                  backgroundDelegate: BackgroundURLSessionDelegate = BackgroundURLSessionDelegate()) {
+                  backgroundDelegate: BackgroundURLSessionDelegate = BackgroundURLSessionDelegate(),
+                  isAppActive: (@Sendable () async -> Bool)? = nil) {
         self.storage = storage
         self.emitter = emitter
         self.connectivity = connectivity
@@ -116,6 +136,7 @@ actor SyncDispatcher {
         self.foregroundSession = foregroundSession
         self.backgroundSession = backgroundSession
         self.backgroundDelegate = backgroundDelegate
+        self.isAppActive = isAppActive ?? Self.applicationIsActive
     }
 
     // MARK: - Configuration
@@ -372,14 +393,24 @@ actor SyncDispatcher {
         }
     }
 
-    private func shouldUseBackgroundSession() async -> Bool {
-        #if os(iOS)
-        let state = await MainActor.run {
-            UIApplication.shared.applicationState
+    /// `true` when an upload must survive the app leaving the foreground. A
+    /// background upload is OS-driven work and can relaunch the app, so it is
+    /// off entirely under `foregroundOnly`.
+    func shouldUseBackgroundSession() async -> Bool {
+        if hooks.foregroundOnly {
+            return false
         }
-        return state != .active
+        return await !isAppActive()
+    }
+
+    @Sendable
+    private static func applicationIsActive() async -> Bool {
+        #if os(iOS)
+        return await MainActor.run {
+            UIApplication.shared.applicationState == .active
+        }
         #else
-        return false
+        return true
         #endif
     }
 
