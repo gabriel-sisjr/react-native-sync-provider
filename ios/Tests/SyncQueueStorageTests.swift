@@ -136,7 +136,7 @@ final class SyncQueueStorageTests: XCTestCase {
     func test_markPendingForRetry_resetsStatus_andRecordsErrorCode() async throws {
         let id = try await storage.enqueue(input: makeInput())
         try await storage.markInFlight(id: id)
-        try await storage.markPendingForRetry(id: id, errorCode: "NETWORK_ERROR")
+        try await storage.markPendingForRetry(id: id, errorCode: "NETWORK_ERROR", retryDelayMs: 0)
 
         let items = try await storage.getAll()
         let item = try XCTUnwrap(items.first(where: { $0.id == id }))

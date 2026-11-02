@@ -53,9 +53,11 @@ struct StoredSyncResult: Sendable, Equatable {
 /// Asynchronous CRUD wrapper around `SyncItemEntity` / `SyncResultEntity`.
 final class SyncItemDao {
     private let stack: CoreDataStack
+    private let clock: SyncClock
 
-    init(stack: CoreDataStack = .shared) {
+    init(stack: CoreDataStack = .shared, clock: SyncClock = SystemClock()) {
         self.stack = stack
+        self.clock = clock
     }
 
     // MARK: - Inserts
@@ -97,8 +99,15 @@ final class SyncItemDao {
 
     // MARK: - Reads
 
-    /// Total number of pending items (status `PENDING`). Used to enforce the
-    /// queue cap.
+    /// Total number of `PENDING` items. Used to enforce the queue cap.
+    ///
+    /// - Important: This deliberately counts items currently in retry
+    ///   **cooldown** (`nextRetryAt` in the future) as well — capacity
+    ///   accounting tracks what is *in the queue*, not what is *dispatchable
+    ///   right now*. Only the dispatch path (``fetchPending(limit:)``) filters
+    ///   by eligibility. Counting cooling items keeps the cap honest so
+    ///   the queue cannot silently over-fill while items wait out their
+    ///   backoff.
     func countPending() async throws -> Int {
         try await stack.performBackgroundTask { context in
             let request = NSFetchRequest<NSNumber>(entityName: "SyncItemEntity")
@@ -109,27 +118,32 @@ final class SyncItemDao {
         }
     }
 
-    /// Fetch pending items sorted by priority (HIGH, NORMAL, LOW) and `createdAt` ASC.
+    /// Fetch **dispatchable** pending items sorted by priority (HIGH, NORMAL,
+    /// LOW) and `createdAt` ASC.
     /// - Parameter limit: 0 means "no limit".
     ///
     /// `priority` is stored as a `String`, so we sort in-memory via the
     /// `priorityRank` helper. `createdAt` ASC is the secondary sort and is
     /// applied via the SQL store directly to keep the in-memory work minimal.
+    ///
+    /// Eligibility gate: a `PENDING` item is only dispatchable once its
+    /// retry cooldown has elapsed, i.e. `nextRetryAt <= now`. A never-attempted
+    /// row (`0`) trivially satisfies the comparison, so freshly enqueued items
+    /// are always returned. This is the only place that filters by cooldown:
+    /// `countPending` (capacity) deliberately does not.
     func fetchPending(limit: Int = 0) async throws -> [StoredSyncItem] {
-        try await stack.performBackgroundTask { context in
+        try await stack.performBackgroundTask { [clock] context in
+            // `%lld` formats the scalar `Int64` `nextRetryAt` (NOT `%d`, which
+            // is 32-bit and would truncate epoch-ms timestamps).
+            let nowMs = clock.nowMs()
             let request = NSFetchRequest<SyncItemEntity>(entityName: "SyncItemEntity")
-            request.predicate = NSPredicate(format: "status == %@", SyncItemStatus.pending.rawValue)
+            request.predicate = NSPredicate(format: "status == %@ AND nextRetryAt <= %lld",
+                                            SyncItemStatus.pending.rawValue, nowMs)
             request.sortDescriptors = [
                 NSSortDescriptor(key: "createdAt", ascending: true)
             ]
             let entities = try context.fetch(request)
-            let materialized = try entities.map(Self.materialize)
-            let sorted = materialized.sorted { lhs, rhs in
-                let lp = Self.priorityRank(lhs.priority)
-                let rp = Self.priorityRank(rhs.priority)
-                if lp != rp { return lp < rp }
-                return lhs.createdAt < rhs.createdAt
-            }
+            let sorted = try entities.map(Self.materialize).sorted(by: Self.isDispatchedBefore)
             if limit > 0 {
                 return Array(sorted.prefix(limit))
             }
@@ -137,8 +151,19 @@ final class SyncItemDao {
         }
     }
 
-    /// Fetch every item (any status). Used by `getPendingItems()` facade —
-    /// "pending" semantics are documented as "queue contents".
+    /// Fetch the items waiting to be dispatched: every `PENDING` row in dispatch
+    /// order, including rows in retry cooldown. Backs `getPendingItems()`.
+    /// `IN_FLIGHT` and `FAILED` rows are not part of the queue contents.
+    func fetchQueued() async throws -> [StoredSyncItem] {
+        try await stack.performBackgroundTask { context in
+            let request = NSFetchRequest<SyncItemEntity>(entityName: "SyncItemEntity")
+            request.predicate = NSPredicate(format: "status == %@", SyncItemStatus.pending.rawValue)
+            let entities = try context.fetch(request)
+            return try entities.map(Self.materialize).sorted(by: Self.isDispatchedBefore)
+        }
+    }
+
+    /// Fetch every row, in any status.
     func fetchAll() async throws -> [StoredSyncItem] {
         try await stack.performBackgroundTask { context in
             let request = NSFetchRequest<SyncItemEntity>(entityName: "SyncItemEntity")
@@ -147,6 +172,37 @@ final class SyncItemDao {
             ]
             let entities = try context.fetch(request)
             return try entities.map(Self.materialize)
+        }
+    }
+
+    /// `MIN(nextRetryAt)` over the `PENDING` rows that have been attempted, or
+    /// `nil` when none qualifies. This is when the retry timer must wake.
+    ///
+    /// Never-attempted rows (`nextRetryAt = 0`) stay out on purpose: a batch
+    /// that left fresh rows behind does not start a new cycle by itself. The
+    /// minimum may already be in the past; the caller clamps the delay to 0,
+    /// so an elapsed cooldown is never stranded.
+    func earliestRetryAt() async throws -> Int64? {
+        try await stack.performBackgroundTask { context in
+            let request = NSFetchRequest<SyncItemEntity>(entityName: "SyncItemEntity")
+            request.predicate = NSPredicate(format: "status == %@ AND nextRetryAt > 0",
+                                            SyncItemStatus.pending.rawValue)
+            request.sortDescriptors = [NSSortDescriptor(key: "nextRetryAt", ascending: true)]
+            request.fetchLimit = 1
+            return try context.fetch(request).first?.nextRetryAt
+        }
+    }
+
+    /// `MIN(nextRetryAt)` over **all** `PENDING` rows, or `nil` for an empty
+    /// queue. A never-attempted row makes this 0, which means "dispatch now".
+    /// Used when the engine resumes.
+    func earliestPendingAt() async throws -> Int64? {
+        try await stack.performBackgroundTask { context in
+            let request = NSFetchRequest<SyncItemEntity>(entityName: "SyncItemEntity")
+            request.predicate = NSPredicate(format: "status == %@", SyncItemStatus.pending.rawValue)
+            request.sortDescriptors = [NSSortDescriptor(key: "nextRetryAt", ascending: true)]
+            request.fetchLimit = 1
+            return try context.fetch(request).first?.nextRetryAt
         }
     }
 
@@ -160,12 +216,14 @@ final class SyncItemDao {
 
     // MARK: - Updates
 
+    /// Claims an item for dispatch and counts the attempt. Counting here, before
+    /// the request, means a kill mid-request spends the attempt.
     func markInFlight(id: String) async throws {
-        try await stack.performBackgroundTask { context in
+        try await stack.performBackgroundTask { [clock] context in
             guard let entity = try Self.fetchEntity(id: id, in: context) else { return }
             entity.status = SyncItemStatus.inFlight.rawValue
             entity.attempts += 1
-            entity.lastAttemptAt = Int64((Date().timeIntervalSince1970 * 1000).rounded())
+            entity.lastAttemptAt = clock.nowMs()
         }
     }
 
@@ -177,18 +235,43 @@ final class SyncItemDao {
         }
     }
 
-    /// Reset to PENDING (for retry), bumping the lastErrorCode and timestamp.
-    func markPendingForRetry(id: String, errorCode: String?) async throws {
-        try await stack.performBackgroundTask { context in
+    /// Reset an item to PENDING for another attempt, recording the error code,
+    /// the attempt timestamp, and a **retry cooldown**.
+    ///
+    /// The cooldown is persisted as `nextRetryAt = now + retryDelayMs`, where
+    /// `now` is read here, after the attempt finished. ``fetchPending(limit:)``
+    /// honors it, so a degraded server cannot drive a hot-retry loop.
+    ///
+    /// The value is a positive timestamp even when the delay is 0, so
+    /// `nextRetryAt > 0` always means "attempted, retry pending" and `0` always
+    /// means "never attempted". The retry timer relies on that distinction.
+    ///
+    /// - Note: `attempts` is intentionally **not** modified here. It is
+    ///   incremented once per dispatch by ``markInFlight(id:)`` and must keep
+    ///   counting across retries so the backoff curve advances.
+    /// - Parameters:
+    ///   - errorCode: the last failure's code, surfaced to JS via `lastErrorCode`.
+    ///   - retryDelayMs: backoff delay (ms) from ``RetryPolicyEvaluator``.
+    func markPendingForRetry(id: String, errorCode: String?, retryDelayMs: Int) async throws {
+        try await stack.performBackgroundTask { [clock] context in
             guard let entity = try Self.fetchEntity(id: id, in: context) else { return }
+            let nowMs = clock.nowMs()
             entity.status = SyncItemStatus.pending.rawValue
             entity.lastErrorCode = errorCode
-            entity.lastAttemptAt = Int64((Date().timeIntervalSince1970 * 1000).rounded())
+            entity.lastAttemptAt = nowMs
+            entity.nextRetryAt = nowMs + Int64(max(0, retryDelayMs))
         }
     }
 
-    /// Reset every IN_FLIGHT item back to PENDING. Used by RecoveryManager on
-    /// app launch.
+    /// Reset every IN_FLIGHT item back to PENDING. Used by ``RecoveryManager``
+    /// on app launch to requeue items orphaned by a crash / force-quit.
+    ///
+    /// - Important: Only `status` is rewritten. `nextRetryAt` (and `attempts`)
+    ///   are deliberately left untouched: recovery must neither extend nor
+    ///   clear an item's retry cooldown. An item that was IN_FLIGHT had already
+    ///   cleared its eligibility gate, so its `nextRetryAt` is in the past and
+    ///   it becomes dispatchable again immediately, which is correct: a crash
+    ///   must not impose a fresh backoff, nor reset the attempt count.
     @discardableResult
     func resetInFlightToPending() async throws -> Int {
         try await stack.performBackgroundTask { context in
@@ -196,6 +279,7 @@ final class SyncItemDao {
             request.predicate = NSPredicate(format: "status == %@", SyncItemStatus.inFlight.rawValue)
             let entities = try context.fetch(request)
             for entity in entities {
+                // Status only — `nextRetryAt` / `attempts` are preserved.
                 entity.status = SyncItemStatus.pending.rawValue
             }
             return entities.count
@@ -300,11 +384,23 @@ final class SyncItemDao {
             // sentinel meaning "never attempted"; map back to `Int64?` so the
             // public-facing `StoredSyncItem` keeps nullable semantics.
             lastAttemptAt: entity.lastAttemptAt == 0 ? nil : entity.lastAttemptAt,
+            // `nextRetryAt` is a scalar `Int64`; `0` means "never attempted"
+            // (eligible now). A positive value is a retry-cooldown deadline
+            // (epoch ms) written by `markPendingForRetry`; `fetchPending`
+            // excludes the item until that deadline elapses.
             nextRetryAt: entity.nextRetryAt,
             lastErrorCode: entity.lastErrorCode,
             status: entity.status ?? SyncItemStatus.pending.rawValue,
             metadata: metadata
         )
+    }
+
+    /// Dispatch order: priority first, then oldest first.
+    private static func isDispatchedBefore(_ lhs: StoredSyncItem, _ rhs: StoredSyncItem) -> Bool {
+        let lp = priorityRank(lhs.priority)
+        let rp = priorityRank(rhs.priority)
+        if lp != rp { return lp < rp }
+        return lhs.createdAt < rhs.createdAt
     }
 
     private static func priorityRank(_ raw: String) -> Int {

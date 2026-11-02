@@ -45,17 +45,35 @@ struct ItemDispatchOutcome: Sendable {
     let errorMessage: String?
 }
 
+/// What ``SyncDispatcher/recordFailureOutcome(item:outcome:)`` decided to do
+/// with a failed item, so callers can update their aggregate counters.
+enum FailureDisposition: Sendable {
+    /// Kept `PENDING` for another attempt; a retry cooldown (`nextRetryAt`)
+    /// was persisted. `attempt` is the 1-based attempt that just failed.
+    case retrying(attempt: Int32)
+    /// Marked terminally `FAILED` (non-retryable, or attempts exhausted).
+    case failed(errorCode: String, message: String?)
+}
+
 /// Collaborators of ``SyncDispatcher`` that are set and read from outside the
 /// actor, synchronously. `BackgroundSyncManager` publishes `foregroundOnly`
 /// from a lock-protected, non-async path, so this cannot be actor state.
 final class DispatcherHooks: @unchecked Sendable {
     private let lock = NSLock()
     private var foregroundOnlyValue = false
+    private var cycleFinished: (@Sendable () async -> Void)?
 
     /// When `true`, uploads never go through the background `URLSession`.
     var foregroundOnly: Bool {
         get { lock.withLock { foregroundOnlyValue } }
         set { lock.withLock { foregroundOnlyValue = newValue } }
+    }
+
+    /// Awaited when a flush cycle ends, whatever its outcome, so whoever awaits
+    /// `flush()` sees its effects.
+    var onCycleFinished: (@Sendable () async -> Void)? {
+        get { lock.withLock { cycleFinished } }
+        set { lock.withLock { cycleFinished = newValue } }
     }
 }
 
@@ -67,7 +85,7 @@ actor SyncDispatcher {
 
     private let storage: SyncQueueStorage
     private let emitter: SyncEventEmitter
-    private let connectivity: ConnectivityMonitor
+    private let connectivity: ConnectivityProviding
     private let foregroundSession: URLSession
     private let backgroundSession: URLSession
     private let backgroundDelegate: BackgroundURLSessionDelegate
@@ -88,7 +106,7 @@ actor SyncDispatcher {
 
     init(storage: SyncQueueStorage,
          emitter: SyncEventEmitter,
-         connectivity: ConnectivityMonitor = .shared,
+         connectivity: ConnectivityProviding = ConnectivityMonitor.shared,
          config: DispatcherConfig = .default) {
         self.storage = storage
         self.emitter = emitter
@@ -123,7 +141,7 @@ actor SyncDispatcher {
     /// exercise background uploads should pass an idle `URLSession`.
     internal init(storage: SyncQueueStorage,
                   emitter: SyncEventEmitter,
-                  connectivity: ConnectivityMonitor,
+                  connectivity: ConnectivityProviding,
                   config: DispatcherConfig,
                   foregroundSession: URLSession,
                   backgroundSession: URLSession,
@@ -177,34 +195,44 @@ actor SyncDispatcher {
 
     // MARK: - Flush
 
-    /// Run one flush cycle. Drains every pending item with respect to retry
-    /// policy and emits the aggregate result. Multiple concurrent calls are
-    /// coalesced — the second call awaits the first.
+    /// Run one flush cycle: dispatches one batch of eligible items with respect
+    /// to the retry policy and emits the aggregate result. A call made while a
+    /// cycle is running returns the last result instead of starting another.
     @discardableResult
     func flush() async throws -> StoredSyncResult {
         if isPaused {
             SyncLogger.debug("flush() called while paused; returning empty result", category: "dispatcher")
-            let now = Int64(Date().timeIntervalSince1970 * 1000)
-            return StoredSyncResult(id: UUID().uuidString,
-                                    startedAt: now,
-                                    finishedAt: now,
-                                    itemsAttempted: 0,
-                                    itemsSucceeded: 0,
-                                    itemsFailed: 0,
-                                    errorMessage: "paused")
+            return Self.skippedResult(reason: "paused")
         }
         if isCycleRunning {
             SyncLogger.debug("flush() called while cycle in progress; piggybacking", category: "dispatcher")
-            // Wait briefly then return the last known result.
             return lastResult ?? Self.emptyResult()
         }
 
         isCycleRunning = true
-        defer { isCycleRunning = false }
-
         let startedAt = Int64(Date().timeIntervalSince1970 * 1000)
         emitter.emit(.now(type: "SYNC_STARTED"))
 
+        do {
+            let result = try await runCycle(startedAt: startedAt)
+            await finishCycle()
+            return result
+        } catch {
+            // Listeners track a cycle from SYNC_STARTED to its terminal event,
+            // so a cycle that dies must still end with one.
+            emitter.emit(.now(type: "SYNC_FAILED",
+                              errorCode: wrapAsSyncProviderError(error).code.stringValue))
+            await finishCycle()
+            throw error
+        }
+    }
+
+    private func finishCycle() async {
+        isCycleRunning = false
+        await hooks.onCycleFinished?()
+    }
+
+    private func runCycle(startedAt: Int64) async throws -> StoredSyncResult {
         let pending = try await storage.getPending(limit: max(config.batchSize, 1))
         if pending.isEmpty {
             let result = StoredSyncResult(id: UUID().uuidString,
@@ -226,10 +254,12 @@ actor SyncDispatcher {
         var succeededIds: [String] = []
         var failedIds: [String] = []
         var firstError: String?
+        var attempted = 0
         let total = pending.count
 
         for (index, item) in pending.enumerated() {
             if isPaused { break }
+            attempted += 1
             inFlight.insert(item.id)
             try await storage.markInFlight(id: item.id)
 
@@ -251,28 +281,15 @@ actor SyncDispatcher {
                                   statusCode: outcome.statusCode.map(Double.init),
                                   attempt: Double(item.attempts + 1)))
             } else {
-                let attemptsAfter = item.attempts + 1
-                let isRetryable = decideRetry(outcome: outcome, statusCode: outcome.statusCode)
-                let exhausted = attemptsAfter >= Int32(config.retryPolicy.maxAttempts)
-
-                if isRetryable && !exhausted {
-                    try await storage.markPendingForRetry(id: item.id, errorCode: outcome.errorCode)
-                    emitter.emit(.now(type: "ITEM_RETRYING",
-                                      itemId: item.id,
-                                      errorCode: outcome.errorCode,
-                                      statusCode: outcome.statusCode.map(Double.init),
-                                      attempt: Double(attemptsAfter)))
-                } else {
+                // Decides retry vs. terminal failure, persists the retry
+                // cooldown, and emits the event.
+                switch try await recordFailureOutcome(item: item, outcome: outcome) {
+                case .retrying:
+                    break // kept PENDING with a cooldown; not counted as failed
+                case let .failed(_, message):
                     failedIds.append(item.id)
-                    let finalErrorCode = exhausted ? "MAX_ATTEMPTS_EXCEEDED" : (outcome.errorCode ?? "NETWORK_ERROR")
-                    try await storage.markFailed(id: item.id, errorCode: finalErrorCode)
-                    emitter.emit(.now(type: "ITEM_FAILED",
-                                      itemId: item.id,
-                                      errorCode: finalErrorCode,
-                                      statusCode: outcome.statusCode.map(Double.init),
-                                      attempt: Double(attemptsAfter)))
                     if firstError == nil {
-                        firstError = outcome.errorMessage ?? finalErrorCode
+                        firstError = message
                     }
                 }
             }
@@ -282,7 +299,7 @@ actor SyncDispatcher {
         let result = StoredSyncResult(id: UUID().uuidString,
                                       startedAt: startedAt,
                                       finishedAt: finishedAt,
-                                      itemsAttempted: Int32(pending.count),
+                                      itemsAttempted: Int32(attempted),
                                       itemsSucceeded: Int32(succeededIds.count),
                                       itemsFailed: Int32(failedIds.count),
                                       errorMessage: firstError)
@@ -291,16 +308,78 @@ actor SyncDispatcher {
 
         if failedIds.isEmpty {
             emitter.emit(.now(type: "SYNC_SUCCEEDED",
-                              metadata: ["attempted": String(pending.count),
+                              metadata: ["attempted": String(attempted),
                                          "succeeded": String(succeededIds.count)]))
         } else {
             emitter.emit(.now(type: "SYNC_FAILED",
-                              metadata: ["attempted": String(pending.count),
+                              metadata: ["attempted": String(attempted),
                                          "succeeded": String(succeededIds.count),
                                          "failed": String(failedIds.count)]))
         }
 
         return result
+    }
+
+    // MARK: - Failure handling
+
+    /// Records the outcome of a **failed** dispatch: decides retry vs. terminal
+    /// failure, persists the retry cooldown (`nextRetryAt`) via
+    /// ``RetryPolicyEvaluator`` when retrying, marks the item terminally FAILED
+    /// otherwise, and emits the matching event.
+    ///
+    /// This is the single source of truth for failure handling. The background
+    /// `URLSession` delegate does not use it yet: a completion delivered after
+    /// a relaunch is still dropped, and that item comes back through launch
+    /// recovery instead, with no cooldown. Routing that path here is follow-up
+    /// work.
+    ///
+    /// A retriable failure with no budget left ends as `MAX_ATTEMPTS_EXCEEDED`.
+    /// A non-retryable failure keeps its real code, even on the last attempt.
+    ///
+    /// - Important: `item` must be the snapshot taken **before**
+    ///   ``SyncQueueStorage/markInFlight(id:)``. This method computes the
+    ///   current attempt as `item.attempts + 1`, so a row re-read from storage
+    ///   after the dispatch would count the same attempt twice. A caller that
+    ///   only has the row, like a delegate fallback after a relaunch, must
+    ///   subtract one. `attempts` itself is never reset, so the backoff curve
+    ///   keeps advancing.
+    /// - Returns: the ``FailureDisposition`` so callers can update their
+    ///   aggregate counters.
+    @discardableResult
+    func recordFailureOutcome(item: StoredSyncItem,
+                              outcome: ItemDispatchOutcome) async throws -> FailureDisposition {
+        let attemptsAfter = item.attempts + 1
+
+        let isRetryable = decideRetry(outcome: outcome, statusCode: outcome.statusCode)
+        let exhausted = Int(attemptsAfter) >= config.retryPolicy.maxAttempts
+
+        guard isRetryable && !exhausted else {
+            let finalErrorCode = isRetryable
+                ? "MAX_ATTEMPTS_EXCEEDED"
+                : (outcome.errorCode ?? "NETWORK_ERROR")
+            try await storage.markFailed(id: item.id, errorCode: finalErrorCode)
+            emitter.emit(.now(type: "ITEM_FAILED",
+                              itemId: item.id,
+                              errorCode: finalErrorCode,
+                              statusCode: outcome.statusCode.map(Double.init),
+                              attempt: Double(attemptsAfter)))
+            return .failed(errorCode: finalErrorCode,
+                           message: outcome.errorMessage ?? finalErrorCode)
+        }
+
+        // Retryable and attempts remain: park the item behind a backoff
+        // cooldown so it is not re-dispatched until `now + delay`.
+        let delayMs = RetryPolicyEvaluator.nextDelayMs(attempt: Int(attemptsAfter),
+                                                       policy: config.retryPolicy)
+        try await storage.markPendingForRetry(id: item.id,
+                                              errorCode: outcome.errorCode,
+                                              retryDelayMs: delayMs)
+        emitter.emit(.now(type: "ITEM_RETRYING",
+                          itemId: item.id,
+                          errorCode: outcome.errorCode,
+                          statusCode: outcome.statusCode.map(Double.init),
+                          attempt: Double(attemptsAfter)))
+        return .retrying(attempt: attemptsAfter)
     }
 
     // MARK: - Single-item dispatch
@@ -486,6 +565,12 @@ actor SyncDispatcher {
     // MARK: - Helpers
 
     static func emptyResult() -> StoredSyncResult {
+        skippedResult(reason: nil)
+    }
+
+    /// A zero-count result for a call that dispatched nothing. It is returned
+    /// without events or a history row: no cycle ran.
+    private static func skippedResult(reason: String?) -> StoredSyncResult {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         return StoredSyncResult(id: UUID().uuidString,
                                 startedAt: now,
@@ -493,6 +578,6 @@ actor SyncDispatcher {
                                 itemsAttempted: 0,
                                 itemsSucceeded: 0,
                                 itemsFailed: 0,
-                                errorMessage: nil)
+                                errorMessage: reason)
     }
 }

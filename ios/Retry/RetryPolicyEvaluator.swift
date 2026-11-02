@@ -44,8 +44,17 @@ enum RetryPolicyEvaluator {
     /// attempt number (1-based — the first retry is `attempt == 1`) and a
     /// policy.
     ///
+    /// The curve is computed in `Double` and clamped to
+    /// ``maxRepresentableDelayMs`` before the `Int` conversion, so no attempt
+    /// number or policy can trap: this path runs in production on every
+    /// retriable failure, with a consumer-controlled `maxAttempts`.
+    ///
+    /// - Parameter random: a sample in `0..<1` for the jitter factor. Tests
+    ///   inject it to pin the bounds of the range.
     /// - Important: **must** match `src/utils/retryBackoff.ts`.
-    static func nextDelayMs(attempt: Int, policy: RetryPolicyValue) -> Int {
+    static func nextDelayMs(attempt: Int,
+                            policy: RetryPolicyValue,
+                            random: () -> Double = { Double.random(in: 0..<1) }) -> Int {
         let safeAttempt = max(1, attempt)
         let base = max(0, policy.baseDelayMs)
 
@@ -56,16 +65,21 @@ enum RetryPolicyEvaluator {
         case .exponential:
             raw = Double(base) * pow(2.0, Double(safeAttempt - 1))
         case .fibonacci:
-            raw = Double(base) * Double(fibonacci(safeAttempt))
+            raw = Double(base) * fibonacci(safeAttempt)
+        }
+
+        // `0 * infinity` (base 0 at a huge attempt) is NaN, not 0.
+        if raw.isNaN {
+            raw = 0
         }
 
         if policy.jitter {
-            let factor = 0.75 + Double.random(in: 0..<0.5)
+            let factor = 0.75 + random() * 0.5
             raw *= factor
         }
 
         let cap = policy.maxDelayMs > 0 ? Double(policy.maxDelayMs) : raw
-        let clamped = min(max(0, raw), cap)
+        let clamped = min(max(0, raw), cap, maxRepresentableDelayMs)
         return Int(clamped.rounded())
     }
 
@@ -76,15 +90,25 @@ enum RetryPolicyEvaluator {
 
     // MARK: - Internals
 
-    private static func fibonacci(_ n: Int) -> Int {
+    /// Ceiling for a computed delay: 2^53 - 1, the largest integer a JS number
+    /// holds exactly. It only matters when `maxDelayMs` is 0 ("no cap").
+    private static let maxRepresentableDelayMs: Double = 9_007_199_254_740_991
+
+    /// Fibonacci in `Double`. `Int` overflows at n = 93, which a long outage
+    /// reaches with a large `maxAttempts`; `Double` saturates at infinity
+    /// instead, and ``nextDelayMs(attempt:policy:)`` clamps that.
+    private static func fibonacci(_ n: Int) -> Double {
         if n <= 0 { return 0 }
         if n <= 2 { return 1 }
-        var prev = 1
-        var curr = 1
+        var prev = 1.0
+        var curr = 1.0
         for _ in 3...n {
             let next = prev + curr
             prev = curr
             curr = next
+            if curr.isInfinite {
+                break
+            }
         }
         return curr
     }
