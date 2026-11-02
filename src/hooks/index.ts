@@ -12,6 +12,7 @@ export type { UseAutoSyncExtraOptions } from './useAutoSync';
 export { useConnection } from './useConnection';
 export { useOfflineQueue } from './useOfflineQueue';
 export { useSyncConfig } from './useSyncConfig';
+export { useSyncContext } from './useSyncContext';
 export { useSyncEvents } from './useSyncEvents';
 export { useSyncQueue } from './useSyncQueue';
 export { useSyncSnapshot } from './useSyncSnapshot';

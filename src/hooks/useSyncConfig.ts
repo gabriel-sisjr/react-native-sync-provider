@@ -18,15 +18,15 @@ import {
 /**
  * Read and mutate the active {@link SyncOptions}.
  *
- * If a {@link SyncProvider} Context is mounted, the hook reads the live
- * config from context (so multiple consumers share one source of truth).
- * Otherwise it falls back to the native singleton via `getSyncConfig()` and
- * keeps `config` fresh on `RESUMED` events.
+ * If a {@link SyncProvider} Context is mounted, the hook mirrors the Provider's
+ * config instead of probing native. Otherwise it falls back to the native
+ * singleton via `getSyncConfig()` and keeps `config` fresh on `RESUMED` events.
  *
  * `setConfig` always round-trips through the native layer (via
- * `configureSync`) and re-fetches the config to ensure consumers observe the
+ * `configureSync`) and re-fetches the config to ensure this hook observes the
  * authoritative shape (which may differ from the input due to native
- * defaults).
+ * defaults). Only the calling hook updates: other `useSyncConfig` instances and
+ * the Provider's context value catch up on their next read.
  *
  * @returns a {@link UseSyncConfigResult}.
  *
@@ -38,7 +38,10 @@ import {
  */
 export function useSyncConfig(): UseSyncConfigResult {
   const ctx = useContext(SyncProviderContext);
-  const ctxConfig = ctx?.config;
+  const ctxConfig = ctx.config;
+  // A context value carrying a `config` but no `hasProvider` comes from a
+  // consumer rendering `SyncProviderContext.Provider` directly.
+  const hasProvider = ctx.hasProvider || ctxConfig !== undefined;
   const [config, setLocalConfig] = useState<SyncOptions | null>(
     ctxConfig ?? null
   );
@@ -73,9 +76,11 @@ export function useSyncConfig(): UseSyncConfigResult {
   useEffect(() => {
     cancelledRef.current = false;
 
-    // If the Provider is mounted, mirror its config and skip our own probes.
-    if (ctxConfig !== undefined) {
-      setLocalConfig(ctxConfig);
+    // If a Provider is mounted, mirror its config and skip our own probes —
+    // even while the Provider's initial config round-trip is still in flight
+    // (`hasProvider` is true before `config` resolves).
+    if (hasProvider) {
+      setLocalConfig(ctxConfig ?? null);
       return undefined;
     }
 
@@ -101,7 +106,7 @@ export function useSyncConfig(): UseSyncConfigResult {
         void removeSyncEventListener(subscriptionId).catch(() => undefined);
       }
     };
-  }, [ctxConfig, refresh]);
+  }, [hasProvider, ctxConfig, refresh]);
 
   const setConfig = useCallback(
     async (next: SyncOptions) => {

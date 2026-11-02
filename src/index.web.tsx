@@ -12,7 +12,7 @@
  * @packageDocumentation
  */
 
-import React, { createContext } from 'react';
+import React, { createContext, useContext } from 'react';
 
 import { SyncError } from './errors/SyncError';
 import { SyncErrorCode } from './errors/SyncErrorCode';
@@ -311,11 +311,13 @@ export function useAutoSync(_options: UseAutoSyncOptions): void {
 /** @public */
 export interface SyncProviderContextValue {
   config: SyncOptions | undefined;
+  hasProvider: boolean;
 }
 
 /** @public */
 export const SyncProviderContext = createContext<SyncProviderContextValue>({
   config: undefined,
+  hasProvider: false,
 });
 
 /** @public */
@@ -325,16 +327,32 @@ export interface SyncProviderProps {
   children: React.ReactNode;
 }
 
+/** One shared value, so a re-render does not re-render every consumer. */
+const WEB_PROVIDER_VALUE: SyncProviderContextValue = {
+  config: undefined,
+  hasProvider: true,
+};
+
 /**
  * Web no-op {@link SyncProviderContext} wrapper. Renders children with
- * `{ config: undefined }` and performs no native calls.
+ * `{ config: undefined, hasProvider: true }` and performs no native calls.
  *
  * @public
  */
 export const SyncProvider: React.FC<SyncProviderProps> = ({ children }) => {
   return (
-    <SyncProviderContext.Provider value={{ config: undefined }}>
+    <SyncProviderContext.Provider value={WEB_PROVIDER_VALUE}>
       {children}
     </SyncProviderContext.Provider>
   );
 };
+
+/**
+ * Web twin of `useSyncContext`. Returns the inert web context value; outside a
+ * `<SyncProvider>` that is `{ config: undefined, hasProvider: false }`.
+ *
+ * @public
+ */
+export function useSyncContext(): SyncProviderContextValue {
+  return useContext(SyncProviderContext);
+}
