@@ -9,13 +9,13 @@ const features = [
     title: 'Offline-first queue',
     icon: '📥',
     description:
-      'Every request is durable. Enqueue from JS and the native layer persists it before the promise resolves — replay across crashes, reboots, and offline windows.',
+      'Every request is durable. Enqueue from JS and the native layer persists it before the promise resolves, so it survives crashes, reboots, and offline windows.',
   },
   {
     title: 'Background sync',
     icon: '🌙',
     description:
-      'OS-scheduled flushes via BGTaskScheduler on iOS and WorkManager on Android. The queue keeps draining even when the app is closed.',
+      'OS-scheduled flushes via BGTaskScheduler on iOS and WorkManager on Android, with no JS running. The OS decides when a window runs.',
   },
   {
     title: 'Native persistence',
@@ -27,13 +27,13 @@ const features = [
     title: 'Configurable retry',
     icon: '🔁',
     description:
-      'Exponential or linear backoff with jitter, per-status retry rules, and a hard attempt budget. Sane defaults aligned with HTTP semantics.',
+      'Linear, exponential or Fibonacci backoff with jitter, per-status retry rules, and a hard attempt budget. Cooldowns persist across restarts.',
   },
   {
     title: 'Nitro-powered',
     icon: '⚡',
     description:
-      'Built on Nitro Modules for synchronous, type-safe JS↔native calls on the New Architecture. Single TypeScript spec drives both platforms.',
+      'Built on Nitro Modules for type-safe JS↔native calls on the New Architecture. Single TypeScript spec drives both platforms.',
   },
 ];
 
@@ -131,9 +131,8 @@ function HooksPreview() {
           <div className="col col--6">
             <Heading as="h2">React Hooks API</Heading>
             <p>
-              7 purpose-built hooks cover every sync use case — from
-              connectivity polling and live queue inspection to event streams,
-              configuration, and one-line auto-flush wiring.
+              9 hooks cover connectivity, live queue inspection, event streams,
+              configuration, a read-only snapshot, and auto-flush wiring.
             </p>
             <ul>
               <li>
@@ -146,7 +145,7 @@ function HooksPreview() {
                 <code>useSyncStatus</code> &mdash; Last result, in-flight flag
               </li>
               <li>
-                <code>useOfflineQueue</code> &mdash; Auto-pause when offline
+                <code>useOfflineQueue</code> &mdash; Queue + connection state
               </li>
               <li>
                 <code>useSyncEvents</code> &mdash; Subscribe to sync events
@@ -155,7 +154,13 @@ function HooksPreview() {
                 <code>useSyncConfig</code> &mdash; Read / replace config live
               </li>
               <li>
-                <code>useAutoSync</code> &mdash; Flush on focus / reconnect
+                <code>useAutoSync</code> &mdash; Flush on interval / reconnect
+              </li>
+              <li>
+                <code>useSyncSnapshot</code> &mdash; Read-only status aggregate
+              </li>
+              <li>
+                <code>useSyncContext</code> &mdash; Read the Provider context
               </li>
             </ul>
             <Link
@@ -174,9 +179,13 @@ function HooksPreview() {
                 overflow: 'auto',
               }}
             >
-              <code>{`import { useSyncQueue } from '@gabriel-sisjr/react-native-sync-provider';
+              <code>{`import {
+  useAutoSync,
+  useSyncQueue,
+} from '@gabriel-sisjr/react-native-sync-provider';
 
 function OutboxScreen() {
+  useAutoSync({ enabled: true });
   const { items, enqueue } = useSyncQueue();
 
   const sendEvent = () =>

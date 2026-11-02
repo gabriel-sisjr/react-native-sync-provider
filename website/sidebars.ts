@@ -48,6 +48,7 @@ const sidebars: SidebarsConfig = {
             'api-reference/hooks/useSyncConfig',
             'api-reference/hooks/useAutoSync',
             'api-reference/hooks/useSyncSnapshot',
+            'api-reference/hooks/useSyncContext',
           ],
         },
         'api-reference/context',

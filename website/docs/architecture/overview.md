@@ -32,7 +32,7 @@ graph TD
 
 ### Layer 1: TypeScript Facade
 
-Source of every public symbol: 19 functions, 8 hooks, the `SyncProvider` context, every type and enum, the `SyncError` class. Located under `src/`. Responsibilities:
+Source of every public symbol: 21 functions (19 wrap the HybridObject, and `drainUntilEmpty` and `cancelDrain` are JS-side), 2 listener helpers, 9 hooks, the `SyncProvider` context, every type and enum, the `SyncError` class. Located under `src/`. Responsibilities:
 
 - Validate inputs (`validateSyncItem`).
 - Translate the native sentinel `startedAt === 0 && finishedAt === 0` for `getLastSyncResult` into `undefined`.
@@ -62,7 +62,9 @@ Each platform implements the spec using platform-idiomatic patterns:
 | HTTP dispatch | `URLSession` + `URLSessionConfiguration.background` | OkHttp 4.12.0 + Coroutines 1.8.1 |
 | Connectivity | `NWPathMonitor` (Network framework) | `ConnectivityManager.NetworkCallback` |
 | Background scheduler | `BGTaskScheduler` (`BGAppRefreshTaskRequest` + `BGProcessingTaskRequest`) | WorkManager 2.9.1 (`PeriodicWorkRequest` + `OneTimeWorkRequest`) |
-| Boot recovery | `BackgroundURLSessionDelegate` + `RecoveryManager` | `BootCompletedReceiver` + `RecoveryWorker` |
+| Recovery | `RecoveryManager`, on every engine start, including a BGTask launch with no JS | `RecoveryWorker`, on JS attach, boot and app update; `SyncWorker`, before a flush with no JS engine attached |
+| Persisted configuration | UserDefaults + Keychain | SharedPreferences + Android Keystore |
+| Retry wake | In-process timer | In-process timer + opt-in `WorkManager` kick |
 | Event emission | `SyncEventEmitter` -> Nitro callback | `SyncEventEmitter` -> Nitro callback |
 
 ## Why Nitro and Not TurboModule
@@ -100,13 +102,13 @@ Both platforms persist:
 
 - The pending queue (Core Data `SyncItem` entity / Room `SyncItemEntity`).
 - The sync history (Core Data `SyncResult` entity / Room `SyncResultEntity`).
-- The current configuration (last applied `SyncOptions`).
+- The current configuration (last applied `SyncOptions`), so a process with no JS honors it. `defaultHeaders` are encrypted at rest. See [Cold-start configuration](../guides/background-sync.md#cold-start-configuration).
 
-On launch, the recovery layer scans for items left in an `in_flight` state by a previous run (process killed mid-dispatch) and atomically resets them to `pending`. Combined with the ULID `id`, replay is safe as long as the server treats the id as an idempotency key.
+The recovery layer scans for items left in an `IN_FLIGHT` state by a previous run (process killed mid-dispatch) and atomically resets them to `PENDING`. It runs on launch, and before a flush in a background run with no JS: an iOS BGTask or an Android worker. A persisted pause or `foregroundOnly` blocks the Android worker, recovery included. The [recovery flow](./data-flow.md#recovery-flow) lists each platform's triggers. Delivery is therefore at least once, and endpoints must be [idempotent](../guides/idempotency.md).
 
 ### Connectivity Monitoring
 
-A single native monitor per process (`ConnectivityMonitor`) emits `CONNECTION_CHANGED` events. The dispatcher consumes these to gate flushes; the JS layer consumes them via `useConnection`.
+A single native monitor per process (`ConnectivityMonitor`) emits `CONNECTION_CHANGED` events. The JS layer consumes them via `useConnection` and `useAutoSync`, and the retry timer uses the monitor to hold a wake while offline. The dispatcher itself does not check connectivity.
 
 ## Next Steps
 

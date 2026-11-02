@@ -120,7 +120,8 @@ export interface SyncProvider extends HybridObject<{
   removeItem(id: string): Promise<boolean>;
 
   /**
-   * Remove every pending item from the queue.
+   * Remove every item from the queue, in any status: pending, in flight, or
+   * failed permanently.
    *
    * @example
    * await sync.clearQueue();
@@ -130,7 +131,9 @@ export interface SyncProvider extends HybridObject<{
   /**
    * Get the current pending-item count.
    *
-   * @returns the number of items currently waiting to be dispatched.
+   * @returns the number of items currently waiting to be dispatched: `PENDING`
+   *   items, including those waiting out a retry cooldown. Items in flight and
+   *   items that failed permanently are not counted.
    *
    * @example
    * if ((await sync.getQueueSize()) > 0) await sync.flush();
@@ -140,8 +143,9 @@ export interface SyncProvider extends HybridObject<{
   /**
    * Read every pending item from the queue.
    *
-   * @returns the pending items in dispatch order, with `id` and `createdAt`
-   *   populated.
+   * @returns the `PENDING` items in dispatch order, including those waiting
+   *   out a retry cooldown, with `id` and `createdAt` populated. Items in
+   *   flight and items that failed permanently are not returned.
    *
    * @example
    * const pending = await sync.getPendingItems();
@@ -152,20 +156,13 @@ export interface SyncProvider extends HybridObject<{
   /* ------------------------------ Sync ops ------------------------------ */
 
   /**
-   * Force a flush cycle, dispatching every pending item according to the
-   * configured strategy and retry policy.
+   * Run one flush cycle: dispatch one batch of eligible items, up to
+   * `SyncOptions.batchSize`, applying the retry policy. Items still cooling down
+   * are skipped. The strategy plays no part.
    *
-   * @returns the outcome of the cycle.
-   * @throws SyncError with code `NETWORK_ERROR` when the cycle aborts due to
-   *   a transport failure.
-   * @throws SyncError with code `SERVER_ERROR` when the cycle aborts due to
-   *   an unrecoverable server response.
-   * @throws SyncError with code `TIMEOUT` when individual requests exceed
-   *   `SyncOptions.requestTimeoutMs` and the cycle aborts.
-   * @throws SyncError with code `MAX_ATTEMPTS_EXCEEDED` when items exhaust
-   *   their retry budget. Per-item failures are also surfaced via
-   *   {@link SyncResult.errors}.
-   * @throws SyncError with code `UNAUTHORIZED` on 401/403 responses.
+   * @returns the outcome of the cycle. Per-item failures never reject: they are
+   *   counted here and reported through item events.
+   * @throws when the cycle itself dies, for example because the store fails.
    *
    * @example
    * const result = await sync.flush();
@@ -175,7 +172,10 @@ export interface SyncProvider extends HybridObject<{
 
   /**
    * Pause the sync engine. While paused, the queue still accepts enqueues
-   * but no flush cycles are scheduled (manual or otherwise).
+   * but no flush cycles run (manual or otherwise). The pause is persisted, so
+   * background workers stay inert while the app is dead. It lasts until
+   * `resumeSync()` or the next launch that reaches the library, including a JS
+   * reload. A launch clears it without emitting `RESUMED`.
    *
    * @example
    * await sync.pauseSync();
@@ -183,8 +183,11 @@ export interface SyncProvider extends HybridObject<{
   pauseSync(): Promise<void>;
 
   /**
-   * Resume the sync engine after `pauseSync()`. If the strategy is
-   * `AUTOMATIC` and items are pending, a flush is scheduled.
+   * Resume the sync engine after `pauseSync()`. Unless the strategy is
+   * `MANUAL`, a flush is scheduled for the soonest pending item: items with no
+   * cooldown left are dispatched right away, and cooling items when their
+   * cooldown ends. If the device is offline at that moment, the flush waits
+   * until connectivity is restored.
    *
    * @example
    * await sync.resumeSync();
@@ -204,9 +207,12 @@ export interface SyncProvider extends HybridObject<{
   /* ----------------------------- Config ops ----------------------------- */
 
   /**
-   * Replace the active sync configuration. The new options take effect
-   * starting with the next flush cycle (in-flight requests honor the
-   * previous config).
+   * Replace the active sync configuration. Android applies the new options
+   * from the next flush cycle. iOS applies them from the next item, even inside
+   * a running cycle. A request already in flight keeps the previous config.
+   *
+   * The options are persisted for background workers. `defaultHeaders` are
+   * encrypted at rest, and omitting them deletes the stored copy.
    *
    * @param options — new library-wide configuration.
    *
@@ -324,9 +330,12 @@ export interface SyncProvider extends HybridObject<{
   disableBackgroundSync(): Promise<void>;
 
   /**
-   * Check whether the OS-level background sync task is currently registered.
+   * Check whether background sync is enabled.
    *
-   * @returns `true` when a registration is active, `false` otherwise.
+   * @returns `true` after `enableBackgroundSync` until
+   *   `disableBackgroundSync`. This reflects the consumer's intent, not OS
+   *   state: with `foregroundOnly: true` it returns `true` although no OS work
+   *   is scheduled.
    *
    * @example
    * const enabled = await sync.isBackgroundSyncEnabled();

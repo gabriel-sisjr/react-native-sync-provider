@@ -5,39 +5,49 @@
  * use the symbol as both a runtime value (`SyncErrorCode.NETWORK_ERROR`) and
  * a type (`code: SyncErrorCode`). Values are upper `SCREAMING_SNAKE_CASE` to
  * keep the wire format stable on both native sides.
+ *
+ * Native codes do not reach JS through a rejection yet: the facade maps every
+ * native rejection to one fallback code per function. Codes a per-item failure
+ * reports arrive on `ITEM_FAILED` and `ITEM_RETRYING` events.
  */
 export const SyncErrorCode = {
   /**
    * Generic transport failure: DNS lookup failed, TCP connection refused,
    * TLS handshake failed, etc. Always retried (subject to `RetryPolicy`).
    *
-   * Thrown by: `flush`.
+   * Reported on item events. Also the code `flush` rejects with when its cycle
+   * dies, whatever the cause.
    */
   NETWORK_ERROR: 'NETWORK_ERROR',
   /**
-   * The server responded with a 5xx status code (or a 4xx status code in
-   * `RetryPolicy.retryOnStatusCodes`). Treated as retryable.
+   * The server responded with a status code outside 2xx, other than 401/403.
+   * Retried when the status is in `RetryPolicy.retryOnStatusCodes`; otherwise
+   * permanent.
    *
-   * Thrown by: `flush`.
+   * Reported on item events.
    */
   SERVER_ERROR: 'SERVER_ERROR',
   /**
-   * The supplied {@link SyncItemInput} is malformed (empty body for a method
-   * that requires one, illegal header value, etc.). Permanent — not retried.
+   * The supplied {@link SyncItemInput} is malformed, with the detail in
+   * `SyncError.validationErrors`. Permanent — not retried. Also the code most
+   * facade functions reject with when native rejects a call, with no
+   * `validationErrors`.
    *
-   * Thrown by: `enqueue`, `enqueueBatch`.
+   * Thrown by: `enqueue`, `enqueueBatch`, and as that fallback.
    */
   INVALID_PAYLOAD: 'INVALID_PAYLOAD',
   /**
    * The queue is at `SyncOptions.maxQueueSize`. Permanent — the consumer
    * must drain the queue (`flush`) or raise the cap before retrying.
    *
-   * Thrown by: `enqueue`, `enqueueBatch`.
+   * Raised by native only, so `enqueue` and `enqueueBatch` currently reject with
+   * `INVALID_PAYLOAD` and no `validationErrors` instead.
    */
   QUEUE_FULL: 'QUEUE_FULL',
   /**
-   * The native HybridObject could not be resolved at runtime. Always thrown
-   * by the JS facade and the `*.tsx` (non-native) fallback files.
+   * The native HybridObject could not be resolved at runtime, or the web entry
+   * is in use. It only reaches you from the JS layer: a native rejection carrying
+   * this code maps to the facade's fallback code like any other.
    *
    * Thrown by: every facade method when the native module is missing.
    */
@@ -59,33 +69,32 @@ export const SyncErrorCode = {
    */
   INVALID_URL: 'INVALID_URL',
   /**
-   * The server responded with `401 Unauthorized` (or `403 Forbidden` when
-   * the policy treats auth failures as permanent). Permanent — the consumer
-   * is expected to refresh credentials before re-enqueueing.
+   * The server responded with `401 Unauthorized` or `403 Forbidden`. Permanent
+   * — the consumer is expected to refresh credentials before re-enqueueing. The
+   * exception is a process running on stored `defaultHeaders`: see
+   * {@link SyncOptions.defaultHeaders}.
    *
-   * Thrown by: `flush`.
+   * Reported on item events.
    */
   UNAUTHORIZED: 'UNAUTHORIZED',
   /**
    * The request exceeded `SyncOptions.requestTimeoutMs`. Always retried
-   * (subject to `RetryPolicy`).
+   * (subject to `RetryPolicy`). Android can report this expiry as
+   * `NETWORK_ERROR`, which is retried the same way.
    *
-   * Thrown by: `flush`.
+   * Reported on item events.
    */
   TIMEOUT: 'TIMEOUT',
   /**
-   * An item exhausted its `RetryPolicy.maxAttempts` budget without
-   * succeeding. The item is moved to the failed bucket of the
-   * `SyncResult`.
+   * A retriable failure with no attempts left in `RetryPolicy.maxAttempts`. A
+   * non-retryable failure keeps its real code instead, even on the last attempt.
    *
-   * Thrown by: `flush` (per-item; surfaced in `SyncResult.errors`).
+   * Reported on `ITEM_FAILED`.
    */
   MAX_ATTEMPTS_EXCEEDED: 'MAX_ATTEMPTS_EXCEEDED',
   /**
-   * An item with the supplied id (or content fingerprint) is already in the
-   * queue. Permanent — not retried.
-   *
-   * Thrown by: `enqueue`, `enqueueBatch`.
+   * Reserved. Neither platform raises it: ids are native-assigned ULIDs, and no
+   * content fingerprint is computed.
    */
   DUPLICATE_ITEM: 'DUPLICATE_ITEM',
   /**

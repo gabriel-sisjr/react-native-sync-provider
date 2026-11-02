@@ -26,9 +26,10 @@ import kotlin.coroutines.cancellation.CancellationException
  * Promise rejection path.
  *
  * Errors:
- * - Every escaping throwable is normalized to [SyncException]. The JS facade
- *   re-instantiates a `SyncError` with the matching `code` based on the
- *   `<code>: <message>` rejection payload.
+ * - Every escaping throwable is normalized to [SyncException], so the Promise
+ *   rejects with a `<code>: <message>` string. The JS facade does not parse it:
+ *   `wrapNativeError` throws a `SyncError` with the failing call's fallback code
+ *   and keeps this string as its message.
  */
 @DoNotStrip
 class SyncProvider : HybridSyncProviderSpec() {

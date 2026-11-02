@@ -144,7 +144,8 @@ For a declarative version that ref-captures the callback (no `useCallback` / `us
 
 - Listeners outlive React component mounts. Always unsubscribe on cleanup.
 - Multiple listeners can be active simultaneously; each receives every event.
-- Listeners do not survive a JS context reload (Metro fast refresh, app restart). The native event bus is recreated; you must re-subscribe.
+- Listeners do not survive a JS context reload or an app restart. You must re-subscribe.
+- Events are delivered only to a running JS engine. Work done by a background worker with no JS emits to nobody.
 
 ---
 

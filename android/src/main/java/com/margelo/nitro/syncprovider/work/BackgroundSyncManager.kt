@@ -239,7 +239,7 @@ internal class BackgroundSyncManager(context: Context) {
     /** WorkManager refuses to register periodic work below 15 minutes. */
     const val MIN_INTERVAL_MS: Long = 15L * 60L * 1000L
 
-    /* Unique work names. Documented in CLAUDE.md / agent memory. */
+    /* Unique work names. */
     const val UNIQUE_PERIODIC = "syncprovider-flush-periodic"
     const val UNIQUE_ONE_TIME = "syncprovider-flush-now"
     const val UNIQUE_RECOVERY = "syncprovider-recovery"

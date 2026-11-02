@@ -19,18 +19,18 @@ The library ships its own manifest, so consumers usually have nothing extra to d
 
 ## What the library declares
 
-`ios/PrivacyInfo.xcprivacy` (bundled into the pod via `s.resource_bundles = { "SyncProvider_Privacy" => ["ios/PrivacyInfo.xcprivacy"] }`) declares exactly one Required Reason API:
+`ios/PrivacyInfo.xcprivacy` (bundled into the pod via `s.resource_bundles = { "SyncProvider_Privacy" => ["ios/PrivacyInfo.xcprivacy"] }`) declares two Required Reason APIs:
 
 | Field                                | Value                                                                                          |
 | ------------------------------------ | ---------------------------------------------------------------------------------------------- |
 | `NSPrivacyAccessedAPICategoryFileTimestamp` | Reason `C617.1` — Core Data's SQLite store reads timestamps on its own database files.  |
+| `NSPrivacyAccessedAPICategoryUserDefaults`  | Reason `CA92.1` — the library keeps its non-secret configuration in its own suite, `com.gabriel-sisjr.syncprovider`. |
 | `NSPrivacyTracking`                  | `false` — the library does not track users across apps or websites.                            |
 | `NSPrivacyTrackingDomains`           | _empty_ — no third-party domains are contacted.                                                |
 | `NSPrivacyCollectedDataTypes`        | _empty_ — the library does not collect any data on Apple's data-type taxonomy.                 |
 
 Specifically, the library does **not** access:
 
-- `UserDefaults` (`CA92.1`) — config lives in Core Data, not user defaults.
 - `SystemBootTime` — not needed.
 - `DiskSpace` — not needed.
 - `ActiveKeyboards` — not needed.
@@ -74,11 +74,13 @@ After archiving, inspect the final aggregated manifest inside the IPA:
 unzip -p YourApp.ipa "Payload/YourApp.app/PrivacyInfo.xcprivacy"
 ```
 
-You should see entries for every Required Reason API your app and SDKs declare, including `NSPrivacyAccessedAPICategoryFileTimestamp` from this library.
+You should see entries for every Required Reason API your app and SDKs declare, including `NSPrivacyAccessedAPICategoryFileTimestamp` and `NSPrivacyAccessedAPICategoryUserDefaults` from this library.
 
 ## App Store Connect Privacy Nutrition Labels
 
 The library does not affect your Privacy Nutrition Labels — it does not collect data and does not track users. Fill in your labels based on what your own app does, including the data you persist server-side as a result of dispatched HTTP requests.
+
+Default headers are stored in the Keychain, encrypted at rest and on the device only. The Keychain is not a Required Reason API, so it adds no manifest entry. They are sent only to the URLs you enqueue.
 
 :::note
 Apple's manifest format is versioned and occasionally adds new Required Reason APIs. If your CI starts emitting "missing privacy manifest entry" warnings after an Xcode bump, audit your own app first — the library's manifest is updated in lockstep with Xcode's requirements.

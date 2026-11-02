@@ -1,7 +1,7 @@
 ---
 sidebar_position: 3
 title: iOS Native Architecture
-description: Deep dive into the iOS native layer — Core Data persistence, URLSession dispatch (foreground + background), NWPathMonitor, BGTaskScheduler, RecoveryManager, and event emitter.
+description: Deep dive into the iOS native layer — SyncEngine, Core Data persistence, URLSession dispatch (foreground + background), NWPathMonitor, BGTaskScheduler, RecoveryManager, persisted configuration, and event emitter.
 keywords:
   - ios
   - swift
@@ -25,13 +25,22 @@ All iOS native code lives under `ios/`. The implementation uses Swift 5.9+, Core
 | `ios/Storage/`                                     | `SyncQueueStorage` — high-level wrapper around the DAOs (filtering, ordering, status transitions).             |
 | `ios/HTTP/`                                        | `SyncDispatcher` (foreground + background `URLSession`) and `BackgroundURLSessionDelegate`.                    |
 | `ios/Connectivity/`                                | `ConnectivityMonitor` over `NWPathMonitor`.                                                                    |
-| `ios/Background/`                                  | `BackgroundSyncManager` (`BGTaskScheduler` registration + scheduling), `RecoveryManager` (app-launch recovery).|
+| `ios/Engine/`                                      | `SyncEngine` (the process-wide runtime, independent of JS) and `RetryWakeTimer`.                               |
+| `ios/Config/`                                      | `SyncConfigStore`, `SecretStore` (Keychain), `SyncOptionsSnapshot`.                                            |
+| `ios/Background/`                                  | `BackgroundTaskRegistrar` and `SyncProviderBackgroundBootstrap.m` (handler registration at `+load`), `BackgroundSyncManager` (what a fired task does), `BackgroundSyncOptionsStore`, `RecoveryManager`. |
 | `ios/Events/`                                      | `SyncEventEmitter` — id-based listeners on the single `'sync-event'` channel.                                  |
 | `ios/Errors/`                                      | `SyncProviderError` — typed errors mapped to `SyncErrorCode`.                                                  |
-| `ios/Utils/`                                       | `ULID` generator and `SyncLogger`.                                                                             |
+| `ios/Retry/`                                       | `RetryPolicyEvaluator` — the backoff math.                                                                     |
+| `ios/Utils/`                                       | `ULID` generator, `SyncLogger`, `SyncClock` (the injectable clock behind cooldowns), `SyncDefaults` (the library's UserDefaults suite). |
 | `ios/Tests/`                                       | XCTest suite (driven by CocoaPods `s.test_spec 'Tests'`).                                                      |
 
-The HybridObject implementation lives in `ios/SyncProvider.swift` (`final class HybridSyncProvider: HybridSyncProviderSpec`) and delegates to the components above — it is the JSI front door and contains no business logic.
+The HybridObject implementation lives in `ios/SyncProvider.swift` (`final class HybridSyncProvider: HybridSyncProviderSpec`) and delegates to the `SyncEngine` — it is the JSI front door and contains no business logic.
+
+## SyncEngine
+
+`SyncEngine.shared` owns the queue, the dispatcher, the retry timer and the configuration. It exists independently of JS, because a BGTask launch needs all of them with no bridge loaded. It is built on first use, from whichever side gets there first: JS creating the hybrid, or a fired BGTask.
+
+On start it loads the persisted configuration, starts `ConnectivityMonitor`, and runs launch recovery. It counts JS-facing hybrids: the retry timer runs only while there is one, and creating a hybrid clears a persisted pause, because JS cannot read the flag and starts out unpaused.
 
 :::note
 The Swift class is intentionally named `HybridSyncProvider`, not `SyncProvider`. Nitro generates a C++ `SyncProvider::SyncProvider` class inside the `margelo::nitro::syncprovider` namespace; reusing the same name from Swift would collide with the generated bridging header (`SyncProvider-Swift.h`) and break the build. The Nitro `iosModuleName` (`SyncProvider`) and the JS lookup (`NitroModules.createHybridObject<SyncProvider>('SyncProvider')`) are unchanged — only the underlying Swift class name differs. The Kotlin implementation has no analogous collision and remains `class SyncProvider`. The autolinking mapping lives in `nitro.json → autolinking.SyncProvider.ios.implementationClassName: "HybridSyncProvider"`.
@@ -41,10 +50,12 @@ The Swift class is intentionally named `HybridSyncProvider`, not `SyncProvider`.
 
 `CoreDataStack` is a singleton that lazily builds an `NSPersistentContainer` against the `SyncProvider.xcdatamodeld` model bundled as a `.podspec` resource.
 
-Two entities are declared with `codeGenerationType="manual/none"` (Xcode auto-codegen disabled to avoid `Invalid redeclaration` clashes with the explicit `+CoreDataClass.swift` files):
+Two entities are declared with no `codeGenerationType` attribute, which Xcode shows as **Manual/None**. No class is generated, so nothing clashes with the explicit `+CoreDataClass.swift` files (`Invalid redeclaration`). `manual/none` is not a valid value for the attribute: `momc` rejects it.
 
-- **`SyncItemEntity`** — `id`, `method`, `url`, `headers` (Data blob), `body`, `contentType`, `priority`, `createdAt`, `attempts`, `lastAttemptAt`, `lastErrorCode`, plus a status discriminator used for the `pending → in-flight → succeeded/failed` lifecycle.
-- **`SyncResultEntity`** — `id`, `startedAt`, `finishedAt`, `itemsAttempted`, `itemsSucceeded`, `itemsFailed`. Persists the flush history exposed by `getSyncHistory()`.
+- **`SyncItemEntity`** — `id`, `method`, `url`, `headersJSON`, `body`, `contentType`, `priority`, `createdAt`, `attempts`, `lastAttemptAt`, `nextRetryAt`, `lastErrorCode`, `metadataJSON`, plus a `status` discriminator (`PENDING`, `IN_FLIGHT`, `FAILED`). A delivered item is deleted.
+- **`SyncResultEntity`** — `id`, `startedAt`, `finishedAt`, `itemsAttempted`, `itemsSucceeded`, `itemsFailed`, `errorMessage`. Persists the flush history exposed by `getSyncHistory()`. It stores no per-item detail, which is why `SyncResult.succeededIds`, `failedIds` and `errors` are always empty on iOS.
+
+The model has two versions. Version 2 adds `nextRetryAt`, the store migrates lightweight, and version 1 stays in the bundle. The store is at `Library/Application Support/SyncProvider.sqlite`.
 
 A separate background `NSManagedObjectContext` is used for writes to keep the JSI thread free of Core Data work.
 
@@ -57,45 +68,68 @@ The model is also reconstructed programmatically in `InMemoryCoreDataStack` (tes
 `SyncQueueStorage` wraps the Core Data DAO and is the only path the rest of the iOS code uses to mutate the queue. It enforces:
 
 - **Atomic batch insert** (`enqueueBatch` either persists every item or throws — no partial success).
-- **`maxQueueSize` enforcement** with `QUEUE_FULL` thrown at the boundary.
-- **Status transitions** (`pending → in-flight → succeeded | pending(for retry) | failed`) via a single transactional `perform` block to avoid race conditions across the dispatcher and recovery paths.
-- **Sort order**: priority descending, `createdAt` ascending — the same order Android uses, kept in sync deliberately.
+- **`maxQueueSize` enforcement** with `QUEUE_FULL` thrown at the boundary. The cap counts `PENDING` rows only, cooling ones included.
+- **Status transitions** (`PENDING → IN_FLIGHT → deleted | PENDING (for retry) | FAILED`) via a single transactional `perform` block to avoid race conditions across the dispatcher and recovery paths. An attempt is counted when the row goes `IN_FLIGHT`, so a kill mid-request spends it.
+- **Sort order**: priority first, `HIGH` to `LOW`, then `createdAt` ascending — the same order Android uses, kept in sync deliberately. `getSize` and `getQueued` cover `PENDING` rows only. The fetch for a cycle also requires `nextRetryAt <= now`.
 
 ## SyncDispatcher (URLSession)
 
-`SyncDispatcher` owns two `URLSession` instances:
+`SyncDispatcher` is an actor that owns two `URLSession` instances. A cycle takes one batch of eligible items and dispatches them one at a time:
 
 | Session                    | Purpose                                                                                                                      |
 | -------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| Foreground                 | `URLSession.shared`-style ephemeral configuration. Used when the app is alive; supports any HTTP method (including PATCH/DELETE). |
-| Background (OS-resumable)  | `URLSessionConfiguration.background(withIdentifier: "com.gabriel-sisjr.syncprovider.background")`. Used during BGTaskScheduler windows; the OS may suspend and resume uploads across app lifetimes. |
+| Foreground                 | `URLSessionConfiguration.default`, with `waitsForConnectivity`. Used when the app is active, and always under `foregroundOnly`. |
+| Background (OS-resumable)  | `URLSessionConfiguration.background(withIdentifier: "com.gabriel-sisjr.syncprovider.background-upload")`. Used when the app is not active, unless `foregroundOnly` is set. The body goes through a temporary file, and the OS may finish the upload while the app is suspended. |
 
-The dispatcher consumes claims from `SyncQueueStorage`, applies the active `RetryPolicy` (linear / exponential / fibonacci with optional full jitter), and reports per-item outcomes back as Core Data status transitions plus `SyncEvent`s on the emitter.
+The dispatcher reads eligible rows from `SyncQueueStorage`, applies the active `RetryPolicy` (linear / exponential / fibonacci with optional equal jitter), and reports per-item outcomes back as Core Data status transitions plus `SyncEvent`s on the emitter. A retriable failure writes `nextRetryAt` from a clock read after the attempt. A non-retryable failure keeps its real code, and `MAX_ATTEMPTS_EXCEEDED` applies only to a retriable failure with no attempts left. It reads `config` per item, so `configureSync` applies from the next item, even inside a running cycle.
 
-`BackgroundURLSessionDelegate` is the bridge that turns OS-resumed completion callbacks into the same status-transition pipeline, and forwards `application(_:handleEventsForBackgroundURLSession:completionHandler:)` invocations from the host app.
+`flush()` during a running cycle returns the last result at once. When paused, or with default headers that cannot be read, it returns a zero-count result with real timestamps and no cycle runs.
+
+`BackgroundURLSessionDelegate` routes a completion back to the dispatcher while the call that started the upload is still waiting, and receives the `application(_:handleEventsForBackgroundURLSession:completionHandler:)` call the host app forwards through `HybridSyncProvider.handleBackgroundURLSessionEvents`.
+
+:::warning A completion delivered after a relaunch is dropped
+The row stays `IN_FLIGHT` until launch recovery puts it back to `PENDING`, with no cooldown and its attempt spent. The server may have accepted the request, so it can be sent twice. See [Idempotency](../guides/idempotency.md).
+:::
+
+## Retry Wake
+
+`RetryWakeTimer` is one single-shot wall-clock timer per engine. `SyncEngine` arms it for the soonest `nextRetryAt` when a cycle ends, when a hybrid attaches, on `configureSync` and on `resumeSync`. It runs only with a JS-facing hybrid attached, and not while paused or under `MANUAL`. If it fires offline, the wake waits for connectivity. After a rejected stored credential, no wake comes before the hold ends. See [Who wakes the queue](../guides/retry-policy.md#who-wakes-the-queue-and-when).
+
+## Persisted Configuration
+
+`SyncConfigStore` keeps the configuration available to a process the app never spoke to. See [Cold-start configuration](../guides/background-sync.md#cold-start-configuration).
+
+| Store                                                 | Contents                                                                                                                      |
+| ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| UserDefaults suite `com.gabriel-sisjr.syncprovider`   | `config.v1` (every option except headers, plus `hasDefaultHeaders`), `paused`, `background.options.v1`, `background.enabled`. No secrets. |
+| Keychain, service `com.gabriel-sisjr.syncprovider`, account `defaultHeaders` | `defaultHeaders`, `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, not synchronized.                |
+
+Keychain items survive an uninstall. If the engine finds an item with no UserDefaults record, it deletes the orphan. That needs a successful read, so it waits for the first unlock.
 
 ## ConnectivityMonitor (NWPathMonitor)
 
 `ConnectivityMonitor` runs an `NWPathMonitor` on a dedicated queue and publishes a `ConnectionState` snapshot (`status`, `type`, `isInternetReachable`, `isExpensive`). It emits a `CONNECTION_CHANGED` event whenever the path status changes, and exposes the latest snapshot synchronously to `getConnectionStatus()`.
 
-The monitor is started lazily on the first `getConnectionStatus()` / `addListener` call and kept alive for the process lifetime — there is no per-listener registration overhead.
+`SyncEngine` starts the monitor when it is built and keeps it alive for the process lifetime — there is no per-listener registration overhead. `.unknown` does not count as online, so the retry timer waits on it.
 
 ## BackgroundSyncManager (BGTaskScheduler)
 
-`BackgroundSyncManager` registers two task identifiers with `BGTaskScheduler.shared`:
+`BackgroundTaskRegistrar` registers the handlers at process start: `SyncProviderBackgroundBootstrap.m` calls it from `+load`, the only hook that needs no change to the app's `AppDelegate` and still runs before `didFinishLaunchingWithOptions` returns. It registers only the identifiers declared in `BGTaskSchedulerPermittedIdentifiers`, because registering any other traps, and it resolves the engine only when a task fires.
 
-- **`BGAppRefreshTaskRequest`** — short, network-only refresh windows (~30 seconds, OS-decided, ~15 minute soft cadence).
-- **`BGProcessingTaskRequest`** — longer-running windows that may require power, used when the queue is large.
+`BackgroundSyncManager` decides what a fired task does. Two fixed identifiers:
 
-Both handlers funnel into `SyncDispatcher.flush()` and emit `BACKGROUND_SYNC_STARTED` / `BACKGROUND_SYNC_COMPLETED` events. The default identifier is `com.gabriel-sisjr.syncprovider.background`; consumers override it via `BackgroundSyncOptions.taskIdentifier`.
+- **`BGAppRefreshTaskRequest`** (`com.gabriel-sisjr.syncprovider.background`) — short refresh window. `enableBackgroundSync` submits it. Its handler re-submits it and submits the processing request.
+- **`BGProcessingTaskRequest`** (`com.gabriel-sisjr.syncprovider.processing`) — longer window. `requiresCharging` maps to `requiresExternalPower`, and network connectivity is always required. Its handler re-submits it.
+
+Both handlers wait for launch recovery, call `SyncDispatcher.flush()` once, and emit `BACKGROUND_SYNC_STARTED` / `BACKGROUND_SYNC_COMPLETED`. `BackgroundSyncOptionsStore` persists the options, including `foregroundOnly`, so a handler honors them with no JS loaded. Under `foregroundOnly`, or after `disableBackgroundSync`, a task that fires completes inert. `requiresUnmeteredNetwork` and `requiresDeviceIdle` are not mapped, and `taskIdentifier` is not used.
 
 :::warning
-Both identifiers MUST appear in the host app's `Info.plist` under `BGTaskSchedulerPermittedIdentifiers`, and the `Background fetch` and `Background processing` capabilities MUST be enabled on the app target. Missing either causes `enableBackgroundSync` to throw `BACKGROUND_TASK_REGISTRATION_FAILED`. See [iOS Background Modes](../production/ios-background-modes.md).
+Both identifiers MUST appear in the host app's `Info.plist` under `BGTaskSchedulerPermittedIdentifiers`, and the `Background fetch` and `Background processing` capabilities MUST be enabled on the app target. A missing identifier skips its handler, and `enableBackgroundSync` throws `BACKGROUND_TASK_REGISTRATION_FAILED` when `.background` is the one missing. See [iOS Background Modes](../production/ios-background-modes.md).
 :::
 
 ## RecoveryManager
 
-`RecoveryManager` runs once at app launch (driven by the host app's app delegate). It scans Core Data for items left in `in-flight` after the previous run (e.g., the app was force-quit mid-dispatch) and atomically transitions them back to `pending` so the next flush can pick them up. It also rehydrates the background `URLSession` and re-emits `SYNC_PROGRESS` events for any in-flight uploads the OS resumed on its own.
+`RecoveryManager` runs once per engine start, driven by `SyncEngine`, including on a BGTask launch with no JS. It atomically transitions items left `IN_FLIGHT` after the previous run (e.g., the app was force-quit mid-dispatch) back to `PENDING`, keeping `attempts` and `nextRetryAt`, so the next flush can pick them up. If it reset any item, it emits `RESUMED` with `metadata.recovered`.
 
 ## SyncEventEmitter
 
@@ -110,8 +144,8 @@ The emitter implements the Nitro listener pattern:
 
 The podspec advertises:
 
-- `s.platforms = { :ios => "13.0" }` (BGTaskScheduler floor).
-- `s.frameworks = "Foundation", "CoreData", "Network", "BackgroundTasks"`.
+- `s.platforms = { :ios => "15.0" }` (the async `URLSession.data(for:)` API). React Native 0.85 raises the built pod to 15.1.
+- `s.frameworks = "Foundation", "CoreData", "Network", "BackgroundTasks", "Security"`.
 - `s.resources = "ios/Database/SyncProvider.xcdatamodeld"` (Core Data model bundled into the pod).
 - `s.resource_bundles = { "SyncProvider_Privacy" => ["ios/PrivacyInfo.xcprivacy"] }` (deliberately a resource bundle, not a top-level resource — the RN 0.85 privacy_manifest aggregator iterates only `file_accessor.resource_bundles`, and listing the manifest as a top-level resource collides with the host app's aggregated manifest with `Multiple commands produce ...PrivacyInfo.xcprivacy`).
 - `s.exclude_files = ["ios/Tests/**/*"]` so the test sources are owned exclusively by the `s.test_spec 'Tests'` block.
@@ -130,26 +164,23 @@ pod 'SyncProvider', :path => '../..', :testspecs => ['Tests']
 Without this line, `pod install` will not generate the test target and `xcodebuild -scheme SyncProvider-Unit-Tests` will fail to resolve the scheme. The `post_install` block also calls `installer.pods_project.recreate_user_schemes(false)` to ensure the generated test scheme is shared (the `false` keeps user-state untouched).
 :::
 
-After `yarn nitrogen` and `bundle exec pod install --project-directory=ios` (run from `example/`), the suite can be exercised in two equivalent ways:
-
-```bash
-yarn test:ios
-```
+After `yarn nitrogen` and `bundle exec pod install --project-directory=ios` (run from `example/`), run the suite with:
 
 ```bash
 cd example/ios
 xcodebuild test \
   -workspace SyncProviderExample.xcworkspace \
   -scheme SyncProvider-Unit-Tests \
-  -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest'
+  -destination 'platform=iOS Simulator,name=iPhone 17,OS=latest'
 ```
 
-`yarn test:ios` shells out to `scripts/test-ios.sh`, which mirrors the CI invocation: it removes any stale `build/SyncProviderTests.xcresult` before each attempt (defends against the `"Existing file at -resultBundlePath"` failure mode) and walks a destination fallback list (`iPhone 16` → `iPhone 17` → `iPhone 16 Pro`, all `OS=latest`) so a missing simulator on a single machine does not block the run. The same loop runs in CI (`test-ios` job in `.github/workflows/ci.yml`).
+CI runs the same command in the `test-ios` job of `.github/workflows/ci.yml`. It prefers an iPhone 17 and picks the simulator automatically from what the runner ships, through `.github/scripts/pick-ios-simulator.mjs`.
 
 ## Privacy Manifest
 
-`ios/PrivacyInfo.xcprivacy` declares exactly one Required Reason API:
+`ios/PrivacyInfo.xcprivacy` declares two Required Reason APIs:
 
 - `NSPrivacyAccessedAPICategoryFileTimestamp` with reason `C617.1` — Core Data's SQLite store reads file timestamps on its own files.
+- `NSPrivacyAccessedAPICategoryUserDefaults` with reason `CA92.1` — the library keeps its non-secret configuration in its own UserDefaults suite.
 
-The library does **not** access `UserDefaults`, does **not** track users (`NSPrivacyTracking = false`), and does **not** declare any collected data types. See [Privacy Manifest](../production/privacy-manifest.md) for what consumers must add to their own app manifest.
+The library does **not** track users (`NSPrivacyTracking = false`), and does **not** declare any collected data types. See [Privacy Manifest](../production/privacy-manifest.md) for what consumers must add to their own app manifest.

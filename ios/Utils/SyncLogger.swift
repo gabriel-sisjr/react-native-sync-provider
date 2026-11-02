@@ -29,9 +29,9 @@ enum SyncLogger {
         "general": OSLog(subsystem: subsystem, category: "general")
     ]
 
-    /// Toggle verbose mode at runtime. When `true`, debug-level messages are
-    /// emitted regardless of `#if DEBUG`. Set by `configureSync` when the JS
-    /// side requests it.
+    /// Manual switch for verbose logging. When `true`, debug-level messages are
+    /// emitted in release builds too. It defaults to `false` and nothing in the
+    /// library sets it; `configureSync` has no option for it.
     static var verbose: Bool = false
 
     static func debug(_ message: @autoclosure () -> String, category: String = "general") {

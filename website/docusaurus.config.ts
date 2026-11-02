@@ -5,7 +5,7 @@ import type * as Preset from '@docusaurus/preset-classic';
 const config: Config = {
   title: 'React Native Sync Provider',
   tagline:
-    'Offline-first HTTP request queue with native persistence and true background sync for React Native — even when the app is closed.',
+    'Offline-first HTTP request queue for React Native, with native persistence and OS-scheduled background sync.',
 
   url: 'https://gabriel-sisjr.github.io',
   baseUrl: '/react-native-sync-provider/',

@@ -27,12 +27,17 @@ import type {
   SyncEvent,
   BackgroundSyncOptions,
   ConnectionState,
+  // Drain types
+  DrainOptions,
+  DrainResult,
+  DrainStoppedReason,
   // Hook result types
   UseConnectionResult,
   UseSyncQueueResult,
   UseSyncStatusResult,
   UseOfflineQueueResult,
   UseSyncConfigResult,
+  UseSyncSnapshotResult,
 } from '@gabriel-sisjr/react-native-sync-provider';
 ```
 
@@ -56,15 +61,19 @@ interface SyncItemInput {
 }
 ```
 
-| Property | Type | Required | Description |
-|----------|------|----------|-------------|
-| `method` | [`HttpMethod`](./enums.md#httpmethod) | Yes | HTTP verb. |
-| `url` | `string` | Yes | Absolute URL. |
-| `headers` | `Record<string, string>` | No | Per-item headers, merged on top of `SyncOptions.defaultHeaders`. |
-| `body` | `string` | No | Request body. Strings only -- encode binary as Base64. |
-| `contentType` | `string` | No | Convenience shortcut for `Content-Type` header. |
-| `priority` | [`SyncPriority`](./enums.md#syncpriority) | No | Dispatch lane. Defaults to `NORMAL`. |
-| `metadata` | `Record<string, string>` | No | Opaque tags persisted with the item and echoed in [`SyncEvent.metadata`](#syncevent). Strings only. |
+| Property      | Type                                      | Required | Description                                                                                         |
+| ------------- | ----------------------------------------- | -------- | --------------------------------------------------------------------------------------------------- |
+| `method`      | [`HttpMethod`](./enums.md#httpmethod)     | Yes      | HTTP verb.                                                                                          |
+| `url`         | `string`                                  | Yes      | Absolute URL.                                                                                       |
+| `headers`     | `Record<string, string>`                  | No       | Per-item headers, merged on top of `SyncOptions.defaultHeaders`. Stored in plain text: put credentials in `defaultHeaders`. |
+| `body`        | `string`                                  | No       | Request body. Strings only, sent as UTF-8 text. Stored in plain text. Android drops it for `GET` and `DELETE`. |
+| `contentType` | `string`                                  | No       | `Content-Type` header. Set it here and leave it out of `headers`: see the note below.               |
+| `priority`    | [`SyncPriority`](./enums.md#syncpriority) | No       | Dispatch lane. Defaults to `NORMAL`.                                                                |
+| `metadata`    | `Record<string, string>`                  | No       | Opaque tags persisted with the item and returned by `getPendingItems`. Not sent with the request and not echoed on events. Strings only. |
+
+:::note `contentType` vs. `headers`
+The platforms resolve a conflict differently. Android uses `contentType`, and sends `application/json` for any body when it is omitted, even if `headers` sets `Content-Type`. iOS uses the value in `headers` or `defaultHeaders`, and sets `contentType` only when neither has one.
+:::
 
 ---
 
@@ -82,21 +91,29 @@ interface SyncItem {
   contentType?: string;
   priority?: SyncPriority;
   createdAt: number;
+  attempts: number;
+  nextRetryAt: number;
   metadata?: Record<string, string>;
 }
 ```
 
-| Property | Type | Required | Description |
-|----------|------|----------|-------------|
-| `id` | `string` | Yes | ULID assigned by the native layer at persistence time. |
-| `method` | [`HttpMethod`](./enums.md#httpmethod) | Yes | HTTP verb. |
-| `url` | `string` | Yes | Absolute URL. |
-| `headers` | `Record<string, string>` | No | Per-item headers. |
-| `body` | `string` | No | Request body. |
-| `contentType` | `string` | No | `Content-Type` shortcut. |
-| `priority` | [`SyncPriority`](./enums.md#syncpriority) | No | Dispatch lane. |
-| `createdAt` | `number` | Yes | Unix milliseconds when the item was persisted. |
-| `metadata` | `Record<string, string>` | No | Opaque tags. |
+| Property      | Type                                      | Required | Description                                                                                                                                                                                                                                             |
+| ------------- | ----------------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`          | `string`                                  | Yes      | ULID assigned by the native layer at persistence time.                                                                                                                                                                                                  |
+| `method`      | [`HttpMethod`](./enums.md#httpmethod)     | Yes      | HTTP verb.                                                                                                                                                                                                                                              |
+| `url`         | `string`                                  | Yes      | Absolute URL.                                                                                                                                                                                                                                           |
+| `headers`     | `Record<string, string>`                  | No       | Per-item headers.                                                                                                                                                                                                                                       |
+| `body`        | `string`                                  | No       | Request body.                                                                                                                                                                                                                                           |
+| `contentType` | `string`                                  | No       | `Content-Type` shortcut.                                                                                                                                                                                                                                |
+| `priority`    | [`SyncPriority`](./enums.md#syncpriority) | No       | Dispatch lane.                                                                                                                                                                                                                                          |
+| `createdAt`   | `number`                                  | Yes      | Unix milliseconds when the item was persisted.                                                                                                                                                                                                          |
+| `attempts`    | `number`                                  | Yes      | Dispatch attempts made so far, across cycles. `0` means **never tried**. iOS counts an attempt when dispatch starts and Android when its outcome is recorded, so an attempt cut short by a process kill counts only on iOS. |
+| `nextRetryAt` | `number`                                  | Yes      | [Retry cooldown](../guides/retry-policy.md#retry-cooldown-across-restarts). `0` means **never attempted** and eligible now. A positive value is an epoch-ms deadline: a retry is pending, and the item is eligible once `nextRetryAt <= now`. The value stays in place afterwards, so a timestamp in the past means the cooldown has elapsed. |
+| `metadata`    | `Record<string, string>`                  | No       | Opaque tags.                                                                                                                                                                                                                                            |
+
+:::note `attempts` / `nextRetryAt` are never `undefined`
+Unlike [`getLastSyncResult`](./functions.md#getlastsyncresult), which maps a native sentinel (`startedAt === 0 && finishedAt === 0`) to `undefined`, a `SyncItem`'s `attempts` and `nextRetryAt` are surfaced **verbatim**. Their `0` values carry meaning, so they are filled in, not skipped.
+:::
 
 ---
 
@@ -117,14 +134,14 @@ interface RetryPolicy {
 }
 ```
 
-| Property | Type | Required | Default | Description |
-|----------|------|----------|---------|-------------|
-| `maxAttempts` | `number` | Yes | `5` | Total attempts before the item is moved to a terminal failed state. |
-| `backoff` | [`BackoffStrategy`](./enums.md#backoffstrategy) | Yes | `EXPONENTIAL` | Curve used to compute the next delay. |
-| `baseDelayMs` | `number` | Yes | `1000` | Base delay -- input to the curve. |
-| `maxDelayMs` | `number` | Yes | `60000` | Upper cap on the computed delay. |
-| `jitter` | `boolean` | Yes | `true` | When `true`, a uniform random factor is applied to the computed delay to avoid thundering-herd retries. |
-| `retryOnStatusCodes` | `number[]` | Yes | `[408, 425, 429, 500, 502, 503, 504]` | Response statuses that trigger a retry. Statuses outside the list are terminal failures. |
+| Property             | Type                                            | Required | Default                               | Description                                                                                             |
+| -------------------- | ----------------------------------------------- | -------- | ------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `maxAttempts`        | `number`                                        | Yes      | `5`                                   | Total attempts before the item is moved to a terminal failed state.                                     |
+| `backoff`            | [`BackoffStrategy`](./enums.md#backoffstrategy) | Yes      | `EXPONENTIAL`                         | Curve used to compute the next delay.                                                                   |
+| `baseDelayMs`        | `number`                                        | Yes      | `1000`                                | Base delay -- input to the curve.                                                                       |
+| `maxDelayMs`         | `number`                                        | Yes      | `60000`                               | Upper cap on the computed delay.                                                                        |
+| `jitter`             | `boolean`                                       | Yes      | `true`                                | When `true`, the computed delay is multiplied by a uniform factor in `[0.75, 1.25)` to avoid thundering-herd retries. |
+| `retryOnStatusCodes` | `number[]`                                      | Yes      | `[408, 425, 429, 500, 502, 503, 504]` | Response statuses that trigger a retry. Statuses outside the list are terminal failures, and 401/403 stay terminal even when listed. |
 
 See [Retry policy guide](../guides/retry-policy.md) for backoff math and tuning.
 
@@ -146,15 +163,15 @@ interface SyncOptions {
 }
 ```
 
-| Property | Type | Required | Description |
-|----------|------|----------|-------------|
-| `strategy` | [`SyncStrategy`](./enums.md#syncstrategy) | Yes | When the engine flushes: `AUTOMATIC`, `MANUAL`, or `OPPORTUNISTIC`. |
-| `retryPolicy` | [`RetryPolicy`](#retrypolicy) | Yes | Backoff policy. |
-| `batchSize` | `number` | No | Items dispatched per batch. Default `10`. |
-| `requestTimeoutMs` | `number` | No | Per-request timeout. |
-| `maxQueueSize` | `number` | No | Cap on pending items. `enqueue` throws `QUEUE_FULL` past this. |
-| `persistQueue` | `boolean` | No | When `false`, the queue lives in memory only and is lost on app death. |
-| `defaultHeaders` | `Record<string, string>` | No | Headers merged into every dispatched item. Per-item `headers` win on conflict. |
+| Property           | Type                                      | Required | Description                                                                                                                                                                                                       |
+| ------------------ | ----------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `strategy`         | [`SyncStrategy`](./enums.md#syncstrategy) | Yes      | What the engine schedules on its own: `AUTOMATIC`, `MANUAL`, or `OPPORTUNISTIC`. It does not control `flush()`.                                                                                                   |
+| `retryPolicy`      | [`RetryPolicy`](#retrypolicy)             | Yes      | Backoff policy.                                                                                                                                                                                                   |
+| `batchSize`        | `number`                                  | No       | Most items one cycle dispatches. Default `25`. Android sends them concurrently, iOS one at a time.                                                                                                                |
+| `requestTimeoutMs` | `number`                                  | No       | Per-request timeout. Default `30000`. Android enforces a floor of 1 second.                                                                                                                                       |
+| `maxQueueSize`     | `number`                                  | No       | Most items the queue may hold. Default `10000`. A value below `1` is treated as `1`, so the cap cannot be removed. Android counts `FAILED` and in-flight rows toward it, iOS counts `PENDING` rows only. See [Native rejections](./errors.md#native-rejections) for how a full queue surfaces. |
+| `persistQueue`     | `boolean`                                 | No       | Stored but not used yet. The queue is always persisted.                                                                                                                                                           |
+| `defaultHeaders`   | `Record<string, string>`                  | No       | Headers merged into every dispatched item. Per-item `headers` win on conflict. Encrypted at rest. Calling `configureSync` without them deletes the stored copy. See [Cold-start configuration](../guides/background-sync.md#cold-start-configuration). |
 
 ---
 
@@ -168,17 +185,74 @@ interface BackgroundSyncOptions {
   requiresCharging?: boolean;
   requiresUnmeteredNetwork?: boolean;
   requiresDeviceIdle?: boolean;
+  foregroundOnly?: boolean;
   taskIdentifier?: string;
 }
 ```
 
-| Property | Type | Required | Description |
-|----------|------|----------|-------------|
-| `minimumIntervalMs` | `number` | Yes | Minimum milliseconds between background runs. Android floor is 15 minutes; iOS treats this as a soft hint. |
-| `requiresCharging` | `boolean` | No | When `true`, only run while plugged in. |
-| `requiresUnmeteredNetwork` | `boolean` | No | When `true`, only run on unmetered networks. |
-| `requiresDeviceIdle` | `boolean` | No | When `true`, only run while the device is idle. |
-| `taskIdentifier` | `string` | No | Override the default identifier (`com.gabriel-sisjr.syncprovider.background`). Must match the `BGTaskSchedulerPermittedIdentifiers` entry in iOS `Info.plist`. |
+| Property                   | Type      | Required | Description                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| -------------------------- | --------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `minimumIntervalMs`        | `number`  | Yes      | Minimum milliseconds between background runs. Android floor is 15 minutes. iOS treats this as a soft hint, with a floor of 60 seconds.                                                                                                                                                                                                       |
+| `requiresCharging`         | `boolean` | No       | When `true`, only run while plugged in. On iOS this applies to the processing task only, not to the app-refresh task.                                                                                                                                                                                                                        |
+| `requiresUnmeteredNetwork` | `boolean` | No       | When `true`, only run on unmetered networks. Android only: iOS does not apply it.                                                                                                                                                                                                                                                            |
+| `requiresDeviceIdle`       | `boolean` | No       | When `true`, only run while the device is idle. Android only.                                                                                                                                                                                                                                                                                |
+| `foregroundOnly`           | `boolean` | No       | Kill-switch for background work. When `true`, the library schedules **no** background dispatch (no `BGTaskScheduler` tasks on iOS, no `WorkManager` periodic or one-time jobs on Android), cancels anything it had already scheduled, and iOS stops using the background `URLSession`. The in-process retry timer keeps running, and launch/boot recovery is **not** suppressed. Defaults to `false`. Persists across relaunches. See [Background sync guide](../guides/background-sync.md#foreground-only-mode). |
+| `taskIdentifier`           | `string`  | No       | Stored but not used yet. Both platforms use fixed identifiers. On iOS, `Info.plist` must declare the two fixed identifiers whatever this field says: see [iOS Setup](../getting-started/ios-setup.md).                                                                                                                                       |
+
+---
+
+## Drain Types
+
+Bounds and outcome for the [`drainUntilEmpty`](./functions.md#drainuntilempty) loop.
+
+### `DrainOptions`
+
+```ts
+interface DrainOptions {
+  maxIterations?: number;
+  timeoutMs?: number;
+  delayBetweenCyclesMs?: number;
+}
+```
+
+| Property               | Type     | Required | Default | Description                                                                                                                                    |
+| ---------------------- | -------- | -------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `maxIterations`        | `number` | No       | `32`    | Maximum flush cycles to start before stopping with `stoppedReason: 'MAX_ITERATIONS'`. Only real flushes count: waiting for a running cycle, a cooldown or connectivity does not use up iterations. |
+| `timeoutMs`            | `number` | No       | `60000` | Hard deadline for the whole loop. When it passes, the loop stops with `stoppedReason: 'TIMEOUT'`, even with a `flush()` still in flight. A native cycle already running keeps going after the drain returns. |
+| `delayBetweenCyclesMs` | `number` | No       | —       | Minimum pause between cycles. Omitted or `0` runs cycles that make progress back-to-back. It is not needed for retry cooldowns: the loop sleeps until the soonest `nextRetryAt` by itself. |
+
+Every option has a safe default, so `drainUntilEmpty()` with no arguments always ends, even under concurrent enqueues. A non-finite value (`NaN`, `Infinity`) falls back to that option's default.
+
+### `DrainResult`
+
+```ts
+interface DrainResult {
+  iterations: number;
+  itemsDispatched: number;
+  queueRemaining: number;
+  stoppedReason: DrainStoppedReason;
+}
+```
+
+| Property          | Type                                        | Description                                                                                                                                                 |
+| ----------------- | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `iterations`      | `number`                                    | Flush cycles started, including one interrupted by a stop.                                                                                                  |
+| `itemsDispatched` | `number`                                    | Best-effort count of items that left the pending queue, summed from decreases in queue size. It is not a success count: it includes items that failed permanently and items removed by `removeItem` / `clearQueue`, and it under-counts when items are enqueued during the drain. Use `getSyncHistory` for per-cycle results. |
+| `queueRemaining`  | `number`                                    | Last pending-item count the loop observed, including items still cooling. After a stop during a flush it predates that flush.                               |
+| `stoppedReason`   | [`DrainStoppedReason`](#drainstoppedreason) | Why the loop ended.                                                                                                                                         |
+
+### `DrainStoppedReason`
+
+```ts
+type DrainStoppedReason = 'EMPTY' | 'MAX_ITERATIONS' | 'TIMEOUT' | 'CANCELLED';
+```
+
+| Value            | Meaning                                                                                                                                                                                       |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `EMPTY`          | `getQueueSize()` is `0` and `isSyncing()` is `false` (the success case).                                                                                                                      |
+| `MAX_ITERATIONS` | The loop started `DrainOptions.maxIterations` flush cycles and items remain.                                                                                                                  |
+| `TIMEOUT`        | `DrainOptions.timeoutMs` elapsed, or the soonest retry cooldown ends at or after that deadline, so waiting for it would be pointless. Also how an offline drain ends, with items intact.       |
+| `CANCELLED`      | [`cancelDrain`](./functions.md#canceldrain) was called while the loop was running.                                                                                                            |
 
 ---
 
@@ -196,19 +270,19 @@ interface SyncResult {
   failureCount: number;
   succeededIds: string[];
   failedIds: string[];
-  errors: Record<string, SyncErrorCode>;
+  errors: Record<string, string>;
 }
 ```
 
-| Property | Type | Required | Description |
-|----------|------|----------|-------------|
-| `startedAt` | `number` | Yes | Unix ms when the run started. |
-| `finishedAt` | `number` | Yes | Unix ms when the run finished. |
-| `successCount` | `number` | Yes | Items dispatched successfully. |
-| `failureCount` | `number` | Yes | Items that exhausted retries or hit a terminal status code. |
-| `succeededIds` | `string[]` | Yes | ULIDs of successful items. |
-| `failedIds` | `string[]` | Yes | ULIDs of failed items. |
-| `errors` | `Record<string, SyncErrorCode>` | Yes | Map of failed-item id to terminal [`SyncErrorCode`](./errors.md#syncerrorcode). |
+| Property       | Type                     | Required | Description                                                                                                                                                                              |
+| -------------- | ------------------------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `startedAt`    | `number`                 | Yes      | Unix ms when the run started.                                                                                                                                                            |
+| `finishedAt`   | `number`                 | Yes      | Unix ms when the run finished.                                                                                                                                                           |
+| `successCount` | `number`                 | Yes      | Items dispatched successfully.                                                                                                                                                           |
+| `failureCount` | `number`                 | Yes      | Items that failed permanently in this cycle. An item waiting for a retry counts as neither a success nor a failure.                                                                      |
+| `succeededIds` | `string[]`               | Yes      | ULIDs of successful items. Always empty on iOS.                                                                                                                                          |
+| `failedIds`    | `string[]`               | Yes      | ULIDs of failed items. Always empty on iOS.                                                                                                                                              |
+| `errors`       | `Record<string, string>` | Yes      | Failed-item id to `"<SyncErrorCode>: <detail>"`, so split on the first `:` to get the code. Always empty on iOS: use `ITEM_FAILED` events there.                                        |
 
 ---
 
@@ -232,17 +306,17 @@ interface SyncEvent {
 }
 ```
 
-| Property | Type | Required | Description |
-|----------|------|----------|-------------|
-| `type` | [`SyncEventType`](./enums.md#synceventtype) | Yes | What kind of event this is. |
-| `timestamp` | `number` | Yes | Unix ms when the event was emitted. |
-| `itemId` | `string` | No | Present on item-scoped events (`ITEM_*`). |
-| `progress` | `number` | No | `[0, 1]`, present on `SYNC_PROGRESS`. |
-| `errorCode` | [`SyncErrorCode`](./errors.md#syncerrorcode) | No | Present on `*_FAILED` events. |
-| `statusCode` | `number` | No | HTTP status code, present on dispatch-related events when available. |
-| `attempt` | `number` | No | 1-indexed attempt count, present on `ITEM_RETRYING` and `ITEM_FAILED`. |
-| `connectionStatus` | [`ConnectionStatus`](./enums.md#connectionstatus) | No | Present on `CONNECTION_CHANGED`. |
-| `metadata` | `Record<string, string>` | No | Echo of [`SyncItem.metadata`](#syncitem) for item-scoped events. |
+| Property           | Type                                              | Required | Description                                                            |
+| ------------------ | ------------------------------------------------- | -------- | ---------------------------------------------------------------------- |
+| `type`             | [`SyncEventType`](./enums.md#synceventtype)       | Yes      | What kind of event this is.                                            |
+| `timestamp`        | `number`                                          | Yes      | Unix ms when the event was emitted.                                    |
+| `itemId`           | `string`                                          | No       | Present on item-scoped events (`ITEM_*`).                              |
+| `progress`         | `number`                                          | No       | `[0, 1]`, present on `SYNC_PROGRESS`, which only iOS emits.            |
+| `errorCode`        | [`SyncErrorCode`](./errors.md#syncerrorcode)      | No       | Present on `ITEM_FAILED` and `ITEM_RETRYING`, and on `SYNC_FAILED` only when the cycle itself died. |
+| `statusCode`       | `number`                                          | No       | HTTP status code, present on dispatch-related events when available.   |
+| `attempt`          | `number`                                          | No       | 1-indexed attempt number, present on `ITEM_SUCCEEDED`, `ITEM_FAILED` and `ITEM_RETRYING`. |
+| `connectionStatus` | [`ConnectionStatus`](./enums.md#connectionstatus) | No       | Present on `CONNECTION_CHANGED`.                                       |
+| `metadata`         | `Record<string, string>`                          | No       | Engine diagnostics on iOS cycle-level events, such as attempted and succeeded counts. This is **not** [`SyncItem.metadata`](#syncitem), which is never echoed on events. |
 
 ---
 
@@ -261,12 +335,12 @@ interface ConnectionState {
 }
 ```
 
-| Property | Type | Required | Description |
-|----------|------|----------|-------------|
-| `status` | [`ConnectionStatus`](./enums.md#connectionstatus) | Yes | High-level status. |
-| `type` | [`ConnectionType`](./enums.md#connectiontype) | Yes | Network family. |
-| `isInternetReachable` | `boolean` | No | Optional reachability probe (iOS only on some setups). |
-| `isExpensive` | `boolean` | No | Mirrors `NWPath.isExpensive` (iOS) / metered status (Android). |
+| Property              | Type                                              | Required | Description                                                    |
+| --------------------- | ------------------------------------------------- | -------- | -------------------------------------------------------------- |
+| `status`              | [`ConnectionStatus`](./enums.md#connectionstatus) | Yes      | High-level status.                                             |
+| `type`                | [`ConnectionType`](./enums.md#connectiontype)     | Yes      | Network family.                                                |
+| `isInternetReachable` | `boolean`                                         | No       | Optional reachability probe (iOS only on some setups).         |
+| `isExpensive`         | `boolean`                                         | No       | Mirrors `NWPath.isExpensive` (iOS) / metered status (Android). |
 
 ---
 
@@ -295,8 +369,8 @@ interface UseSyncQueueResult {
   items: SyncItem[];
   isLoading: boolean;
   error: SyncError | null;
-  enqueue: (item: SyncItemInput) => Promise<string | null>;
-  enqueueBatch: (items: SyncItemInput[]) => Promise<string[] | null>;
+  enqueue: (input: SyncItemInput) => Promise<string>;
+  enqueueBatch: (inputs: SyncItemInput[]) => Promise<string[]>;
   removeItem: (id: string) => Promise<boolean>;
   clearQueue: () => Promise<void>;
   refresh: () => Promise<void>;
@@ -311,10 +385,10 @@ See [`useSyncQueue`](./hooks/useSyncQueue.md).
 interface UseSyncStatusResult {
   isSyncing: boolean;
   isPaused: boolean;
-  progress: number;
+  progress: number | null;
   lastResult: SyncResult | null;
   error: SyncError | null;
-  flush: () => Promise<SyncResult | null>;
+  flush: () => Promise<SyncResult>;
   pause: () => Promise<void>;
   resume: () => Promise<void>;
 }
@@ -326,14 +400,14 @@ See [`useSyncStatus`](./hooks/useSyncStatus.md).
 
 ```ts
 interface UseOfflineQueueResult {
-  connection: ConnectionState;
+  connection: UseConnectionResult;
   size: number;
   items: SyncItem[];
   isSyncing: boolean;
   isWaitingForConnection: boolean;
   error: SyncError | null;
-  enqueue: (item: SyncItemInput) => Promise<string | null>;
-  flush: () => Promise<SyncResult | null>;
+  enqueue: (input: SyncItemInput) => Promise<string>;
+  flush: () => Promise<SyncResult>;
 }
 ```
 
@@ -343,10 +417,10 @@ See [`useOfflineQueue`](./hooks/useOfflineQueue.md).
 
 ```ts
 interface UseSyncConfigResult {
-  config: SyncOptions | undefined;
+  config: SyncOptions | null;
   isLoading: boolean;
   error: SyncError | null;
-  setConfig: (options: SyncOptions) => Promise<void>;
+  setConfig: (next: SyncOptions) => Promise<void>;
   refresh: () => Promise<void>;
 }
 ```
@@ -366,25 +440,25 @@ interface UseSyncSnapshotResult {
   lastResult: SyncResult | null;
   isWaitingForConnection: boolean;
   error: SyncError | null;
-  // Forward fields (Block B / v0.3) -- ALWAYS undefined in v0.2:
+  // Forward fields for v0.3 -- ALWAYS undefined in v0.2:
   networkQuality?: NetworkQuality;
   deadLetter?: readonly SyncDeadLetterItem[];
 }
 ```
 
-Read-only dashboard aggregator with no action methods. `networkQuality` and `deadLetter` are forward-looking fields that are **ALWAYS `undefined` in v0.2** -- see [Forward Types](#forward-types-block-b-v03) below.
+Read-only dashboard aggregator with no action methods. `networkQuality` and `deadLetter` are forward-looking fields that are **ALWAYS `undefined` in v0.2** -- see [Forward Types](#forward-types-v03) below.
 
 See [`useSyncSnapshot`](./hooks/useSyncSnapshot.md).
 
 ---
 
-## Forward Types (Block B, v0.3) {#forward-types-block-b-v03}
+## Forward Types (v0.3) {#forward-types-v03}
 
 These types are part of the frozen public surface so consumer code can depend on their final shape, but in v0.2 they are surfaced **only** as the optional [`UseSyncSnapshotResult.networkQuality`](#usesyncsnapshotresult) and [`UseSyncSnapshotResult.deadLetter`](#usesyncsnapshotresult) fields, both **ALWAYS `undefined`** until the v0.3 features ship.
 
 ### `SyncDeadLetterItem`
 
-An item that exhausted its retry budget and was moved to the dead-letter queue instead of being dropped. This is the **Gap #4** dead-letter item slated for Block B (v0.3); in v0.2 it is never produced.
+An item that exhausted its retry budget and was moved to the dead-letter queue. The dead-letter queue is slated for v0.3; in v0.2 this type is never produced, and an item that fails permanently stays in the queue store as a `FAILED` row.
 
 ```ts
 interface SyncDeadLetterItem {
@@ -405,24 +479,24 @@ interface SyncDeadLetterItem {
 }
 ```
 
-| Property | Type | Required | Description |
-|----------|------|----------|-------------|
-| `id` | `string` | Yes | ULID assigned by the native layer at enqueue time. |
-| `method` | [`HttpMethod`](./enums.md#httpmethod) | Yes | HTTP verb used to dispatch the request. |
-| `url` | `string` | Yes | Absolute URL of the request. |
-| `headers` | `Record<string, string>` | No | Request headers, mirroring what was enqueued. |
-| `body` | `string` | No | Pre-serialized request body. |
-| `contentType` | `string` | No | `Content-Type` shortcut; native prefers it over any value in `headers`. |
-| `priority` | [`SyncPriority`](./enums.md#syncpriority) | No | Dispatch lane (`NORMAL` if not supplied on enqueue). |
-| `createdAt` | `number` | Yes | Unix ms captured by the native layer at enqueue time. |
-| `metadata` | `Record<string, string>` | No | Opaque tags, mirroring what was enqueued. |
-| `attempts` | `number` | Yes | Total dispatch attempts made before dead-lettering. |
-| `lastAttemptAt` | `number` | Yes | Unix ms of the final (failing) dispatch attempt. |
-| `lastErrorCode` | [`SyncErrorCode`](./errors.md#syncerrorcode) | Yes | Failure code from the final attempt -- the reason it was dead-lettered. |
-| `lastErrorMessage` | `string` | No | Human-readable detail accompanying `lastErrorCode`. |
-| `deadLetteredAt` | `number` | Yes | Unix ms at which the item was moved to dead-letter. |
+| Property           | Type                                         | Required | Description                                                             |
+| ------------------ | -------------------------------------------- | -------- | ----------------------------------------------------------------------- |
+| `id`               | `string`                                     | Yes      | ULID assigned by the native layer at enqueue time.                      |
+| `method`           | [`HttpMethod`](./enums.md#httpmethod)        | Yes      | HTTP verb used to dispatch the request.                                 |
+| `url`              | `string`                                     | Yes      | Absolute URL of the request.                                            |
+| `headers`          | `Record<string, string>`                     | No       | Request headers, mirroring what was enqueued.                           |
+| `body`             | `string`                                     | No       | Pre-serialized request body.                                            |
+| `contentType`      | `string`                                     | No       | `Content-Type` shortcut, mirroring what was enqueued.                   |
+| `priority`         | [`SyncPriority`](./enums.md#syncpriority)    | No       | Dispatch lane (`NORMAL` if not supplied on enqueue).                    |
+| `createdAt`        | `number`                                     | Yes      | Unix ms captured by the native layer at enqueue time.                   |
+| `metadata`         | `Record<string, string>`                     | No       | Opaque tags, mirroring what was enqueued.                               |
+| `attempts`         | `number`                                     | Yes      | Total dispatch attempts made before dead-lettering.                     |
+| `lastAttemptAt`    | `number`                                     | Yes      | Unix ms of the final (failing) dispatch attempt.                        |
+| `lastErrorCode`    | [`SyncErrorCode`](./errors.md#syncerrorcode) | Yes      | Failure code from the final attempt -- the reason it was dead-lettered. |
+| `lastErrorMessage` | `string`                                     | No       | Human-readable detail accompanying `lastErrorCode`.                     |
+| `deadLetteredAt`   | `number`                                     | Yes      | Unix ms at which the item was moved to dead-letter.                     |
 
-See also [`NetworkQuality`](./enums.md#networkquality) -- the companion forward enum (Gap #2).
+See also [`NetworkQuality`](./enums.md#networkquality) -- the companion forward enum.
 
 ---
 

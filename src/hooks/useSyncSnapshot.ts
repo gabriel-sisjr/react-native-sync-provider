@@ -47,13 +47,13 @@ const QUEUE_REFRESH_EVENTS: ReadonlySet<string> = new Set<string>([
  * The hook performs its initial fetches on mount, guards every async `setState`
  * with a `cancelledRef`, and removes the listener on unmount.
  *
- * **No selector (Q6).** The hook takes no parameters and always returns the
+ * **No selector.** The hook takes no parameters and always returns the
  * full snapshot object. Consumers that need fine-grained re-render control can
  * memoize derived values themselves.
  *
- * **Forward fields.** `networkQuality` (Block B / Gap #2) and `deadLetter`
- * (Block B / Gap #4) are typed-optional and ALWAYS `undefined` in v0.2; real
- * values arrive with the v0.3 classifier / dead-letter store.
+ * **Forward fields.** `networkQuality` and `deadLetter` are typed-optional and
+ * ALWAYS `undefined` in v0.2; real values arrive with the v0.3 classifier /
+ * dead-letter store.
  *
  * Safe to call before the native module loads — it returns inert state and
  * never throws on render.

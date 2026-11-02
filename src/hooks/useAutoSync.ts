@@ -21,22 +21,21 @@ const DEFAULT_INTERVAL_MS = 60_000;
  * Extended {@link UseAutoSyncOptions} accepted by `useAutoSync`.
  *
  * Adds `intervalMs` (poll period) and `flushOnAppForeground` (opt-in
- * AppState integration), neither of which is part of the frozen Phase 1
- * type because they are JS-only orchestration concerns.
+ * AppState integration), which are JS-only orchestration concerns.
  */
 export interface UseAutoSyncExtraOptions extends UseAutoSyncOptions {
   /**
-   * Interval (in ms) at which the orchestrator polls and triggers a flush
-   * when the queue is non-empty and not currently syncing. Defaults to
-   * `60_000` (60s). Ignored when `enabled !== true`.
+   * Interval (in ms) at which the orchestrator triggers a flush when not
+   * offline and not currently syncing. Defaults to `60_000` (60s), and a value
+   * that is not positive falls back to that default, so the tick cannot be
+   * turned off. Ignored when `enabled !== true`.
    */
   intervalMs?: number;
   /**
    * If `true`, the orchestrator listens to `AppState.change` and triggers a
-   * flush when the app returns to `'active'`. Defaults to `false` to avoid
-   * unintended foreground sync battery cost. Distinct from the frozen
-   * `flushOnForeground` option which is reserved for a future event-based
-   * implementation.
+   * flush when the app returns to `'active'`, unless the device is
+   * `DISCONNECTED`. Defaults to `false` to avoid unintended foreground sync
+   * battery cost.
    */
   flushOnAppForeground?: boolean;
 }

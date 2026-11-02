@@ -20,7 +20,7 @@ Reactive view of the device's network state. Subscribes to `CONNECTION_CHANGED` 
 import { useConnection } from '@gabriel-sisjr/react-native-sync-provider';
 ```
 
-**Platform:** Android and iOS. On web / SSR returns `{ status: 'UNKNOWN', type: 'UNKNOWN', isOnline: false, isMetered: false }`.
+**Platform:** Android and iOS. On web / SSR returns `{ status: 'UNKNOWN', type: 'NONE', isOnline: false, isMetered: false }`.
 
 ---
 
@@ -46,7 +46,7 @@ function useConnection(): UseConnectionResult
 ## Behavior
 
 - **Initial value** -- on mount, the hook calls [`getConnectionStatus()`](../functions.md#getconnectionstatus) once to seed state.
-- **Subscription** -- registers a listener for `SyncEventType.CONNECTION_CHANGED` events via [`addSyncEventListener`](../listeners.md#addsynceventlistener) and updates state on every emission.
+- **Subscription** -- registers a listener for `SyncEventType.CONNECTION_CHANGED` events via [`addSyncEventListener`](../listeners.md#addsynceventlistener), and re-reads the snapshot on every emission so `type` stays current.
 - **Cleanup** -- unsubscribes on unmount.
 - **Web / SSR safety** -- when the native module is unavailable, the hook returns the `UNKNOWN` defaults without throwing.
 

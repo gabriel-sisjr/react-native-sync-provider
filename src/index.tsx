@@ -3,8 +3,8 @@
  *
  * Offline-first HTTP sync for React Native, powered by Nitro Modules. The
  * library persists outbound HTTP requests on the native side (Core Data on
- * iOS, Room on Android), drains them when connectivity allows, and keeps
- * working when the app is killed (BGTaskScheduler / WorkManager).
+ * iOS, Room on Android), dispatches them on a flush, and can flush while the app
+ * is not running (BGTaskScheduler / WorkManager).
  *
  * This module re-exports the entire public surface:
  *
@@ -105,8 +105,8 @@ function nativeOrThrow(): ReturnType<typeof getNativeSyncProvider> {
  * Enqueue a single HTTP request for asynchronous, offline-tolerant dispatch.
  *
  * The native layer assigns a ULID and returns it once the item is durably
- * persisted. The function is fire-and-forget from the JS side — the queue
- * keeps draining whether the caller awaits this promise or not.
+ * persisted. Enqueueing does not dispatch the item: that takes a flush, from
+ * `flush()`, `useAutoSync`, or an OS background window.
  *
  * @param item — request to enqueue (no `id` / `createdAt` — assigned by native).
  * @returns the ULID assigned to the new item.
@@ -115,9 +115,10 @@ function nativeOrThrow(): ReturnType<typeof getNativeSyncProvider> {
  * @throws {SyncError} {@link SyncErrorCode.INVALID_URL} when `url` is not a
  *   valid absolute http(s) URL.
  * @throws {SyncError} {@link SyncErrorCode.INVALID_PAYLOAD} when any other
- *   field in `item` is malformed.
- * @throws {SyncError} {@link SyncErrorCode.QUEUE_FULL} when the queue is at
- *   `SyncOptions.maxQueueSize`.
+ *   field in `item` is malformed, with `validationErrors` set. Also, with no
+ *   `validationErrors`, when native rejects the call. That includes a queue at
+ *   `SyncOptions.maxQueueSize`: native reports `QUEUE_FULL`, but native codes do
+ *   not reach JS yet.
  *
  * @example
  * const id = await enqueue({
@@ -226,7 +227,8 @@ export async function removeItem(id: string): Promise<boolean> {
 }
 
 /**
- * Remove every pending item from the queue.
+ * Remove every item from the queue, in any status: pending, in flight, or failed
+ * permanently. Does not affect the sync history.
  *
  * @returns resolves once the queue is empty.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
@@ -249,7 +251,9 @@ export async function clearQueue(): Promise<void> {
 /**
  * Read the current pending-item count.
  *
- * @returns the number of items currently waiting to be dispatched.
+ * @returns the number of items currently waiting to be dispatched: `PENDING`
+ *   items, including those waiting out a retry cooldown. Items in flight and
+ *   items that failed permanently are not counted.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
  *
@@ -270,10 +274,21 @@ export async function getQueueSize(): Promise<number> {
 /**
  * Read every pending item from the queue.
  *
- * @returns the pending items in dispatch order, with `id` and `createdAt`
- *   populated by the native layer.
+ * @returns the `PENDING` items in dispatch order, including those waiting out
+ *   a retry cooldown, with `id` and `createdAt` populated by the native layer.
+ *   Items in flight and items that failed permanently are not returned.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
+ *
+ * @remarks
+ * Each item's `attempts` and `nextRetryAt` are returned **verbatim** from the
+ * native layer — the facade performs **no** sentinel translation on a
+ * {@link SyncItem}. This is deliberately asymmetric with
+ * {@link getLastSyncResult}, which maps the native sentinel
+ * (`startedAt === 0 && finishedAt === 0`) to `undefined` via `isLastSyncSentinel`.
+ * For a `SyncItem`, `attempts === 0` ("never tried") and `nextRetryAt === 0`
+ * ("never attempted, eligible now") are real values — see
+ * {@link SyncItem.attempts} and {@link SyncItem.nextRetryAt}.
  *
  * @example
  * const pending = await getPendingItems();
@@ -295,22 +310,28 @@ export async function getPendingItems(): Promise<SyncItem[]> {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Force a flush cycle, dispatching every pending item according to the active
- * strategy and retry policy.
+ * Run one flush cycle: dispatch one batch of eligible items, up to
+ * `SyncOptions.batchSize`, applying the retry policy. Items still cooling down
+ * are skipped. The strategy plays no part, so this also works under `MANUAL`.
  *
- * @returns the outcome of the cycle.
+ * @returns the outcome of the cycle. Per-item failures never reject: read them
+ *   from the result and from `ITEM_FAILED` events.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
- * @throws {SyncError} {@link SyncErrorCode.NETWORK_ERROR} on transport
- *   failures aborting the cycle.
- * @throws {SyncError} {@link SyncErrorCode.SERVER_ERROR} on unrecoverable
- *   server responses aborting the cycle.
- * @throws {SyncError} {@link SyncErrorCode.TIMEOUT} when individual requests
- *   exceed `SyncOptions.requestTimeoutMs`.
- * @throws {SyncError} {@link SyncErrorCode.UNAUTHORIZED} on 401/403 responses.
- * @throws {SyncError} {@link SyncErrorCode.MAX_ATTEMPTS_EXCEEDED} when items
- *   exhaust their retry budget. Per-item failures are surfaced via
- *   `SyncResult.errors`.
+ * @throws {SyncError} {@link SyncErrorCode.NETWORK_ERROR} when the cycle itself
+ *   dies, for example because the store fails. It has nothing to do with the
+ *   network in that case: every native rejection maps to this code.
+ *
+ * @remarks
+ * A cycle with nothing eligible (the queue is empty, or every item is cooling
+ * down) resolves with a 0/0 result and ends with `SYNC_SUCCEEDED`.
+ *
+ * `flush()` does not check connectivity first, so calling it offline can spend
+ * retry attempts. {@link drainUntilEmpty} waits for the network instead, and
+ * `useAutoSync` skips its interval and foreground flushes while `DISCONNECTED`.
+ *
+ * While a cycle is running, iOS returns the last result at once, and Android
+ * waits and then runs its own cycle.
  *
  * @example
  * const result = await flush();
@@ -423,7 +444,12 @@ export function cancelDrain(): void {
 
 /**
  * Pause the sync engine. While paused, `enqueue`/`enqueueBatch` continue to
- * accept items but no flush cycles are scheduled.
+ * accept items but no flush cycles run: `flush()` resolves with an empty result
+ * and the retry timer is cancelled.
+ *
+ * The pause is persisted, so background workers stay inert while the app is
+ * dead. It lasts until {@link resumeSync} or the next launch that reaches the
+ * library, including a JS reload. A launch clears it without emitting `RESUMED`.
  *
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
@@ -443,8 +469,12 @@ export async function pauseSync(): Promise<void> {
 }
 
 /**
- * Resume the sync engine after {@link pauseSync}. If the strategy is
- * `AUTOMATIC` and items are pending, a flush is scheduled.
+ * Resume the sync engine after {@link pauseSync}.
+ *
+ * Unless the strategy is `MANUAL`, the engine then schedules a flush for the
+ * soonest pending item: items with no cooldown left are dispatched right away,
+ * and cooling items when their cooldown ends. If the device is offline at that
+ * moment, the flush waits until connectivity is restored.
  *
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
@@ -489,14 +519,21 @@ export async function isSyncing(): Promise<boolean> {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Replace the active sync configuration. The new options take effect starting
- * with the next flush cycle (in-flight requests honor the previous config).
+ * Replace the active sync configuration. Android applies the new options from
+ * the next flush cycle. iOS applies them from the next item, even inside a
+ * running cycle. A request already in flight keeps the previous config.
  *
  * @param options — new library-wide configuration.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
- * @throws {SyncError} {@link SyncErrorCode.INVALID_PAYLOAD} when `options`
- *   is malformed.
+ * @throws {SyncError} {@link SyncErrorCode.INVALID_PAYLOAD} when native rejects
+ *   the call.
+ *
+ * @remarks
+ * The options are persisted, so a background worker started without JS uses
+ * them too. `defaultHeaders` are encrypted at rest. Calling `configureSync`
+ * without `defaultHeaders` deletes the stored copy, which makes it the way to
+ * clear credentials on logout. See {@link SyncOptions.defaultHeaders}.
  *
  * @example
  * await configureSync({
@@ -649,6 +686,9 @@ export async function getConnectionStatus(): Promise<ConnectionState> {
  * Register the OS-level background sync task and start honoring it.
  *
  * @param options — constraints applied to the OS-scheduled task.
+ * @remarks Set `options.foregroundOnly` to `true` to suppress all OS-scheduled
+ *   background work while preserving launch/boot data-integrity recovery — see
+ *   {@link BackgroundSyncOptions.foregroundOnly}.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
  * @throws {SyncError} {@link SyncErrorCode.BACKGROUND_TASK_REGISTRATION_FAILED}
@@ -694,9 +734,12 @@ export async function disableBackgroundSync(): Promise<void> {
 }
 
 /**
- * Check whether the OS-level background sync task is currently registered.
+ * Check whether background sync is enabled.
  *
- * @returns `true` when a registration is active, `false` otherwise.
+ * @returns `true` after {@link enableBackgroundSync} until
+ *   {@link disableBackgroundSync}. This reflects the consumer's intent, not OS
+ *   state: with `foregroundOnly: true` it returns `true` although no OS work is
+ *   scheduled.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
  *

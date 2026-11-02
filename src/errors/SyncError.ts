@@ -19,8 +19,8 @@ import type { ValidationIssue } from './ValidationIssue';
  * try {
  *   await enqueue({ method: HttpMethod.POST, url: 'https://api.example.com/x' });
  * } catch (e) {
- *   if (e instanceof SyncError && e.code === SyncErrorCode.QUEUE_FULL) {
- *     // back off, drain the queue, and retry
+ *   if (e instanceof SyncError && e.code === SyncErrorCode.INVALID_URL) {
+ *     // the URL will never work: fix it at the call site
  *   } else {
  *     throw e;
  *   }

@@ -73,16 +73,13 @@ The flush dispatches in the following order:
 4. **D** (NORMAL)
 5. **C** (LOW)
 
-`batchSize` limits how many items are dispatched **concurrently** within a cycle, but the global ordering is preserved across batches.
+Each cycle takes one batch of up to `batchSize` eligible items, so this order decides which items go in the next batch. iOS sends a batch one item at a time, in this order. Android sends it concurrently, so items in a batch can arrive in any order.
 
 ## Avoiding HIGH Starvation
 
-`HIGH` is dispatched first within each cycle, but the cycle still drains the entire queue (constrained only by `batchSize`). LOW items are not starved -- they always run after HIGH/NORMAL drain in the same cycle.
+`HIGH` is dispatched first, and each cycle takes only one batch, so `LOW` items wait until `HIGH` and `NORMAL` items no longer fill it. An item that failed does not block others: it waits out its cooldown, and the next cycle takes the next eligible items.
 
-If you observe LOW items piling up indefinitely, the cause is usually:
-
-- The HIGH/NORMAL bucket producing items faster than the network can drain them (a backpressure problem, not a starvation one).
-- A failing endpoint causing HIGH items to retry indefinitely. In that case, raise `RetryPolicy.maxAttempts` for HIGH items so they exit the queue instead of blocking it -- or accept the failure faster with a smaller budget.
+If you observe `LOW` items piling up indefinitely, the cause is usually the `HIGH` and `NORMAL` buckets producing items faster than cycles can dispatch them. That is a backpressure problem, not a starvation one: raise `batchSize`, flush more often, or lower the priority of the bulk traffic. `RetryPolicy` is library-wide, so there is no per-priority retry budget.
 
 ## `defaultHeaders` and Per-Item Overrides
 
@@ -134,13 +131,16 @@ The merged headers attached to the dispatched request are:
 
 ### `Content-Type` priority
 
-`SyncItemInput.contentType`, when set, takes precedence over any `Content-Type` value present in `headers`. This is a convenience to avoid duplicating the field.
+Set the type through `SyncItemInput.contentType`, and leave it out of `headers` and `defaultHeaders`. The platforms resolve a conflict differently:
+
+- **Android** uses `contentType`. When it is omitted, a request with a body goes out as `application/json`, even if `headers` sets `Content-Type`.
+- **iOS** uses the value in `headers` or `defaultHeaders`, and applies `contentType` only when neither has one.
 
 ```ts
 await enqueue({
   method: HttpMethod.POST,
   url: 'https://api.example.com/text',
-  contentType: 'text/plain', // wins over headers['Content-Type']
+  contentType: 'text/plain',
   body: 'hello',
 });
 ```
@@ -154,11 +154,11 @@ await configureSync({
 });
 ```
 
-`batchSize` controls how many items dispatch in parallel within a cycle. Defaults are conservative (native side chooses `4` when omitted). Raise it for upload-heavy workloads on stable networks; lower it on flaky connections to avoid swamping the retry queue.
+`batchSize` caps how many items one cycle dispatches. The default is `25`. Android sends them concurrently, and iOS one at a time, so on Android it is also the concurrency limit. Raise it for upload-heavy workloads on stable networks; lower it on flaky connections to avoid swamping the retry queue.
 
 ## Per-Item Timeout
 
-`requestTimeoutMs` is library-wide -- there is no per-item override in v0.1. If you need different timeouts for different endpoints, partition them across separate apps or wait for the v0.2 callback API.
+`requestTimeoutMs` is library-wide -- there is no per-item override.
 
 ## Next Steps
 

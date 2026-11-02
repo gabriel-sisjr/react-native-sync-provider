@@ -282,7 +282,7 @@ internal class SyncQueueStorage(
   }
 
   companion object {
-    /** Default cap from the ux-researcher decisions brief. */
+    /** Queue cap used when `SyncOptions.maxQueueSize` is not set. */
     const val DEFAULT_MAX_QUEUE_SIZE: Int = 10_000
 
     fun from(

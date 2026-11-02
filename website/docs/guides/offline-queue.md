@@ -25,7 +25,7 @@ The offline queue is the heart of `react-native-sync-provider`. Every outbound H
 
 Items are written to disk **before** `enqueue()` resolves -- the function never returns until durability is confirmed. There is no in-memory-only mode.
 
-The queue is not encrypted at rest. If your items carry secrets, set `SyncOptions.persistQueue = false` (in-memory only, lost on app death) or encrypt the request bodies on the JS side before enqueueing.
+The queue is not encrypted at rest: per-item `headers` and `body` are stored in plain text. Put credentials in `SyncOptions.defaultHeaders`, which are [encrypted at rest](./background-sync.md#cold-start-configuration), and encrypt sensitive bodies on the JS side before enqueueing. `SyncOptions.persistQueue` is stored but not used yet, so it cannot turn persistence off.
 
 ## Enqueue Patterns
 
@@ -42,7 +42,9 @@ const id = await enqueue({
 });
 ```
 
-The returned `id` is a ULID assigned by the native layer. Store it if you need to remove the item later or correlate it with server-side records.
+The returned `id` is a ULID assigned by the native layer. Store it if you need to remove the item later or match it against sync events. It is not sent with the request: see [Idempotency](./idempotency.md).
+
+Enqueueing does not dispatch the item. See [When Items Are Dispatched](#when-items-are-dispatched).
 
 ### Atomic batch
 
@@ -56,11 +58,11 @@ const ids = await enqueueBatch([
 ]);
 ```
 
-`enqueueBatch` is **atomic**: either every item is persisted (and `ids` returns all ULIDs), or the call throws and no items are added. Use this when ordering matters (e.g., a multi-step server-side transaction) or when you need all-or-nothing semantics.
+`enqueueBatch` is **atomic**: either every item is persisted (and `ids` returns all ULIDs), or the call throws and no items are added. It is atomic for persistence, not for delivery: each item is dispatched and retried on its own, and Android sends a batch concurrently, so do not rely on the arrival order.
 
 ### With metadata
 
-Attach opaque tags to an item -- they are persisted alongside the item and echoed back in `SyncEvent.metadata` for item-scoped events:
+Attach opaque tags to an item. They are persisted with it and returned by `getPendingItems()`. They are not sent with the request and not echoed on sync events:
 
 ```ts
 await enqueue({
@@ -100,7 +102,7 @@ function PendingBadge() {
 }
 ```
 
-The hook re-fetches `items` and `size` whenever an `ITEM_ENQUEUED`, `ITEM_REMOVED`, `ITEM_SUCCEEDED`, `QUEUE_CLEARED`, or `SYNC_SUCCEEDED` event fires.
+The hook re-fetches `items` and `size` whenever an `ITEM_ENQUEUED`, `ITEM_REMOVED`, `ITEM_SUCCEEDED`, `ITEM_FAILED`, `QUEUE_CLEARED`, `SYNC_SUCCEEDED` or `SYNC_FAILED` event fires.
 
 ### Direct facade calls
 
@@ -112,6 +114,8 @@ import { getQueueSize, getPendingItems } from '@gabriel-sisjr/react-native-sync-
 const count = await getQueueSize();
 const items = await getPendingItems();
 ```
+
+`getQueueSize()` and `getPendingItems()` cover `PENDING` items only, on both platforms. Items waiting out a retry cooldown are included. Items in flight and items that failed permanently are not, so `0` does not mean the engine is idle: check `isSyncing()` too.
 
 `getPendingItems()` returns items in dispatch order (priority desc, `createdAt` asc).
 
@@ -136,7 +140,13 @@ await configureSync({
 });
 ```
 
-When the cap is reached, subsequent `enqueue()` calls throw `SyncErrorCode.QUEUE_FULL`. Catch and decide: drop the new item, drain via `flush()`, or surface a retry-later UX.
+The default cap is `10000`. Any value below `1` is treated as `1`, so the cap cannot be removed.
+
+When the cap is reached, subsequent `enqueue()` calls reject. The native layer raises `QUEUE_FULL`, but it [reaches JS as `INVALID_PAYLOAD` with no `validationErrors`](../api-reference/errors.md#native-rejections) for now. Catch that and decide: drop the new item, flush, or surface a retry-later UX.
+
+:::warning Failed items count toward the Android cap
+Android counts every row toward the cap, including items that failed permanently, which `getQueueSize()` does not show. iOS counts `PENDING` rows only. Remove failed items as described in [Permanent Failures](./retry-policy.md#permanent-failures).
+:::
 
 ## Manual Removal
 
@@ -157,18 +167,26 @@ import { clearQueue } from '@gabriel-sisjr/react-native-sync-provider';
 await clearQueue();
 ```
 
-`clearQueue()` does not touch the persisted flush history -- use [`clearSyncHistory()`](../api-reference/functions.md#clearsynchistory) for that.
+`clearQueue()` removes every item, including items that failed permanently. It does not touch the persisted flush history -- use [`clearSyncHistory()`](../api-reference/functions.md#clearsynchistory) for that.
 
-## Manual Flush vs Automatic
+## When Items Are Dispatched
 
-- **`SyncStrategy.AUTOMATIC`** (default): the engine flushes the moment the queue is non-empty and connectivity allows. You rarely need to call `flush()` directly.
-- **`SyncStrategy.MANUAL`**: nothing flushes until you call `flush()`. Useful for explicit upload screens.
-- **`SyncStrategy.OPPORTUNISTIC`**: flushes only on opportunistic windows (foreground resume, charging, unmetered network).
+Enqueueing never dispatches an item, under any strategy. A flush does, and something has to start one:
+
+- **[`useAutoSync`](../api-reference/hooks/useAutoSync.md)**: flushes on an interval and on reconnect while the app runs. This is the usual choice.
+- **[`flush()`](../api-reference/functions.md#flush)** and **[`drainUntilEmpty()`](../api-reference/functions.md#drainuntilempty)**: flush when you ask.
+- **[Background sync](./background-sync.md)**: OS windows while the app is not running.
+
+The [strategy](../api-reference/enums.md#syncstrategy) only decides what the engine schedules on its own:
+
+- **`SyncStrategy.AUTOMATIC`** (default): the engine retries by itself. A failed item is dispatched again when its cooldown ends, and pending items are dispatched on `resumeSync()`.
+- **`SyncStrategy.MANUAL`**: the engine schedules nothing by itself. Useful for explicit upload screens. Background windows still run if you called `enableBackgroundSync`.
+- **`SyncStrategy.OPPORTUNISTIC`**: reserved. It currently behaves like `AUTOMATIC`.
 
 See the [`useSyncStatus` hook](../api-reference/hooks/useSyncStatus.md) for live progress reporting.
 
 ## Next Steps
 
-- [Background Sync](./background-sync.md) -- Drain the queue while the app is killed.
+- [Background Sync](./background-sync.md) -- Flush the queue while the app is not running.
 - [Retry Policy](./retry-policy.md) -- How failed items are retried.
 - [Idempotency](./idempotency.md) -- Avoid double-sending after a crash.

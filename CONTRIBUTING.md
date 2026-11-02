@@ -115,14 +115,20 @@ Run the checks that match what your change touched before opening or merging a P
 
 | Check                       | Command                                                                                                                                                 | When                                                                                            |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| **V-JS** — JS gate (always) | `yarn typecheck && yarn lint && yarn test`                                                                                                              | Every change, no exceptions.                                                                    |
-| **V-AND** — Android gate    | `yarn nitrogen` then `yarn turbo run build:android`, plus the Gradle unit tests (`gradlew :gabriel-sisjr_react-native-sync-provider:testDebugUnitTest`) | Android native (`android/**`) **or** the Nitro bridge (`src/SyncProvider.nitro.ts`) is touched. |
-| **V-IOS** — iOS gate        | `cd example && bundle exec pod install --project-directory=ios` then `xcodebuild test` with scheme `SyncProvider-Unit-Tests`                            | iOS native (`ios/**`) **or** the Nitro bridge is touched.                                       |
+| JS gate (always)            | `yarn typecheck && yarn lint && yarn test`                                                                                                              | Every change, no exceptions.                                                                    |
+| Android gate                | `yarn nitrogen` then `yarn turbo run build:android`, plus the Gradle unit tests (`gradlew :gabriel-sisjr_react-native-sync-provider:testDebugUnitTest`) | Android native (`android/**`) **or** the Nitro bridge (`src/SyncProvider.nitro.ts`) is touched. |
+| iOS gate                    | `cd example && bundle exec pod install --project-directory=ios` then `xcodebuild test` with scheme `SyncProvider-Unit-Tests`                            | iOS native (`ios/**`) **or** the Nitro bridge is touched.                                       |
 
 And these correctness gates, regardless of platform:
 
-- **R-A** — Re-run `yarn nitrogen` on any change to `src/SyncProvider.nitro.ts` or to any spec-reachable type. Stale generated base classes are a silent source of build drift.
-- **R-E** — Every new facade function or hook needs a web twin in `src/index.web.tsx` (a throwing fallback for functions, inert state for hooks). A new export with no web twin breaks the web/SSR bundle.
+- Re-run `yarn nitrogen` on any change to `src/SyncProvider.nitro.ts` or to any spec-reachable type. Stale generated base classes are a silent source of build drift.
+- Every new facade function or hook needs a web twin in `src/index.web.tsx` (a throwing fallback for functions, inert state for hooks). A new export with no web twin breaks the web/SSR bundle.
+
+### Reading a failed CI job
+
+For a failed example iOS build, the job log can leave out the reason, so CI prints the compiler diagnostics from Xcode's activity log as an annotation. It also uploads that log as the **`ios-build-log`** artifact, kept for 14 days, only when the build failed. The artifact is an `.xcactivitylog`: open it in Xcode, or read it as text with `gunzip -c <log> | tr '\r' '\n'`.
+
+The `build-library` job and both release workflows assert the `npm pack` contents with `.github/scripts/assert-pack-contents.mjs`. If it fails, the tarball is missing a Core Data model file, or would ship native tests: check the `files` list in `package.json`.
 
 ### Commit message convention
 
@@ -197,7 +203,7 @@ What happens next is automatic:
 
 1. The push to `main` triggers **`publish.yml`**.
 2. The workflow re-reads `package.json`, compares the version against the last version on npm, and only proceeds if it changed (the **version-diff guard**). This is what prevents accidental re-publishes when you push unrelated commits to `main`.
-3. CI runs `yarn install --immutable` → `yarn nitrogen` → `yarn lint` → `yarn typecheck` → `yarn prepare` (build) → `yarn test`. The `yarn lint` and `yarn typecheck` gates run inside `publish.yml` (right after nitrogen, before the build) so the publish path fails fast on lint/type errors, not just on test failures.
+3. CI runs `yarn install --immutable` → `yarn nitrogen` → `yarn lint` → `yarn typecheck` → `yarn prepare` (build) → `yarn test`, then asserts the `npm pack` contents. The `yarn lint` and `yarn typecheck` gates run inside `publish.yml` (right after nitrogen, before the build) so the publish path fails fast on lint/type errors, not just on test failures.
 4. CI runs `npm publish --access public --provenance`. The `--provenance` flag attaches a signed attestation linking the published tarball to this exact commit and workflow run.
 5. CI creates the `v<version>` GitHub release with notes generated from the commit log between tags.
 
@@ -297,9 +303,9 @@ The `package.json` file contains various scripts for common tasks:
 
 - `yarn`: setup project by installing dependencies.
 - `yarn typecheck`: type-check files with TypeScript.
-  - `yarn lint`: lint files with [ESLint](https://eslint.org/).
-    - `yarn test`: run unit tests with [Jest](https://jestjs.io/).
-  - `yarn example start`: start the Metro server for the example app.
+- `yarn lint`: lint files with [ESLint](https://eslint.org/).
+- `yarn test`: run unit tests with [Jest](https://jestjs.io/).
+- `yarn example start`: start the Metro server for the example app.
 - `yarn example android`: run the example app on Android.
 - `yarn example ios`: run the example app on iOS.
 

@@ -41,23 +41,23 @@ Takes no parameters and always returns the full snapshot object. Consumers that 
 | Property | Type | Description |
 |----------|------|-------------|
 | `connection` | [`UseConnectionResult`](../types.md#useconnectionresult) | Connection snapshot -- `status`, `type`, `isOnline`, `isMetered`. |
-| `size` | `number` | Pending queue size, mirroring [`getQueueSize`](../functions.md#getqueuesize). |
+| `size` | `number` | `PENDING` items, cooling ones included, mirroring [`getQueueSize`](../functions.md#getqueuesize). |
 | `items` | [`SyncItem[]`](../types.md#syncitem) | Pending items snapshot, mirroring [`getPendingItems`](../functions.md#getpendingitems). |
 | `isSyncing` | `boolean` | `true` while a flush cycle is currently in progress. |
-| `isPaused` | `boolean` | `true` after `pauseSync()` and before `resumeSync()`. |
-| `progress` | `number \| null` | Current flush progress in `[0, 1]`, or `null` when idle. |
-| `lastResult` | [`SyncResult`](../types.md#syncresult) `\| null` | Most recent flush outcome, or `null` if none yet this session. |
+| `isPaused` | `boolean` | `true` after a `PAUSED` event, until `RESUMED`. It starts `false` and cannot read a pause already in force. |
+| `progress` | `number \| null` | Current flush progress in `[0, 1]`, or `null` when idle. `SYNC_PROGRESS` is iOS-only, so on Android it stays `0` during a cycle. |
+| `lastResult` | [`SyncResult`](../types.md#syncresult) `\| null` | Most recent persisted flush outcome, or `null` if none exists. |
 | `isWaitingForConnection` | `boolean` | `size > 0 && !connection.isOnline`. The "Waiting for connection..." sentinel. |
 | `error` | [`SyncError`](../errors.md) `\| null` | Last error captured by the hook, or `null` once cleared. |
 
-### Forward fields (Block B / v0.3)
+### Forward fields for v0.3
 
 These two optional fields are part of the frozen type so consumer code can depend on their final shape, but they are **ALWAYS `undefined` in v0.2**. Real values arrive once the v0.3 network-quality classifier and dead-letter store ship.
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `networkQuality` | [`NetworkQuality`](../enums.md#networkquality) `\| undefined` | **Forward field (Gap #2).** Coarse network-quality classification. `undefined` in v0.2. |
-| `deadLetter` | [`SyncDeadLetterItem[]`](../types.md#syncdeadletteritem) `\| undefined` | **Forward field (Gap #4).** Items moved to the dead-letter queue after exhausting their retry budget. `undefined` in v0.2. |
+| `networkQuality` | [`NetworkQuality`](../enums.md#networkquality) `\| undefined` | **Forward field.** Coarse network-quality classification. `undefined` in v0.2. |
+| `deadLetter` | [`SyncDeadLetterItem[]`](../types.md#syncdeadletteritem) `\| undefined` | **Forward field.** Items moved to the dead-letter queue after exhausting their retry budget. `undefined` in v0.2. |
 
 :::note v0.2 vs v0.3
 `networkQuality` and `deadLetter` are typed-optional today purely so the snapshot shape is stable across the v0.2 → v0.3 boundary. Do not branch on them in v0.2 -- they will never be populated until the v0.3 features land.

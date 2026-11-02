@@ -80,18 +80,24 @@ export type ConnectionType =
  */
 export const SyncStrategy = {
   /**
-   * The library flushes automatically as soon as the queue is non-empty and
-   * connectivity allows.
+   * The engine retries on its own: a failed item is dispatched again when its
+   * cooldown ends, and pending items are dispatched on `resumeSync()`.
+   *
+   * Enqueueing does **not** trigger a native flush. To dispatch new items, mount
+   * `useAutoSync` or call `flush()`.
    */
   AUTOMATIC: 'AUTOMATIC',
   /**
-   * The queue is only drained when the consumer explicitly calls `flush()`.
-   * Useful for batch upload screens.
+   * The engine schedules nothing on its own: no retry timer and no Android
+   * retry kick. Items are dispatched by an explicit `flush()`, plus any OS
+   * windows enabled through `enableBackgroundSync`. Useful for batch upload
+   * screens.
    */
   MANUAL: 'MANUAL',
   /**
-   * Like AUTOMATIC, but only flushes on opportunistic windows (foreground
-   * resume, charging, unmetered network) — defers work otherwise.
+   * Reserved for flushing only on opportunistic windows (foreground resume,
+   * charging, unmetered network). Not implemented yet: it currently behaves
+   * like AUTOMATIC.
    */
   OPPORTUNISTIC: 'OPPORTUNISTIC',
 } as const;
@@ -136,9 +142,8 @@ export type BackoffStrategy =
 /**
  * Coarse network-quality classification (worst → best).
  *
- * This is the Gap #2 network-quality classification slated for Block B
- * (v0.3). It is introduced early so consumer types can depend on its final
- * shape, but in v0.2 it is surfaced ONLY as the optional
+ * Slated for v0.3. It is introduced early so consumer types can depend on its
+ * final shape, but in v0.2 it is surfaced ONLY as the optional
  * {@link UseSyncSnapshotResult.networkQuality} field and is ALWAYS `undefined`
  * until the v0.3 classifier ships and begins emitting real measurements.
  *
@@ -169,7 +174,7 @@ export type NetworkQuality =
  * (`HttpMethod.POST`) without re-spelling the union.
  */
 export const HttpMethod = {
-  /** HTTP GET — must not carry a body. */
+  /** HTTP GET — must not carry a body. Android drops one if supplied. */
   GET: 'GET',
   /** HTTP POST — typically carries a body. */
   POST: 'POST',
@@ -177,7 +182,7 @@ export const HttpMethod = {
   PUT: 'PUT',
   /** HTTP PATCH — partial update. */
   PATCH: 'PATCH',
-  /** HTTP DELETE — body is optional and discouraged. */
+  /** HTTP DELETE — body is discouraged. Android drops one if supplied. */
   DELETE: 'DELETE',
 } as const;
 /** See {@link HttpMethod} value set. */
@@ -196,34 +201,45 @@ export type HttpMethod = (typeof HttpMethod)[keyof typeof HttpMethod];
 export const SyncEventType = {
   /** A new item was accepted into the queue. `itemId` is set. */
   ITEM_ENQUEUED: 'ITEM_ENQUEUED',
-  /** An item was removed from the queue (manual or post-success). `itemId` is set. */
+  /** An item was removed by `removeItem()`. `itemId` is set. */
   ITEM_REMOVED: 'ITEM_REMOVED',
   /** A flush cycle has begun. */
   SYNC_STARTED: 'SYNC_STARTED',
-  /** Coarse progress update for the current flush. `progress` (0..1) is set. */
+  /**
+   * Coarse progress update for the current flush. `progress` (0..1) is set.
+   * iOS only: Android does not emit it.
+   */
   SYNC_PROGRESS: 'SYNC_PROGRESS',
-  /** The current flush cycle finished with no failures. */
+  /**
+   * The current flush cycle finished with no permanent failure. This includes a
+   * cycle with nothing eligible (empty queue, or every item cooling down), which
+   * records a 0/0 result, and a cycle whose items all went back to wait for a
+   * retry.
+   */
   SYNC_SUCCEEDED: 'SYNC_SUCCEEDED',
   /**
-   * The current flush cycle finished with at least one failure.
-   * `errorCode` carries the dominant failure reason.
+   * The current flush cycle finished with at least one permanent failure, or
+   * died. `errorCode` is set only when it died: per-item failures are on
+   * `ITEM_FAILED`.
    */
   SYNC_FAILED: 'SYNC_FAILED',
   /**
-   * A single item dispatched successfully. `itemId` and `statusCode` are set.
+   * A single item dispatched successfully. `itemId`, `statusCode` and `attempt`
+   * are set.
    */
   ITEM_SUCCEEDED: 'ITEM_SUCCEEDED',
   /**
-   * A single item failed permanently (after exhausting its retry budget).
-   * `itemId`, `errorCode` and (when applicable) `statusCode` are set.
+   * A single item failed permanently: a non-retryable failure, or a retriable
+   * one with no attempts left. `itemId`, `errorCode` and `attempt` are set, plus
+   * `statusCode` when applicable.
    */
   ITEM_FAILED: 'ITEM_FAILED',
   /**
-   * A single item was scheduled for retry.
+   * A single item went back to wait for a retry.
    * `itemId`, `attempt` and `errorCode` are set.
    */
   ITEM_RETRYING: 'ITEM_RETRYING',
-  /** The queue was cleared via `clearQueue()` or by reaching `maxQueueSize`. */
+  /** The queue was cleared via `clearQueue()`. */
   QUEUE_CLEARED: 'QUEUE_CLEARED',
   /**
    * Network connectivity changed. `connectionStatus` is set; richer detail is
@@ -232,7 +248,10 @@ export const SyncEventType = {
   CONNECTION_CHANGED: 'CONNECTION_CHANGED',
   /** Sync was paused via `pauseSync()`. */
   PAUSED: 'PAUSED',
-  /** Sync was resumed via `resumeSync()`. */
+  /**
+   * Sync was resumed via `resumeSync()`. iOS also emits it at launch when
+   * recovery put interrupted items back in the queue.
+   */
   RESUMED: 'RESUMED',
   /** OS-scheduled background sync window started. */
   BACKGROUND_SYNC_STARTED: 'BACKGROUND_SYNC_STARTED',
