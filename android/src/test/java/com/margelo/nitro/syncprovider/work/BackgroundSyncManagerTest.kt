@@ -3,19 +3,29 @@ package com.margelo.nitro.syncprovider.work
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import androidx.work.Configuration
+import androidx.work.ListenableWorker
+import androidx.work.NetworkType
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import androidx.work.impl.WorkManagerImpl
 import androidx.work.impl.model.WorkSpec
 import androidx.work.testing.SynchronousExecutor
+import androidx.work.testing.TestListenableWorkerBuilder
 import androidx.work.testing.WorkManagerTestInitHelper
 import com.google.common.truth.Truth.assertThat
+import com.margelo.nitro.syncprovider.SyncProviderRuntime
+import com.margelo.nitro.syncprovider.http.SyncDispatcher
 import com.margelo.nitro.syncprovider.testutil.RuntimeTestSupport
 import com.margelo.nitro.syncprovider.testutil.TestData
+import io.mockk.coEvery
+import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
+import io.mockk.mockkObject
 import io.mockk.mockkStatic
+import io.mockk.unmockkObject
 import io.mockk.unmockkStatic
+import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Before
 import org.junit.Test
@@ -187,6 +197,155 @@ internal class BackgroundSyncManagerTest {
     assertThat(activeWorkCount(BackgroundSyncManager.UNIQUE_ONE_TIME)).isEqualTo(1)
   }
 
+  /* --------------------------- (f) the opt-in retry kick ----------------------------- */
+
+  @Test
+  fun `the kick needs background sync to have been enabled`() {
+    manager.scheduleOneTimeFlush(initialDelayMs = 30_000L)
+
+    assertThat(manager.isEnabled()).isFalse()
+    assertThat(activeWorkCount(BackgroundSyncManager.UNIQUE_ONE_TIME)).isEqualTo(0)
+  }
+
+  @Test
+  fun `the kick is delayed by setInitialDelay`() {
+    manager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+
+    manager.scheduleOneTimeFlush(initialDelayMs = 30_000L)
+
+    assertThat(activeSpec(BackgroundSyncManager.UNIQUE_ONE_TIME).initialDelay).isEqualTo(30_000L)
+  }
+
+  @Test
+  fun `a zero delay runs as soon as WorkManager allows`() {
+    manager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+
+    manager.scheduleOneTimeFlush(initialDelayMs = 0L)
+
+    assertThat(activeSpec(BackgroundSyncManager.UNIQUE_ONE_TIME).initialDelay).isEqualTo(0L)
+  }
+
+  @Test
+  fun `a later kick REPLACEs the armed one`() {
+    manager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+    manager.scheduleOneTimeFlush(initialDelayMs = 30_000L)
+    val first = activeSpec(BackgroundSyncManager.UNIQUE_ONE_TIME)
+
+    manager.scheduleOneTimeFlush(initialDelayMs = 5_000L)
+
+    val second = activeSpec(BackgroundSyncManager.UNIQUE_ONE_TIME)
+    assertThat(second.id).isNotEqualTo(first.id)
+    assertThat(second.initialDelay).isEqualTo(5_000L)
+    assertThat(activeWorkCount(BackgroundSyncManager.UNIQUE_ONE_TIME)).isEqualTo(1)
+  }
+
+  @Test
+  fun `the kick honors the constraints the consumer configured`() {
+    manager.enable(
+      TestData.backgroundSyncOptions(
+        foregroundOnly = false,
+        requiresUnmeteredNetwork = true,
+        requiresCharging = true,
+      ),
+    )
+
+    manager.scheduleOneTimeFlush(initialDelayMs = 1_000L)
+
+    val constraints = activeSpec(BackgroundSyncManager.UNIQUE_ONE_TIME).constraints
+    assertThat(constraints.requiredNetworkType).isEqualTo(NetworkType.UNMETERED)
+    assertThat(constraints.requiresCharging()).isTrue()
+  }
+
+  @Test
+  fun `the kick needs only a connection by default`() {
+    manager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+
+    manager.scheduleOneTimeFlush(initialDelayMs = 1_000L)
+
+    val constraints = activeSpec(BackgroundSyncManager.UNIQUE_ONE_TIME).constraints
+    assertThat(constraints.requiredNetworkType).isEqualTo(NetworkType.CONNECTED)
+    assertThat(constraints.requiresCharging()).isFalse()
+  }
+
+  @Test
+  fun `the kick is suppressed when foregroundOnly is persisted`() {
+    manager.enable(TestData.backgroundSyncOptions(foregroundOnly = true))
+
+    manager.scheduleOneTimeFlush(initialDelayMs = 30_000L)
+
+    assertThat(activeWorkCount(BackgroundSyncManager.UNIQUE_ONE_TIME)).isEqualTo(0)
+  }
+
+  @Test
+  fun `a kick that cannot be scheduled is logged, not thrown`() {
+    manager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+    mockkStatic(WorkManager::class)
+    try {
+      every { WorkManager.getInstance(any<Context>()) } throws IllegalStateException("not initialized")
+
+      manager.scheduleOneTimeFlush(initialDelayMs = 1_000L)
+    } finally {
+      unmockkStatic(WorkManager::class)
+    }
+  }
+
+  @Test
+  fun `cancelRetryKick drops the kick and leaves periodic work alone`() {
+    manager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+    manager.scheduleOneTimeFlush(initialDelayMs = 30_000L)
+
+    manager.cancelRetryKick()
+
+    assertThat(activeWorkCount(BackgroundSyncManager.UNIQUE_ONE_TIME)).isEqualTo(0)
+    assertThat(activeWorkCount(BackgroundSyncManager.UNIQUE_PERIODIC)).isEqualTo(1)
+  }
+
+  /* --------------------------------- (g) disable() ----------------------------------- */
+
+  @Test
+  fun `disable cancels the periodic work and a pending kick`() {
+    manager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+    manager.scheduleOneTimeFlush(initialDelayMs = 30_000L)
+
+    manager.disable()
+
+    assertThat(manager.isEnabled()).isFalse()
+    assertThat(activeWorkCount(BackgroundSyncManager.UNIQUE_PERIODIC)).isEqualTo(0)
+    assertThat(activeWorkCount(BackgroundSyncManager.UNIQUE_ONE_TIME)).isEqualTo(0)
+  }
+
+  @Test
+  fun `no kick can be armed after disable`() {
+    manager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+
+    manager.disable()
+    manager.scheduleOneTimeFlush(initialDelayMs = 30_000L)
+
+    assertThat(activeWorkCount(BackgroundSyncManager.UNIQUE_ONE_TIME)).isEqualTo(0)
+  }
+
+  /** A cycle ending between the two steps must see it, or it re-arms a kick. */
+  @Test
+  fun `disable publishes the flag before anything is cancelled`() {
+    manager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+    val enabledSeenByCancel = mutableListOf<Boolean>()
+    val workManager = mockk<WorkManager>(relaxed = true)
+    every { workManager.cancelUniqueWork(any()) } answers {
+      enabledSeenByCancel += manager.isEnabled()
+      mockk(relaxed = true)
+    }
+    mockkStatic(WorkManager::class)
+    try {
+      every { WorkManager.getInstance(any<Context>()) } returns workManager
+
+      manager.disable()
+    } finally {
+      unmockkStatic(WorkManager::class)
+    }
+
+    assertThat(enabledSeenByCancel).containsExactly(false, false)
+  }
+
   /* --- (d) data-integrity recovery still runs under the flag; boot re-arm stays gated - */
 
   @Test
@@ -196,5 +355,35 @@ internal class BackgroundSyncManagerTest {
     manager.scheduleRecovery()
 
     assertThat(workInfos(BackgroundSyncManager.UNIQUE_RECOVERY)).hasSize(1)
+  }
+
+  @Test
+  fun `recovery resets in-flight items under foregroundOnly without re-arming periodic`() = runTest {
+    // Persist the foreground-only intent through a real manager (no periodic scheduled).
+    manager.enable(TestData.backgroundSyncOptions(foregroundOnly = true))
+    assertThat(activeWorkCount(BackgroundSyncManager.UNIQUE_PERIODIC)).isEqualTo(0)
+
+    val dispatcher = mockk<SyncDispatcher>(relaxed = true)
+    coEvery { dispatcher.resetInFlight() } returns 2
+    val runtime = mockk<SyncProviderRuntime>(relaxed = true)
+    every { runtime.dispatcher } returns dispatcher
+    every { runtime.backgroundSyncManager } returns manager
+
+    mockkObject(SyncProviderRuntime.Companion)
+    try {
+      every { SyncProviderRuntime.getOrNull(any()) } returns runtime
+      every { SyncProviderRuntime.bootstrap(any()) } returns runtime
+
+      val worker = TestListenableWorkerBuilder<RecoveryWorker>(context).build()
+      val result = worker.doWork()
+
+      // Recovery (data integrity) ran regardless of the flag...
+      assertThat(result).isEqualTo(ListenableWorker.Result.success())
+      coVerify(exactly = 1) { dispatcher.resetInFlight() }
+      // ...but the boot re-arm of OS-scheduled work stayed gated.
+      assertThat(activeWorkCount(BackgroundSyncManager.UNIQUE_PERIODIC)).isEqualTo(0)
+    } finally {
+      unmockkObject(SyncProviderRuntime.Companion)
+    }
   }
 }

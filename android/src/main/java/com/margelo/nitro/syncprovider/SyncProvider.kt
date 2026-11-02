@@ -7,6 +7,7 @@ import com.margelo.nitro.NitroModules
 import com.margelo.nitro.core.Promise
 import com.margelo.nitro.syncprovider.error.SyncException
 import com.margelo.nitro.syncprovider.events.SyncEventEmitter
+import com.margelo.nitro.syncprovider.http.SyncDispatcher
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -46,17 +47,13 @@ class SyncProvider : HybridSyncProviderSpec() {
     SupervisorJob() + Dispatchers.Default + exceptionHandler,
   )
 
-  private val runtime: SyncProviderRuntime by lazy {
+  private val lazyRuntime: Lazy<SyncProviderRuntime> = lazy {
     val context: Context = NitroModules.applicationContext
       ?: error("NitroModules.applicationContext is null. SyncProvider cannot bootstrap.")
-    SyncProviderRuntime.bootstrap(context).also { rt ->
-      // Start observing connectivity so getConnectionStatus() and
-      // CONNECTION_CHANGED events stay live.
-      rt.connectivityMonitor.start()
-      // Schedule recovery on first construction (no-op if already done).
-      rt.backgroundSyncManager.scheduleRecovery()
-    }
+    SyncProviderRuntime.bootstrap(context).also { it.attachEngine() }
   }
+
+  private val runtime: SyncProviderRuntime by lazyRuntime
 
   /* ------------------------------ Queue ops ----------------------------- */
 
@@ -97,7 +94,7 @@ class SyncProvider : HybridSyncProviderSpec() {
   }
 
   override fun getQueueSize(): Promise<Double> = promise {
-    runtime.storage.count().toDouble()
+    runtime.queueSize().toDouble()
   }
 
   override fun getPendingItems(): Promise<Array<SyncItem>> = promise {
@@ -107,21 +104,16 @@ class SyncProvider : HybridSyncProviderSpec() {
   /* ------------------------------ Sync ops ------------------------------ */
 
   override fun flush(): Promise<SyncResult> = promise {
-    if (runtime.paused) {
-      // Pause is a soft signal: return an empty no-op result instead of
-      // rejecting, so consumers can call flush() defensively.
-      return@promise emptyResult()
-    }
     runtime.dispatcher.flush()
   }
 
   override fun pauseSync(): Promise<Unit> = promise {
-    runtime.paused = true
+    runtime.pause()
     runtime.emitter.emit(SyncEventEmitter.event(SyncEventType.PAUSED))
   }
 
   override fun resumeSync(): Promise<Unit> = promise {
-    runtime.paused = false
+    runtime.resume()
     runtime.emitter.emit(SyncEventEmitter.event(SyncEventType.RESUMED))
   }
 
@@ -132,7 +124,7 @@ class SyncProvider : HybridSyncProviderSpec() {
   /* ----------------------------- Config ops ----------------------------- */
 
   override fun configureSync(options: SyncOptions): Promise<Unit> = promise {
-    runtime.updateOptions(options)
+    runtime.configure(options)
   }
 
   override fun getSyncConfig(): Promise<SyncOptions> = promise {
@@ -142,7 +134,7 @@ class SyncProvider : HybridSyncProviderSpec() {
   /* ----------------------------- History ops ---------------------------- */
 
   override fun getLastSyncResult(): Promise<SyncResult> = promise {
-    runtime.storage.getLastResult() ?: emptyResult()
+    runtime.storage.getLastResult() ?: SyncDispatcher.emptyResult()
   }
 
   override fun getSyncHistory(limit: Double): Promise<Array<SyncResult>> = promise {
@@ -194,10 +186,11 @@ class SyncProvider : HybridSyncProviderSpec() {
   /* ------------------------------ teardown ------------------------------ */
 
   /**
-   * Cancel the module scope. Called by Nitro when the HybridObject is
-   * disposed via JS.
+   * Detach from the runtime and cancel the module scope. Called by Nitro when the
+   * HybridObject is disposed via JS.
    */
   override fun dispose() {
+    if (lazyRuntime.isInitialized()) runCatching { runtime.detachEngine() }
     runCatching { coroutineScope.coroutineContext[Job]?.cancel() }
     super.dispose()
   }
@@ -225,14 +218,4 @@ class SyncProvider : HybridSyncProviderSpec() {
         )
       }
     }
-
-  private fun emptyResult(): SyncResult = SyncResult(
-    startedAt = 0.0,
-    finishedAt = 0.0,
-    successCount = 0.0,
-    failureCount = 0.0,
-    succeededIds = emptyArray(),
-    failedIds = emptyArray(),
-    errors = emptyMap(),
-  )
 }

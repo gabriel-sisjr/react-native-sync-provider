@@ -6,14 +6,16 @@ import com.margelo.nitro.syncprovider.SyncEventType
 import com.margelo.nitro.syncprovider.SyncOptions
 import com.margelo.nitro.syncprovider.SyncResult
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
+import com.margelo.nitro.syncprovider.error.SyncException
 import com.margelo.nitro.syncprovider.events.SyncEventEmitter
 import com.margelo.nitro.syncprovider.retry.RetryPolicyEvaluator
 import com.margelo.nitro.syncprovider.storage.SyncQueueStorage
 import com.margelo.nitro.syncprovider.util.JsonMap
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -29,25 +31,50 @@ import java.io.IOException
 import java.net.SocketTimeoutException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.random.Random
 
 /**
  * Drains the queue by issuing HTTP requests via a singleton OkHttpClient.
  *
+ * Retry model (persisted cooldowns):
+ * - Each flush cycle makes **at most one** HTTP attempt per claimed item. On a
+ *   retriable failure the item returns to `PENDING` with
+ *   `nextRetryAt = <attempt finished> + backoff`, and [SyncQueueStorage.claimPending]
+ *   skips it until that deadline elapses.
+ * - [SyncItemEntity.attempts] is cross-cycle: it continues from whatever prior
+ *   cycles persisted, so the retry budget survives process death and reboots.
+ * - [onCycleFinished] fires after every cycle, whatever its outcome, so the next
+ *   wake is always re-armed.
+ *
  * Concurrency model:
- * - The class is a singleton (within a [com.margelo.nitro.syncprovider.SyncProvider]
- *   instance); a [Mutex] gates the [flush] entry point so only one cycle runs
- *   at a time. Concurrent callers see the in-progress cycle and return its
- *   shared result via the `_isSyncing` flag (they get a NO-OP empty result).
- * - Within a cycle, items are dispatched via [supervisorScope] so a single
- *   item's failure cannot cancel siblings.
- * - Per-attempt timeout is enforced with `withTimeoutOrNull(...)`; the
- *   underlying OkHttp call also has its own timeouts.
+ * - [flushMutex] serializes cycles: a concurrent [flush] waits for the running one
+ *   and then runs its own.
+ * - Within a cycle, items are dispatched via [supervisorScope] so a single item's
+ *   failure cannot cancel siblings.
+ * - A dispatch that started always records its outcome, even if the cycle is
+ *   cancelled. Rows that never started are released back to `PENDING`.
+ * - Per-attempt timeout is enforced with `withTimeoutOrNull(...)`; the underlying
+ *   OkHttp call also has its own timeouts.
+ *
+ * @param clock epoch-millis source; injectable so tests can move time.
+ * @param random PRNG forwarded to [RetryPolicyEvaluator.computeDelayMs] for
+ *   back-off jitter; injectable for reproducible delays in tests.
+ * @param isPaused checked inside the mutex, so every caller obeys it, workers included.
+ * @param credentialPolicy read once per cycle. See [CredentialPolicy].
+ * @param onCycleFinished called after every cycle. Its argument, when present, is
+ *   the earliest instant the next wake may fire. Failures are logged and never
+ *   reject a cycle that already completed.
  */
 internal class SyncDispatcher(
   private val storage: SyncQueueStorage,
   private val emitter: SyncEventEmitter,
   private val getOptions: () -> SyncOptions,
   private val verboseLogging: () -> Boolean = { false },
+  private val clock: () -> Long = { System.currentTimeMillis() },
+  private val random: Random = Random.Default,
+  private val isPaused: () -> Boolean = { false },
+  private val credentialPolicy: () -> CredentialPolicy = { CredentialPolicy.TRUSTED },
+  private val onCycleFinished: suspend (notBefore: Long?) -> Unit = {},
 ) {
   private val flushMutex = Mutex()
   private val syncing = AtomicBoolean(false)
@@ -65,139 +92,285 @@ internal class SyncDispatcher(
   /**
    * Run a single flush cycle. Returns the aggregated [SyncResult]. Per-item
    * failures are aggregated; the function only throws when the cycle itself
-   * cannot start (e.g. the storage layer rejects with [SyncErrorCode.NETWORK_ERROR]).
+   * cannot run (e.g. the storage layer fails).
+   *
+   * Paused, or with default headers that cannot be recovered, nothing is dispatched
+   * and an empty sentinel result is returned without starting a cycle.
    */
   suspend fun flush(): SyncResult = flushMutex.withLock {
-    val options = getOptions()
-    val startedAt = System.currentTimeMillis()
-    syncing.set(true)
-    val succeeded = mutableListOf<String>()
-    val failed = mutableListOf<String>()
-    val errors = HashMap<String, String>()
-    try {
-      emitter.emit(
-        SyncEventEmitter.event(SyncEventType.SYNC_STARTED),
-      )
-
-      val batchSize = (options.batchSize?.toInt() ?: DEFAULT_BATCH_SIZE).coerceAtLeast(1)
-      val claimed = storage.claimPending(batchSize)
-      if (claimed.isEmpty()) {
-        return@withLock buildResult(startedAt, succeeded, failed, errors)
-      }
-
-      supervisorScope {
-        val deferreds = claimed.map { entity ->
-          async(Dispatchers.IO) {
-            runCatching { dispatchWithRetry(entity, options) }
-              .fold(
-                onSuccess = { outcome -> outcome },
-                onFailure = { t ->
-                  ItemOutcome.Failed(entity.id, SyncErrorCode.NETWORK_ERROR, t.message ?: "")
-                },
-              )
-          }
-        }
-        val outcomes = deferreds.awaitAll()
-        for (outcome in outcomes) {
-          when (outcome) {
-            is ItemOutcome.Succeeded -> succeeded += outcome.itemId
-            is ItemOutcome.Failed -> {
-              failed += outcome.itemId
-              errors[outcome.itemId] = "${outcome.code.name}: ${outcome.message}"
-            }
-          }
-        }
-      }
-
-      val result = buildResult(startedAt, succeeded, failed, errors)
-      storage.recordResult(result)
-
-      emitter.emit(
-        SyncEventEmitter.event(
-          type = if (failed.isEmpty()) SyncEventType.SYNC_SUCCEEDED else SyncEventType.SYNC_FAILED,
-        ),
-      )
-      result
-    } finally {
-      syncing.set(false)
+    if (isPaused()) return@withLock emptyResult()
+    val credentials = credentialPolicy()
+    if (credentials == CredentialPolicy.UNAVAILABLE) {
+      Log.w(TAG, "Default headers cannot be recovered; leaving the queue untouched.")
+      return@withLock emptyResult()
     }
+    runCycle(getOptions(), credentials)
   }
+
+  /**
+   * Reset rows left `IN_FLIGHT` by a previous process. Takes the flush mutex because
+   * a running cycle's rows are legitimately `IN_FLIGHT`: resetting them would make
+   * them claimable while their request is still on the wire.
+   */
+  suspend fun resetInFlight(): Int = flushMutex.withLock { storage.resetInFlight() }
 
   /* ------------------------------ internals ----------------------------- */
 
-  private suspend fun dispatchWithRetry(
+  private suspend fun runCycle(options: SyncOptions, credentials: CredentialPolicy): SyncResult {
+    val startedAt = clock()
+    syncing.set(true)
+    var notBefore: Long? = null
+    var terminalEventSent = false
+    try {
+      emitter.emit(SyncEventEmitter.event(SyncEventType.SYNC_STARTED))
+
+      val batchSize = (options.batchSize?.toInt() ?: DEFAULT_BATCH_SIZE).coerceAtLeast(1)
+      val claimed = storage.claimPending(batchSize, startedAt)
+      val outcomes = if (claimed.isEmpty()) {
+        emptyList()
+      } else {
+        dispatchClaimed(claimed, options, credentials)
+      }
+      notBefore = outcomes
+        .filterIsInstance<ItemOutcome.CredentialRejected>()
+        .maxOfOrNull { it.nextRetryAt }
+
+      val result = buildResult(startedAt, outcomes)
+      storage.recordResult(result)
+
+      terminalEventSent = true
+      emitter.emit(
+        SyncEventEmitter.event(
+          type = if (result.failedIds.isEmpty()) {
+            SyncEventType.SYNC_SUCCEEDED
+          } else {
+            SyncEventType.SYNC_FAILED
+          },
+        ),
+      )
+      return result
+    } catch (t: Throwable) {
+      withContext(NonCancellable) { abortCycle(t, terminalEventSent) }
+      throw t
+    } finally {
+      syncing.set(false)
+      withContext(NonCancellable) {
+        runCatching { onCycleFinished(notBefore) }
+          .onFailure { Log.w(TAG, "Could not arm the next retry wake", it) }
+      }
+    }
+  }
+
+  /**
+   * Leave no path without a terminal event and no row stranded. On cancellation the
+   * supervisor scope has already waited for its children and this cycle still holds
+   * the mutex, so any row left `IN_FLIGHT` is one that never started.
+   */
+  private suspend fun abortCycle(cause: Throwable, terminalEventSent: Boolean) {
+    if (cause is CancellationException) {
+      runCatching { storage.resetInFlight() }
+        .onFailure { Log.e(TAG, "Could not release unattempted rows", it) }
+    }
+    if (terminalEventSent) return
+    runCatching {
+      emitter.emit(
+        SyncEventEmitter.event(
+          type = SyncEventType.SYNC_FAILED,
+          errorCode = (cause as? SyncException)?.code ?: SyncErrorCode.NETWORK_ERROR,
+        ),
+      )
+    }.onFailure { Log.e(TAG, "Could not emit the terminal event", it) }
+  }
+
+  /**
+   * With headers restored from disk, one item goes first. If the server rejects the
+   * credential, the rest of the batch is released untouched, so an expired token
+   * costs one request per wake rather than a burst of `batchSize`.
+   */
+  private suspend fun dispatchClaimed(
+    claimed: List<SyncItemEntity>,
+    options: SyncOptions,
+    credentials: CredentialPolicy,
+  ): List<ItemOutcome> {
+    if (credentials != CredentialPolicy.PERSISTED) {
+      return dispatchConcurrently(claimed, options, credentials)
+    }
+    val first = dispatchRecordingOutcome(claimed.first(), options, credentials)
+    if (first is ItemOutcome.CredentialRejected) {
+      storage.resetInFlight()
+      return listOf(first)
+    }
+    return listOf(first) + dispatchConcurrently(claimed.drop(1), options, credentials)
+  }
+
+  private suspend fun dispatchConcurrently(
+    entities: List<SyncItemEntity>,
+    options: SyncOptions,
+    credentials: CredentialPolicy,
+  ): List<ItemOutcome> = supervisorScope {
+    entities
+      .map { entity ->
+        async(Dispatchers.IO) { dispatchRecordingOutcome(entity, options, credentials) }
+      }
+      .awaitAll()
+  }
+
+  /**
+   * Non-cancellable because the request may reach the server whatever happens to the
+   * cycle. Abandoning its outcome would leave the row to be sent a second time.
+   */
+  private suspend fun dispatchRecordingOutcome(
     entity: SyncItemEntity,
     options: SyncOptions,
+    credentials: CredentialPolicy,
+  ): ItemOutcome = withContext(NonCancellable) {
+    runCatching { dispatchItem(entity, options, credentials) }
+      .getOrElse { t -> ItemOutcome.Failed(entity.id, SyncErrorCode.NETWORK_ERROR, t.message ?: "") }
+  }
+
+  /**
+   * Dispatch a single attempt for [entity]. On a retriable failure with budget
+   * remaining, the item is re-queued `PENDING` with a persisted cooldown
+   * ([ItemOutcome.Rescheduled]); otherwise it terminally succeeds or fails. The
+   * [SyncItemEntity.attempts] counter continues across cycles (never reset).
+   */
+  private suspend fun dispatchItem(
+    entity: SyncItemEntity,
+    options: SyncOptions,
+    credentials: CredentialPolicy,
   ): ItemOutcome {
     val timeoutMs = (options.requestTimeoutMs?.toLong() ?: DEFAULT_REQUEST_TIMEOUT_MS)
       .coerceAtLeast(MIN_REQUEST_TIMEOUT_MS)
     val policy = options.retryPolicy
     val maxAttempts = policy.maxAttempts.toInt().coerceAtLeast(1)
 
-    var attempt = entity.attempts
-    var lastErrorCode: SyncErrorCode = SyncErrorCode.NETWORK_ERROR
-    var lastErrorMessage: String = ""
+    // Cross-cycle attempt counter: this attempt is one past whatever prior
+    // cycles persisted. Never reset to 0 — the budget must survive cycles.
+    val attempt = entity.attempts + 1
+    val startedAt = clock()
 
-    while (attempt < maxAttempts) {
-      attempt += 1
-      val now = System.currentTimeMillis()
-      val outcome = runOnce(entity, timeoutMs, options.defaultHeaders)
-      when (outcome) {
-        is AttemptResult.Success -> {
-          storage.markSucceeded(entity.id)
-          emitter.emit(
-            SyncEventEmitter.event(
-              type = SyncEventType.ITEM_SUCCEEDED,
-              itemId = entity.id,
-              statusCode = outcome.statusCode,
-              attempt = attempt,
-            ),
-          )
-          return ItemOutcome.Succeeded(entity.id, outcome.statusCode)
-        }
-        is AttemptResult.Failure -> {
-          lastErrorCode = outcome.code
-          lastErrorMessage = outcome.message
-          val canRetry = outcome.retryable &&
-            RetryPolicyEvaluator.hasBudget(attempt, policy)
-          if (!canRetry) {
-            val terminalCode = if (!RetryPolicyEvaluator.hasBudget(attempt, policy) && outcome.retryable) {
-              SyncErrorCode.MAX_ATTEMPTS_EXCEEDED
-            } else {
-              outcome.code
-            }
-            storage.markFailed(entity.id, attempt, now, terminalCode)
-            emitter.emit(
-              SyncEventEmitter.event(
-                type = SyncEventType.ITEM_FAILED,
-                itemId = entity.id,
-                errorCode = terminalCode,
-                statusCode = outcome.statusCode,
-                attempt = attempt,
-              ),
-            )
-            return ItemOutcome.Failed(entity.id, terminalCode, outcome.message)
-          }
-          // Will retry inside the same flush cycle: emit RETRYING and back-off.
-          emitter.emit(
-            SyncEventEmitter.event(
-              type = SyncEventType.ITEM_RETRYING,
-              itemId = entity.id,
-              errorCode = outcome.code,
-              statusCode = outcome.statusCode,
-              attempt = attempt,
-            ),
-          )
-          val delayMs = RetryPolicyEvaluator.computeDelayMs(attempt, policy)
-          if (delayMs > 0) delay(delayMs)
-          // Persist the increment so a crash mid-cycle doesn't lose the count.
-          storage.markRetry(entity.id, attempt, now, outcome.code)
+    // Defensive: a row that already exhausted its budget must not be re-attempted.
+    // Terminal rows are FAILED (not claimable), so this only fires if maxAttempts
+    // was lowered via configureSync between cycles.
+    if (entity.attempts >= maxAttempts) {
+      storage.markFailed(entity.id, entity.attempts, startedAt, SyncErrorCode.MAX_ATTEMPTS_EXCEEDED)
+      emitter.emit(
+        SyncEventEmitter.event(
+          type = SyncEventType.ITEM_FAILED,
+          itemId = entity.id,
+          errorCode = SyncErrorCode.MAX_ATTEMPTS_EXCEEDED,
+          attempt = entity.attempts,
+        ),
+      )
+      return ItemOutcome.Failed(
+        entity.id,
+        SyncErrorCode.MAX_ATTEMPTS_EXCEEDED,
+        "Retry budget exhausted",
+      )
+    }
+
+    return when (val outcome = runOnce(entity, timeoutMs, options.defaultHeaders)) {
+      is AttemptResult.Success -> {
+        storage.markSucceeded(entity.id)
+        emitter.emit(
+          SyncEventEmitter.event(
+            type = SyncEventType.ITEM_SUCCEEDED,
+            itemId = entity.id,
+            statusCode = outcome.statusCode,
+            attempt = attempt,
+          ),
+        )
+        ItemOutcome.Succeeded(entity.id, outcome.statusCode)
+      }
+      is AttemptResult.Failure -> {
+        // Read after the attempt: measuring from its start would shorten the
+        // cooldown by the request's own duration, down to nothing for a timeout.
+        val finishedAt = clock()
+        when {
+          credentials == CredentialPolicy.PERSISTED &&
+            outcome.code == SyncErrorCode.UNAUTHORIZED ->
+            holdForCredentialRenewal(entity, attempt, startedAt, finishedAt, outcome, options)
+          outcome.retryable && RetryPolicyEvaluator.hasBudget(attempt, policy) ->
+            reschedule(entity, attempt, startedAt, finishedAt, outcome, options)
+          else -> failTerminally(entity, attempt, startedAt, outcome)
         }
       }
     }
-    // Budget exhausted without success — already persisted above on the last
-    // failed attempt path; defensive fallback in case we ever exit the loop.
-    return ItemOutcome.Failed(entity.id, lastErrorCode, lastErrorMessage)
+  }
+
+  /** Persist the cooldown; the row is excluded from claims until it elapses. */
+  private suspend fun reschedule(
+    entity: SyncItemEntity,
+    attempt: Int,
+    startedAt: Long,
+    finishedAt: Long,
+    outcome: AttemptResult.Failure,
+    options: SyncOptions,
+  ): ItemOutcome {
+    val nextRetryAt = finishedAt +
+      RetryPolicyEvaluator.computeDelayMs(attempt, options.retryPolicy, random)
+    storage.markRetry(entity.id, attempt, startedAt, outcome.code, nextRetryAt)
+    emitRetrying(entity, attempt, outcome)
+    return ItemOutcome.Rescheduled(entity.id)
+  }
+
+  /**
+   * A restored token was rejected. The item is not at fault, so it stays `PENDING`
+   * without spending an attempt. Because attempts do not advance, the backoff would
+   * never grow either: [MIN_CREDENTIAL_HOLD_MS] keeps an expired token from turning
+   * into an endless stream of rejected requests from background wakes.
+   */
+  private suspend fun holdForCredentialRenewal(
+    entity: SyncItemEntity,
+    attempt: Int,
+    startedAt: Long,
+    finishedAt: Long,
+    outcome: AttemptResult.Failure,
+    options: SyncOptions,
+  ): ItemOutcome {
+    val backoffMs = RetryPolicyEvaluator.computeDelayMs(attempt, options.retryPolicy, random)
+    val nextRetryAt = finishedAt + maxOf(backoffMs, MIN_CREDENTIAL_HOLD_MS)
+    storage.markRetry(entity.id, entity.attempts, startedAt, outcome.code, nextRetryAt)
+    emitRetrying(entity, attempt, outcome)
+    return ItemOutcome.CredentialRejected(entity.id, nextRetryAt)
+  }
+
+  private suspend fun failTerminally(
+    entity: SyncItemEntity,
+    attempt: Int,
+    startedAt: Long,
+    outcome: AttemptResult.Failure,
+  ): ItemOutcome {
+    // A non-retryable failure keeps its real code; only a retriable one can run out
+    // of budget.
+    val terminalCode = if (outcome.retryable) SyncErrorCode.MAX_ATTEMPTS_EXCEEDED else outcome.code
+    storage.markFailed(entity.id, attempt, startedAt, terminalCode)
+    emitter.emit(
+      SyncEventEmitter.event(
+        type = SyncEventType.ITEM_FAILED,
+        itemId = entity.id,
+        errorCode = terminalCode,
+        statusCode = outcome.statusCode,
+        attempt = attempt,
+      ),
+    )
+    return ItemOutcome.Failed(entity.id, terminalCode, outcome.message)
+  }
+
+  private suspend fun emitRetrying(
+    entity: SyncItemEntity,
+    attempt: Int,
+    outcome: AttemptResult.Failure,
+  ) {
+    emitter.emit(
+      SyncEventEmitter.event(
+        type = SyncEventType.ITEM_RETRYING,
+        itemId = entity.id,
+        errorCode = outcome.code,
+        statusCode = outcome.statusCode,
+        attempt = attempt,
+      ),
+    )
   }
 
   private suspend fun runOnce(
@@ -317,7 +490,8 @@ internal class SyncDispatcher(
     builder.method(entity.method.uppercase(), body)
     builder.build()
   }.getOrElse {
-    Log.e(TAG, "Failed to build OkHttp request for ${entity.id}", it)
+    // Only the type: OkHttp puts header values in these messages.
+    Log.e(TAG, "Failed to build OkHttp request for ${entity.id}: ${it.javaClass.simpleName}")
     null
   }
 
@@ -330,26 +504,30 @@ internal class SyncDispatcher(
 
     if (verboseLogging()) {
       val logging = HttpLoggingInterceptor { msg -> Log.d(TAG, msg) }
-      logging.level = HttpLoggingInterceptor.Level.BODY
+      // BASIC, because every level above it logs header values.
+      logging.level = HttpLoggingInterceptor.Level.BASIC
       builder.addInterceptor(logging)
     }
     return builder.build()
   }
 
-  private fun buildResult(
-    startedAt: Long,
-    succeeded: List<String>,
-    failed: List<String>,
-    errors: Map<String, String>,
-  ): SyncResult = SyncResult(
-    startedAt = startedAt.toDouble(),
-    finishedAt = System.currentTimeMillis().toDouble(),
-    successCount = succeeded.size.toDouble(),
-    failureCount = failed.size.toDouble(),
-    succeededIds = succeeded.toTypedArray(),
-    failedIds = failed.toTypedArray(),
-    errors = errors,
-  )
+  /**
+   * Rescheduled and held items count as neither success nor failure: they are still
+   * queued, and their outcome belongs to a later cycle.
+   */
+  private fun buildResult(startedAt: Long, outcomes: List<ItemOutcome>): SyncResult {
+    val succeeded = outcomes.filterIsInstance<ItemOutcome.Succeeded>().map { it.itemId }
+    val failed = outcomes.filterIsInstance<ItemOutcome.Failed>()
+    return SyncResult(
+      startedAt = startedAt.toDouble(),
+      finishedAt = clock().toDouble(),
+      successCount = succeeded.size.toDouble(),
+      failureCount = failed.size.toDouble(),
+      succeededIds = succeeded.toTypedArray(),
+      failedIds = failed.map { it.itemId }.toTypedArray(),
+      errors = failed.associate { it.itemId to "${it.code.name}: ${it.message}" },
+    )
+  }
 
   private sealed interface AttemptResult {
     data class Success(val statusCode: Int) : AttemptResult
@@ -364,6 +542,12 @@ internal class SyncDispatcher(
   private sealed interface ItemOutcome {
     val itemId: String
     data class Succeeded(override val itemId: String, val statusCode: Int) : ItemOutcome
+
+    /** Retriable failure re-queued with a persisted cooldown. */
+    data class Rescheduled(override val itemId: String) : ItemOutcome
+
+    /** Restored credential rejected: the item waits, without spending an attempt. */
+    data class CredentialRejected(override val itemId: String, val nextRetryAt: Long) : ItemOutcome
     data class Failed(
       override val itemId: String,
       val code: SyncErrorCode,
@@ -379,5 +563,19 @@ internal class SyncDispatcher(
     private const val CONNECT_TIMEOUT_MS: Long = 10_000L
     private const val READ_TIMEOUT_MS: Long = 30_000L
     private const val WRITE_TIMEOUT_MS: Long = 30_000L
+
+    /** Floor for the wait after a restored credential is rejected. */
+    const val MIN_CREDENTIAL_HOLD_MS: Long = 60_000L
+
+    /** The zeroed result that means "no cycle ran". The facade maps it to `undefined`. */
+    fun emptyResult(): SyncResult = SyncResult(
+      startedAt = 0.0,
+      finishedAt = 0.0,
+      successCount = 0.0,
+      failureCount = 0.0,
+      succeededIds = emptyArray(),
+      failedIds = emptyArray(),
+      errors = emptyMap(),
+    )
   }
 }

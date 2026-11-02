@@ -12,7 +12,6 @@ import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequest
 import androidx.work.OneTimeWorkRequestBuilder
-import androidx.work.OutOfQuotaPolicy
 import androidx.work.PeriodicWorkRequest
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
@@ -25,7 +24,7 @@ import java.util.concurrent.TimeUnit
  * Wraps [WorkManager] for the SyncProvider's three named work units:
  *
  * - `syncprovider-flush-periodic` — [PeriodicWorkRequest] (15min floor).
- * - `syncprovider-flush-now` — [OneTimeWorkRequest] kicked off opportunistically.
+ * - `syncprovider-flush-now` — [OneTimeWorkRequest], the opt-in retry kick.
  * - `syncprovider-recovery` — one-shot recovery on app launch / boot.
  */
 internal class BackgroundSyncManager(context: Context) {
@@ -120,42 +119,52 @@ internal class BackgroundSyncManager(context: Context) {
     }
   }
 
+  /**
+   * Turn background sync off, including any pending retry kick. The flag is published
+   * first, so that a cycle ending in between cannot re-arm a kick after the cancel.
+   */
   fun disable() {
-    runCatching { workManager.cancelUniqueWork(UNIQUE_PERIODIC) }
     prefs.edit().putBoolean(KEY_ENABLED, false).apply()
+    runCatching {
+      workManager.cancelUniqueWork(UNIQUE_PERIODIC)
+      workManager.cancelUniqueWork(UNIQUE_ONE_TIME)
+    }
+  }
+
+  /** Drop a pending retry kick, for when dispatch must stop but stays enabled. */
+  fun cancelRetryKick() {
+    runCatching { workManager.cancelUniqueWork(UNIQUE_ONE_TIME) }
   }
 
   /**
-   * Schedule a one-time flush. If [urgent] is true and the OS supports it
-   * (API 31+), the request is marked as expedited (RUN_AS_NON_EXPEDITED_WORK_REQUEST
-   * fallback for quota-exhausted scenarios).
+   * Arm the opt-in retry kick: a delayed one-time flush that survives process death.
+   * Does nothing unless the consumer enabled background sync and did not ask for
+   * `foregroundOnly`. It honors the same constraints as the periodic work.
+   *
+   * [ExistingWorkPolicy.REPLACE] keeps one kick armed, always for the latest deadline.
+   * Delays are computed from absolute deadlines, so re-arming never postpones a wake.
+   *
+   * A failure here is only logged: the callers run at the end of a flush cycle that
+   * already completed, and it must not be rejected for this.
    */
-  fun scheduleOneTimeFlush(urgent: Boolean = false) {
+  fun scheduleOneTimeFlush(initialDelayMs: Long = 0L) {
     if (!isEnabled() || isForegroundOnly()) return
     try {
-      val constraints = Constraints.Builder()
-        .setRequiredNetworkType(NetworkType.CONNECTED)
-        .build()
       val builder = OneTimeWorkRequestBuilder<SyncWorker>()
-        .setConstraints(constraints)
+        .setConstraints(lastOptions()?.let(::buildConstraints) ?: defaultConstraints())
         .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 1, TimeUnit.MINUTES)
-      if (urgent && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-        builder.setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+      if (initialDelayMs > 0L) {
+        builder.setInitialDelay(initialDelayMs, TimeUnit.MILLISECONDS)
       }
-      workManager.enqueueUniqueWork(UNIQUE_ONE_TIME, ExistingWorkPolicy.KEEP, builder.build())
+      workManager.enqueueUniqueWork(UNIQUE_ONE_TIME, ExistingWorkPolicy.REPLACE, builder.build())
     } catch (t: Throwable) {
       Log.e(TAG, "scheduleOneTimeFlush failed", t)
-      throw SyncException(
-        SyncErrorCode.BACKGROUND_TASK_REGISTRATION_FAILED,
-        t.message ?: "OneTime WorkRequest registration failed",
-        t,
-      )
     }
   }
 
   /**
-   * One-shot recovery scheduling, called by the bridge on construction and
-   * by [com.margelo.nitro.syncprovider.work.BootCompletedReceiver] on boot.
+   * One-shot recovery scheduling, called when a JS engine attaches and by
+   * [com.margelo.nitro.syncprovider.work.BootCompletedReceiver] on boot.
    */
   fun scheduleRecovery() {
     try {
@@ -182,6 +191,9 @@ internal class BackgroundSyncManager(context: Context) {
       Log.e(TAG, "Failed to re-arm periodic work after recovery", it)
     }
   }
+
+  private fun defaultConstraints(): Constraints =
+    Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
 
   private fun buildConstraints(options: BackgroundSyncOptions): Constraints {
     val networkType = when {

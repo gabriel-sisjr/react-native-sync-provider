@@ -5,12 +5,19 @@ import com.margelo.nitro.syncprovider.connectivity.ConnectivityMonitor
 import com.margelo.nitro.syncprovider.database.SyncDatabase
 import com.margelo.nitro.syncprovider.events.SyncEventEmitter
 import com.margelo.nitro.syncprovider.http.SyncDispatcher
+import com.margelo.nitro.syncprovider.retry.RetryTimer
+import com.margelo.nitro.syncprovider.retry.RetryWake
 import com.margelo.nitro.syncprovider.storage.SyncQueueStorage
 import com.margelo.nitro.syncprovider.work.BackgroundSyncManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.onEach
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -24,6 +31,8 @@ import java.util.concurrent.atomic.AtomicReference
  *
  * Lifecycle:
  * - [bootstrap] is idempotent and safe to call from any thread.
+ * - [attachEngine] / [detachEngine] track live JS engines. The retry timer and the
+ *   connectivity watch only run while one is attached.
  * - [shutdown] cancels the [scope] and drops the singleton; rarely used in
  *   practice (only the test harness calls it).
  */
@@ -46,35 +55,123 @@ internal class SyncProviderRuntime private constructor(
   val connectivityMonitor: ConnectivityMonitor = ConnectivityMonitor(appContext, emitter, scope)
 
   /**
-   * Mutable holder for [SyncOptions]. Defaults are written by
-   * [SyncProvider] on first use; [SyncDispatcher] reads through this lambda
-   * so configuration changes apply on the next attempt.
+   * The active configuration. [SyncDispatcher] reads through it, so configuration
+   * changes apply on the next attempt.
    */
   private val optionsRef: AtomicReference<SyncOptions> = AtomicReference(defaultOptions())
+  private val pausedFlag = AtomicBoolean(false)
+
+  private val attachedEngines = AtomicInteger(0)
+
+  @Volatile private var connectivityWatch: Job? = null
 
   val dispatcher: SyncDispatcher = SyncDispatcher(
     storage = storage,
     emitter = emitter,
-    getOptions = { optionsRef.get() },
+    getOptions = { currentOptions() },
     verboseLogging = { false },
+    isPaused = { pausedFlag.get() },
+    onCycleFinished = { notBefore -> retryWake.arm(notBefore) },
   )
 
-  /** Pause flag honored by [SyncProvider.flush]. */
-  @Volatile var paused: Boolean = false
+  private val retryTimer = RetryTimer(
+    scope = scope,
+    isOffline = { connectivityMonitor.isOffline() },
+    flush = { dispatcher.flush() },
+  )
+
+  private val retryWake = RetryWake(
+    storage = storage,
+    timer = retryTimer,
+    scheduleKick = { delayMs -> backgroundSyncManager.scheduleOneTimeFlush(initialDelayMs = delayMs) },
+    isHalted = { isWakeHalted() },
+    isEngineLive = { attachedEngines.get() > 0 },
+  )
+
+  init {
+    applyQueueCap(currentOptions())
+  }
+
+  /** Whether the engine is paused. */
+  val isPaused: Boolean get() = pausedFlag.get()
 
   fun currentOptions(): SyncOptions = optionsRef.get()
 
-  fun updateOptions(options: SyncOptions) {
+  /** Whether the in-process retry timer is counting down. */
+  val isRetryTimerArmed: Boolean get() = retryTimer.isWaiting
+
+  /** Items waiting to be dispatched, cooling ones included. */
+  suspend fun queueSize(): Int = storage.pendingCount()
+
+  /** Apply a `configureSync` from JS. */
+  suspend fun configure(options: SyncOptions) {
     optionsRef.set(options)
-    storage.maxQueueSize = (options.maxQueueSize?.toInt() ?: SyncQueueStorage.DEFAULT_MAX_QUEUE_SIZE)
-      .coerceAtLeast(1)
+    applyQueueCap(options)
+    if (options.strategy == SyncStrategy.MANUAL) backgroundSyncManager.cancelRetryKick()
+    retryWake.arm()
+  }
+
+  fun pause() {
+    pausedFlag.set(true)
+    retryTimer.cancel()
+    backgroundSyncManager.cancelRetryKick()
+  }
+
+  suspend fun resume() {
+    pausedFlag.set(false)
+    retryWake.armForResume()
+  }
+
+  /** Arm the next retry wake from the current queue. */
+  suspend fun armRetryWake() {
+    retryWake.arm()
+  }
+
+  /**
+   * True when a background worker must do nothing: the engine is paused, or the consumer
+   * asked for no OS-scheduled dispatch.
+   *
+   * The `MANUAL` strategy does not block it. Enabling background sync is an explicit
+   * request, and `MANUAL` only keeps the retry timer and the retry kick unarmed.
+   */
+  fun isBackgroundDispatchBlocked(): Boolean =
+    isPaused || backgroundSyncManager.isForegroundOnly()
+
+  /** A JS engine now lives in this process. Pair with [detachEngine]. */
+  fun attachEngine() {
+    if (attachedEngines.getAndIncrement() == 0) {
+      connectivityMonitor.start()
+      connectivityWatch = connectivityMonitor.state
+        .filter { it.status == ConnectionStatus.CONNECTED || it.status == ConnectionStatus.METERED }
+        .onEach { retryTimer.onNetworkAvailable() }
+        .launchIn(scope)
+    }
+    // Recovery arms the first retry wake once it has finished.
+    backgroundSyncManager.scheduleRecovery()
+  }
+
+  fun detachEngine() {
+    if (attachedEngines.decrementAndGet() == 0) {
+      connectivityWatch?.cancel()
+      connectivityWatch = null
+      retryTimer.cancel()
+    }
   }
 
   fun shutdown() {
+    retryTimer.cancel()
     runCatching { connectivityMonitor.stop() }
     runCatching { scope.coroutineContext[Job]?.cancel() }
     INSTANCE.set(null)
   }
+
+  private fun applyQueueCap(options: SyncOptions) {
+    storage.maxQueueSize = (options.maxQueueSize?.toInt() ?: SyncQueueStorage.DEFAULT_MAX_QUEUE_SIZE)
+      .coerceAtLeast(1)
+  }
+
+  private fun isWakeHalted(): Boolean =
+    isPaused || currentOptions().strategy == SyncStrategy.MANUAL
 
   companion object {
     private val INSTANCE: AtomicReference<SyncProviderRuntime?> = AtomicReference(null)

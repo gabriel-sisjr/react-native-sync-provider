@@ -89,6 +89,13 @@ internal class ConnectivityMonitor(
   fun currentState(): ConnectionState = _state.value.takeIf { it.status != ConnectionStatus.UNKNOWN }
     ?: extractCurrentSnapshot()
 
+  /**
+   * Asks the system rather than reading [state]. The callback marks the device
+   * disconnected when any one network is lost, even if another is still up, so
+   * [state] can be wrong in exactly the moment dispatch has to be decided.
+   */
+  fun isOffline(): Boolean = extractCurrentSnapshot().status == ConnectionStatus.DISCONNECTED
+
   private fun extractCurrentSnapshot(): ConnectionState {
     val mgr = cm ?: return unknownState()
     val active = mgr.activeNetwork ?: return disconnectedState()

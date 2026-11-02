@@ -11,6 +11,9 @@ import com.margelo.nitro.syncprovider.database.SyncDatabase
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
 import com.margelo.nitro.syncprovider.error.SyncException
 import com.margelo.nitro.syncprovider.testutil.TestData
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Assert.assertThrows
@@ -152,6 +155,8 @@ internal class SyncQueueStorageTest {
     val claimed = storage.claimPending(1)
     assertThat(claimed).hasSize(1)
     assertThat(claimed.first().id).isEqualTo(id)
+    val failed = storage.enqueue(TestData.input())
+    storage.markFailed(failed, attempts = 1, lastAttemptAt = 1L, lastErrorCode = SyncErrorCode.TIMEOUT)
 
     val pending = storage.getPending()
 
@@ -188,17 +193,130 @@ internal class SyncQueueStorageTest {
   }
 
   @Test
-  fun `markRetry resets the row to PENDING with new attempts and error code`() = runTest {
+  fun `markRetry resets the row to PENDING with attempts error code and cooldown`() = runTest {
     val id = storage.enqueue(TestData.input())
     storage.claimPending(1)
 
-    storage.markRetry(id, attempts = 2, lastAttemptAt = 1_234L, lastErrorCode = SyncErrorCode.NETWORK_ERROR)
+    storage.markRetry(
+      id,
+      attempts = 2,
+      lastAttemptAt = 1_234L,
+      lastErrorCode = SyncErrorCode.NETWORK_ERROR,
+      nextRetryAt = 9_876L,
+    )
 
     val row = db.syncItemDao().findById(id)!!
     assertThat(row.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
     assertThat(row.attempts).isEqualTo(2)
     assertThat(row.lastAttemptAt).isEqualTo(1_234L)
     assertThat(row.lastErrorCode).isEqualTo(SyncErrorCode.NETWORK_ERROR.name)
+    assertThat(row.nextRetryAt).isEqualTo(9_876L)
+  }
+
+  @Test
+  fun `claimPending excludes rows whose cooldown has not elapsed`() = runTest {
+    val dao = db.syncItemDao()
+    val now = 5_000L
+    dao.insert(TestData.entity(id = "cooling", nextRetryAt = now + 1_000L))
+    dao.insert(TestData.entity(id = "eligible", nextRetryAt = now))
+
+    val claimed = storage.claimPending(limit = 10, now = now)
+
+    assertThat(claimed.map { it.id }).containsExactly("eligible")
+    assertThat(dao.findById("cooling")!!.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(dao.findById("eligible")!!.status).isEqualTo(SyncItemEntity.STATUS_IN_FLIGHT)
+  }
+
+  @Test
+  fun `claimPending picks a cooling row up once now reaches its nextRetryAt`() = runTest {
+    val dao = db.syncItemDao()
+    dao.insert(TestData.entity(id = "cooling", nextRetryAt = 5_000L))
+
+    // Before the deadline: excluded.
+    assertThat(storage.claimPending(limit = 10, now = 4_999L)).isEmpty()
+    // At the deadline (<=): eligible.
+    val claimed = storage.claimPending(limit = 10, now = 5_000L)
+
+    assertThat(claimed.map { it.id }).containsExactly("cooling")
+  }
+
+  @Test
+  fun `nextRetryDeadline returns the soonest retry deadline or null when none`() = runTest {
+    val dao = db.syncItemDao()
+    assertThat(storage.nextRetryDeadline()).isNull()
+
+    dao.insert(TestData.entity(id = "late", nextRetryAt = 6_000L))
+    dao.insert(TestData.entity(id = "soon", nextRetryAt = 1_500L))
+    dao.insert(TestData.entity(id = "never-attempted", nextRetryAt = 0L))
+
+    assertThat(storage.nextRetryDeadline()).isEqualTo(1_500L)
+  }
+
+  @Test
+  fun `nextPendingDeadline returns 0 once a never-attempted row exists`() = runTest {
+    val dao = db.syncItemDao()
+    assertThat(storage.nextPendingDeadline()).isNull()
+
+    dao.insert(TestData.entity(id = "cooling", nextRetryAt = 1_500L))
+    assertThat(storage.nextPendingDeadline()).isEqualTo(1_500L)
+
+    dao.insert(TestData.entity(id = "never-attempted", nextRetryAt = 0L))
+    assertThat(storage.nextPendingDeadline()).isEqualTo(0L)
+  }
+
+  @Test
+  fun `getPending surfaces attempts and nextRetryAt, cooling rows included`() = runTest {
+    db.syncItemDao().insert(TestData.entity(id = "cooling", attempts = 2, nextRetryAt = 9_000L))
+
+    val item = storage.getPending().single()
+
+    assertThat(item.attempts).isEqualTo(2.0)
+    assertThat(item.nextRetryAt).isEqualTo(9_000.0)
+  }
+
+  @Test
+  fun `pendingCount counts cooling rows but not FAILED or IN_FLIGHT ones`() = runTest {
+    val dao = db.syncItemDao()
+    dao.insert(TestData.entity(id = "new"))
+    dao.insert(TestData.entity(id = "cooling", nextRetryAt = 9_000L))
+    dao.insert(TestData.entity(id = "in-flight", status = SyncItemEntity.STATUS_IN_FLIGHT))
+    dao.insert(TestData.entity(id = "failed", status = SyncItemEntity.STATUS_FAILED))
+
+    assertThat(storage.pendingCount()).isEqualTo(2)
+  }
+
+  @Test
+  fun `the capacity check still counts every row`() = runTest {
+    val dao = db.syncItemDao()
+    storage.maxQueueSize = 2
+    dao.insert(TestData.entity(id = "in-flight", status = SyncItemEntity.STATUS_IN_FLIGHT))
+    dao.insert(TestData.entity(id = "failed", status = SyncItemEntity.STATUS_FAILED))
+
+    val exception = assertThrows(SyncException::class.java) {
+      kotlinx.coroutines.runBlocking { storage.enqueue(TestData.input()) }
+    }
+
+    assertThat(exception.code).isEqualTo(SyncErrorCode.QUEUE_FULL)
+  }
+
+  @Test
+  fun `claimPending never double-claims under concurrent cycles`() = runTest {
+    val dao = db.syncItemDao()
+    val now = 5_000L
+    repeat(20) { i -> dao.insert(TestData.entity(id = "row-$i", createdAt = i.toLong())) }
+
+    // Two concurrent claims racing over the same eligible pool.
+    val (a, b) = coroutineScope {
+      val first = async(Dispatchers.IO) { storage.claimPending(limit = 20, now = now) }
+      val second = async(Dispatchers.IO) { storage.claimPending(limit = 20, now = now) }
+      first.await() to second.await()
+    }
+
+    val claimedIds = a.map { it.id } + b.map { it.id }
+    // @Transaction atomicity: no row appears in both claims.
+    assertThat(claimedIds.toSet()).hasSize(claimedIds.size)
+    assertThat(dao.countByStatus(SyncItemEntity.STATUS_IN_FLIGHT)).isEqualTo(20)
+    assertThat(dao.countByStatus(SyncItemEntity.STATUS_PENDING)).isEqualTo(0)
   }
 
   @Test
@@ -224,6 +342,19 @@ internal class SyncQueueStorageTest {
 
     assertThat(reset).isEqualTo(2)
     assertThat(storage.pendingCount()).isEqualTo(2)
+  }
+
+  @Test
+  fun `resetInFlight does not extend or clear a cooldown`() = runTest {
+    db.syncItemDao().insert(
+      TestData.entity(id = "in-flight", status = SyncItemEntity.STATUS_IN_FLIGHT, nextRetryAt = 42_000L),
+    )
+
+    storage.resetInFlight()
+
+    val row = db.syncItemDao().findById("in-flight")!!
+    assertThat(row.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(row.nextRetryAt).isEqualTo(42_000L)
   }
 
   private fun sampleResult(
