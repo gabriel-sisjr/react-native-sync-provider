@@ -39,6 +39,9 @@ internal class BackgroundSyncManager(context: Context) {
 
   fun isEnabled(): Boolean = prefs.getBoolean(KEY_ENABLED, false)
 
+  /** Whether the consumer opted out of all OS-scheduled dispatch. Survives process death. */
+  fun isForegroundOnly(): Boolean = prefs.getBoolean(KEY_FOREGROUND_ONLY, false)
+
   /** Snapshot of the most recently configured options, or `null`. */
   fun lastOptions(): BackgroundSyncOptions? {
     if (!prefs.contains(KEY_INTERVAL_MS)) return null
@@ -51,7 +54,7 @@ internal class BackgroundSyncManager(context: Context) {
       } else {
         null
       },
-      foregroundOnly = null,
+      foregroundOnly = prefs.getBoolean(KEY_FOREGROUND_ONLY, false),
       taskIdentifier = prefs.getString(KEY_TASK_ID, null),
     )
   }
@@ -60,12 +63,37 @@ internal class BackgroundSyncManager(context: Context) {
    * Register the periodic flush job and persist a flag so we can re-arm it
    * on boot.
    *
+   * **`foregroundOnly` handling:** when [BackgroundSyncOptions.foregroundOnly]
+   * is `true` the consumer opts out of OS-scheduled background work entirely. In that
+   * case we register **no** periodic work and proactively cancel both the periodic and
+   * one-time unique works (clearing anything a previous `enable` left armed), but we
+   * still [persist] the options so the flag survives process death / reboot.
+   *
+   * **`KEY_ENABLED` semantics:** we deliberately keep `KEY_ENABLED = true` even in the
+   * `foregroundOnly` branch. Calling `enableBackgroundSync` expresses the consumer's
+   * *intent* to have background sync on; `foregroundOnly` governs only *whether* the OS
+   * schedules work, not *whether* the feature is conceptually enabled. Therefore
+   * `isBackgroundSyncEnabled()` reflects intent (returns `true`) while no OS work runs.
+   * This keeps the flag composable — flipping `foregroundOnly` back to `false` via a
+   * later `enable` re-arms the periodic job without a separate enable step — and leaves
+   * `disable()` (`KEY_ENABLED = false`) as the single explicit "off" switch.
+   *
    * @throws SyncException with [SyncErrorCode.BACKGROUND_TASK_REGISTRATION_FAILED]
    *   on WorkManager errors (typically due to a missing AndroidX initializer
    *   in the host app).
    */
   fun enable(options: BackgroundSyncOptions) {
     try {
+      if (options.foregroundOnly == true) {
+        // Publish the flag before cancelling: a cycle ending in between must see it,
+        // or it could re-arm a kick after the cancel below.
+        persist(options)
+        prefs.edit().putBoolean(KEY_ENABLED, true).apply()
+        workManager.cancelUniqueWork(UNIQUE_PERIODIC)
+        workManager.cancelUniqueWork(UNIQUE_ONE_TIME)
+        return
+      }
+
       val intervalMs = options.minimumIntervalMs.toLong().coerceAtLeast(MIN_INTERVAL_MS)
       val constraints = buildConstraints(options)
 
@@ -103,6 +131,7 @@ internal class BackgroundSyncManager(context: Context) {
    * fallback for quota-exhausted scenarios).
    */
   fun scheduleOneTimeFlush(urgent: Boolean = false) {
+    if (!isEnabled() || isForegroundOnly()) return
     try {
       val constraints = Constraints.Builder()
         .setRequiredNetworkType(NetworkType.CONNECTED)
@@ -144,6 +173,11 @@ internal class BackgroundSyncManager(context: Context) {
   fun maybeReschedulePeriodic() {
     if (!isEnabled()) return
     val opts = lastOptions() ?: return
+    // Under foregroundOnly, boot and recovery must not re-arm OS-scheduled work.
+    // Note: this gates only the *scheduling* re-arm. Data-integrity recovery
+    // (RecoveryWorker -> storage.resetInFlight()) runs independently and is
+    // intentionally untouched here.
+    if (opts.foregroundOnly == true) return
     runCatching { enable(opts) }.onFailure {
       Log.e(TAG, "Failed to re-arm periodic work after recovery", it)
     }
@@ -172,6 +206,8 @@ internal class BackgroundSyncManager(context: Context) {
       } else {
         remove(KEY_REQ_IDLE)
       }
+      // A plain boolean (false when null), so readers need no tri-state check.
+      putBoolean(KEY_FOREGROUND_ONLY, options.foregroundOnly == true)
       if (options.taskIdentifier != null) putString(KEY_TASK_ID, options.taskIdentifier) else remove(KEY_TASK_ID)
     }.apply()
   }
@@ -185,6 +221,7 @@ internal class BackgroundSyncManager(context: Context) {
     private const val KEY_REQ_CHARGING = "requiresCharging"
     private const val KEY_REQ_UNMETERED = "requiresUnmeteredNetwork"
     private const val KEY_REQ_IDLE = "requiresDeviceIdle"
+    private const val KEY_FOREGROUND_ONLY = "foregroundOnly"
     private const val KEY_TASK_ID = "taskIdentifier"
 
     /** WorkManager refuses to register periodic work below 15 minutes. */

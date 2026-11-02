@@ -1,5 +1,6 @@
 package com.margelo.nitro.syncprovider.testutil
 
+import com.margelo.nitro.syncprovider.BackgroundSyncOptions
 import com.margelo.nitro.syncprovider.BackoffStrategy
 import com.margelo.nitro.syncprovider.HttpMethod
 import com.margelo.nitro.syncprovider.RetryPolicy
@@ -8,6 +9,7 @@ import com.margelo.nitro.syncprovider.SyncOptions
 import com.margelo.nitro.syncprovider.SyncPriority
 import com.margelo.nitro.syncprovider.SyncStrategy
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
+import com.margelo.nitro.syncprovider.work.BackgroundSyncManager
 
 internal object TestData {
 
@@ -43,6 +45,22 @@ internal object TestData {
     maxQueueSize = maxQueueSize?.toDouble(),
     persistQueue = persistQueue,
     defaultHeaders = defaultHeaders,
+  )
+
+  fun backgroundSyncOptions(
+    minimumIntervalMs: Long = BackgroundSyncManager.MIN_INTERVAL_MS,
+    requiresCharging: Boolean? = null,
+    requiresUnmeteredNetwork: Boolean? = null,
+    requiresDeviceIdle: Boolean? = null,
+    foregroundOnly: Boolean? = null,
+    taskIdentifier: String? = null,
+  ): BackgroundSyncOptions = BackgroundSyncOptions(
+    minimumIntervalMs = minimumIntervalMs.toDouble(),
+    requiresCharging = requiresCharging,
+    requiresUnmeteredNetwork = requiresUnmeteredNetwork,
+    requiresDeviceIdle = requiresDeviceIdle,
+    foregroundOnly = foregroundOnly,
+    taskIdentifier = taskIdentifier,
   )
 
   fun input(
