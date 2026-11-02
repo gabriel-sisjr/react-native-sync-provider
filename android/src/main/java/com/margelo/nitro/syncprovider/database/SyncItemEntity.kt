@@ -24,12 +24,20 @@ import androidx.room.PrimaryKey
  *   name observed on this row, or `null` if never failed.
  * @property status One of `PENDING`, `IN_FLIGHT`, `FAILED`.
  * @property metadata Free-form JSON blob attached by the consumer.
+ * @property nextRetryAt Epoch-millis earliest time this item is eligible for
+ *   re-dispatch (its retry cooldown). `0` means "never attempted"; any
+ *   positive value means "attempted, retry pending". Either way the row is
+ *   eligible once `nextRetryAt <= now`. Indexed with [status] via
+ *   `index_sync_items_status_nextRetryAt`, which serves the claim query.
  */
 @Keep
 @Entity(
   tableName = "sync_items",
   indices = [
-    Index(value = ["status"]),
+    // Composite (status, nextRetryAt): serves status-only lookups via its left
+    // prefix and the "eligible PENDING rows" claim query. It supersedes the v1
+    // single-column `index_sync_items_status`, which the v1 -> v2 migration drops.
+    Index(value = ["status", "nextRetryAt"]),
     Index(value = ["priorityWeight", "createdAt"]),
   ],
 )
@@ -77,6 +85,14 @@ internal data class SyncItemEntity(
 
   @ColumnInfo(name = "metadata")
   val metadata: String?,
+
+  /**
+   * Epoch-millis retry-eligibility deadline; `0` (default) means "never
+   * attempted". The SQL `DEFAULT 0` keeps the v1 -> v2 `ALTER TABLE ADD COLUMN`
+   * in sync with the fresh-install schema so Room's migration validation passes.
+   */
+  @ColumnInfo(name = "nextRetryAt", defaultValue = "0")
+  val nextRetryAt: Long,
 ) {
   companion object {
     const val STATUS_PENDING = "PENDING"

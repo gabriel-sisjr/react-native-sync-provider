@@ -91,6 +91,7 @@ internal object TestData {
     status: String = SyncItemEntity.STATUS_PENDING,
     body: String? = """{"hello":"world"}""",
     contentType: String? = "application/json",
+    nextRetryAt: Long = 0L,
   ): SyncItemEntity = SyncItemEntity(
     id = id,
     method = method,
@@ -106,5 +107,6 @@ internal object TestData {
     lastErrorCode = null,
     status = status,
     metadata = null,
+    nextRetryAt = nextRetryAt,
   )
 }

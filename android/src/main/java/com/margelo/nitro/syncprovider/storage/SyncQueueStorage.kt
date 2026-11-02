@@ -208,6 +208,8 @@ internal class SyncQueueStorage(
       lastErrorCode = null,
       status = SyncItemEntity.STATUS_PENDING,
       metadata = JsonMap.encode(input.metadata),
+      // 0 = never attempted, and therefore eligible now.
+      nextRetryAt = 0L,
     )
   }
 
@@ -221,7 +223,7 @@ internal class SyncQueueStorage(
     priority = parsePriority(entity.priority),
     createdAt = entity.createdAt.toDouble(),
     attempts = entity.attempts.toDouble(),
-    nextRetryAt = 0.0,
+    nextRetryAt = entity.nextRetryAt.toDouble(),
     metadata = JsonMap.decode(entity.metadata),
   )
 
