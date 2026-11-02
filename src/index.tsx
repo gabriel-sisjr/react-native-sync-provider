@@ -68,9 +68,13 @@ export {
   useSyncSnapshot,
   useSyncStatus,
 } from './hooks';
+export type { UseAutoSyncExtraOptions } from './hooks';
 
 export { SyncProvider, SyncProviderContext } from './contexts/SyncProvider';
-export type { SyncProviderContextValue } from './contexts/SyncProvider';
+export type {
+  SyncProviderContextValue,
+  SyncProviderProps,
+} from './contexts/SyncProvider';
 
 /* -------------------------------------------------------------------------- */
 /*                                  Internal                                  */

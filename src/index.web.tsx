@@ -17,9 +17,9 @@ import React, { createContext, useContext } from 'react';
 
 import { SyncError } from './errors/SyncError';
 import { SyncErrorCode } from './errors/SyncErrorCode';
+import type { UseAutoSyncExtraOptions } from './hooks';
 import { ConnectionStatus, ConnectionType } from './types/enums';
 import type {
-  UseAutoSyncOptions,
   UseConnectionResult,
   UseOfflineQueueResult,
   UseSyncConfigResult,
@@ -48,6 +48,7 @@ export { SyncError } from './errors/SyncError';
 export { SyncErrorCode } from './errors/SyncErrorCode';
 export type { ValidationIssue } from './errors/ValidationIssue';
 export { generateId } from './utils/idGenerator';
+export type { UseAutoSyncExtraOptions } from './hooks';
 
 /* -------------------------------------------------------------------------- */
 /*                                  Helpers                                   */
@@ -317,7 +318,7 @@ export function useSyncConfig(): UseSyncConfigResult {
 }
 
 /** Mirrors `useAutoSync` from the native bundle. No-op on web. @public */
-export function useAutoSync(_options: UseAutoSyncOptions): void {
+export function useAutoSync(_options: UseAutoSyncExtraOptions): void {
   // no-op
 }
 
