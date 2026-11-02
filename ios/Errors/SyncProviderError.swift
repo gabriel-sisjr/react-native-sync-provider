@@ -58,6 +58,15 @@ struct SyncProviderError: LocalizedError, CustomNSError {
         }
     }
 
+    /// `code` as its wire string (for example `"QUEUE_FULL"`).
+    ///
+    /// `SyncErrorCode` is a Nitro C++ enum, so `code` itself is invisible to
+    /// modules without the generated bridge headers, the XCTest bundle among
+    /// them. This is the Swift-only view of the same value.
+    var codeName: String {
+        code.stringValue
+    }
+
     var errorUserInfo: [String: Any] {
         var info: [String: Any] = [
             NSLocalizedDescriptionKey: message,

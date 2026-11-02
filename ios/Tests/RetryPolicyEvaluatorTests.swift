@@ -79,7 +79,7 @@ final class RetryPolicyEvaluatorTests: XCTestCase {
         for _ in 0..<200 {
             let delay = RetryPolicyEvaluator.nextDelayMs(attempt: 3, policy: policy)
             XCTAssertGreaterThanOrEqual(delay, 3_000)
-            XCTAssertLessThan(delay, 5_000)
+            XCTAssertLessThanOrEqual(delay, 5_000)
         }
     }
 

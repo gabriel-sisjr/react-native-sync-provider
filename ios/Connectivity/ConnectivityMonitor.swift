@@ -109,7 +109,7 @@ final class ConnectivityMonitor: @unchecked Sendable {
 
     func unsubscribe(_ token: UUID) {
         lock.withLock {
-            listeners.removeValue(forKey: token)
+            _ = listeners.removeValue(forKey: token)
         }
     }
 

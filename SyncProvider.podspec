@@ -74,9 +74,13 @@ Pod::Spec.new do |s|
   # `Unit-` segment for `:test_type => :unit` (the default). Sources live
   # under `ios/Tests/**` so they ship in the same git tree as production.
   s.test_spec 'Tests' do |test_spec|
-    test_spec.platforms = { :ios => "15.0" }
+    # Must not be lower than the deployment target CocoaPods gives the library
+    # target, which comes from the Podfile (`min_ios_version_supported`, 15.1).
+    # Otherwise `@testable import SyncProvider` fails: "compiling for iOS 15.0,
+    # but module 'SyncProvider' has a minimum deployment target of iOS 15.1".
+    test_spec.platforms = { :ios => "15.1" }
     test_spec.source_files = "ios/Tests/**/*.swift"
     test_spec.requires_app_host = false
-    test_spec.frameworks = "XCTest", "Foundation", "CoreData", "Network"
+    test_spec.frameworks = "XCTest", "Foundation", "CoreData", "Network", "BackgroundTasks"
   end
 end

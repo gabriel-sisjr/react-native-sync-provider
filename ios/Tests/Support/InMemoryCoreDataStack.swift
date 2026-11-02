@@ -4,6 +4,11 @@ import Foundation
 
 /// Test helper. Constructs a fresh in-memory Core Data stack on every call so
 /// XCTest cases stay independent.
+///
+/// The store is SQLite at `/dev/null`, which SQLite keeps in memory.
+/// `NSInMemoryStoreType` is not an option: it crashes on `NSBatchDeleteRequest`,
+/// which production uses to clear the queue and the history, and it evaluates
+/// predicates in Swift-side code rather than in SQL.
 enum InMemoryCoreDataStack {
     /// Build the `NSManagedObjectModel` programmatically. We mirror the model
     /// declared in `ios/Database/SyncProvider.xcdatamodeld/.../contents` — the
@@ -58,7 +63,7 @@ enum InMemoryCoreDataStack {
         let container = NSPersistentContainer(name: "SyncProvider", managedObjectModel: model)
 
         let description = NSPersistentStoreDescription()
-        description.type = NSInMemoryStoreType
+        description.type = NSSQLiteStoreType
         description.url = URL(fileURLWithPath: "/dev/null")
         description.shouldAddStoreAsynchronously = false
         container.persistentStoreDescriptions = [description]
@@ -93,7 +98,6 @@ enum InMemoryCoreDataStack {
         }
         // Match the model file: most numeric attrs use scalar getters/setters.
         attr.allowsExternalBinaryDataStorage = false
-        attr.isIndexed = false
         if !usesScalar && type == .integer64AttributeType {
             attr.attributeValueClassName = "NSNumber"
         }

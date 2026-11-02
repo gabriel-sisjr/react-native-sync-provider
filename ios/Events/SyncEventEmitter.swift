@@ -49,8 +49,8 @@ struct SyncEventPayload: Sendable {
 }
 
 /// Thread-safe broker between the Swift side and the JS-registered
-/// listeners.
-final class SyncEventEmitter: @unchecked Sendable {
+/// listeners. Not `final`: the unit tests subclass it to record emissions.
+class SyncEventEmitter: @unchecked Sendable {
     private let lock = NSLock()
     private var listeners: [String: [String: (SyncEventPayload) -> Void]] = [:]
 
