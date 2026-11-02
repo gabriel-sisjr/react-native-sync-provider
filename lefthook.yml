@@ -4,13 +4,13 @@ pre-commit:
 
     lint:
       glob: "*.{js,ts,jsx,tsx}"
-      run: npx eslint {staged_files}
+      run: yarn eslint {staged_files}
 
     types:
       glob: "*.{js,ts,jsx,tsx}"
-      run: npx tsc --noEmit
+      run: yarn tsc --noEmit
 commit-msg:
   parallel: true
   commands:
     commitlint:
-      run: npx commitlint --edit
+      run: yarn commitlint --edit
