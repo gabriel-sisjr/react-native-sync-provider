@@ -111,6 +111,14 @@ func wrapAsSyncProviderError(_ error: Error) -> SyncProviderError {
         return already
     }
 
+    // The queue store could not be opened: no operation can succeed, so this
+    // is "module unavailable", not a bad payload.
+    if let storeError = error as? CoreDataStackError {
+        return SyncProviderError(code: .nativeModuleUnavailable,
+                                 message: storeError.localizedDescription,
+                                 underlying: error)
+    }
+
     if let urlError = error as? URLError {
         switch urlError.code {
         case .timedOut:

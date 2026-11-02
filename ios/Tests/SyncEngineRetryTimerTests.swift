@@ -1,3 +1,4 @@
+import CoreData
 import XCTest
 @testable import SyncProvider
 
@@ -588,6 +589,33 @@ final class SyncEngineRetryTimerTests: XCTestCase {
         await engine.pause()
         gate.release()
         await inFlight
+
+        XCTAssertFalse(timer.isArmed)
+    }
+
+    // MARK: - Failure handling
+
+    /// No JS caller exists on a timer path. A store that failed to open must
+    /// be logged, not crash the process.
+    func test_engineStart_withAFailedStore_doesNotCrash() async {
+        let failing = CoreDataStack(load: {
+            (NSPersistentContainer(name: "Broken", managedObjectModel: NSManagedObjectModel()),
+             CoreDataStackError.modelNotFound)
+        })
+        let (defaults, suite) = UserDefaults.ephemeral()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let engine = SyncEngine(stack: failing,
+                                configStore: SyncConfigStore(defaults: defaults, secrets: InMemorySecretStore()),
+                                backgroundStore: BackgroundSyncOptionsStore(defaults: defaults),
+                                connectivity: FakeConnectivity(),
+                                scheduler: FakeBackgroundTaskScheduler(),
+                                sessions: (fixture.foregroundSession, fixture.backgroundSession),
+                                clock: clock,
+                                retryTimer: timer)
+        defer { engine.shutdown() }
+
+        engine.attachHybrid()
+        await engine.waitUntilStarted()
 
         XCTAssertFalse(timer.isArmed)
     }

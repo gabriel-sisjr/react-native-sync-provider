@@ -2,7 +2,8 @@
 //  BackgroundSyncManager.swift
 //  SyncProvider
 //
-//  `BGTaskScheduler` registration + scheduling. Owns two task identifiers:
+//  `BGTaskScheduler` scheduling, and what a fired task does. Handlers are
+//  registered by `BackgroundTaskRegistrar`. Owns two task identifiers:
 //    - `com.gabriel-sisjr.syncprovider.background` — short app refresh, used
 //      to opportunistically peek at the queue and decide whether to schedule
 //      the heavier processing task.
@@ -70,7 +71,8 @@ extension BGTaskScheduler: BackgroundTaskScheduling {
 }
 #endif
 
-/// Owns BGTaskScheduler interactions. Single instance per engine.
+/// Owns BGTaskScheduler interactions. Handlers are registered at process start
+/// by ``BackgroundTaskRegistrar``; this type decides what a fired task does.
 ///
 /// The options and the enabled state are persisted, so a task launched by the
 /// OS honors them with no JS loaded and can continue the chain.
@@ -79,7 +81,6 @@ final class BackgroundSyncManager: @unchecked Sendable {
     private let emitter: SyncEventEmitter
     private let store: BackgroundSyncOptionsStore
     private let lock = NSLock()
-    private var registered = false
     private var enabled: Bool
     private var lastOptions: BackgroundSyncOptionsValue?
     private var prepare: (@Sendable () async -> Void)?
@@ -133,43 +134,11 @@ final class BackgroundSyncManager: @unchecked Sendable {
         lock.withLock { self.prepare = prepare }
     }
 
-    /// Register handlers for both task identifiers. Must be called before
-    /// `application(_:didFinishLaunchingWithOptions:)` returns to satisfy the
-    /// `BGTaskScheduler` contract. Idempotent — safe to call from `init`.
-    func registerHandlers() {
-        #if canImport(BackgroundTasks)
-        let already = lock.withLock { () -> Bool in
-            let wasRegistered = registered
-            registered = true
-            return wasRegistered
-        }
-        guard !already else { return }
-
-        let scheduler = self.scheduler
-        scheduler.registerHandler(forTaskWithIdentifier: kBackgroundRefreshIdentifier) { [weak self] task in
-            guard let self = self else {
-                task.setTaskCompleted(success: false)
-                return
-            }
-            self.handleAppRefresh(task: task)
-        }
-        scheduler.registerHandler(forTaskWithIdentifier: kBackgroundProcessingIdentifier) { [weak self] task in
-            guard let self = self else {
-                task.setTaskCompleted(success: false)
-                return
-            }
-            self.handleProcessing(task: task)
-        }
-        SyncLogger.info("Registered BGTaskScheduler handlers", category: "background")
-        #endif
-    }
-
     /// Enable + schedule the next BGAppRefresh window.
     /// - Throws: `SyncProviderError(.backgroundTaskRegistrationFailed)` if the
     ///   OS rejects the submission (most commonly: missing `Info.plist` key).
     func enable(options: BackgroundSyncOptionsValue) throws {
         #if canImport(BackgroundTasks)
-        registerHandlers()
         if options.foregroundOnly == true {
             // Foreground-only: schedule no OS-driven work, and cancel any request
             // a previous (background-enabled) `enable` may have submitted so it

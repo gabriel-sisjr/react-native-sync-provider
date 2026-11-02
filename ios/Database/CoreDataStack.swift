@@ -30,12 +30,15 @@ enum CoreDataStackError: LocalizedError {
 
 /// Lazy, thread-safe wrapper around `NSPersistentContainer`.
 ///
-/// The store is loaded on first access of ``persistentContainer`` (or the
-/// convenience accessors). Lightweight migration is enabled — Phase 0.x ships
-/// with a single model version and consumer apps will receive automatic
-/// migration on schema bumps. Once the library reaches 1.0, explicit migration
-/// mappings will replace this default.
-final class CoreDataStack {
+/// The store is loaded once, on first access of ``persistentContainer`` (or the
+/// convenience accessors). Concurrent first accesses are serialized: JS calls,
+/// launch recovery and a BGTask launch all race here, and two containers
+/// opening the same file would run the lightweight migration twice.
+///
+/// Lightweight migration is enabled: the model bundle carries every version,
+/// and Core Data infers each step between them. Once the library reaches 1.0,
+/// explicit migration mappings will replace this default.
+final class CoreDataStack: @unchecked Sendable {
     /// Shared singleton.
     static let shared = CoreDataStack()
 
@@ -44,22 +47,70 @@ final class CoreDataStack {
 
     private let logger = OSLog(subsystem: "com.gabriel-sisjr.syncprovider", category: "core-data")
 
+    /// Serializes the one-time load and guards the two fields below.
+    private let loadLock = NSLock()
+    private var loadedContainer: NSPersistentContainer?
     private var loadError: Error?
 
-    /// Backing storage. Lazily loaded on the queue that asks for it.
-    private(set) lazy var persistentContainer: NSPersistentContainer = {
-        if let injected = self.injectedContainer {
-            return injected
+    /// Builds the container and reports any load failure. Runs at most once.
+    private let makeContainer: (CoreDataStack) -> (NSPersistentContainer, Error?)
+
+    /// The loaded container. The first caller loads the store while holding
+    /// the lock, so concurrent callers wait for it instead of opening their
+    /// own coordinator on the same file.
+    var persistentContainer: NSPersistentContainer {
+        loadLock.withLock {
+            if let loadedContainer {
+                return loadedContainer
+            }
+            let (container, error) = makeContainer(self)
+            loadedContainer = container
+            loadError = error
+            return container
         }
+    }
+
+    /// Read-only context, exclusively for the main thread.
+    var viewContext: NSManagedObjectContext {
+        return persistentContainer.viewContext
+    }
+
+    /// Returns the load error, if any. ``performBackgroundTask(_:)`` throws it,
+    /// so a failed load reaches JS as a `SyncError` instead of a crash.
+    var initializationError: Error? {
+        loadLock.withLock { loadError }
+    }
+
+    private init() {
+        self.makeContainer = { $0.loadBundledContainer() }
+    }
+
+    /// Test-only initializer. Accepts a pre-loaded `NSPersistentContainer`
+    /// so XCTest cases can run without touching disk or the bundled `.momd`
+    /// resource.
+    ///
+    /// - Important: callers are responsible for invoking
+    ///   `loadPersistentStores` on the container before passing it in.
+    internal init(container: NSPersistentContainer) {
+        self.makeContainer = { _ in (container, nil) }
+    }
+
+    /// Test-only initializer. Injects the one-time load itself, so tests can
+    /// count how many loads run and simulate a store that fails to open.
+    internal init(load: @escaping () -> (NSPersistentContainer, Error?)) {
+        self.makeContainer = { _ in load() }
+    }
+
+    /// Loads the bundled model and store. Called once, under `loadLock`.
+    private func loadBundledContainer() -> (NSPersistentContainer, Error?) {
         let bundle = Self.resolveBundle()
         guard let modelURL = bundle.url(forResource: Self.modelName, withExtension: "momd"),
               let model = NSManagedObjectModel(contentsOf: modelURL) else {
-            self.loadError = CoreDataStackError.modelNotFound
-            os_log("Failed to find %@.momd in any candidate bundle", log: self.logger, type: .error, Self.modelName)
+            os_log("Failed to find %@.momd in any candidate bundle", log: logger, type: .error, Self.modelName)
             // Returning an empty container would crash on first use; instead we
-            // return a stub container backed by an in-memory store so callers
-            // can recover gracefully via the cached `loadError`.
-            return Self.makeFallbackContainer()
+            // return a stub container backed by an in-memory store, and
+            // `performBackgroundTask` rejects with the cached error.
+            return (Self.makeFallbackContainer(), CoreDataStackError.modelNotFound)
         }
 
         let container = NSPersistentContainer(name: Self.modelName, managedObjectModel: model)
@@ -71,11 +122,12 @@ final class CoreDataStack {
             description.setOption(true as NSNumber, forKey: NSPersistentStoreRemoteChangeNotificationPostOptionKey)
         }
 
-        container.loadPersistentStores { [weak self] _, error in
+        var failure: Error?
+        container.loadPersistentStores { [logger] _, error in
             if let error = error {
-                self?.loadError = CoreDataStackError.persistentStoreLoadFailed(underlying: error)
+                failure = CoreDataStackError.persistentStoreLoadFailed(underlying: error)
                 os_log("Failed to load persistent store: %{public}@",
-                       log: self?.logger ?? OSLog.default,
+                       log: logger,
                        type: .error,
                        error.localizedDescription)
             }
@@ -84,37 +136,7 @@ final class CoreDataStack {
         container.viewContext.automaticallyMergesChangesFromParent = true
         container.viewContext.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
 
-        return container
-    }()
-
-    /// Read-only context, exclusively for the main thread.
-    var viewContext: NSManagedObjectContext {
-        return persistentContainer.viewContext
-    }
-
-    /// Returns the load error, if any. Useful for surfacing initialization
-    /// failures to JS as `SyncError` instances instead of crashing.
-    var initializationError: Error? {
-        return loadError
-    }
-
-    /// Optional pre-built container injected via the test-only initializer.
-    /// When non-nil, the lazy `persistentContainer` short-circuits and returns
-    /// it instead of resolving the bundled `.momd`.
-    private let injectedContainer: NSPersistentContainer?
-
-    private init() {
-        self.injectedContainer = nil
-    }
-
-    /// Test-only initializer. Accepts a pre-loaded `NSPersistentContainer`
-    /// (typically backed by `NSInMemoryStoreType`) so XCTest cases can run
-    /// without touching disk or the bundled `.momd` resource.
-    ///
-    /// - Important: callers are responsible for invoking
-    ///   `loadPersistentStores` on the container before passing it in.
-    internal init(container: NSPersistentContainer) {
-        self.injectedContainer = container
+        return (container, failure)
     }
 
     // MARK: - Background work
@@ -125,8 +147,13 @@ final class CoreDataStack {
     /// - Parameter block: Work to perform inside `context.perform { }`. The
     ///   block runs on the context's private queue.
     /// - Returns: The value returned by `block`.
+    /// - Throws: ``CoreDataStackError`` when the store failed to load, before
+    ///   `block` runs. A container with no store would crash on first use.
     func performBackgroundTask<T>(_ block: @escaping (NSManagedObjectContext) throws -> T) async throws -> T {
         let container = persistentContainer
+        if let loadError = initializationError {
+            throw loadError
+        }
         return try await withCheckedThrowingContinuation { continuation in
             container.performBackgroundTask { context in
                 context.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy

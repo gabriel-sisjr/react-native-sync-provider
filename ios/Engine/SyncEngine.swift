@@ -135,10 +135,6 @@ final class SyncEngine: @unchecked Sendable {
             await self?.waitUntilStarted()
         }
 
-        // `enableBackgroundSync` is the consumer-controlled toggle; registering
-        // only flips on the dispatch slot, it does not schedule anything.
-        background.registerHandlers()
-
         // Eagerly start the monitor so the first read returns a real snapshot
         // rather than the `.unknown` default.
         connectivity.start()

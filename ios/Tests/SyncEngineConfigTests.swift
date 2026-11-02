@@ -1,3 +1,4 @@
+import CoreData
 import XCTest
 @testable import SyncProvider
 
@@ -587,5 +588,134 @@ final class SyncEngineConfigTests: XCTestCase {
         XCTAssertTrue(remaining.isEmpty)
         let last = try XCTUnwrap(URLProtocolStub.capturedRequests.last)
         XCTAssertEqual(last.value(forHTTPHeaderField: "Authorization"), "Bearer fresh")
+    }
+
+    // MARK: - Launch recovery
+
+    /// What a process killed mid-dispatch leaves behind: background sync on, and
+    /// a row still IN_FLIGHT that nothing in the next process is working on.
+    private func rowLeftInFlight(cooling: Bool = false) async throws -> StoredSyncItem {
+        let first = await fixture.makeEngine()
+        try first.background.enable(options: backgroundOptions())
+        let id = try await first.storage.enqueue(input: .sample(url: "https://api.test/left-in-flight"))
+        try await first.storage.markInFlight(id: id)
+        if cooling {
+            try await first.storage.markPendingForRetry(id: id, errorCode: "SERVER_ERROR", retryDelayMs: 60_000)
+            try await first.storage.markInFlight(id: id)
+        }
+        let left = try await item(id, in: first)
+        first.shutdown()
+        XCTAssertEqual(left.status, "IN_FLIGHT")
+        return left
+    }
+
+    /// Runs a background launch no JS reaches, with recovery held just before
+    /// its write lands while `fire` delivers the task. A handler that does not
+    /// wait for recovery then reaches the queue first every time, rather than
+    /// only when it happens to win the race.
+    ///
+    /// Uses `buildEngine()` because `makeColdEngine()` finishes recovery before
+    /// returning, which would hide the order under test.
+    private func launchCold(emitter: MockSyncEventEmitter,
+                            fire: (BackgroundSyncManager, FakeBackgroundTask) -> Void) async throws -> SyncEngine {
+        let hold = RecoveryWriteHold(stack: fixture.stack)
+        defer { hold.release() }
+        let cold = fixture.buildEngine(emitter: emitter)
+        await fulfillment(of: [hold.reached], timeout: 30)
+
+        let task = FakeBackgroundTask()
+        fire(cold.background, task)
+
+        // A correct handler does nothing until the release, however long this
+        // is, so this wait cannot fail it. It only has to be long enough for a
+        // handler that skipped recovery to show itself.
+        try await Task.sleep(nanoseconds: 250_000_000)
+        XCTAssertTrue(emitter.events(ofType: "SYNC_STARTED").isEmpty, "the flush must wait for recovery")
+        XCTAssertTrue(task.completedResults.isEmpty, "the task must not finish before recovery")
+
+        hold.release()
+        await task.waitForCompletion()
+        XCTAssertEqual(task.completedResults, [true])
+        return cold
+    }
+
+    /// A flush that runs before recovery cannot see the row, which then stays
+    /// stuck until something next starts the app.
+    func test_coldBackgroundLaunch_sendsARowLeftInFlight_inTheSameRun() async throws {
+        _ = try await rowLeftInFlight()
+        URLProtocolStub.setHandler(stubResponse(200))
+        let emitter = MockSyncEventEmitter()
+
+        let cold = try await launchCold(emitter: emitter) { $0.handleProcessing(task: $1) }
+
+        XCTAssertEqual(emitter.events(ofType: "RESUMED").first?.metadata?["recovered"], "1")
+        XCTAssertEqual(URLProtocolStub.capturedRequests.map(\.url?.absoluteString),
+                       ["https://api.test/left-in-flight"])
+        let remaining = try await cold.storage.getAll()
+        XCTAssertTrue(remaining.isEmpty, "a delivered row leaves the queue")
+    }
+
+    /// Recovery gives a row back to the queue, not a way past its cooldown.
+    func test_coldBackgroundLaunch_resetsACoolingRow_withoutSendingIt() async throws {
+        let left = try await rowLeftInFlight(cooling: true)
+        XCTAssertGreaterThan(left.nextRetryAt, fixture.clock.nowMs())
+        URLProtocolStub.setHandler(stubResponse(200))
+        let emitter = MockSyncEventEmitter()
+
+        let cold = try await launchCold(emitter: emitter) { $0.handleAppRefresh(task: $1) }
+
+        XCTAssertEqual(emitter.events(ofType: "RESUMED").first?.metadata?["recovered"], "1")
+        XCTAssertEqual(requestCount, 0)
+        let stored = try await item(left.id, in: cold)
+        XCTAssertEqual(stored.status, "PENDING")
+        XCTAssertEqual(stored.nextRetryAt, left.nextRetryAt, "the cooldown must survive recovery")
+        XCTAssertEqual(stored.attempts, left.attempts, "no attempt was made")
+    }
+}
+
+/// Holds launch recovery between changing a row and saving it. Every store
+/// operation has its own context, so reads carry on meanwhile and still see the
+/// row as IN_FLIGHT. That is the state a flush running too early would find.
+private final class RecoveryWriteHold: @unchecked Sendable {
+    /// Fulfilled once recovery has changed the row and is blocked on saving it.
+    let reached = XCTestExpectation(description: "recovery reached its save")
+
+    private let released = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var isSpent = false
+    private var observer: NSObjectProtocol?
+
+    init(stack: CoreDataStack) {
+        let coordinator = stack.persistentContainer.persistentStoreCoordinator
+        observer = NotificationCenter.default.addObserver(forName: .NSManagedObjectContextWillSave,
+                                                          object: nil,
+                                                          queue: nil) { [weak self] notification in
+            guard let context = notification.object as? NSManagedObjectContext,
+                  context.persistentStoreCoordinator === coordinator,
+                  context.updatedObjects.contains(where: { $0.changedValues()["status"] as? String == "PENDING" })
+            else { return }
+            self?.holdOnce()
+        }
+    }
+
+    deinit {
+        if let observer {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
+
+    /// Lets the held save through. Safe to call more than once.
+    func release() {
+        released.signal()
+    }
+
+    private func holdOnce() {
+        let isFirst = lock.withLock { () -> Bool in
+            defer { isSpent = true }
+            return !isSpent
+        }
+        guard isFirst else { return }
+        reached.fulfill()
+        released.wait()
     }
 }
