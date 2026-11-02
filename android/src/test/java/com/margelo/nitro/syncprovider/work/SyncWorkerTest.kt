@@ -104,6 +104,17 @@ internal class SyncWorkerTest {
   }
 
   @Test
+  fun `doWork returns retry when recovery throws`() = runTest {
+    coEvery { dispatcher.resetInFlight() } throws RuntimeException("db gone")
+    val worker = TestListenableWorkerBuilder<SyncWorker>(context).build()
+
+    val result = worker.doWork()
+
+    assertThat(result).isEqualTo(ListenableWorker.Result.retry())
+    coVerify(exactly = 0) { dispatcher.flush() }
+  }
+
+  @Test
   fun `doWork does not turn a stopped worker into a retry`() {
     coEvery { dispatcher.flush() } throws CancellationException("stopped")
     val worker = TestListenableWorkerBuilder<SyncWorker>(context).build()

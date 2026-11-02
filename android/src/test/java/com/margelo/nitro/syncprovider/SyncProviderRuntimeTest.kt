@@ -15,18 +15,28 @@ import androidx.work.testing.TestListenableWorkerBuilder
 import androidx.work.testing.WorkManagerTestInitHelper
 import com.google.common.collect.Range
 import com.google.common.truth.Truth.assertThat
+import com.margelo.nitro.syncprovider.config.ConfigSource
+import com.margelo.nitro.syncprovider.config.SecretStore
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
+import com.margelo.nitro.syncprovider.http.SyncDispatcher
+import com.margelo.nitro.syncprovider.testutil.InMemorySecretStore
 import com.margelo.nitro.syncprovider.testutil.RuntimeTestSupport
 import com.margelo.nitro.syncprovider.testutil.TestData
 import com.margelo.nitro.syncprovider.work.BackgroundSyncManager
+import com.margelo.nitro.syncprovider.work.RecoveryWorker
 import com.margelo.nitro.syncprovider.work.SyncWorker
+import io.mockk.every
+import io.mockk.mockkConstructor
+import io.mockk.unmockkConstructor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.RecordedRequest
 import org.junit.After
 import org.junit.Before
 import org.junit.Test
@@ -39,7 +49,11 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 /**
- * The runtime wired for real: SQLite, SharedPreferences and a test WorkManager.
+ * The runtime wired for real: SQLite, SharedPreferences and a test WorkManager. Only
+ * the Keystore is faked, which neither Robolectric nor a JVM can provide.
+ *
+ * [restartProcess] drops the runtime and keeps what is on disk, which is what a worker
+ * started with no JS sees.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [30])
@@ -48,6 +62,7 @@ internal class SyncProviderRuntimeTest {
   private lateinit var context: Context
   private lateinit var server: MockWebServer
   private lateinit var runtime: SyncProviderRuntime
+  private val secrets = InMemorySecretStore()
 
   @Before
   fun setUp() {
@@ -58,7 +73,7 @@ internal class SyncProviderRuntimeTest {
     )
     RuntimeTestSupport.reset()
     server = MockWebServer().apply { start() }
-    runtime = SyncProviderRuntime.bootstrap(context)
+    runtime = SyncProviderRuntime.bootstrap(context, secrets)
   }
 
   @After
@@ -66,6 +81,11 @@ internal class SyncProviderRuntimeTest {
     RuntimeTestSupport.awaitRecovery(context)
     RuntimeTestSupport.reset()
     server.shutdown()
+  }
+
+  private fun restartProcess() {
+    runtime.shutdown()
+    runtime = SyncProviderRuntime.bootstrap(context, secrets)
   }
 
   private suspend fun runWorker(): ListenableWorker.Result =
@@ -93,6 +113,11 @@ internal class SyncProviderRuntimeTest {
 
   private fun goOffline() {
     shadowOf(manager()).setNetworkCapabilities(manager().activeNetwork, ShadowNetworkCapabilities.newInstance())
+  }
+
+  private fun rejectingWithoutToken(): Dispatcher = object : Dispatcher() {
+    override fun dispatch(request: RecordedRequest): MockResponse =
+      MockResponse().setResponseCode(if (request.getHeader("Authorization") == TOKEN) 200 else 401)
   }
 
   private suspend fun insert(
@@ -432,6 +457,447 @@ internal class SyncProviderRuntimeTest {
     assertThat(server.requestCount).isEqualTo(1)
   }
 
+  /* ----------------------------- cold-start config ---------------------------- */
+
+  @Test
+  fun `a runtime with nothing configured reports DEFAULTS`() {
+    assertThat(runtime.configSource).isEqualTo(ConfigSource.DEFAULTS)
+    assertThat(runtime.currentOptions()).isEqualTo(SyncProviderRuntime.defaultOptions())
+  }
+
+  @Test
+  fun `configureSync in this process reports LIVE, and a restart reports PERSISTED`() = runBlocking {
+    runtime.configure(TestData.syncOptions())
+    assertThat(runtime.configSource).isEqualTo(ConfigSource.LIVE)
+
+    restartProcess()
+
+    assertThat(runtime.configSource).isEqualTo(ConfigSource.PERSISTED)
+  }
+
+  @Test
+  fun `a configured maxAttempts survives a fresh runtime`() = runBlocking<Unit> {
+    runtime.configure(TestData.syncOptions(retryPolicy = TestData.retryPolicy(maxAttempts = 10)))
+    insert("budget", attempts = 6)
+    server.enqueue(MockResponse().setResponseCode(200))
+
+    restartProcess()
+    runWorker()
+
+    // With the default budget of 5, this row would fail without a single request.
+    assertThat(runtime.currentOptions().retryPolicy.maxAttempts).isEqualTo(10.0)
+    assertThat(server.requestCount).isEqualTo(1)
+    assertThat(row("budget")).isNull()
+  }
+
+  @Test
+  fun `a cold worker honors the configured batchSize`() = runBlocking<Unit> {
+    runtime.configure(TestData.syncOptions(batchSize = 2))
+    repeat(3) { insert("row-$it", createdAt = it.toLong()) }
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest) = MockResponse().setResponseCode(200)
+    }
+
+    restartProcess()
+    runWorker()
+
+    assertThat(server.requestCount).isEqualTo(2)
+  }
+
+  @Test
+  fun `a cold worker honors the configured requestTimeoutMs`() = runBlocking<Unit> {
+    runtime.configure(TestData.syncOptions(requestTimeoutMs = 1_000L))
+    insert("slow")
+    val release = CountDownLatch(1)
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest): MockResponse {
+        // Past the default 30s timeout, so only the configured one can end this early.
+        release.await(40, TimeUnit.SECONDS)
+        return MockResponse().setResponseCode(200)
+      }
+    }
+
+    restartProcess()
+    val startedAt = System.currentTimeMillis()
+    runWorker()
+    release.countDown()
+
+    assertThat(System.currentTimeMillis() - startedAt).isLessThan(20_000L)
+    assertThat(row("slow")!!.attempts).isEqualTo(1)
+  }
+
+  @Test
+  fun `a cold periodic worker dispatches under a persisted MANUAL, which still gates the kick`() = runBlocking<Unit> {
+    server.enqueue(MockResponse().setResponseCode(503))
+    runtime.backgroundSyncManager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+    runtime.configure(TestData.syncOptions(strategy = SyncStrategy.MANUAL))
+    insert("x")
+
+    restartProcess()
+    runPeriodicWorker()
+
+    assertThat(runtime.currentOptions().strategy).isEqualTo(SyncStrategy.MANUAL)
+    assertThat(server.requestCount).isEqualTo(1)
+    assertThat(row("x")!!.nextRetryAt).isGreaterThan(0L)
+    assertThat(oneTimeWork()).isEmpty()
+  }
+
+  @Test
+  fun `a fresh runtime applies the configured maxQueueSize`() = runBlocking<Unit> {
+    runtime.configure(TestData.syncOptions(maxQueueSize = 321))
+
+    restartProcess()
+
+    assertThat(runtime.storage.maxQueueSize).isEqualTo(321)
+  }
+
+  /* --------------------------- cold-worker recovery --------------------------- */
+
+  @Test
+  fun `a cold worker dispatches a row a dead process left IN_FLIGHT`() = runBlocking<Unit> {
+    server.enqueue(MockResponse().setResponseCode(200))
+    insert("orphan", status = SyncItemEntity.STATUS_IN_FLIGHT)
+
+    restartProcess()
+    val result = runWorker()
+
+    assertThat(result).isEqualTo(ListenableWorker.Result.success())
+    assertThat(server.requestCount).isEqualTo(1)
+    assertThat(row("orphan")).isNull()
+  }
+
+  @Test
+  fun `a cold worker resets a row still cooling, without dispatching it`() = runBlocking<Unit> {
+    val deadline = System.currentTimeMillis() + FAR_MS
+    insert("cooling", attempts = 1, nextRetryAt = deadline, status = SyncItemEntity.STATUS_IN_FLIGHT)
+    runtime.backgroundSyncManager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+
+    restartProcess()
+    runWorker()
+
+    assertThat(server.requestCount).isEqualTo(0)
+    assertThat(row("cooling")!!.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(row("cooling")!!.nextRetryAt).isEqualTo(deadline)
+    // A row left IN_FLIGHT has no wake. Once reset, the cycle that follows arms one.
+    assertThat(oneTimeWork()).hasSize(1)
+  }
+
+  @Test
+  fun `a paused cold worker leaves an orphaned row alone`() = runBlocking<Unit> {
+    insert("orphan", status = SyncItemEntity.STATUS_IN_FLIGHT)
+    runtime.pause()
+
+    restartProcess()
+    runWorker()
+
+    assertThat(server.requestCount).isEqualTo(0)
+    assertThat(row("orphan")!!.status).isEqualTo(SyncItemEntity.STATUS_IN_FLIGHT)
+  }
+
+  @Test
+  fun `a cold worker under foregroundOnly leaves an orphaned row alone`() = runBlocking<Unit> {
+    insert("orphan", status = SyncItemEntity.STATUS_IN_FLIGHT)
+    runtime.backgroundSyncManager.enable(TestData.backgroundSyncOptions(foregroundOnly = true))
+
+    restartProcess()
+    runWorker()
+
+    assertThat(server.requestCount).isEqualTo(0)
+    assertThat(row("orphan")!!.status).isEqualTo(SyncItemEntity.STATUS_IN_FLIGHT)
+  }
+
+  @Test
+  fun `a cold worker resets an orphaned row even when headers cannot be recovered`() = runBlocking<Unit> {
+    runtime.configure(TestData.syncOptions(defaultHeaders = mapOf("Authorization" to TOKEN)))
+    insert("orphan", status = SyncItemEntity.STATUS_IN_FLIGHT)
+    secrets.failReads = true
+
+    restartProcess()
+    runWorker()
+
+    assertThat(server.requestCount).isEqualTo(0)
+    assertThat(row("orphan")!!.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+  }
+
+  @Test
+  fun `a worker beside an attached engine leaves recovery to the engine`() = runBlocking<Unit> {
+    attachEngineAndRecover()
+    insert("claimed", status = SyncItemEntity.STATUS_IN_FLIGHT)
+
+    runWorker()
+
+    assertThat(server.requestCount).isEqualTo(0)
+    assertThat(row("claimed")!!.status).isEqualTo(SyncItemEntity.STATUS_IN_FLIGHT)
+  }
+
+  /* --------------------------------- pause lifetime ----------------------------- */
+
+  @Test
+  fun `a cold runtime stays paused and its worker is inert`() = runBlocking<Unit> {
+    insert("x")
+    runtime.pause()
+
+    restartProcess()
+    val result = runWorker()
+
+    assertThat(result).isEqualTo(ListenableWorker.Result.success())
+    assertThat(runtime.dispatcher.flush()).isEqualTo(SyncDispatcher.emptyResult())
+    assertThat(server.requestCount).isEqualTo(0)
+    assertThat(row("x")!!.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+
+    restartProcess() // A runtime built for a worker leaves the flag for the next one.
+    assertThat(runtime.isPaused).isTrue()
+  }
+
+  @Test
+  fun `a cold recovery leaves the pause on and arms nothing`() = runBlocking<Unit> {
+    runtime.backgroundSyncManager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+    insertFarCooling()
+    runtime.pause()
+
+    restartProcess()
+    TestListenableWorkerBuilder<RecoveryWorker>(context).build().doWork()
+
+    assertThat(runtime.isPaused).isTrue()
+    assertThat(oneTimeWork()).isEmpty()
+  }
+
+  @Test
+  fun `a new JS engine clears the persisted pause, so a later cold worker dispatches`() = runBlocking<Unit> {
+    server.enqueue(MockResponse().setResponseCode(200))
+    insert("x")
+    runtime.pause()
+    restartProcess()
+    assertThat(runtime.isPaused).isTrue()
+
+    attachEngineAndRecover()
+    assertThat(runtime.isPaused).isFalse()
+
+    restartProcess()
+    assertThat(runtime.isPaused).isFalse()
+    runWorker()
+    assertThat(row("x")).isNull()
+  }
+
+  @Test
+  fun `a new engine is unpaused before its recovery arms the first wake`() = runBlocking<Unit> {
+    runtime.backgroundSyncManager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+    insertFarCooling()
+    runtime.pause()
+    mockkConstructor(BackgroundSyncManager::class)
+    // Recovery runs at the instant it is scheduled, the worst case for whatever follows.
+    every { anyConstructed<BackgroundSyncManager>().scheduleRecovery() } answers {
+      runBlocking { TestListenableWorkerBuilder<RecoveryWorker>(context).build().doWork() }
+    }
+    try {
+      restartProcess()
+
+      runtime.attachEngine()
+
+      assertThat(runtime.isRetryTimerArmed).isTrue()
+      assertThat(oneTimeWork()).hasSize(1)
+    } finally {
+      unmockkConstructor(BackgroundSyncManager::class)
+    }
+  }
+
+  @Test
+  fun `an engine arriving after an inert worker wakes the queue in that process`() = runBlocking<Unit> {
+    goOnline()
+    server.enqueue(MockResponse().setResponseCode(200))
+    insert("due", attempts = 1, nextRetryAt = 1L)
+    runtime.pause()
+    restartProcess()
+    runWorker()
+    assertThat(server.requestCount).isEqualTo(0)
+
+    runtime.attachEngine()
+
+    awaitGone("due")
+    assertThat(server.requestCount).isEqualTo(1)
+  }
+
+  @Test
+  fun `a reload clears the pause even though the old engine never detached`() = runBlocking<Unit> {
+    attachEngineAndRecover()
+    runtime.pause()
+
+    attachEngineAndRecover()
+
+    assertThat(runtime.isPaused).isFalse()
+  }
+
+  @Test
+  fun `a pause set after the engine attached holds until resumeSync`() = runBlocking<Unit> {
+    attachEngineAndRecover()
+    runtime.pause()
+    restartProcess()
+    assertThat(runtime.isPaused).isTrue()
+
+    runtime.resume()
+    restartProcess()
+
+    assertThat(runtime.isPaused).isFalse()
+  }
+
+  /* ----------------------------- restored credentials ------------------------- */
+
+  @Test
+  fun `a cold worker authenticates with the persisted default headers`() = runBlocking<Unit> {
+    runtime.configure(TestData.syncOptions(defaultHeaders = mapOf("Authorization" to TOKEN)))
+    insert("auth")
+    server.dispatcher = rejectingWithoutToken()
+
+    restartProcess()
+    runWorker()
+
+    assertThat(server.takeRequest(1, TimeUnit.SECONDS)!!.getHeader("Authorization")).isEqualTo(TOKEN)
+    assertThat(row("auth")).isNull()
+  }
+
+  @Test
+  fun `a rejected persisted token leaves the item pending and the worker successful`() = runBlocking<Unit> {
+    runtime.configure(TestData.syncOptions(defaultHeaders = mapOf("Authorization" to "Bearer expired")))
+    insert("auth")
+    server.dispatcher = rejectingWithoutToken()
+
+    restartProcess()
+    val result = runWorker()
+
+    assertThat(result).isEqualTo(ListenableWorker.Result.success())
+    val held = row("auth")!!
+    assertThat(held.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(held.attempts).isEqualTo(0)
+    assertThat(held.lastErrorCode).isEqualTo(SyncErrorCode.UNAUTHORIZED.name)
+    assertThat(held.nextRetryAt).isGreaterThan(System.currentTimeMillis())
+  }
+
+  @Test
+  fun `a 401 stays terminal once JS has configured in this process`() = runBlocking<Unit> {
+    runtime.configure(TestData.syncOptions(defaultHeaders = mapOf("Authorization" to "Bearer expired")))
+    restartProcess()
+    runtime.configure(TestData.syncOptions(defaultHeaders = mapOf("Authorization" to "Bearer expired")))
+    insert("auth")
+    server.dispatcher = rejectingWithoutToken()
+
+    runtime.dispatcher.flush()
+
+    assertThat(row("auth")!!.status).isEqualTo(SyncItemEntity.STATUS_FAILED)
+  }
+
+  @Test
+  fun `a 401 stays terminal when no headers were ever persisted`() = runBlocking<Unit> {
+    runtime.configure(TestData.syncOptions())
+    insert("auth")
+    server.dispatcher = rejectingWithoutToken()
+
+    restartProcess()
+    runWorker()
+
+    assertThat(row("auth")!!.status).isEqualTo(SyncItemEntity.STATUS_FAILED)
+  }
+
+  @Test
+  fun `a logout cannot overtake a configureSync that is still being written`() = runBlocking<Unit> {
+    val writing = CountDownLatch(1)
+    val finishWrite = CountDownLatch(1)
+    val slowSecrets = object : SecretStore by secrets {
+      override fun write(value: String): Boolean {
+        writing.countDown()
+        finishWrite.await(20, TimeUnit.SECONDS)
+        return secrets.write(value)
+      }
+    }
+    runtime.shutdown()
+    runtime = SyncProviderRuntime.bootstrap(context, slowSecrets)
+    val login = async(Dispatchers.IO) {
+      runtime.configure(TestData.syncOptions(defaultHeaders = mapOf("Authorization" to TOKEN)))
+    }
+    assertThat(writing.await(20, TimeUnit.SECONDS)).isTrue()
+
+    val logout = async(Dispatchers.IO) { runtime.configure(TestData.syncOptions(defaultHeaders = null)) }
+    delay(100L)
+
+    // Had the logout taken effect in memory, its write would race this one for the disk.
+    assertThat(runtime.currentOptions().defaultHeaders).containsKey("Authorization")
+    finishWrite.countDown()
+    login.await()
+    logout.await()
+
+    assertThat(runtime.currentOptions().defaultHeaders).isNull()
+    assertThat(secrets.stored).isNull()
+  }
+
+  @Test
+  fun `configuring without headers deletes them, which is the logout path`() = runBlocking<Unit> {
+    runtime.configure(TestData.syncOptions(defaultHeaders = mapOf("Authorization" to TOKEN)))
+    assertThat(secrets.stored).isNotNull()
+
+    runtime.configure(TestData.syncOptions(defaultHeaders = null))
+    assertThat(secrets.stored).isNull()
+
+    restartProcess()
+    assertThat(runtime.currentOptions().defaultHeaders).isNull()
+  }
+
+  @Test
+  fun `headers that cannot be recovered dispatch nothing and the worker succeeds`() = runBlocking<Unit> {
+    runtime.configure(TestData.syncOptions(defaultHeaders = mapOf("Authorization" to TOKEN)))
+    insert("auth")
+    secrets.failReads = true
+
+    restartProcess()
+    val result = runWorker()
+
+    assertThat(result).isEqualTo(ListenableWorker.Result.success())
+    assertThat(server.requestCount).isEqualTo(0)
+    assertThat(row("auth")!!.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(row("auth")!!.attempts).isEqualTo(0)
+  }
+
+  @Test
+  fun `no wake is armed while headers cannot be recovered`() = runBlocking<Unit> {
+    runtime.configure(TestData.syncOptions(defaultHeaders = mapOf("Authorization" to TOKEN)))
+    runtime.backgroundSyncManager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+    insert("due", attempts = 1, nextRetryAt = 1L)
+    secrets.failReads = true
+
+    restartProcess()
+    runtime.armRetryWake()
+
+    assertThat(oneTimeWork()).isEmpty()
+  }
+
+  @Test
+  fun `a worker recovers once the headers can be read again`() = runBlocking<Unit> {
+    runtime.configure(TestData.syncOptions(defaultHeaders = mapOf("Authorization" to TOKEN)))
+    insert("auth")
+    server.dispatcher = rejectingWithoutToken()
+    secrets.failReads = true
+    restartProcess()
+    runWorker()
+    assertThat(server.requestCount).isEqualTo(0)
+
+    secrets.failReads = false
+    runWorker()
+
+    assertThat(row("auth")).isNull()
+  }
+
+  @Test
+  fun `configureSync lifts the block when headers could not be recovered`() = runBlocking<Unit> {
+    runtime.configure(TestData.syncOptions(defaultHeaders = mapOf("Authorization" to TOKEN)))
+    insert("auth")
+    server.dispatcher = rejectingWithoutToken()
+    secrets.failReads = true
+    restartProcess()
+
+    runtime.configure(TestData.syncOptions(defaultHeaders = mapOf("Authorization" to TOKEN)))
+    runtime.dispatcher.flush()
+
+    assertThat(row("auth")).isNull()
+  }
+
   /* ----------------------------------- queue ---------------------------------- */
 
   @Test
@@ -445,6 +911,7 @@ internal class SyncProviderRuntimeTest {
   }
 
   private companion object {
+    const val TOKEN = "Bearer live"
     const val AWAIT_TIMEOUT_MS = 20_000L
     const val FAR_MS = 3_600_000L
   }

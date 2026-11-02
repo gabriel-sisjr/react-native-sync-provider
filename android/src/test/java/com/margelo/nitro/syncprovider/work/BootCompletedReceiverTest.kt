@@ -4,6 +4,8 @@ import android.content.Context
 import android.content.Intent
 import androidx.test.core.app.ApplicationProvider
 import androidx.work.Configuration
+import androidx.work.ExistingWorkPolicy
+import androidx.work.OneTimeWorkRequest
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import androidx.work.testing.SynchronousExecutor
@@ -11,8 +13,14 @@ import androidx.work.testing.WorkManagerTestInitHelper
 import com.google.common.truth.Truth.assertThat
 import com.margelo.nitro.syncprovider.SyncProviderRuntime
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
+import com.margelo.nitro.syncprovider.testutil.InMemorySecretStore
 import com.margelo.nitro.syncprovider.testutil.RuntimeTestSupport
 import com.margelo.nitro.syncprovider.testutil.TestData
+import io.mockk.every
+import io.mockk.mockk
+import io.mockk.mockkStatic
+import io.mockk.unmockkStatic
+import io.mockk.verify
 import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Before
@@ -37,7 +45,7 @@ internal class BootCompletedReceiverTest {
       Configuration.Builder().setExecutor(SynchronousExecutor()).build(),
     )
     RuntimeTestSupport.reset()
-    runtime = SyncProviderRuntime.bootstrap(context)
+    runtime = SyncProviderRuntime.bootstrap(context, InMemorySecretStore())
   }
 
   @After
@@ -93,6 +101,34 @@ internal class BootCompletedReceiverTest {
     receive(Intent.ACTION_MY_PACKAGE_REPLACED)
 
     assertThat(infos(BackgroundSyncManager.UNIQUE_RECOVERY)).hasSize(1)
+  }
+
+  /**
+   * Building a runtime opens the database and decrypts the stored headers, which must
+   * not happen on the broadcast's main thread. WorkManager is mocked because the real
+   * worker starts at once and builds the runtime, which is exactly where it belongs.
+   */
+  @Test
+  fun `the broadcast enqueues recovery and builds no runtime`() {
+    RuntimeTestSupport.reset() // A boot starts with no runtime: drop the one from setUp.
+    val workManager = mockk<WorkManager>(relaxed = true)
+    mockkStatic(WorkManager::class)
+    try {
+      every { WorkManager.getInstance(any<Context>()) } returns workManager
+
+      receive(Intent.ACTION_BOOT_COMPLETED)
+
+      assertThat(SyncProviderRuntime.getOrNull(null)).isNull()
+      verify(exactly = 1) {
+        workManager.enqueueUniqueWork(
+          BackgroundSyncManager.UNIQUE_RECOVERY,
+          any<ExistingWorkPolicy>(),
+          any<OneTimeWorkRequest>(),
+        )
+      }
+    } finally {
+      unmockkStatic(WorkManager::class)
+    }
   }
 
   @Test

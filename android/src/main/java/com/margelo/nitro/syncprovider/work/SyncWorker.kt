@@ -10,9 +10,12 @@ import com.margelo.nitro.syncprovider.events.SyncEventEmitter
 import kotlinx.coroutines.CancellationException
 
 /**
- * WorkManager-driven flush worker. Runs against the singleton [SyncProviderRuntime].
+ * WorkManager-driven flush worker. Runs against the singleton [SyncProviderRuntime],
+ * which restores the persisted configuration when this is a cold start with no JS.
+ * With no JS engine attached, it also recovers rows a dead process left `IN_FLIGHT`.
  *
- * Inert when dispatch is blocked. See [SyncProviderRuntime.isBackgroundDispatchBlocked].
+ * Inert when dispatch is blocked, recovery included.
+ * See [SyncProviderRuntime.isBackgroundDispatchBlocked].
  */
 internal class SyncWorker(
   context: Context,
@@ -34,6 +37,11 @@ internal class SyncWorker(
     }
 
     return try {
+      // Recovery otherwise needs an engine to attach, a boot or an app update, and until
+      // then flush cannot see a row a dead process left IN_FLIGHT. The reset takes the
+      // flush mutex, so it cannot catch a running cycle. It sends nothing, so unlike
+      // dispatch it does not wait for headers that cannot be recovered.
+      if (!runtime.isEngineAttached) runtime.dispatcher.resetInFlight()
       runtime.dispatcher.flush()
       if (isPeriodic) {
         emitter.emit(SyncEventEmitter.event(SyncEventType.BACKGROUND_SYNC_COMPLETED))

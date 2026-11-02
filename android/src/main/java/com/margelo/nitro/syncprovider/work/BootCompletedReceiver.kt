@@ -4,7 +4,6 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.util.Log
-import com.margelo.nitro.syncprovider.SyncProviderRuntime
 
 /**
  * Schedules [RecoveryWorker] when the device finishes booting (or when the
@@ -24,9 +23,10 @@ class BootCompletedReceiver : BroadcastReceiver() {
       return
     }
     Log.i(TAG, "Received $action — scheduling recovery worker")
+    // Only enqueues the worker. The runtime is built there, off the main thread,
+    // because building it opens the database and decrypts the stored headers.
     runCatching {
-      val runtime = SyncProviderRuntime.bootstrap(context.applicationContext)
-      runtime.backgroundSyncManager.scheduleRecovery()
+      BackgroundSyncManager(context.applicationContext).scheduleRecovery()
     }.onFailure { Log.e(TAG, "Failed to schedule RecoveryWorker", it) }
   }
 
