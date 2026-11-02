@@ -1930,7 +1930,7 @@ PODS:
     - ReactCommon/turbomodule/core
     - ReactNativeDependencies
     - Yoga
-  - SyncProvider (0.1.0):
+  - SyncProvider (0.1.1):
     - hermes-engine
     - NitroModules
     - RCTRequired
@@ -1954,7 +1954,7 @@ PODS:
     - ReactCommon/turbomodule/core
     - ReactNativeDependencies
     - Yoga
-  - SyncProvider/Tests (0.1.0):
+  - SyncProvider/Tests (0.1.1):
     - hermes-engine
     - NitroModules
     - RCTRequired
@@ -2302,7 +2302,7 @@ SPEC CHECKSUMS:
   ReactCommon: fe2a3af8975e63efa60f95fca8c34dc85deee360
   ReactNativeDependencies: da8e9df65d9712acfe42f0674d770c12fe7f39b1
   RNScreens: a6a509f05ea74d50abab8c21b319b33cfca1ea1c
-  SyncProvider: e3f05351afe482684a8fa9fc869d02ecf725b0ff
+  SyncProvider: 6b011da317fbc331f3c198b271766e029b44bb03
   Yoga: e83c3121d079541e69f3c5c623faaaf933fb5812
 
 PODFILE CHECKSUM: a50b973fcddec24d4ac90f9eec5b77f8c93b061d

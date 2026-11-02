@@ -248,4 +248,35 @@ final class SyncRetryCooldownTests: XCTestCase {
         let withFresh = try await storage.earliestPendingAt()
         XCTAssertEqual(withFresh, 0, "a never-attempted row is due now")
     }
+
+    // MARK: - Stale credential
+
+    func test_markCredentialRejected_refundsTheAttempt_andCoolsTheItem() async throws {
+        let id = try await storage.enqueue(input: makeInput())
+        let before = try await item(id).attempts
+        try await storage.markInFlight(id: id)
+
+        let heldUntil = try await storage.markCredentialRejected(id: id,
+                                                                 errorCode: "UNAUTHORIZED",
+                                                                 retryDelayMs: 5_000,
+                                                                 attempts: before)
+
+        let stored = try await item(id)
+        XCTAssertEqual(stored.status, "PENDING")
+        XCTAssertEqual(stored.attempts, before)
+        XCTAssertEqual(stored.lastErrorCode, "UNAUTHORIZED")
+        XCTAssertEqual(stored.nextRetryAt, clock.nowMs() + 5_000)
+        XCTAssertEqual(heldUntil, stored.nextRetryAt)
+    }
+
+    /// The row can go while its request is out. The credential was still
+    /// rejected, so the hold must still reach the timer.
+    func test_markCredentialRejected_forARemovedRow_stillReportsTheHold() async throws {
+        let heldUntil = try await storage.markCredentialRejected(id: "gone",
+                                                                 errorCode: "UNAUTHORIZED",
+                                                                 retryDelayMs: 5_000,
+                                                                 attempts: 0)
+
+        XCTAssertEqual(heldUntil, clock.nowMs() + 5_000)
+    }
 }

@@ -7,6 +7,7 @@ import Foundation
 /// manual: nothing happens until a test moves `clock` and fires `timer`.
 final class EngineFixture {
     let stack = InMemoryCoreDataStack.make()
+    let secrets = InMemorySecretStore()
     let connectivity = FakeConnectivity()
     let scheduler = FakeBackgroundTaskScheduler()
     let clock = ManualClock()
@@ -41,6 +42,7 @@ final class EngineFixture {
     /// Builds an engine without waiting for it to start.
     func buildEngine(emitter: SyncEventEmitter = MockSyncEventEmitter()) -> SyncEngine {
         let engine = SyncEngine(stack: stack,
+                                configStore: SyncConfigStore(defaults: defaults, secrets: secrets),
                                 backgroundStore: BackgroundSyncOptionsStore(defaults: defaults),
                                 connectivity: connectivity,
                                 emitter: emitter,

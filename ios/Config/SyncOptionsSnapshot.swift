@@ -8,6 +8,17 @@
 
 import Foundation
 
+/// Where the active configuration came from.
+enum ConfigSource: String, Sendable {
+    /// Nothing was ever configured on this install.
+    case defaults = "DEFAULTS"
+    /// Read back from disk when the engine started. The app has not spoken in
+    /// this process, so a persisted credential may be stale.
+    case persisted = "PERSISTED"
+    /// Set by `configureSync` in this process.
+    case live = "LIVE"
+}
+
 /// Sendable mirror of `SyncOptions`.
 struct SyncOptionsSnapshot: Sendable, Equatable {
     var strategy: String
@@ -33,10 +44,14 @@ struct SyncOptionsSnapshot: Sendable, Equatable {
         strategy == "MANUAL"
     }
 
-    func toDispatcherConfig() -> DispatcherConfig {
+    func toDispatcherConfig(source: ConfigSource = .live,
+                            credentialsUnavailable: Bool = false) -> DispatcherConfig {
         DispatcherConfig(retryPolicy: retryPolicy,
                          requestTimeoutMs: Int(requestTimeoutMs),
                          batchSize: Int(batchSize),
-                         defaultHeaders: defaultHeaders)
+                         defaultHeaders: defaultHeaders,
+                         source: source,
+                         hasDefaultHeaders: !defaultHeaders.isEmpty || credentialsUnavailable,
+                         credentialsUnavailable: credentialsUnavailable)
     }
 }

@@ -56,7 +56,8 @@ Pod::Spec.new do |s|
   #   CoreData         — queue + history persistence
   #   Network          — NWPathMonitor connectivity tracking
   #   BackgroundTasks  — BGTaskScheduler (iOS 13+; library floor is 15.0)
-  s.frameworks = "Foundation", "CoreData", "Network", "BackgroundTasks"
+  #   Security         — Keychain storage for `defaultHeaders`
+  s.frameworks = "Foundation", "CoreData", "Network", "BackgroundTasks", "Security"
 
   s.dependency 'React-jsi'
   s.dependency 'React-callinvoker'

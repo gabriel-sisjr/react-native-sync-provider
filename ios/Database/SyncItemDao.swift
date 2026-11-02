@@ -263,6 +263,31 @@ final class SyncItemDao {
         }
     }
 
+    /// Reset an item rejected for a stale persisted credential. It goes back to
+    /// PENDING behind a cooldown, and the attempt is refunded: an expired token
+    /// says nothing about the item, so it must not spend the retry budget.
+    ///
+    /// - Parameter attempts: the value from before ``markInFlight(id:)``.
+    /// - Returns: when the hold ends, even if the row was removed meanwhile: the
+    ///   credential was rejected either way.
+    @discardableResult
+    func markCredentialRejected(id: String,
+                                errorCode: String?,
+                                retryDelayMs: Int,
+                                attempts: Int32) async throws -> Int64 {
+        try await stack.performBackgroundTask { [clock] context in
+            let nowMs = clock.nowMs()
+            let heldUntil = nowMs + Int64(max(0, retryDelayMs))
+            guard let entity = try Self.fetchEntity(id: id, in: context) else { return heldUntil }
+            entity.status = SyncItemStatus.pending.rawValue
+            entity.attempts = attempts
+            entity.lastErrorCode = errorCode
+            entity.lastAttemptAt = nowMs
+            entity.nextRetryAt = heldUntil
+            return heldUntil
+        }
+    }
+
     /// Reset every IN_FLIGHT item back to PENDING. Used by ``RecoveryManager``
     /// on app launch to requeue items orphaned by a crash / force-quit.
     ///

@@ -121,6 +121,19 @@ actor SyncQueueStorage {
         try await dao.markPendingForRetry(id: id, errorCode: errorCode, retryDelayMs: retryDelayMs)
     }
 
+    /// Put back an item rejected for a stale persisted credential, refunding
+    /// its attempt. See ``SyncItemDao/markCredentialRejected(id:errorCode:retryDelayMs:attempts:)``.
+    @discardableResult
+    func markCredentialRejected(id: String,
+                                errorCode: String?,
+                                retryDelayMs: Int,
+                                attempts: Int32) async throws -> Int64 {
+        try await dao.markCredentialRejected(id: id,
+                                             errorCode: errorCode,
+                                             retryDelayMs: retryDelayMs,
+                                             attempts: attempts)
+    }
+
     @discardableResult
     func resetInFlightToPending() async throws -> Int {
         try await dao.resetInFlightToPending()

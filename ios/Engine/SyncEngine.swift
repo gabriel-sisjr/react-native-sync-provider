@@ -30,7 +30,7 @@ enum RetryWakeScope: Sendable {
     case allPending
 }
 
-/// Owns the queue, the dispatcher and the retry timer.
+/// Owns the queue, the dispatcher, the retry timer and the configuration.
 final class SyncEngine: @unchecked Sendable {
     /// The engine for this process. Built on first use, from whichever side
     /// gets there first: JS creating the hybrid, or a fired BGTask.
@@ -42,13 +42,15 @@ final class SyncEngine: @unchecked Sendable {
     let dispatcher: SyncDispatcher
     let background: BackgroundSyncManager
 
+    private let configStore: SyncConfigStore
     private let recovery: RecoveryManager
     private let clock: SyncClock
     private let retryTimer: RetryWakeScheduling
     private let wakeSource: RetryWakeSource
 
     private let lock = NSLock()
-    private var options: SyncOptionsSnapshot = .default
+    private var options: SyncOptionsSnapshot
+    private var source: ConfigSource
     /// A timer fired while offline. Flushing then would spend attempts on items
     /// that are fine, so the wake waits here for connectivity.
     private var wakeAwaitingConnectivity = false
@@ -61,6 +63,9 @@ final class SyncEngine: @unchecked Sendable {
     /// is one: a background launch answers to the OS, and a timer there would
     /// dispatch outside the constraints the consumer asked for.
     private var attachedHybrids = 0
+    /// No wake before this moment, whatever else is due: a persisted credential
+    /// was rejected, and waking sooner would spend another request on it.
+    private var credentialHoldUntil: Int64 = 0
     private var connectivityToken: UUID?
     private var startup: Task<Void, Never>?
     private var attachWake: Task<Void, Never>?
@@ -73,6 +78,7 @@ final class SyncEngine: @unchecked Sendable {
     ///   - retryTimer: tests fire it explicitly.
     ///   - wrapWakeSource: test seam around the deadline queries.
     init(stack: CoreDataStack = .shared,
+         configStore: SyncConfigStore = SyncConfigStore(),
          backgroundStore: BackgroundSyncOptionsStore = BackgroundSyncOptionsStore(),
          connectivity: ConnectivityProviding = ConnectivityMonitor.shared,
          emitter: SyncEventEmitter = SyncEventEmitter(),
@@ -81,8 +87,11 @@ final class SyncEngine: @unchecked Sendable {
          clock: SyncClock = SystemClock(),
          retryTimer: RetryWakeScheduling = RetryWakeTimer(),
          wrapWakeSource: ((RetryWakeSource) -> RetryWakeSource)? = nil) {
-        let storage = SyncQueueStorage(dao: SyncItemDao(stack: stack, clock: clock))
-        let config = SyncOptionsSnapshot.default.toDispatcherConfig()
+        let loaded = configStore.load()
+        let storage = SyncQueueStorage(dao: SyncItemDao(stack: stack, clock: clock),
+                                       capacity: max(1, Int(loaded.options.maxQueueSize)))
+        let config = loaded.options.toDispatcherConfig(source: loaded.source,
+                                                       credentialsUnavailable: loaded.credentialsUnavailable)
         let dispatcher: SyncDispatcher
         if let sessions {
             dispatcher = SyncDispatcher(storage: storage,
@@ -90,17 +99,22 @@ final class SyncEngine: @unchecked Sendable {
                                         connectivity: connectivity,
                                         config: config,
                                         foregroundSession: sessions.foreground,
-                                        backgroundSession: sessions.background)
+                                        backgroundSession: sessions.background,
+                                        paused: loaded.paused)
         } else {
             dispatcher = SyncDispatcher(storage: storage,
                                         emitter: emitter,
                                         connectivity: connectivity,
-                                        config: config)
+                                        config: config,
+                                        paused: loaded.paused)
         }
 
         self.clock = clock
         self.retryTimer = retryTimer
         self.wakeSource = wrapWakeSource?(storage) ?? storage
+        self.configStore = configStore
+        self.options = loaded.options
+        self.source = loaded.source
         self.storage = storage
         self.emitter = emitter
         self.connectivity = connectivity
@@ -111,8 +125,11 @@ final class SyncEngine: @unchecked Sendable {
                                                 store: backgroundStore)
         self.recovery = RecoveryManager(storage: storage, emitter: emitter)
 
-        dispatcher.hooks.onCycleFinished = { [weak self] in
-            await self?.rearmRetryTimer()
+        dispatcher.hooks.onCycleFinished = { [weak self] notBefore in
+            await self?.rearmRetryTimer(notBefore: notBefore)
+        }
+        dispatcher.hooks.recoverCredentials = { [weak self] in
+            self?.recoverDefaultHeaders()
         }
         background.setPrepare { [weak self] in
             await self?.waitUntilStarted()
@@ -146,8 +163,14 @@ final class SyncEngine: @unchecked Sendable {
     // MARK: - JS lifecycle
 
     /// A JS-facing hybrid was created, so an app is running in this process.
+    ///
+    /// Clears the persisted pause: JS cannot read it and starts out unpaused, so
+    /// keeping it would stop the queue silently. A launch that never reaches JS
+    /// does not get here, so it stays inert while the app is dead.
     func attachHybrid() {
         lock.withLock { attachedHybrids += 1 }
+        configStore.setPaused(false)
+        dispatcher.hooks.paused = false
         let wake = Task { [weak self, startup] in
             await startup?.value
             await self?.rearmRetryTimer()
@@ -194,22 +217,40 @@ final class SyncEngine: @unchecked Sendable {
         lock.withLock { options }
     }
 
-    /// Applies a configuration set by the app.
+    /// Where the active options came from.
+    func configSource() -> ConfigSource {
+        lock.withLock { source }
+    }
+
+    /// Applies and persists a configuration set by the app in this process.
     func configure(_ snapshot: SyncOptionsSnapshot) async {
-        lock.withLock { options = snapshot }
+        lock.withLock {
+            options = snapshot
+            source = .live
+            credentialHoldUntil = 0
+        }
+        configStore.save(snapshot)
         await storage.updateCapacity(Int(snapshot.maxQueueSize))
-        await dispatcher.updateConfig(snapshot.toDispatcherConfig())
+        await dispatcher.updateConfig(snapshot.toDispatcherConfig(source: .live))
         await rearmRetryTimer()
+    }
+
+    private func recoverDefaultHeaders() -> [String: String]? {
+        guard let headers = configStore.readDefaultHeaders() else { return nil }
+        lock.withLock { options.defaultHeaders = headers }
+        return headers
     }
 
     // MARK: - Pause
 
     func pause() async {
+        configStore.setPaused(true)
         await dispatcher.setPaused(true)
         disarmRetryTimer()
     }
 
     func resume() async {
+        configStore.setPaused(false)
         await dispatcher.setPaused(false)
         await rearmRetryTimer(scope: .allPending)
     }
@@ -229,10 +270,14 @@ final class SyncEngine: @unchecked Sendable {
     /// Arms the single retry timer for the next due row, replacing any pending
     /// wake. Called when a cycle ends, when a hybrid attaches, and on
     /// configuration changes.
-    func rearmRetryTimer(scope: RetryWakeScope = .attempted) async {
-        let (ticket, canArm) = lock.withLock { () -> (UInt64, Bool) in
+    ///
+    /// - Parameter notBefore: when the hold on a rejected credential ends. It
+    ///   outlives this call, so a later re-arm cannot wake earlier.
+    func rearmRetryTimer(scope: RetryWakeScope = .attempted, notBefore: Int64? = nil) async {
+        let (ticket, canArm, holdUntil) = lock.withLock { () -> (UInt64, Bool, Int64) in
             rearmTicket &+= 1
-            return (rearmTicket, attachedHybrids > 0 && !options.isManual)
+            credentialHoldUntil = max(credentialHoldUntil, notBefore ?? 0)
+            return (rearmTicket, attachedHybrids > 0 && !options.isManual, credentialHoldUntil)
         }
         let isPaused = await dispatcher.paused()
 
@@ -260,7 +305,7 @@ final class SyncEngine: @unchecked Sendable {
                 wakeAwaitingConnectivity = false
                 return
             }
-            retryTimer.arm(afterMs: max(0, wakeAt - nowMs)) { [weak self] in
+            retryTimer.arm(afterMs: max(0, max(wakeAt, holdUntil) - nowMs)) { [weak self] in
                 await self?.retryWakeFired()
             }
         }

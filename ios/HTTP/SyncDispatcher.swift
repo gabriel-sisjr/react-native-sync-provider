@@ -19,6 +19,10 @@ import UIKit
 /// AppDelegate forwards from `application(_:handleEventsForBackgroundURLSession:completionHandler:)`.
 let kBackgroundURLSessionIdentifier = "com.gabriel-sisjr.syncprovider.background-upload"
 
+/// The least a persisted credential is left alone after a rejection. `attempts`
+/// does not advance on one, so backoff alone would stay at its first value.
+let kMinCredentialHoldMs = 60_000
+
 /// Knobs the dispatcher reads on each cycle. Updated by the bridge whenever
 /// `configureSync` is called.
 struct DispatcherConfig: Sendable {
@@ -26,6 +30,14 @@ struct DispatcherConfig: Sendable {
     var requestTimeoutMs: Int
     var batchSize: Int
     var defaultHeaders: [String: String]
+    /// Where this configuration came from. See ``ConfigSource``.
+    var source: ConfigSource = .defaults
+    /// `true` when the configuration declares default headers, even if they
+    /// could not be read back.
+    var hasDefaultHeaders: Bool = false
+    /// `true` when default headers are declared but unreadable. Dispatch is
+    /// suspended: sending without them would fail every item for no reason.
+    var credentialsUnavailable: Bool = false
 
     static let `default` = DispatcherConfig(
         retryPolicy: .default,
@@ -45,7 +57,7 @@ struct ItemDispatchOutcome: Sendable {
     let errorMessage: String?
 }
 
-/// What ``SyncDispatcher/recordFailureOutcome(item:outcome:)`` decided to do
+/// What ``SyncDispatcher/recordFailureOutcome(item:outcome:sentWith:)`` decided to do
 /// with a failed item, so callers can update their aggregate counters.
 enum FailureDisposition: Sendable {
     /// Kept `PENDING` for another attempt; a retry cooldown (`nextRetryAt`)
@@ -53,6 +65,10 @@ enum FailureDisposition: Sendable {
     case retrying(attempt: Int32)
     /// Marked terminally `FAILED` (non-retryable, or attempts exhausted).
     case failed(errorCode: String, message: String?)
+    /// Rejected with 401/403 while running on a persisted credential. Kept
+    /// `PENDING` with its attempt refunded; the cycle must stop claiming items,
+    /// and no wake may come before `heldUntil`.
+    case credentialRejected(heldUntil: Int64)
 }
 
 /// Collaborators of ``SyncDispatcher`` that are set and read from outside the
@@ -61,7 +77,9 @@ enum FailureDisposition: Sendable {
 final class DispatcherHooks: @unchecked Sendable {
     private let lock = NSLock()
     private var foregroundOnlyValue = false
-    private var cycleFinished: (@Sendable () async -> Void)?
+    private var pausedValue = false
+    private var cycleFinished: (@Sendable (Int64?) async -> Void)?
+    private var credentialRecovery: (@Sendable () -> [String: String]?)?
 
     /// When `true`, uploads never go through the background `URLSession`.
     var foregroundOnly: Bool {
@@ -69,11 +87,26 @@ final class DispatcherHooks: @unchecked Sendable {
         set { lock.withLock { foregroundOnlyValue = newValue } }
     }
 
+    /// When `true`, no cycle runs. Lives here so creating the hybrid can clear
+    /// it synchronously: a `pauseSync()` right after must not be overtaken.
+    var paused: Bool {
+        get { lock.withLock { pausedValue } }
+        set { lock.withLock { pausedValue = newValue } }
+    }
+
     /// Awaited when a flush cycle ends, whatever its outcome, so whoever awaits
-    /// `flush()` sees its effects.
-    var onCycleFinished: (@Sendable () async -> Void)? {
+    /// `flush()` sees its effects. Receives the moment a credential hold ends
+    /// when the cycle was stopped by one.
+    var onCycleFinished: (@Sendable (Int64?) async -> Void)? {
         get { lock.withLock { cycleFinished } }
         set { lock.withLock { cycleFinished = newValue } }
+    }
+
+    /// Reads the default headers again when they were unavailable at start.
+    /// Returns `nil` when they still cannot be read.
+    var recoverCredentials: (@Sendable () -> [String: String]?)? {
+        get { lock.withLock { credentialRecovery } }
+        set { lock.withLock { credentialRecovery = newValue } }
     }
 }
 
@@ -99,19 +132,22 @@ actor SyncDispatcher {
     private var config: DispatcherConfig
     private var inFlight: Set<String> = []
     private var isCycleRunning = false
-    private var isPaused = false
+    private var credentialHeldUntil: Int64?
     private(set) var lastResult: StoredSyncResult?
+    private var isPaused: Bool { hooks.paused }
 
     // MARK: - Init
 
     init(storage: SyncQueueStorage,
          emitter: SyncEventEmitter,
          connectivity: ConnectivityProviding = ConnectivityMonitor.shared,
-         config: DispatcherConfig = .default) {
+         config: DispatcherConfig = .default,
+         paused: Bool = false) {
         self.storage = storage
         self.emitter = emitter
         self.connectivity = connectivity
         self.config = config
+        self.hooks.paused = paused
         self.isAppActive = Self.applicationIsActive
 
         let foreground = URLSessionConfiguration.default
@@ -146,6 +182,7 @@ actor SyncDispatcher {
                   foregroundSession: URLSession,
                   backgroundSession: URLSession,
                   backgroundDelegate: BackgroundURLSessionDelegate = BackgroundURLSessionDelegate(),
+                  paused: Bool = false,
                   isAppActive: (@Sendable () async -> Bool)? = nil) {
         self.storage = storage
         self.emitter = emitter
@@ -154,6 +191,7 @@ actor SyncDispatcher {
         self.foregroundSession = foregroundSession
         self.backgroundSession = backgroundSession
         self.backgroundDelegate = backgroundDelegate
+        self.hooks.paused = paused
         self.isAppActive = isAppActive ?? Self.applicationIsActive
     }
 
@@ -168,7 +206,7 @@ actor SyncDispatcher {
     }
 
     func setPaused(_ paused: Bool) {
-        self.isPaused = paused
+        hooks.paused = paused
     }
 
     func paused() -> Bool {
@@ -204,6 +242,13 @@ actor SyncDispatcher {
             SyncLogger.debug("flush() called while paused; returning empty result", category: "dispatcher")
             return Self.skippedResult(reason: "paused")
         }
+        guard restoreCredentialsIfNeeded() else {
+            // Items stay PENDING and the caller sees a normal, empty result: a
+            // worker reports success instead of driving OS-level retries.
+            SyncLogger.error("Default headers could not be read; skipping dispatch until they can",
+                             category: "dispatcher")
+            return Self.skippedResult(reason: "credentials-unavailable")
+        }
         if isCycleRunning {
             SyncLogger.debug("flush() called while cycle in progress; piggybacking", category: "dispatcher")
             return lastResult ?? Self.emptyResult()
@@ -229,7 +274,9 @@ actor SyncDispatcher {
 
     private func finishCycle() async {
         isCycleRunning = false
-        await hooks.onCycleFinished?()
+        let notBefore = credentialHeldUntil
+        credentialHeldUntil = nil
+        await hooks.onCycleFinished?(notBefore)
     }
 
     private func runCycle(startedAt: Int64) async throws -> StoredSyncResult {
@@ -257,12 +304,15 @@ actor SyncDispatcher {
         var attempted = 0
         let total = pending.count
 
-        for (index, item) in pending.enumerated() {
+        dispatchLoop: for (index, item) in pending.enumerated() {
             if isPaused { break }
             attempted += 1
             inFlight.insert(item.id)
             try await storage.markInFlight(id: item.id)
 
+            // `configureSync` can land while the request is out. Its answer is
+            // about the credential it carried, not the one configured since.
+            let sentWith = config
             let outcome = await dispatchOne(item: item)
             inFlight.remove(item.id)
 
@@ -283,7 +333,7 @@ actor SyncDispatcher {
             } else {
                 // Decides retry vs. terminal failure, persists the retry
                 // cooldown, and emits the event.
-                switch try await recordFailureOutcome(item: item, outcome: outcome) {
+                switch try await recordFailureOutcome(item: item, outcome: outcome, sentWith: sentWith) {
                 case .retrying:
                     break // kept PENDING with a cooldown; not counted as failed
                 case let .failed(_, message):
@@ -291,6 +341,10 @@ actor SyncDispatcher {
                     if firstError == nil {
                         firstError = message
                     }
+                case let .credentialRejected(heldUntil):
+                    // The next item would carry the same rejected credential.
+                    credentialHeldUntil = heldUntil
+                    break dispatchLoop
                 }
             }
         }
@@ -343,12 +397,29 @@ actor SyncDispatcher {
     ///   only has the row, like a delegate fallback after a relaunch, must
     ///   subtract one. `attempts` itself is never reset, so the backoff curve
     ///   keeps advancing.
+    /// - Parameter sentWith: the configuration the request went out with.
     /// - Returns: the ``FailureDisposition`` so callers can update their
     ///   aggregate counters.
     @discardableResult
     func recordFailureOutcome(item: StoredSyncItem,
-                              outcome: ItemDispatchOutcome) async throws -> FailureDisposition {
+                              outcome: ItemDispatchOutcome,
+                              sentWith: DispatcherConfig) async throws -> FailureDisposition {
         let attemptsAfter = item.attempts + 1
+
+        if isStaleCredentialRejection(outcome, sentWith: sentWith) {
+            let delayMs = RetryPolicyEvaluator.nextDelayMs(attempt: Int(attemptsAfter),
+                                                           policy: config.retryPolicy)
+            let heldUntil = try await storage.markCredentialRejected(id: item.id,
+                                                                     errorCode: outcome.errorCode,
+                                                                     retryDelayMs: max(delayMs, kMinCredentialHoldMs),
+                                                                     attempts: item.attempts)
+            emitter.emit(.now(type: "ITEM_RETRYING",
+                              itemId: item.id,
+                              errorCode: outcome.errorCode,
+                              statusCode: outcome.statusCode.map(Double.init),
+                              attempt: Double(attemptsAfter)))
+            return .credentialRejected(heldUntil: heldUntil)
+        }
 
         let isRetryable = decideRetry(outcome: outcome, statusCode: outcome.statusCode)
         let exhausted = Int(attemptsAfter) >= config.retryPolicy.maxAttempts
@@ -380,6 +451,27 @@ actor SyncDispatcher {
                           statusCode: outcome.statusCode.map(Double.init),
                           attempt: Double(attemptsAfter)))
         return .retrying(attempt: attemptsAfter)
+    }
+
+    /// `true` for a 401/403 sent with default headers read back from storage.
+    /// Only the app can renew such a token, and it may simply be asleep: the
+    /// item must wait for it, not fail. With a configuration set by the app in
+    /// this process, the app owns the token, so the rejection is final.
+    private func isStaleCredentialRejection(_ outcome: ItemDispatchOutcome,
+                                            sentWith: DispatcherConfig) -> Bool {
+        sentWith.source == .persisted
+            && sentWith.hasDefaultHeaders
+            && outcome.errorCode == "UNAUTHORIZED"
+    }
+
+    /// Re-reads default headers that were unavailable at start, for example
+    /// when the engine came up before the device's first unlock.
+    private func restoreCredentialsIfNeeded() -> Bool {
+        guard config.credentialsUnavailable else { return true }
+        guard let headers = hooks.recoverCredentials?() else { return false }
+        config.defaultHeaders = headers
+        config.credentialsUnavailable = false
+        return true
     }
 
     // MARK: - Single-item dispatch

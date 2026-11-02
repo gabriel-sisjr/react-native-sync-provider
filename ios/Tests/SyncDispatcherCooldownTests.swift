@@ -201,7 +201,7 @@ final class SyncDispatcherCooldownTests: XCTestCase {
     func test_cycleEnd_notifiesTheObserver_onEveryOutcome_beforeFlushReturns() async throws {
         let cycles = RequestLog()
         let dispatcher = makeDispatcher(.exact(maxAttempts: 5, baseDelayMs: 60_000))
-        dispatcher.hooks.onCycleFinished = { cycles.record() }
+        dispatcher.hooks.onCycleFinished = { _ in cycles.record() }
 
         _ = try await dispatcher.flush() // empty
         XCTAssertEqual(cycles.times.count, 1)
@@ -219,7 +219,7 @@ final class SyncDispatcherCooldownTests: XCTestCase {
     func test_cycleStaysMarkedRunning_untilItEnds_andNotDuringTheObserver() async throws {
         let dispatcher = makeDispatcher(.default)
         let runningDuringObserver = RequestLog()
-        dispatcher.hooks.onCycleFinished = { [weak dispatcher] in
+        dispatcher.hooks.onCycleFinished = { [weak dispatcher] _ in
             if await dispatcher?.cycleRunning() == true {
                 runningDuringObserver.record()
             }
