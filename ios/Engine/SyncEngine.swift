@@ -73,6 +73,7 @@ final class SyncEngine: @unchecked Sendable {
     ///   - retryTimer: tests fire it explicitly.
     ///   - wrapWakeSource: test seam around the deadline queries.
     init(stack: CoreDataStack = .shared,
+         backgroundStore: BackgroundSyncOptionsStore = BackgroundSyncOptionsStore(),
          connectivity: ConnectivityProviding = ConnectivityMonitor.shared,
          emitter: SyncEventEmitter = SyncEventEmitter(),
          scheduler: BackgroundTaskScheduling = BGTaskScheduler.shared,
@@ -106,11 +107,15 @@ final class SyncEngine: @unchecked Sendable {
         self.dispatcher = dispatcher
         self.background = BackgroundSyncManager(dispatcher: dispatcher,
                                                 emitter: emitter,
-                                                scheduler: scheduler)
+                                                scheduler: scheduler,
+                                                store: backgroundStore)
         self.recovery = RecoveryManager(storage: storage, emitter: emitter)
 
         dispatcher.hooks.onCycleFinished = { [weak self] in
             await self?.rearmRetryTimer()
+        }
+        background.setPrepare { [weak self] in
+            await self?.waitUntilStarted()
         }
 
         // `enableBackgroundSync` is the consumer-controlled toggle; registering

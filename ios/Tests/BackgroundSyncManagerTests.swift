@@ -12,6 +12,8 @@ final class BackgroundSyncManagerTests: XCTestCase {
     private var dispatcher: SyncDispatcher!
     private var scheduler: FakeBackgroundTaskScheduler!
     private var manager: BackgroundSyncManager!
+    private var defaults: UserDefaults!
+    private var suite: String!
 
     override func setUp() {
         super.setUp()
@@ -25,11 +27,13 @@ final class BackgroundSyncManagerTests: XCTestCase {
                                     config: .default,
                                     foregroundSession: URLSession(configuration: .ephemeral),
                                     backgroundSession: URLSession(configuration: .ephemeral))
+        (defaults, suite) = UserDefaults.ephemeral()
         scheduler = FakeBackgroundTaskScheduler()
         manager = makeManager()
     }
 
     override func tearDown() {
+        defaults.removePersistentDomain(forName: suite)
         manager = nil
         scheduler = nil
         dispatcher = nil
@@ -83,8 +87,13 @@ final class BackgroundSyncManagerTests: XCTestCase {
     // MARK: - `foregroundOnly`
 
     #if canImport(BackgroundTasks)
+    /// A new manager over the same persisted store, which is what a relaunch
+    /// builds.
     private func makeManager() -> BackgroundSyncManager {
-        BackgroundSyncManager(dispatcher: dispatcher, emitter: emitter, scheduler: scheduler)
+        BackgroundSyncManager(dispatcher: dispatcher,
+                              emitter: emitter,
+                              scheduler: scheduler,
+                              store: BackgroundSyncOptionsStore(defaults: defaults))
     }
 
     private func makeOptions(foregroundOnly: Bool?) -> BackgroundSyncOptionsValue {

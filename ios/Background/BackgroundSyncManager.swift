@@ -24,7 +24,7 @@ let kBackgroundProcessingIdentifier = "com.gabriel-sisjr.syncprovider.processing
 
 /// Sendable mirror of `BackgroundSyncOptions` (Nitro). Translated by the
 /// bridge so this layer does not need to import the generated C++ struct.
-struct BackgroundSyncOptionsValue: Sendable, Equatable {
+struct BackgroundSyncOptionsValue: Sendable, Equatable, Codable {
     let minimumIntervalMs: Double
     let requiresCharging: Bool?
     let requiresUnmeteredNetwork: Bool?
@@ -71,13 +71,18 @@ extension BGTaskScheduler: BackgroundTaskScheduling {
 #endif
 
 /// Owns BGTaskScheduler interactions. Single instance per engine.
+///
+/// The options and the enabled state are persisted, so a task launched by the
+/// OS honors them with no JS loaded and can continue the chain.
 final class BackgroundSyncManager: @unchecked Sendable {
     private weak var dispatcher: SyncDispatcher?
     private let emitter: SyncEventEmitter
+    private let store: BackgroundSyncOptionsStore
     private let lock = NSLock()
     private var registered = false
-    private var enabled = false
+    private var enabled: Bool
     private var lastOptions: BackgroundSyncOptionsValue?
+    private var prepare: (@Sendable () async -> Void)?
     #if canImport(BackgroundTasks)
     private let scheduler: BackgroundTaskScheduling
     #endif
@@ -85,15 +90,28 @@ final class BackgroundSyncManager: @unchecked Sendable {
     #if canImport(BackgroundTasks)
     init(dispatcher: SyncDispatcher,
          emitter: SyncEventEmitter,
-         scheduler: BackgroundTaskScheduling = BGTaskScheduler.shared) {
+         scheduler: BackgroundTaskScheduling = BGTaskScheduler.shared,
+         store: BackgroundSyncOptionsStore = BackgroundSyncOptionsStore()) {
         self.dispatcher = dispatcher
         self.emitter = emitter
         self.scheduler = scheduler
+        self.store = store
+        let persisted = store.load()
+        self.enabled = persisted.enabled
+        self.lastOptions = persisted.options
+        dispatcher.hooks.foregroundOnly = persisted.options?.foregroundOnly == true
     }
     #else
-    init(dispatcher: SyncDispatcher, emitter: SyncEventEmitter) {
+    init(dispatcher: SyncDispatcher,
+         emitter: SyncEventEmitter,
+         store: BackgroundSyncOptionsStore = BackgroundSyncOptionsStore()) {
         self.dispatcher = dispatcher
         self.emitter = emitter
+        self.store = store
+        let persisted = store.load()
+        self.enabled = persisted.enabled
+        self.lastOptions = persisted.options
+        dispatcher.hooks.foregroundOnly = persisted.options?.foregroundOnly == true
     }
     #endif
 
@@ -107,6 +125,12 @@ final class BackgroundSyncManager: @unchecked Sendable {
     /// OS, so suppressing scheduling alone is not enough.
     var isForegroundOnly: Bool {
         lock.withLock { lastOptions?.foregroundOnly == true }
+    }
+
+    /// Work a fired task must wait for before flushing. On a cold launch that
+    /// is launch recovery, which has to finish first.
+    func setPrepare(_ prepare: @escaping @Sendable () async -> Void) {
+        lock.withLock { self.prepare = prepare }
     }
 
     /// Register handlers for both task identifiers. Must be called before
@@ -176,6 +200,7 @@ final class BackgroundSyncManager: @unchecked Sendable {
             lastOptions = options
         }
         dispatcher?.hooks.foregroundOnly = options.foregroundOnly == true
+        store.save(options: options, enabled: true)
     }
 
     /// Cancel any pending submissions and mark disabled.
@@ -184,9 +209,11 @@ final class BackgroundSyncManager: @unchecked Sendable {
         scheduler.cancel(taskRequestWithIdentifier: kBackgroundRefreshIdentifier)
         scheduler.cancel(taskRequestWithIdentifier: kBackgroundProcessingIdentifier)
         #endif
-        lock.withLock {
+        let options = lock.withLock { () -> BackgroundSyncOptionsValue? in
             enabled = false
+            return lastOptions
         }
+        store.save(options: options, enabled: false)
         SyncLogger.info("Background sync disabled", category: "background")
     }
 
@@ -242,6 +269,7 @@ final class BackgroundSyncManager: @unchecked Sendable {
         emitter.emit(.now(type: "BACKGROUND_SYNC_STARTED"))
 
         let dispatchTask = Task { [weak self] in
+            await self?.waitUntilPrepared()
             do {
                 _ = try await self?.dispatcher?.flush()
                 self?.emitter.emit(.now(type: "BACKGROUND_SYNC_COMPLETED",
@@ -277,6 +305,7 @@ final class BackgroundSyncManager: @unchecked Sendable {
                           metadata: ["kind": "processing"]))
 
         let dispatchTask = Task { [weak self] in
+            await self?.waitUntilPrepared()
             do {
                 _ = try await self?.dispatcher?.flush()
                 self?.emitter.emit(.now(type: "BACKGROUND_SYNC_COMPLETED",
@@ -303,14 +332,17 @@ final class BackgroundSyncManager: @unchecked Sendable {
     /// never land after that cancel.
     private func continueChain(submit: (BackgroundSyncOptionsValue) -> Void) -> Bool {
         lock.withLock {
-            guard lastOptions?.foregroundOnly != true else {
+            guard enabled, let options = lastOptions, options.foregroundOnly != true else {
                 return false
             }
-            if let options = lastOptions {
-                submit(options)
-            }
+            submit(options)
             return true
         }
+    }
+
+    private func waitUntilPrepared() async {
+        let prepare = lock.withLock { self.prepare }
+        await prepare?()
     }
     #endif
 }

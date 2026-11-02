@@ -41,6 +41,7 @@ final class EngineFixture {
     /// Builds an engine without waiting for it to start.
     func buildEngine(emitter: SyncEventEmitter = MockSyncEventEmitter()) -> SyncEngine {
         let engine = SyncEngine(stack: stack,
+                                backgroundStore: BackgroundSyncOptionsStore(defaults: defaults),
                                 connectivity: connectivity,
                                 emitter: emitter,
                                 scheduler: scheduler,
