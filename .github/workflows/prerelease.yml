@@ -127,6 +127,15 @@ jobs:
             echo "No coverage summary found." >> $GITHUB_STEP_SUMMARY
           fi
 
+      # Directly before the publish, so nothing can change the tree after this
+      # check. A failure here skips the publish, the tag and the release. The
+      # script comes from the branch being released, so a branch older than the
+      # script stops here too.
+      - name: Assert npm pack contents
+        run: |
+          set -o pipefail
+          npm pack --dry-run --ignore-scripts --json | node .github/scripts/assert-pack-contents.mjs
+
       - name: Publish to NPM (beta tag)
         run: |
           npm publish --access public --tag beta --provenance
