@@ -142,4 +142,4 @@ Skipping these masks real bugs. If a hook fails, fix the cause and re-stage.
 
 ## Releases
 
-Releases use `release-it` plus the publish workflows, and every published artifact goes through CI. See the Releasing section of the root [`CONTRIBUTING.md`](https://github.com/gabriel-sisjr/react-native-sync-provider/blob/develop/CONTRIBUTING.md#releasing). Watch the changelog discipline — every release entry mirrors the Conventional Commits log.
+Releases go through pull requests, and CI does the publishing. A bump PR sets the version on `develop`. When that version reaches `main`, `publish.yml` publishes it to npm, tags it and creates the GitHub release. Pre-releases come from the `prerelease.yml` workflow; `yarn release` and `yarn release:beta` are not part of the flow. `CHANGELOG.md` is curated by hand in [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format: add your entry under `## [Unreleased]` in the PR that makes the change, and the bump PR turns it into the release heading. See the Releasing section of the root [`CONTRIBUTING.md`](https://github.com/gabriel-sisjr/react-native-sync-provider/blob/develop/CONTRIBUTING.md#releasing) for the full flow.
