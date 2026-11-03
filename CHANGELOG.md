@@ -61,7 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ci:** the iOS unit tests run on an iPhone 17, with the simulator picked automatically from what the runner ships. A failed example build uploads its Xcode activity log as the `ios-build-log` artifact.
 - **tooling:** Git hooks run through `yarn`.
 
-## v0.1.1 - 2025-05-19
+## v0.1.1 - 2026-05-19
 
 ### Fixed
 
@@ -73,7 +73,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ci:** wire iOS unit tests into CI via the existing `SyncProvider-Unit-Tests` CocoaPods test_spec scheme. CocoaPods 1.10+ auto-prefixes `:test_type => :unit` (the default) with `Unit-`, so the `s.test_spec 'Tests'` block in `SyncProvider.podspec` produces the scheme name `SyncProvider-Unit-Tests` (not `SyncProvider-Tests`) — the `test-ios` job in `.github/workflows/ci.yml` was rewritten to target that scheme with a destination fallback loop (`iPhone 16` → `iPhone 17` → `iPhone 16 Pro`, all `OS=latest`), `rm -rf build/SyncProviderTests.xcresult` before each attempt (recovers from the previous `"Existing file at -resultBundlePath"` failure mode), `-skipPackagePluginValidation`, `-skipMacroValidation`, opportunistic `xcbeautify` formatting, GitHub annotations, plus a new "Show available iOS simulators" diagnostic step. Also added an explicit `pod 'SyncProvider', :path => '../..', :testspecs => ['Tests']` to `example/ios/Podfile` (after `use_react_native!`) because `use_native_modules!` autolinking does not propagate `:testspecs` — without the opt-in, CocoaPods would never generate the test target — and added `installer.pods_project.recreate_user_schemes(false)` inside the existing `post_install` block to defensively share the generated test scheme.
 - **scripts:** add `yarn test:ios` (`scripts/test-ios.sh`, executable) to mirror the CI iOS test invocation locally — same destination fallback loop and `.xcresult` cleanup as CI, so a green local run is a strong predictor of CI success.
 
-## v0.1.0 - 2025-05-19
+## v0.1.0 - 2026-05-19
 
 ### Documentation
 
