@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 > **Pre-1.0 notice:** while the library is on `0.x`, minor version bumps (`0.x.0`) may include breaking changes. Every breaking change is summarized in [`BREAKING_CHANGES.md`](./BREAKING_CHANGES.md) and ships with a dedicated migration guide under `website/docs/migration/`.
 
-## [Unreleased]
+## [0.2.0] - 2026-11-03
 
 ### Added
 
@@ -147,5 +147,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **android:** remove `apply plugin: "com.facebook.react"` from `android/build.gradle` — the RN Gradle plugin ran Codegen across hoisted RN libs in `node_modules` and baked their `*ManagerDelegate` classes into this AAR, causing consumer builds to fail `:app:mergeLibDexDebug` with duplicate-class errors (e.g. `RNCSafeAreaProviderManagerDelegate`). Nitro generates bindings via `yarn nitrogen`; the RN plugin is unnecessary.
 
 ### Security
-
-[Unreleased]: https://github.com/gabriel-sisjr/react-native-sync-provider/compare/HEAD...HEAD

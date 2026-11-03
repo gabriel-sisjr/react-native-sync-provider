@@ -45,7 +45,7 @@ One-paragraph overview: what changed, why, and the blast radius (compile-time on
 
 Use the table at the bottom of each entry to enumerate every renamed, removed, or reshaped public symbol so consumers can grep for what they import.
 
-## [Unreleased]
+## [v0.2.0] - 2026-11-03 - No app-side BGTaskScheduler registration, iOS 15.0 minimum, persisted retries and configuration
 
 > **Upgrade path:** v0.1.z --> v0.2.0
 >
@@ -57,7 +57,7 @@ Most entries below are observable behavior changes rather than renamed APIs. Sta
 
 > **Category:** native integration change. **Action required** if your `AppDelegate` registers a library identifier. Pre-1.0.
 >
-> **Changelog:** see the [`[Unreleased]` Added entry in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+> **Changelog:** see the [`[0.2.0]` Added entry in `CHANGELOG.md`](./CHANGELOG.md#020---2026-11-03).
 
 The library now registers its BGTask handlers at process start, through `+load`, before `application(_:didFinishLaunchingWithOptions:)` runs. No `AppDelegate` code is needed for registration.
 
@@ -114,7 +114,7 @@ func application(
 
 > **Category:** platform-requirement change (**not** a JS/TS API break). Pre-1.0.
 >
-> **Changelog:** see the [`[Unreleased]` Changed entry in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+> **Changelog:** see the [`[0.2.0]` Changed entry in `CHANGELOG.md`](./CHANGELOG.md#020---2026-11-03).
 
 The iOS minimum deployment target declared in `SyncProvider.podspec` is raised from `13.0` to `15.0`. Apps that pin an iOS deployment target below `15.0` must raise it. React Native 0.85 raises the built pod to `15.1`.
 
@@ -139,7 +139,7 @@ No JS/TS code changes are required.
 
 > **Category:** compile-time change. Pre-1.0.
 >
-> **Changelog:** see the [`[Unreleased]` Added entries in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+> **Changelog:** see the [`[0.2.0]` Added entries in `CHANGELOG.md`](./CHANGELOG.md#020---2026-11-03).
 
 `SyncItem.attempts`, `SyncItem.nextRetryAt` and `SyncProviderContextValue.hasProvider` are required. Runtime code that only reads these types is unaffected. Hand-built values, usually test fixtures and test wrappers around `SyncProviderContext.Provider`, stop compiling.
 
@@ -181,7 +181,7 @@ const value: SyncProviderContextValue = { config, hasProvider: true };
 
 > **Category:** observable behavior change (**not** a JS/TS API surface break). Pre-1.0.
 >
-> **Changelog:** see the [`[Unreleased]` Changed entry in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+> **Changelog:** see the [`[0.2.0]` Changed entry in `CHANGELOG.md`](./CHANGELOG.md#020---2026-11-03).
 
 Both functions now report items waiting to be dispatched, on both platforms. Cooling items are included. `IN_FLIGHT` and `FAILED` items are not. Android's `getQueueSize()` used to count `FAILED` and `IN_FLIGHT` rows, and iOS's `getPendingItems()` used to return them. `getPendingItems()` now returns dispatch order on both.
 
@@ -204,7 +204,7 @@ Capacity checks did not change. On Android the cap still counts `FAILED` rows, w
 
 > **Category:** observable behavior change (**not** a JS/TS API surface break). Pre-1.0.
 >
-> **Changelog:** see the [`[Unreleased]` Fixed entry in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+> **Changelog:** see the [`[0.2.0]` Fixed entry in `CHANGELOG.md`](./CHANGELOG.md#020---2026-11-03).
 
 A non-retryable failure on an item's last attempt used to end as `MAX_ATTEMPTS_EXCEEDED` on iOS. It now keeps its real code, so a 401 stays `UNAUTHORIZED`. `MAX_ATTEMPTS_EXCEEDED` applies only to a retriable failure with no attempts left. Android already behaved this way.
 
@@ -223,7 +223,7 @@ If you branch on `ITEM_FAILED.errorCode`, make sure `UNAUTHORIZED` and `SERVER_E
 
 > **Category:** observable behavior change (**not** a JS/TS API surface break). Pre-1.0.
 >
-> **Changelog:** see the [`[Unreleased]` Changed entries in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+> **Changelog:** see the [`[0.2.0]` Changed entries in `CHANGELOG.md`](./CHANGELOG.md#020---2026-11-03).
 
 `strategy: MANUAL` suppresses the in-process retry timer and the Android retry kick. It does not stop periodic workers or BGTasks: if you called `enableBackgroundSync`, those windows still dispatch. Use `foregroundOnly: true` to stop background work.
 
@@ -245,7 +245,7 @@ If you branch on `ITEM_FAILED.errorCode`, make sure `UNAUTHORIZED` and `SERVER_E
 
 > **Category:** observable behavior change (**not** a JS/TS API surface break). Pre-1.0.
 >
-> **Changelog:** see the [`[Unreleased]` Added entry in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+> **Changelog:** see the [`[0.2.0]` Added entry in `CHANGELOG.md`](./CHANGELOG.md#020---2026-11-03).
 
 `configureSync` now persists its options, so a worker or BGTask in a fresh process honors them. Before, a cold worker ran on the defaults and with no default headers.
 
@@ -296,7 +296,7 @@ await configureSync({ strategy, retryPolicy });
 
 > **Category:** observable behavior change (**not** a JS/TS API surface break). Pre-1.0.
 >
-> **Changelog:** see the [`[Unreleased]` Changed and Fixed entries in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+> **Changelog:** see the [`[0.2.0]` Changed and Fixed entries in `CHANGELOG.md`](./CHANGELOG.md#020---2026-11-03).
 
 On iOS, failed-retriable items used to return to `PENDING` with no cooldown, so they were re-dispatched on the next cycle: a hot retry loop against a degraded server. On Android, backoff lived inside a single cycle and was lost on a restart. Both platforms now persist the cooldown as `SyncItem.nextRetryAt`, measured from the end of the attempt, and skip an item until it passes. Each cycle makes at most one attempt per item, and a timer in the running app brings the item back when its cooldown ends.
 
@@ -319,7 +319,7 @@ A cycle where every item is cooling now ends with `SYNC_SUCCEEDED` and a 0/0 res
 
 > **Category:** observable behavior change (additive field + error-code shift on a single path). Pre-1.0.
 >
-> **Changelog:** see the [`[Unreleased]` Changed entry in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+> **Changelog:** see the [`[0.2.0]` Changed entry in `CHANGELOG.md`](./CHANGELOG.md#020---2026-11-03).
 
 When a batch contains invalid items, `enqueueBatch` previously threw the **first** bad item's specific code (e.g. `INVALID_URL`). It now throws a single umbrella `SyncError(INVALID_PAYLOAD)` whose new `validationErrors: ValidationIssue[]` field carries **every** issue across **every** item, each tagged with its `itemIndex`. No items are enqueued when any issue is present. Single-item `enqueue` still throws the first violation's specific code, now with the full `validationErrors` list attached.
 
@@ -366,7 +366,7 @@ try {
 
 > **Category:** persisted-data / migration note (**not** a JS/TS API break). Pre-1.0.
 >
-> **Changelog:** see the [`[Unreleased]` Changed entry in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+> **Changelog:** see the [`[0.2.0]` Changed entry in `CHANGELOG.md`](./CHANGELOG.md#020---2026-11-03).
 
 v0.2 ships **Room v1→v2** (Android) and **Core Data model v2** (iOS) to persist `nextRetryAt`. Both are **roll-forward only** once shipped to consumers: a forward upgrade migrates existing rows in place. There is **no supported downgrade** — recovery from a regression is a new forward migration, never a revert.
 
