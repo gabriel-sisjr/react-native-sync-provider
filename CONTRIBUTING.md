@@ -153,7 +153,7 @@ Releases go through pull requests, and CI does the publishing. A bump PR sets th
 
 Before cutting a release, make sure you have:
 
-- **Maintainer or admin rights** on the GitHub repository, to merge into `develop` and `main` and to run `prerelease.yml`. Both branches take changes only through pull requests: one approving review, squash merges only, linear history.
+- **Maintainer or admin rights** on the GitHub repository, to merge into `develop` and `main` and to run `prerelease.yml`. Both branches take changes only through pull requests, and the ruleset enforces one approving review, squash merges and linear history by default. Maintainers use the ruleset bypass to merge with a merge commit when a PR's commits must stay individually revertible, as on the release PR.
 - **Node** matching `.nvmrc` (v24.13.0), **Yarn 4.11.0** (Berry), and Ruby with Bundler for `bundle exec pod install` in `example/`.
 - An **npm account** with publish access to `@gabriel-sisjr/react-native-sync-provider`, to create the `NPM_TOKEN` secret.
 
@@ -198,7 +198,7 @@ In **Settings → Pages**:
 
    Commit as `chore(version): bump vx.y.z` and open the PR to `develop`.
 
-2. **Release PR.** Open a PR from `develop` to `main` titled `Release - vx.y.z`.
+2. **Release PR.** Open a PR from `develop` to `main` titled `Release - vx.y.z`, and merge it with a merge commit through the ruleset bypass, so each commit stays individually revertible.
 3. **Publish.** Merging it pushes to `main`, which runs `publish.yml`. The workflow:
    1. compares the `package.json` version with the `latest` dist-tag and stops if they are equal (see [The version guard](#the-version-guard));
    2. runs `yarn nitrogen`, `yarn lint`, `yarn typecheck`, `yarn prepare` and `yarn test`, then asserts the `npm pack` contents;
