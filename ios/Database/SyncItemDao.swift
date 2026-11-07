@@ -293,10 +293,14 @@ final class SyncItemDao {
     /// ``kDeadLetterMessageMaxLength`` characters. An older dead letter with
     /// the same id, from an earlier failure of a replayed item, is replaced.
     ///
+    /// Runs one at a time with the purges and replays (see
+    /// ``CoreDataStack/performSerializedTask(_:)``): a row purged before the
+    /// move saves, while its request was out say, is never copied.
+    ///
     /// - Returns: `false` when no queue row has `id`, removed meanwhile.
     @discardableResult
     func moveToDeadLetters(id: String, errorCode: String, errorMessage: String?) async throws -> Bool {
-        try await stack.performBackgroundTask { [clock] context in
+        try await stack.performSerializedTask { [clock] context in
             guard let entity = try Self.fetchEntity(id: id, in: context) else { return false }
             if let older = try Self.fetchDeadLetter(id: id, in: context) {
                 context.delete(older)
@@ -329,10 +333,14 @@ final class SyncItemDao {
     /// Checked against `capacity` in the same transaction, counted the way
     /// ``countPending()`` counts it for an enqueue; dead letters count toward
     /// it no more than before. A queue row that already has `id`, which only
-    /// a replay racing this one or a damaged store can leave, is left alone,
-    /// and so is the dead letter.
+    /// a damaged store can leave, is left alone, and so is the dead letter.
+    ///
+    /// Runs one at a time with the purges, moves and other replays (see
+    /// ``CoreDataStack/performSerializedTask(_:)``): a dead letter discarded
+    /// or cleared before the replay saves is not put back in the queue, and
+    /// of two replays of one id only the first finds it.
     func replayDeadLetter(id: String, capacity: Int) async throws -> DeadLetterReplay {
-        try await stack.performBackgroundTask { context in
+        try await stack.performSerializedTask { context in
             guard let letter = try Self.fetchDeadLetter(id: id, in: context) else { return .unknown }
             // The model makes `id` unique, and the merge policy would let this
             // insert overwrite that row instead of failing.
@@ -364,7 +372,7 @@ final class SyncItemDao {
     /// Deletes the dead letter `id`. `false` when there is none.
     @discardableResult
     func deleteDeadLetter(id: String) async throws -> Bool {
-        try await stack.performBackgroundTask { context in
+        try await stack.performSerializedTask { context in
             guard let letter = try Self.fetchDeadLetter(id: id, in: context) else { return false }
             context.delete(letter)
             return true
@@ -469,7 +477,7 @@ final class SyncItemDao {
     /// with that id. Returns `true` if a row was removed from either store.
     @discardableResult
     func delete(id: String) async throws -> Bool {
-        try await stack.performBackgroundTask { context in
+        try await stack.performSerializedTask { context in
             if let entity = try Self.fetchEntity(id: id, in: context) {
                 context.delete(entity)
                 return true
@@ -483,7 +491,7 @@ final class SyncItemDao {
     /// Delete every item, in the queue and in the dead-letter store: a purge
     /// such as a logout must leave no request behind.
     func clear() async throws {
-        try await stack.performBackgroundTask { context in
+        try await stack.performSerializedTask { context in
             for entityName in ["SyncItemEntity", "SyncDeadLetterEntity"] {
                 let fetch: NSFetchRequest<NSFetchRequestResult> = NSFetchRequest(entityName: entityName)
                 let batch = NSBatchDeleteRequest(fetchRequest: fetch)

@@ -280,6 +280,31 @@ final class DeadLetterStoreTests: XCTestCase {
         XCTAssertTrue(emitter.events(ofType: "ITEM_DEAD_LETTERED").isEmpty, "Nothing was moved")
     }
 
+    func test_dlq_queueClearedWhileInFlight_isNotDeadLettered() async throws {
+        let engine = await engine(maxAttempts: 1)
+        let id = try await enqueue(in: engine)
+        URLProtocolStub.setHandler { request in
+            // A logout-style purge lands while the request is out.
+            let cleared = DispatchSemaphore(value: 0)
+            Task {
+                try? await engine.storage.clear()
+                cleared.signal()
+            }
+            cleared.wait()
+            return (HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!, Data())
+        }
+        emitter.clear()
+
+        _ = try await engine.dispatcher.flush()
+
+        let letters = try await engine.storage.getDeadLetters()
+        XCTAssertTrue(letters.isEmpty, "A purged item must not come back as a dead letter")
+        let queue = try await engine.storage.getAll()
+        XCTAssertTrue(queue.isEmpty)
+        XCTAssertEqual(emitter.events(ofType: "ITEM_FAILED").map(\.itemId), [id], "The attempt was made and failed")
+        XCTAssertTrue(emitter.events(ofType: "ITEM_DEAD_LETTERED").isEmpty, "Nothing was moved")
+    }
+
     // MARK: - Purges reach dead letters
 
     func test_dlq_clearQueue_clearsDeadLetters() async throws {
@@ -320,5 +345,185 @@ final class DeadLetterStoreTests: XCTestCase {
         XCTAssertEqual(emitter.events(ofType: "ITEM_REMOVED").map(\.itemId), [dead, queued])
         let letters = try await engine.storage.getDeadLetters()
         XCTAssertTrue(letters.isEmpty)
+    }
+
+    // MARK: - Purges racing a copy between the stores
+
+    // A move or a replay reads its row, then saves the copy. Every store
+    // operation has its own context, and the merge policy accepts a save over
+    // a row deleted meanwhile, so a purge landing between the read and the
+    // save would be undone: the copy, headers and body included, would be
+    // written for a row that is gone. Each test holds the copy at its save and
+    // gives the purge time to land in that gap.
+
+    func test_dlq_queueClearedDuringTheMove_leavesNoDeadLetter() async throws {
+        let engine = await engine()
+        let id = try await enqueue(in: engine)
+        let hold = InsertingSaveHold(stack: fixture.stack, entity: "SyncDeadLetterEntity", id: id)
+        defer { hold.release() }
+
+        let move = Task {
+            try await engine.storage.moveToDeadLetters(id: id, errorCode: "SERVER_ERROR", errorMessage: "HTTP 404 Not Found")
+        }
+        await fulfillment(of: [hold.reached], timeout: 5)
+        let purge = Task { try await engine.storage.clear() }
+        try await letPurgeLand()
+        hold.release()
+        _ = try await move.value
+        try await purge.value
+
+        let letters = try await engine.storage.getDeadLetters()
+        XCTAssertTrue(letters.isEmpty, "The purge must not be undone by the move")
+        let queued = try await engine.storage.isQueued(id)
+        XCTAssertFalse(queued)
+    }
+
+    func test_dlq_itemRemovedDuringTheMove_leavesNoDeadLetter() async throws {
+        let engine = await engine()
+        let id = try await enqueue(in: engine)
+        let hold = InsertingSaveHold(stack: fixture.stack, entity: "SyncDeadLetterEntity", id: id)
+        defer { hold.release() }
+
+        let move = Task {
+            try await engine.storage.moveToDeadLetters(id: id, errorCode: "SERVER_ERROR", errorMessage: "HTTP 404 Not Found")
+        }
+        await fulfillment(of: [hold.reached], timeout: 5)
+        let remove = Task { try await engine.storage.remove(id: id) }
+        try await letPurgeLand()
+        hold.release()
+        _ = try await move.value
+        let removed = try await remove.value
+
+        XCTAssertTrue(removed, "The row went, from one store or the other")
+        let letters = try await engine.storage.getDeadLetters()
+        XCTAssertTrue(letters.isEmpty, "The removal must not be undone by the move")
+        let queued = try await engine.storage.isQueued(id)
+        XCTAssertFalse(queued)
+    }
+
+    func test_dlq_queueClearedDuringAReplay_leavesNothingQueued() async throws {
+        let engine = await engine()
+        let id = try await deadLettered(in: engine)
+        let hold = InsertingSaveHold(stack: fixture.stack, entity: "SyncItemEntity", id: id)
+        defer { hold.release() }
+
+        let replay = Task { try await engine.storage.replayDeadLetter(id: id) }
+        await fulfillment(of: [hold.reached], timeout: 5)
+        let purge = Task { try await engine.storage.clear() }
+        try await letPurgeLand()
+        hold.release()
+        _ = try await replay.value
+        try await purge.value
+
+        let queued = try await engine.storage.isQueued(id)
+        XCTAssertFalse(queued, "The purge must not be undone by the replay")
+        let letters = try await engine.storage.getDeadLetters()
+        XCTAssertTrue(letters.isEmpty)
+    }
+
+    func test_dlq_discardDuringAReplay_isNotUndoneByIt() async throws {
+        let engine = await engine()
+        let id = try await deadLettered(in: engine)
+        let hold = InsertingSaveHold(stack: fixture.stack, entity: "SyncItemEntity", id: id)
+        defer { hold.release() }
+
+        let replay = Task { try await engine.storage.replayDeadLetter(id: id) }
+        await fulfillment(of: [hold.reached], timeout: 5)
+        let discard = Task { try await engine.storage.discardDeadLetter(id: id) }
+        try await letPurgeLand()
+        hold.release()
+        let replayed = try await replay.value
+        let discarded = try await discard.value
+
+        XCTAssertTrue(replayed)
+        XCTAssertFalse(discarded, "Replayed first: nothing was left to discard")
+        let queued = try await engine.storage.isQueued(id)
+        XCTAssertTrue(queued)
+        let letters = try await engine.storage.getDeadLetters()
+        XCTAssertTrue(letters.isEmpty)
+    }
+
+    func test_dlq_overlappingReplays_requeueOnce() async throws {
+        let engine = await engine()
+        let id = try await deadLettered(in: engine)
+        let hold = InsertingSaveHold(stack: fixture.stack, entity: "SyncItemEntity", id: id)
+        defer { hold.release() }
+
+        let first = Task { try await engine.storage.replayDeadLetter(id: id) }
+        await fulfillment(of: [hold.reached], timeout: 5)
+        let second = Task { try await engine.storage.replayDeadLetter(id: id) }
+        try await letPurgeLand()
+        hold.release()
+        let firstReplayed = try await first.value
+        let secondReplayed = try await second.value
+
+        XCTAssertEqual([firstReplayed, secondReplayed], [true, false], "Only one replay may report the item requeued")
+        let queue = try await engine.storage.getAll()
+        XCTAssertEqual(queue.map(\.id), [id])
+    }
+
+    /// An item moved to the dead letters, with nothing left in the queue.
+    private func deadLettered(in engine: SyncEngine) async throws -> String {
+        let id = try await enqueue(in: engine)
+        let moved = try await engine.storage.moveToDeadLetters(id: id,
+                                                               errorCode: "SERVER_ERROR",
+                                                               errorMessage: "HTTP 404 Not Found")
+        XCTAssertTrue(moved)
+        return id
+    }
+
+    /// Long enough for a purge that nothing makes wait to commit.
+    private func letPurgeLand() async throws {
+        try await Task.sleep(nanoseconds: 300_000_000)
+    }
+}
+
+/// Holds the first save, on `stack`, of a transaction that inserts a row of
+/// `entity` with `id`: after it has read and changed what it needs, before the
+/// store sees any of it. Every store operation has its own context, so other
+/// operations carry on meanwhile unless something makes them wait.
+private final class InsertingSaveHold: @unchecked Sendable {
+    /// Fulfilled once the transaction is blocked on its save.
+    let reached = XCTestExpectation(description: "the transaction reached its save")
+
+    private let released = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var isSpent = false
+    private var observer: NSObjectProtocol?
+
+    init(stack: CoreDataStack, entity: String, id: String) {
+        let coordinator = stack.persistentContainer.persistentStoreCoordinator
+        observer = NotificationCenter.default.addObserver(forName: .NSManagedObjectContextWillSave,
+                                                          object: nil,
+                                                          queue: nil) { [weak self] notification in
+            guard let context = notification.object as? NSManagedObjectContext,
+                  context.persistentStoreCoordinator === coordinator,
+                  context.insertedObjects.contains(where: {
+                      $0.entity.name == entity && $0.value(forKey: "id") as? String == id
+                  })
+            else { return }
+            self?.holdOnce()
+        }
+    }
+
+    deinit {
+        if let observer {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
+
+    /// Lets the held save through. Safe to call more than once.
+    func release() {
+        released.signal()
+    }
+
+    private func holdOnce() {
+        let isFirst = lock.withLock { () -> Bool in
+            defer { isSpent = true }
+            return !isSpent
+        }
+        guard isFirst else { return }
+        reached.fulfill()
+        released.wait()
     }
 }

@@ -61,6 +61,9 @@ final class CoreDataStack: @unchecked Sendable {
     /// Builds the container and reports any load failure. Runs at most once.
     private let makeContainer: (CoreDataStack) -> (NSPersistentContainer, Error?)
 
+    /// Runs the transactions of ``performSerializedTask(_:)``, one at a time.
+    private let serializedQueue = DispatchQueue(label: "com.syncprovider.coredata.serialized", qos: .utility)
+
     /// The loaded container. The first caller loads the store while holding
     /// the lock, so concurrent callers wait for it instead of opening their
     /// own coordinator on the same file.
@@ -196,17 +199,49 @@ final class CoreDataStack: @unchecked Sendable {
         }
         return try await withCheckedThrowingContinuation { continuation in
             container.performBackgroundTask { context in
-                context.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
-                do {
-                    let value = try block(context)
-                    if context.hasChanges {
-                        try context.save()
-                    }
-                    continuation.resume(returning: value)
-                } catch {
-                    continuation.resume(throwing: error)
+                continuation.resume(with: Self.run(block, in: context))
+            }
+        }
+    }
+
+    /// ``performBackgroundTask(_:)``, one transaction at a time: a block starts
+    /// only once every block submitted here before it has saved, in the order
+    /// they were submitted. Transactions submitted to
+    /// ``performBackgroundTask(_:)`` still run alongside.
+    ///
+    /// Every transaction has its own context, and the merge policy accepts a
+    /// save over a row another context deleted after it was read: the stale
+    /// delete does nothing, and whatever the block inserted is written. A
+    /// transaction that copies a row to the other store once it has read it
+    /// would then write a copy of a row that is gone, the request's headers
+    /// and body included. Those transactions, and every transaction that
+    /// deletes queued items or dead letters, run here, so such a deletion
+    /// cannot land between that read and its save.
+    func performSerializedTask<T>(_ block: @escaping (NSManagedObjectContext) throws -> T) async throws -> T {
+        let container = persistentContainer
+        if let loadError = initializationError {
+            throw loadError
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            serializedQueue.async {
+                let context = container.newBackgroundContext()
+                context.performAndWait {
+                    continuation.resume(with: Self.run(block, in: context))
                 }
             }
+        }
+    }
+
+    /// Runs `block` on `context` and saves what it changed, if it did not throw.
+    private static func run<T>(_ block: (NSManagedObjectContext) throws -> T,
+                               in context: NSManagedObjectContext) -> Result<T, Error> {
+        context.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
+        return Result {
+            let value = try block(context)
+            if context.hasChanges {
+                try context.save()
+            }
+            return value
         }
     }
 
