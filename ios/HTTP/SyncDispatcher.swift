@@ -46,6 +46,13 @@ struct DispatcherConfig: Sendable {
     /// The lowest network quality a cycle may start at. `nil`, or `offline`,
     /// means no gate.
     var minNetworkQuality: NetworkQualityLevel? = nil
+    /// Checked with a HEAD before a cycle claims its first item. `nil`: no
+    /// health check.
+    var healthCheckUrl: URL? = nil
+    /// How long a 2xx spares the next health-check HEAD.
+    var healthCheckTtlMs: Int64 = SyncOptionsSnapshot.defaultHealthCheckTtlMs
+    /// How long cycles are skipped, without a HEAD, after a failed check.
+    var healthCheckBackoffMs: Int64 = SyncOptionsSnapshot.defaultHealthCheckBackoffMs
 
     static let `default` = DispatcherConfig(
         retryPolicy: .default,
@@ -84,6 +91,7 @@ enum FlushSkipReason: Sendable, Equatable {
     case paused
     case credentialsUnavailable
     case networkQualityTooLow
+    case healthCheckFailed
 }
 
 /// What one ``SyncDispatcher/flushOutcome()`` call did.
@@ -112,6 +120,8 @@ final class DispatcherHooks: @unchecked Sendable {
     private var credentialRecovery: (@Sendable () -> [String: String]?)?
     private var qualitySource: (@Sendable () -> NetworkQualityLevel)?
     private var qualityRefresh: (@Sendable () -> Void)?
+    private var healthChecker: HealthCheck?
+    private var healthFailure: (@Sendable () async -> Void)?
 
     /// When `true`, uploads never go through the background `URLSession`.
     var foregroundOnly: Bool {
@@ -153,6 +163,20 @@ final class DispatcherHooks: @unchecked Sendable {
     var refreshStaleNetworkQuality: (@Sendable () -> Void)? {
         get { lock.withLock { qualityRefresh } }
         set { lock.withLock { qualityRefresh = newValue } }
+    }
+
+    /// The engine's health check. Without it no health check runs, whatever
+    /// the configuration says.
+    var healthCheck: HealthCheck? {
+        get { lock.withLock { healthChecker } }
+        set { lock.withLock { healthChecker = newValue } }
+    }
+
+    /// Awaited after a flush the health check stopped, so the next retry wake
+    /// can be armed no earlier than the end of the backoff.
+    var onHealthCheckFailed: (@Sendable () async -> Void)? {
+        get { lock.withLock { healthFailure } }
+        set { lock.withLock { healthFailure = newValue } }
     }
 }
 
@@ -290,11 +314,12 @@ actor SyncDispatcher {
     /// ``flush()``, reporting why no cycle ran when none did.
     ///
     /// The checks before a cycle run in this order: paused, stored credentials,
-    /// a cycle already running, the network-quality gate. Only the gate emits
-    /// anything when it stops the flush: `SYNC_FAILED` with
-    /// `NETWORK_QUALITY_TOO_LOW`, with no `SYNC_STARTED` before it, no history
-    /// row and no item touched. A cycle already running is joined rather than
-    /// gated, so its listeners never see a `SYNC_FAILED` in the middle of it.
+    /// a cycle already running, the network-quality gate, the health check.
+    /// Only the last two emit anything when they stop the flush: `SYNC_FAILED`
+    /// with `NETWORK_QUALITY_TOO_LOW` or `HEALTH_CHECK_FAILED`, with no
+    /// `SYNC_STARTED` before it, no history row and no item touched. A cycle
+    /// already running is joined rather than gated, so its listeners never see
+    /// a `SYNC_FAILED` in the middle of it.
     func flushOutcome() async throws -> FlushOutcome {
         if let early = exitBeforeCycle() {
             return early
@@ -310,6 +335,17 @@ actor SyncDispatcher {
                             category: "dispatcher")
             emitter.emit(.now(type: "SYNC_FAILED", errorCode: "NETWORK_QUALITY_TOO_LOW"))
             return .skipped(Self.skippedResult(reason: "network-quality-too-low"), .networkQualityTooLow)
+        }
+        // Suspends for the HEAD, if one is sent.
+        let unhealthy = await healthCheckFails()
+        if let early = exitBeforeCycle() {
+            return early
+        }
+        if unhealthy {
+            SyncLogger.info("Flush skipped: the health check failed", category: "dispatcher")
+            emitter.emit(.now(type: "SYNC_FAILED", errorCode: "HEALTH_CHECK_FAILED"))
+            await hooks.onHealthCheckFailed?()
+            return .skipped(Self.skippedResult(reason: "health-check-failed"), .healthCheckFailed)
         }
 
         isCycleRunning = true
@@ -357,6 +393,17 @@ actor SyncDispatcher {
             return .ran(lastResult ?? Self.emptyResult())
         }
         return nil
+    }
+
+    /// `true` when the health check keeps this flush from starting a cycle:
+    /// the HEAD to `healthCheckUrl` failed, or an earlier failure's backoff is
+    /// running. `false` without a URL, and whenever a 2xx is cached.
+    private func healthCheckFails() async -> Bool {
+        guard let url = config.healthCheckUrl, let healthCheck = hooks.healthCheck else { return false }
+        let verdict = await healthCheck.check(url: url,
+                                              ttlMs: config.healthCheckTtlMs,
+                                              backoffMs: config.healthCheckBackoffMs)
+        return verdict != .healthy
     }
 
     /// The grade that keeps this flush from starting a cycle, or `nil` when it

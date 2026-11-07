@@ -52,6 +52,11 @@ final class SyncEngine: @unchecked Sendable {
     let background: BackgroundSyncManager
     /// Grades the network. Internal so tests can await its measurements.
     let qualityMonitor: NetworkQualityMonitor
+    /// The HEAD before a cycle, and its cache and backoff.
+    let healthCheck: HealthCheck
+    /// The one HEAD probe of the process: measurements and the health check
+    /// share it, and with it one connection to the host.
+    let probe: HeadProbing
 
     private let configStore: SyncConfigStore
     private let recovery: RecoveryManager
@@ -172,7 +177,10 @@ final class SyncEngine: @unchecked Sendable {
                                                    probe: probe,
                                                    clock: clock,
                                                    debounceMs: qualityProbeDebounceMs)
+        let healthCheck = HealthCheck(probe: probe, clock: clock)
         self.qualityMonitor = qualityMonitor
+        self.healthCheck = healthCheck
+        self.probe = probe
 
         dispatcher.hooks.onCycleFinished = { [weak self] notBefore in
             await self?.rearmRetryTimer(notBefore: notBefore)
@@ -185,6 +193,13 @@ final class SyncEngine: @unchecked Sendable {
         }
         dispatcher.hooks.refreshStaleNetworkQuality = {
             qualityMonitor.refreshIfStale()
+        }
+        dispatcher.hooks.healthCheck = healthCheck
+        dispatcher.hooks.onHealthCheckFailed = { [weak self] in
+            await self?.rearmRetryTimer(scope: .allPending)
+        }
+        qualityMonitor.onHealthySample = { url in
+            healthCheck.recordHealthy(url: url)
         }
         background.setPrepare { [weak self] in
             await self?.waitUntilStarted()
@@ -296,6 +311,7 @@ final class SyncEngine: @unchecked Sendable {
             heldWakeRecheckMs = kHeldWakeRecheckInitialMs
         }
         configStore.save(snapshot)
+        healthCheck.clearBackoff()
         qualityMonitor.setProbeURL(Self.probeURL(snapshot))
         await storage.updateCapacity(Int(snapshot.maxQueueSize))
         await dispatcher.updateConfig(snapshot.toDispatcherConfig(source: .live))
@@ -336,8 +352,11 @@ final class SyncEngine: @unchecked Sendable {
     }
 
     /// Arms the single retry timer for the next due row, replacing any pending
-    /// wake. Called when a cycle ends, when a hybrid attaches, and on
-    /// configuration changes.
+    /// wake. Called when a cycle ends, when a hybrid attaches, on
+    /// configuration changes, and after the health check stopped a flush.
+    ///
+    /// The wake comes no earlier than the latest of the row's deadline, the
+    /// credential hold and the end of a running health-check backoff.
     ///
     /// - Parameter notBefore: when the hold on a rejected credential ends. It
     ///   outlives this call, so a later re-arm cannot wake earlier.
@@ -366,6 +385,7 @@ final class SyncEngine: @unchecked Sendable {
         }
 
         let nowMs = clock.nowMs()
+        let backoffUntil = healthCheckBackoffEnd() ?? 0
         lock.withLock {
             guard ticket == rearmTicket, !isShutDown else { return }
             guard let wakeAt else {
@@ -373,7 +393,7 @@ final class SyncEngine: @unchecked Sendable {
                 releaseHeldWakeLocked()
                 return
             }
-            retryTimer.arm(afterMs: max(0, max(wakeAt, holdUntil) - nowMs)) { [weak self] in
+            retryTimer.arm(afterMs: max(0, max(wakeAt, holdUntil, backoffUntil) - nowMs)) { [weak self] in
                 await self?.retryWakeFired()
             }
         }
@@ -430,6 +450,13 @@ final class SyncEngine: @unchecked Sendable {
             return
         }
         lock.withLock { releaseHeldWakeLocked() }
+        if healthCheckBackoffEnd() != nil {
+            // A health-check backoff is running: like a gated wake, wait for it
+            // silently. The re-arm lands no earlier than its end.
+            SyncLogger.debug("Retry wake during a health-check backoff; waiting for its end", category: "dispatcher")
+            await rearmRetryTimer(scope: .allPending)
+            return
+        }
         do {
             // The grade can drop between the check above and the gate. That is
             // a real attempt, so the gate reports it with `SYNC_FAILED`, as it
@@ -464,6 +491,12 @@ final class SyncEngine: @unchecked Sendable {
                              ? "Retry wake below the network-quality minimum; waiting for it"
                              : "Retry wake while offline; waiting for connectivity",
                          category: "dispatcher")
+    }
+
+    /// The end of a running health-check backoff, when a health check is set.
+    private func healthCheckBackoffEnd() -> Int64? {
+        guard lock.withLock({ options.healthCheckUrl != nil }) else { return nil }
+        return healthCheck.backoffUntilMs
     }
 
     /// `true` when an automatic wake may flush: online and, with a

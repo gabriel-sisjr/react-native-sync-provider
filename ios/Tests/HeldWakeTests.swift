@@ -280,6 +280,8 @@ final class HeldWakeTests: XCTestCase {
         let engine = await fixture.makeEngine(emitter: emitter)
         fixture.probe.hold()
         await engine.configure(options(minimum: .good, healthCheckUrl: healthURL))
+        // The health check shares the held probe: answer it from its cache.
+        engine.healthCheck.recordHealthy(url: URL(string: healthURL)!)
         _ = try await engine.storage.enqueue(input: .sample())
 
         let atGood = try await engine.dispatcher.flushOutcome()

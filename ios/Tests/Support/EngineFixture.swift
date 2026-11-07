@@ -9,8 +9,10 @@ final class EngineFixture {
     let stack = InMemoryCoreDataStack.make()
     let secrets = InMemorySecretStore()
     let connectivity = FakeConnectivity()
-    /// Every measurement goes through it, with no debounce.
+    /// Every measurement and health check goes through it, with no debounce.
     let probe = FakeHeadProbe()
+    /// Set before building an engine to use another probe, a real one say.
+    var probeOverride: HeadProbing?
     let scheduler = FakeBackgroundTaskScheduler()
     let clock = ManualClock()
     let timer = ManualWakeTimer()
@@ -52,7 +54,7 @@ final class EngineFixture {
                                 emitter: emitter,
                                 scheduler: scheduler,
                                 sessions: (foregroundSession, backgroundSession),
-                                probe: probe,
+                                probe: probeOverride ?? probe,
                                 qualityProbeDebounceMs: 0,
                                 clock: clock,
                                 retryTimer: timer,

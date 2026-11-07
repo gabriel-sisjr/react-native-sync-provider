@@ -65,7 +65,10 @@ struct SyncOptionsSnapshot: Sendable, Equatable {
                          source: source,
                          hasDefaultHeaders: !defaultHeaders.isEmpty || credentialsUnavailable,
                          credentialsUnavailable: credentialsUnavailable,
-                         minNetworkQuality: minNetworkQuality)
+                         minNetworkQuality: minNetworkQuality,
+                         healthCheckUrl: healthCheckUrl.flatMap { URL(string: $0) },
+                         healthCheckTtlMs: effectiveHealthCheckTtlMs,
+                         healthCheckBackoffMs: effectiveHealthCheckBackoffMs)
     }
 }
 

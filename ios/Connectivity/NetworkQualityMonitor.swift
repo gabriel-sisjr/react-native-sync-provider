@@ -111,6 +111,7 @@ final class NetworkQualityMonitor: @unchecked Sendable {
     private var generation: UInt64 = 0
     private var published: Published?
     private var changeHandler: (@Sendable (NetworkState) -> Void)?
+    private var healthySampleHandler: (@Sendable (URL) -> Void)?
     private var subscription: UUID?
 
     /// - Parameter probe: the probe the health check shares, so both reuse
@@ -135,6 +136,13 @@ final class NetworkQualityMonitor: @unchecked Sendable {
     var onChange: (@Sendable (NetworkState) -> Void)? {
         get { lock.withLock { changeHandler } }
         set { lock.withLock { changeHandler = newValue } }
+    }
+
+    /// Called with the probe URL for every sample that got a 2xx, kept or not:
+    /// it is what the health check counts as a healthy result.
+    var onHealthySample: (@Sendable (URL) -> Void)? {
+        get { lock.withLock { healthySampleHandler } }
+        set { lock.withLock { healthySampleHandler = newValue } }
     }
 
     /// Starts following the connectivity provider. Idempotent.
@@ -264,6 +272,9 @@ final class NetworkQualityMonitor: @unchecked Sendable {
         var samples: [Int?] = []
         while samples.count < kQualityProbeSamples, !Task.isCancelled {
             let result = await probe.head(url, timeoutMs: kQualityProbeTimeoutMs)
+            if result.isHealthy {
+                lock.withLock { healthySampleHandler }?(url)
+            }
             if Task.isCancelled { break }
             // Any status is a latency sample: what a status means is the
             // health check's business.
