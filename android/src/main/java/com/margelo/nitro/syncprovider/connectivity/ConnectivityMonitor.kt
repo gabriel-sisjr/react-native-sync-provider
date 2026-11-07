@@ -4,7 +4,6 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
-import android.net.NetworkRequest
 import android.os.Build
 import android.util.Log
 import com.margelo.nitro.syncprovider.ConnectionState
@@ -22,6 +21,11 @@ import kotlinx.coroutines.launch
  * Wraps [ConnectivityManager.NetworkCallback] in a [StateFlow] so the rest
  * of the module reads connectivity reactively without leaking the callback
  * registration.
+ *
+ * Only the app's default network is followed: the one the system routes this
+ * app's traffic through, a VPN included when one applies. A device can hold
+ * several networks at once (Wi-Fi and cellular, or a VPN over either); losing
+ * one that is not the default leaves the app online, so it is not reported.
  *
  * The monitor is started lazily by [start] and stopped via [stop]; the bridge
  * class's `moduleScope` owns the lifecycle.
@@ -41,37 +45,48 @@ internal class ConnectivityMonitor(
 
   private var callback: ConnectivityManager.NetworkCallback? = null
 
+  /**
+   * The network the last `onAvailable` reported, or null while there is none.
+   * Callbacks about any other network are stale and ignored.
+   */
+  @Volatile private var defaultNetwork: Network? = null
+
   fun start() {
     if (callback != null || cm == null) return
     val cb = object : ConnectivityManager.NetworkCallback() {
+      // Also how a new default network replaces the previous one: the system
+      // reports no loss for the network it replaced.
       override fun onAvailable(network: Network) {
+        defaultNetwork = network
         update(extractState(network))
       }
 
+      // On a default-network callback, only once no default network is left.
       override fun onLost(network: Network) {
+        if (network != defaultNetwork) return
+        defaultNetwork = null
         update(disconnectedState())
       }
 
       override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+        if (network != defaultNetwork) return
         update(stateFromCapabilities(caps))
       }
 
       override fun onUnavailable() {
+        defaultNetwork = null
         update(disconnectedState())
       }
     }
-    val request = NetworkRequest.Builder()
-      .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-      .build()
 
     try {
-      cm.registerNetworkCallback(request, cb)
+      cm.registerDefaultNetworkCallback(cb)
       callback = cb
       // Seed the StateFlow with the current snapshot.
       val seeded = currentState()
       update(seeded, emit = false)
     } catch (t: Throwable) {
-      Log.e(TAG, "registerNetworkCallback failed", t)
+      Log.e(TAG, "registerDefaultNetworkCallback failed", t)
     }
   }
 
@@ -83,6 +98,7 @@ internal class ConnectivityMonitor(
       Log.e(TAG, "unregisterNetworkCallback failed", t)
     }
     callback = null
+    defaultNetwork = null
   }
 
   /** Snapshot read used by `getConnectionStatus()`. */
@@ -90,9 +106,9 @@ internal class ConnectivityMonitor(
     ?: extractCurrentSnapshot()
 
   /**
-   * Asks the system rather than reading [state]. The callback marks the device
-   * disconnected when any one network is lost, even if another is still up, so
-   * [state] can be wrong in exactly the moment dispatch has to be decided.
+   * Asks the system rather than reading [state]. The system switches networks
+   * before its callbacks reach [state], so a decision taken in between would read
+   * the previous network; the system's own answer is already current.
    */
   fun isOffline(): Boolean = extractCurrentSnapshot().status == ConnectionStatus.DISCONNECTED
 
@@ -112,25 +128,32 @@ internal class ConnectivityMonitor(
   private fun stateFromCapabilities(caps: NetworkCapabilities): ConnectionState {
     val hasInternet = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
     val validated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-    val notMetered = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+    val unmetered = isUnmetered(caps)
     val type = transportToType(caps)
 
     val status = when {
       !hasInternet -> ConnectionStatus.DISCONNECTED
-      !notMetered -> ConnectionStatus.METERED
+      !unmetered -> ConnectionStatus.METERED
       else -> ConnectionStatus.CONNECTED
-    }
-    val isExpensive = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-      !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
-    } else {
-      !notMetered
     }
     return ConnectionState(
       status = status,
       type = type,
       isInternetReachable = validated,
-      isExpensive = isExpensive,
+      isExpensive = !unmetered,
     )
+  }
+
+  /**
+   * Unmetered permanently, or, from Android 11 (API 30), temporarily: a link that is
+   * usually metered but currently is not, such as some 5G plans. The system can
+   * withdraw the temporary state at any time; the capability change that follows
+   * reports the link metered again.
+   */
+  private fun isUnmetered(caps: NetworkCapabilities): Boolean {
+    if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)) return true
+    return Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+      caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_TEMPORARILY_NOT_METERED)
   }
 
   private fun transportToType(caps: NetworkCapabilities): ConnectionType = when {
