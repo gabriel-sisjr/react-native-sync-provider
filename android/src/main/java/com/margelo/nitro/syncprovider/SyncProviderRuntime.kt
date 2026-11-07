@@ -9,10 +9,13 @@ import com.margelo.nitro.syncprovider.config.SecretStore
 import com.margelo.nitro.syncprovider.config.SyncConfigStore
 import com.margelo.nitro.syncprovider.config.SyncOptionsValidator
 import com.margelo.nitro.syncprovider.connectivity.ConnectivityMonitor
+import com.margelo.nitro.syncprovider.connectivity.LatencyProbe
+import com.margelo.nitro.syncprovider.connectivity.meetsMinimum
 import com.margelo.nitro.syncprovider.database.SyncDatabase
 import com.margelo.nitro.syncprovider.error.SyncException
 import com.margelo.nitro.syncprovider.events.SyncEventEmitter
 import com.margelo.nitro.syncprovider.http.CredentialPolicy
+import com.margelo.nitro.syncprovider.http.HeadProbe
 import com.margelo.nitro.syncprovider.http.SyncDispatcher
 import com.margelo.nitro.syncprovider.retry.RetryTimer
 import com.margelo.nitro.syncprovider.retry.RetryWake
@@ -68,7 +71,17 @@ internal class SyncProviderRuntime private constructor(
   val emitter: SyncEventEmitter = SyncEventEmitter()
   val storage: SyncQueueStorage = SyncQueueStorage.from(database)
   val backgroundSyncManager: BackgroundSyncManager = BackgroundSyncManager(appContext)
-  val connectivityMonitor: ConnectivityMonitor = ConnectivityMonitor(appContext, emitter, scope)
+
+  /** The one `HEAD` probe the latency measurement and the health check share, connections too. */
+  val headProbe: HeadProbe = HeadProbe()
+
+  val connectivityMonitor: ConnectivityMonitor = ConnectivityMonitor(
+    context = appContext,
+    emitter = emitter,
+    scope = scope,
+    healthCheckUrl = { currentOptions().healthCheckUrl },
+    measure = LatencyProbe(headProbe)::measure,
+  )
 
   private val configStore = SyncConfigStore(appContext, secretStore)
 
@@ -99,13 +112,15 @@ internal class SyncProviderRuntime private constructor(
     verboseLogging = { false },
     isPaused = { pausedFlag.get() },
     credentialPolicy = { credentialPolicy() },
+    networkQuality = { connectivityMonitor.qualityForGate() },
     onCycleFinished = { notBefore -> retryWake.arm(notBefore) },
   )
 
   private val retryTimer = RetryTimer(
     scope = scope,
     isOffline = { connectivityMonitor.isOffline() },
-    flush = { dispatcher.flush() },
+    flush = { flushForWake() },
+    canDispatch = { !connectivityMonitor.isOffline() && isQualityGateOpen() },
   )
 
   private val retryWake = RetryWake(
@@ -114,6 +129,7 @@ internal class SyncProviderRuntime private constructor(
     scheduleKick = { delayMs -> backgroundSyncManager.scheduleOneTimeFlush(initialDelayMs = delayMs) },
     isHalted = { isWakeHalted() },
     isEngineLive = { isEngineAttached },
+    isQualityGateOpen = { isQualityGateOpen() },
   )
 
   init {
@@ -161,6 +177,7 @@ internal class SyncProviderRuntime private constructor(
           .onFailure { Log.w(TAG, "Could not persist the configuration: ${it.javaClass.simpleName}") }
       }
     }
+    connectivityMonitor.onConfigurationChanged()
     if (options.strategy == SyncStrategy.MANUAL) backgroundSyncManager.cancelRetryKick()
     retryWake.arm()
   }
@@ -181,6 +198,14 @@ internal class SyncProviderRuntime private constructor(
   /** Arm the next retry wake from the current queue, no earlier than a credential hold. */
   suspend fun armRetryWake() {
     retryWake.arm()
+  }
+
+  /**
+   * Re-arm after the network-quality gate held an automatic wake back. See
+   * [RetryWake.armAfterGate].
+   */
+  suspend fun armAfterQualityGate() {
+    retryWake.armAfterGate()
   }
 
   /**
@@ -222,7 +247,12 @@ internal class SyncProviderRuntime private constructor(
       connectivityMonitor.start()
       connectivityWatch = connectivityMonitor.state
         .filter { it.status == ConnectionStatus.CONNECTED || it.status == ConnectionStatus.METERED }
-        .onEach { retryTimer.onNetworkAvailable() }
+        .onEach { state ->
+          retryTimer.onNetworkAvailable()
+          if (state.networkQuality.meetsMinimum(currentOptions().minNetworkQuality)) {
+            retryTimer.onDispatchPossible()
+          }
+        }
         .launchIn(scope)
     }
     // Recovery arms the first retry wake once it has finished.
@@ -247,6 +277,16 @@ internal class SyncProviderRuntime private constructor(
   private fun applyQueueCap(options: SyncOptions) {
     storage.maxQueueSize = (options.maxQueueSize?.toInt() ?: SyncQueueStorage.DEFAULT_MAX_QUEUE_SIZE)
       .coerceAtLeast(1)
+  }
+
+  /** A timer wake runs one flush; a wake the quality gate holds back is held, not lost. */
+  private suspend fun flushForWake() {
+    if (dispatcher.flushWithOutcome().isHeldByQualityGate) retryWake.armAfterGate()
+  }
+
+  private fun isQualityGateOpen(): Boolean {
+    val minimum = currentOptions().minNetworkQuality
+    return connectivityMonitor.currentState().networkQuality.meetsMinimum(minimum)
   }
 
   private fun isWakeHalted(): Boolean =

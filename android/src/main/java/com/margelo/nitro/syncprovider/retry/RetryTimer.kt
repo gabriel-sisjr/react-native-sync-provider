@@ -6,7 +6,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Single-shot, in-process retry timer. A new [arm] replaces the previous one.
@@ -16,18 +16,25 @@ import java.util.concurrent.atomic.AtomicBoolean
  * network. When the timer fires offline it therefore does not flush: it remembers
  * the wake, and [onNetworkAvailable] delivers it.
  *
+ * A wake the network-quality gate turned back is remembered the same way, through
+ * [hold]: [onDispatchPossible] delivers it once the classification reaches the minimum,
+ * and the hold's own deadline brings it back otherwise, so the gate is evaluated again.
+ *
  * @param isOffline live connectivity check, evaluated when the timer fires.
  * @param flush the normal, mutex-guarded flush. Failures are logged, never thrown:
  *   no JS caller exists to receive them.
+ * @param canDispatch whether a held wake could pass the gate now: online and at the
+ *   minimum quality.
  */
 internal class RetryTimer(
   private val scope: CoroutineScope,
   private val isOffline: () -> Boolean,
   private val flush: suspend () -> Unit,
+  private val canDispatch: () -> Boolean = { !isOffline() },
 ) {
   private val lock = Any()
   private var waiting: Job? = null
-  private val wakeOwed = AtomicBoolean(false)
+  private val owed = AtomicReference(Owed.NOTHING)
 
   /** Whether a timer is counting down. */
   val isWaiting: Boolean
@@ -37,7 +44,7 @@ internal class RetryTimer(
   fun arm(delayMs: Long) {
     synchronized(lock) {
       waiting?.cancel()
-      wakeOwed.set(false)
+      owed.set(Owed.NOTHING)
       waiting = scope.launch {
         delay(delayMs)
         onFire()
@@ -45,26 +52,66 @@ internal class RetryTimer(
     }
   }
 
-  /** Drop the waiting timer and any wake owed to the network. A running cycle finishes. */
+  /**
+   * Remember a wake the network-quality gate turned back. [onDispatchPossible] delivers it
+   * as soon as the gate would let it through. Otherwise the timer fires after [delayMs],
+   * replacing any timer still waiting, and the gate decides again.
+   */
+  fun hold(delayMs: Long) {
+    synchronized(lock) {
+      waiting?.cancel()
+      waiting = scope.launch {
+        delay(delayMs)
+        onFire()
+      }
+      owed.set(Owed.QUALITY)
+    }
+    // The gate may have opened while the flush that it held ran; its signal then came first.
+    if (canDispatch()) onDispatchPossible()
+  }
+
+  /** Drop the waiting timer and any wake owed. A running cycle finishes. */
   fun cancel() {
     synchronized(lock) {
       waiting?.cancel()
       waiting = null
-      wakeOwed.set(false)
+      owed.set(Owed.NOTHING)
     }
   }
 
-  /** Deliver the wake owed by a timer that fired offline, if there is one. */
+  /**
+   * The device is online again: deliver the wake owed by a timer that fired offline, if
+   * there is one. A wake the gate holds waits for [onDispatchPossible].
+   */
   fun onNetworkAvailable() {
-    if (wakeOwed.compareAndSet(true, false)) dispatch()
+    deliverIf(Owed.NETWORK)
+  }
+
+  /** Online and at the minimum quality: deliver any wake owed, the gate's included. */
+  fun onDispatchPossible() {
+    deliverIf(Owed.NETWORK, Owed.QUALITY)
+  }
+
+  private fun deliverIf(vararg kinds: Owed) {
+    synchronized(lock) {
+      val current = owed.get()
+      if (current !in kinds || !owed.compareAndSet(current, Owed.NOTHING)) return
+      // A held wake's own deadline would only repeat this delivery.
+      if (current == Owed.QUALITY) {
+        waiting?.cancel()
+        waiting = null
+      }
+    }
+    dispatch()
   }
 
   private fun onFire() {
     if (!isOffline()) {
+      owed.set(Owed.NOTHING)
       dispatch()
       return
     }
-    wakeOwed.set(true)
+    owed.set(Owed.NETWORK)
     // The network may have returned between the check and the flag, in which case
     // its callback already passed and nothing else would deliver this wake.
     if (!isOffline()) onNetworkAvailable()
@@ -85,6 +132,8 @@ internal class RetryTimer(
       }
     }
   }
+
+  private enum class Owed { NOTHING, NETWORK, QUALITY }
 
   private companion object {
     const val TAG = "RetryTimer"

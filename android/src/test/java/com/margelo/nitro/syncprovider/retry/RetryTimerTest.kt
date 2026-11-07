@@ -209,4 +209,123 @@ internal class RetryTimerTest {
 
     assertThat(calls).isEqualTo(2)
   }
+
+  /* ------------------------- wakes the quality gate holds ------------------------ */
+
+  private var gateOpen = false
+
+  private fun TestScope.gatedTimer(flush: suspend () -> Unit = { flushes++ }): RetryTimer =
+    RetryTimer(
+      scope = backgroundScope,
+      isOffline = { offline },
+      flush = flush,
+      canDispatch = { !offline && gateOpen },
+    )
+
+  @Test
+  fun `gate_automaticWake_rerunsWhenQualityReachesMinimum`() = runTest {
+    var dispatched = 0
+    lateinit var timer: RetryTimer
+    // As the runtime wires it: a flush the gate turns back holds the wake.
+    timer = gatedTimer { if (gateOpen) dispatched++ else timer.hold(HOLD_MS) }
+
+    timer.arm(1_000L)
+    advance(1_000L)
+    assertThat(dispatched).isEqualTo(0)
+    assertThat(timer.isWaiting).isTrue()
+
+    gateOpen = true
+    timer.onDispatchPossible()
+    runCurrent()
+    assertThat(dispatched).isEqualTo(1)
+
+    // Delivered once: the hold's own deadline does not run it again.
+    advance(HOLD_MS)
+    assertThat(dispatched).isEqualTo(1)
+    assertThat(timer.isWaiting).isFalse()
+  }
+
+  @Test
+  fun `a held wake waits for the minimum, not just for the network`() = runTest {
+    val timer = gatedTimer()
+    timer.hold(HOLD_MS)
+
+    timer.onNetworkAvailable()
+    runCurrent()
+
+    assertThat(flushes).isEqualTo(0)
+  }
+
+  @Test
+  fun `a held wake comes back on its own when the hold ends`() = runTest {
+    val timer = gatedTimer()
+    timer.hold(HOLD_MS)
+
+    advance(HOLD_MS - 1)
+    assertThat(flushes).isEqualTo(0)
+    advance(1L)
+    assertThat(flushes).isEqualTo(1)
+  }
+
+  @Test
+  fun `a gate that opened during the flush releases the hold at once`() = runTest {
+    gateOpen = true
+    val timer = gatedTimer()
+
+    timer.hold(HOLD_MS)
+    runCurrent()
+    assertThat(flushes).isEqualTo(1)
+
+    advance(HOLD_MS)
+    assertThat(flushes).isEqualTo(1)
+  }
+
+  @Test
+  fun `a new arm supersedes a held wake`() = runTest {
+    val timer = gatedTimer()
+    timer.hold(HOLD_MS)
+
+    timer.arm(1_000L)
+    gateOpen = true
+    timer.onDispatchPossible()
+    runCurrent()
+    assertThat(flushes).isEqualTo(0)
+
+    advance(1_000L)
+    assertThat(flushes).isEqualTo(1)
+    advance(HOLD_MS)
+    assertThat(flushes).isEqualTo(1)
+  }
+
+  @Test
+  fun `cancel forgets a held wake`() = runTest {
+    val timer = gatedTimer()
+    timer.hold(HOLD_MS)
+
+    timer.cancel()
+    gateOpen = true
+    timer.onDispatchPossible()
+    advance(HOLD_MS)
+
+    assertThat(flushes).isEqualTo(0)
+  }
+
+  @Test
+  fun `a wake owed to the network is also delivered once dispatch is possible`() = runTest {
+    offline = true
+    val timer = gatedTimer()
+    timer.arm(0L)
+    runCurrent()
+
+    offline = false
+    gateOpen = true
+    timer.onDispatchPossible()
+    runCurrent()
+
+    assertThat(flushes).isEqualTo(1)
+  }
+
+  private companion object {
+    const val HOLD_MS = 30_000L
+  }
 }

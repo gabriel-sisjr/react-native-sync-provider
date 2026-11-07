@@ -316,18 +316,17 @@ internal class ConnectivityMonitorTest {
 
   /* ----------------------------- network quality ----------------------------- */
 
-  private fun assertQualityInvariant(state: ConnectionState) {
+  /** `connection_offlineInvariant`: OFFLINE exactly when the status is DISCONNECTED or UNKNOWN. */
+  private fun assertOfflineInvariant(state: ConnectionState) {
     val offline = state.status == ConnectionStatus.DISCONNECTED ||
       state.status == ConnectionStatus.UNKNOWN
-    // Provisional: every live link reads GOOD until latency measurements classify it.
-    val expected = if (offline) NetworkQuality.OFFLINE else NetworkQuality.GOOD
     assertWithMessage("networkQuality for ${state.status}")
-      .that(state.networkQuality)
-      .isEqualTo(expected)
+      .that(state.networkQuality == NetworkQuality.OFFLINE)
+      .isEqualTo(offline)
   }
 
   @Test
-  fun `every reported state is OFFLINE exactly when it is DISCONNECTED or UNKNOWN`() {
+  fun `connection_offlineInvariant holds for every reported state`() {
     val seen = mutableListOf(monitor.state.value)
     monitor.start()
     val wifi = network(WIFI_ID, NetworkCapabilities.TRANSPORT_WIFI, *INTERNET, NOT_METERED)
@@ -350,11 +349,11 @@ internal class ConnectivityMonitorTest {
       ConnectionStatus.DISCONNECTED,
       ConnectionStatus.DISCONNECTED,
     ).inOrder()
-    seen.forEach(::assertQualityInvariant)
+    seen.forEach(::assertOfflineInvariant)
   }
 
   @Test
-  fun `getConnectionStatus honors the quality invariant before any callback`() {
+  fun `connection_offlineInvariant holds for getConnectionStatus before any callback`() {
     val shadow = shadowOf(manager())
 
     shadow.setDefaultNetworkActive(false)
@@ -382,7 +381,7 @@ internal class ConnectivityMonitorTest {
       ConnectionStatus.METERED,
       ConnectionStatus.DISCONNECTED,
     ).inOrder()
-    listOf(noNetwork, unmetered, metered, noInternet).forEach(::assertQualityInvariant)
+    listOf(noNetwork, unmetered, metered, noInternet).forEach(::assertOfflineInvariant)
   }
 
   /** The stock shadow, counting which registration call the monitor makes. */

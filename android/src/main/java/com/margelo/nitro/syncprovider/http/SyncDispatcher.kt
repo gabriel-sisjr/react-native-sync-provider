@@ -1,10 +1,12 @@
 package com.margelo.nitro.syncprovider.http
 
 import android.util.Log
+import com.margelo.nitro.syncprovider.NetworkQuality
 import com.margelo.nitro.syncprovider.SyncErrorCode
 import com.margelo.nitro.syncprovider.SyncEventType
 import com.margelo.nitro.syncprovider.SyncOptions
 import com.margelo.nitro.syncprovider.SyncResult
+import com.margelo.nitro.syncprovider.connectivity.meetsMinimum
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
 import com.margelo.nitro.syncprovider.error.SyncException
 import com.margelo.nitro.syncprovider.events.SyncEventEmitter
@@ -61,6 +63,8 @@ import kotlin.random.Random
  *   back-off jitter; injectable for reproducible delays in tests.
  * @param isPaused checked inside the mutex, so every caller obeys it, workers included.
  * @param credentialPolicy read once per cycle. See [CredentialPolicy].
+ * @param networkQuality the classification the `minNetworkQuality` gate compares. Read only
+ *   while a gate is configured.
  * @param onCycleFinished called after every cycle. Its argument, when present, is
  *   the earliest instant the next wake may fire. Failures are logged and never
  *   reject a cycle that already completed.
@@ -74,6 +78,7 @@ internal class SyncDispatcher(
   private val random: Random = Random.Default,
   private val isPaused: () -> Boolean = { false },
   private val credentialPolicy: () -> CredentialPolicy = { CredentialPolicy.TRUSTED },
+  private val networkQuality: () -> NetworkQuality = { NetworkQuality.GOOD },
   private val onCycleFinished: suspend (notBefore: Long?) -> Unit = {},
 ) {
   private val flushMutex = Mutex()
@@ -94,17 +99,38 @@ internal class SyncDispatcher(
    * failures are aggregated; the function only throws when the cycle itself
    * cannot run (e.g. the storage layer fails).
    *
-   * Paused, or with default headers that cannot be recovered, nothing is dispatched
-   * and an empty sentinel result is returned without starting a cycle.
+   * See [flushWithOutcome] for when no cycle runs.
    */
-  suspend fun flush(): SyncResult = flushMutex.withLock {
-    if (isPaused()) return@withLock emptyResult()
+  suspend fun flush(): SyncResult = flushWithOutcome().result
+
+  /**
+   * [flush], telling callers that act on it whether a cycle ran. Every flush passes these
+   * checks first, in order, and skips the cycle at the first that fails, with the empty
+   * sentinel result and no `SYNC_STARTED`:
+   * 1. paused;
+   * 2. default headers that cannot be recovered;
+   * 3. the network-quality gate: with `minNetworkQuality` set to more than `OFFLINE` and
+   *    [networkQuality] below it, `SYNC_FAILED` is emitted with `NETWORK_QUALITY_TOO_LOW`.
+   *    No history row is written and no item changes.
+   */
+  suspend fun flushWithOutcome(): FlushOutcome = flushMutex.withLock {
+    if (isPaused()) return@withLock FlushOutcome.Skipped(FlushSkip.PAUSED)
     val credentials = credentialPolicy()
     if (credentials == CredentialPolicy.UNAVAILABLE) {
       Log.w(TAG, "Default headers cannot be recovered; leaving the queue untouched.")
-      return@withLock emptyResult()
+      return@withLock FlushOutcome.Skipped(FlushSkip.CREDENTIALS_UNAVAILABLE)
     }
-    runCycle(getOptions(), credentials)
+    val options = getOptions()
+    if (isBelowMinimumQuality(options)) {
+      emitter.emit(
+        SyncEventEmitter.event(
+          type = SyncEventType.SYNC_FAILED,
+          errorCode = SyncErrorCode.NETWORK_QUALITY_TOO_LOW,
+        ),
+      )
+      return@withLock FlushOutcome.Skipped(FlushSkip.NETWORK_QUALITY_TOO_LOW)
+    }
+    FlushOutcome.Ran(runCycle(options, credentials))
   }
 
   /**
@@ -115,6 +141,13 @@ internal class SyncDispatcher(
   suspend fun resetInFlight(): Int = flushMutex.withLock { storage.resetInFlight() }
 
   /* ------------------------------ internals ----------------------------- */
+
+  /** Reads [networkQuality] only while a gate is configured: unset and `OFFLINE` gate nothing. */
+  private fun isBelowMinimumQuality(options: SyncOptions): Boolean {
+    val minimum = options.minNetworkQuality ?: return false
+    if (minimum == NetworkQuality.OFFLINE) return false
+    return !networkQuality().meetsMinimum(minimum)
+  }
 
   private suspend fun runCycle(options: SyncOptions, credentials: CredentialPolicy): SyncResult {
     val startedAt = clock()
@@ -569,9 +602,9 @@ internal class SyncDispatcher(
 
     /**
      * The zeroed result that means "no cycle ran". `flush()` returns it to JS unchanged
-     * while paused or while default headers cannot be recovered. `getLastSyncResult()`
-     * returns it when no result is stored, and only there does the facade map it to
-     * `undefined`.
+     * while paused, while default headers cannot be recovered, and while the
+     * network-quality gate holds flushes back. `getLastSyncResult()` returns it when no
+     * result is stored, and only there does the facade map it to `undefined`.
      */
     fun emptyResult(): SyncResult = SyncResult(
       startedAt = 0.0,

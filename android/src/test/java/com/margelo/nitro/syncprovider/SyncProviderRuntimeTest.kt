@@ -18,6 +18,7 @@ import com.google.common.truth.Truth.assertThat
 import com.google.common.truth.Truth.assertWithMessage
 import com.margelo.nitro.syncprovider.config.ConfigSource
 import com.margelo.nitro.syncprovider.config.SecretStore
+import com.margelo.nitro.syncprovider.connectivity.ConnectivityMonitor
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
 import com.margelo.nitro.syncprovider.error.SyncException
 import com.margelo.nitro.syncprovider.http.SyncDispatcher
@@ -31,15 +32,20 @@ import com.margelo.nitro.syncprovider.work.SyncWorker
 import io.mockk.every
 import io.mockk.mockkConstructor
 import io.mockk.unmockkConstructor
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.onSubscription
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
+import okhttp3.mockwebserver.SocketPolicy
 import org.junit.After
 import org.junit.Before
 import org.junit.Test
@@ -47,6 +53,7 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import org.robolectric.shadows.ShadowNetwork
 import org.robolectric.shadows.ShadowNetworkCapabilities
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
@@ -1166,6 +1173,129 @@ internal class SyncProviderRuntimeTest {
     assertThat(runtime.currentOptions()).isEqualTo(applied)
     restartProcess()
     assertThat(runtime.currentOptions()).isEqualTo(applied)
+  }
+
+  /* --------------------------- network-quality gate --------------------------- */
+
+  private fun capabilities(vararg capabilities: Int): NetworkCapabilities =
+    ShadowNetworkCapabilities.newInstance().also { caps ->
+      shadowOf(caps).addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+      capabilities.forEach { shadowOf(caps).addCapability(it) }
+    }
+
+  /** Every event the current runtime emits from now on, until [block] returns. */
+  private suspend fun <T> withEvents(block: suspend (List<SyncEvent>) -> T): T {
+    val events: MutableList<SyncEvent> = CopyOnWriteArrayList()
+    val collecting = CoroutineScope(Dispatchers.Default)
+    val subscribed = CountDownLatch(1)
+    collecting.launch {
+      runtime.emitter.events.onSubscription { subscribed.countDown() }.collect { events += it }
+    }
+    subscribed.await(5, TimeUnit.SECONDS)
+    return try {
+      block(events)
+    } finally {
+      collecting.cancel()
+    }
+  }
+
+  private suspend fun awaitUntil(condition: suspend () -> Boolean) {
+    val met = withTimeoutOrNull(AWAIT_TIMEOUT_MS) {
+      while (!condition()) delay(10L)
+      true
+    }
+    assertThat(met).isTrue()
+  }
+
+  @Test
+  fun `a kick the quality gate holds dispatches nothing and comes back 30 s later`() = runBlocking<Unit> {
+    // INTERNET only: metered and not validated, so the link signals classify it POOR.
+    goOnline()
+    runtime.backgroundSyncManager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+    runtime.configure(TestData.syncOptions(minNetworkQuality = NetworkQuality.MODERATE))
+    insert("due", attempts = 1, nextRetryAt = 1L)
+    restartProcess()
+    val startedAt = System.currentTimeMillis()
+
+    val (result, events) = withEvents { events ->
+      val result = runWorker()
+      // Delivered in order: anything emitted before SYNC_FAILED is visible once it is.
+      awaitUntil { events.any { it.type == SyncEventType.SYNC_FAILED } }
+      result to events.toList()
+    }
+
+    assertThat(result).isEqualTo(ListenableWorker.Result.success())
+    assertThat(server.requestCount).isEqualTo(0)
+    assertThat(row("due")!!.attempts).isEqualTo(1)
+    assertThat(events.map { it.type }).containsExactly(SyncEventType.SYNC_FAILED)
+    assertThat(events.single().errorCode).isEqualTo(SyncErrorCode.NETWORK_QUALITY_TOO_LOW)
+    assertThat(kickFiresAt()).isAtLeast(startedAt + ConnectivityMonitor.QUALITY_CACHE_TTL_MS)
+  }
+
+  @Test
+  fun `a periodic run the quality gate holds leaves the kick as it was`() = runBlocking<Unit> {
+    goOnline()
+    runtime.backgroundSyncManager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+    runtime.configure(TestData.syncOptions(minNetworkQuality = NetworkQuality.MODERATE))
+    insert("due", attempts = 1, nextRetryAt = 1L)
+    runtime.armRetryWake()
+    val kick = oneTimeWork().single().id
+    restartProcess()
+
+    val result = runPeriodicWorker()
+
+    assertThat(result).isEqualTo(ListenableWorker.Result.success())
+    assertThat(server.requestCount).isEqualTo(0)
+    assertThat(oneTimeWork().single().id).isEqualTo(kick)
+  }
+
+  @Test
+  fun `gate_automaticWake_rerunsWhenQualityReachesMinimum`() = runBlocking<Unit> {
+    var healthy = false
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest): MockResponse = when {
+        request.path == "/health" && !healthy ->
+          MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST)
+        else -> MockResponse().setResponseCode(200)
+      }
+    }
+    val wifi = manager().activeNetwork!!
+    val linkCaps = intArrayOf(
+      NetworkCapabilities.NET_CAPABILITY_INTERNET,
+      NetworkCapabilities.NET_CAPABILITY_VALIDATED,
+      NetworkCapabilities.NET_CAPABILITY_NOT_METERED,
+    )
+    shadowOf(manager()).setNetworkCapabilities(wifi, capabilities(*linkCaps))
+    // An IP literal: with one route, a failed HEAD cannot steer the next one to another
+    // address the server does not listen on.
+    val healthCheckUrl = server.url("/health").newBuilder().host("127.0.0.1").build().toString()
+    // EXCELLENT: the link signals alone reach GOOD at most, so only a measurement passes.
+    runtime.configure(
+      TestData.syncOptions(
+        minNetworkQuality = NetworkQuality.EXCELLENT,
+        healthCheckUrl = healthCheckUrl,
+      ),
+    )
+    attachEngineAndRecover()
+    shadowOf(manager()).networkCallbacks.forEach { it.onAvailable(wifi) }
+    // Every HEAD fails, so the measurement classifies the link POOR.
+    awaitUntil { runtime.connectivityMonitor.currentState().networkQuality == NetworkQuality.POOR }
+
+    withEvents { events ->
+      insert("due", attempts = 1, nextRetryAt = 1L)
+      runtime.armRetryWake()
+      awaitUntil { events.any { it.errorCode == SyncErrorCode.NETWORK_QUALITY_TOO_LOW } }
+    }
+    assertThat(row("due")!!.attempts).isEqualTo(1)
+
+    // A better network becomes the default and is measured at once: the held wake runs.
+    healthy = true
+    val better = ShadowNetwork.newInstance(202)
+    shadowOf(manager()).setNetworkCapabilities(better, capabilities(*linkCaps))
+    shadowOf(manager()).networkCallbacks.forEach { it.onAvailable(better) }
+
+    awaitGone("due")
+    assertThat(runtime.connectivityMonitor.currentState().networkQuality).isEqualTo(NetworkQuality.EXCELLENT)
   }
 
   /* ------------------------------- dead letters ------------------------------- */

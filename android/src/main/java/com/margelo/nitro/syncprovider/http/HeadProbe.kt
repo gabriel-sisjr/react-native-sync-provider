@@ -54,7 +54,8 @@ internal sealed interface HeadResult {
  *
  * It sends with its own minimal client, never the dispatcher's:
  * - no interceptors, cache, cookies or authenticator, so a probe never carries the
- *   queue's default headers or credentials;
+ *   queue's default headers or credentials. The one header it adds,
+ *   `Cache-Control: no-cache`, keeps an intermediary from answering from its cache;
  * - redirects are followed, so [HeadResult.Response.statusCode] is the final status;
  * - no retry after a connection failure: a failed probe must read as a failure;
  * - a single timeout, set per call, spanning DNS, connect, TLS, the request, the
@@ -83,7 +84,11 @@ internal class HeadProbe(client: Lazy<OkHttpClient> = sharedClient) {
     if (!UrlValidator.isValid(url)) {
       return HeadResult.Failure(HeadResult.FailureKind.INVALID_URL, "Not an absolute http(s) URL")
     }
-    val request = Request.Builder().url(url.toHttpUrl()).head().build()
+    val request = Request.Builder()
+      .url(url.toHttpUrl())
+      .head()
+      .header("Cache-Control", "no-cache")
+      .build()
     // IO for the first call, which builds the client (TLS and trust-store set-up). The
     // request itself never blocks a thread.
     return withContext(Dispatchers.IO) {

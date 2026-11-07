@@ -4,6 +4,7 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.google.common.truth.Truth.assertThat
 import com.margelo.nitro.syncprovider.HttpMethod
+import com.margelo.nitro.syncprovider.NetworkQuality
 import com.margelo.nitro.syncprovider.SyncErrorCode
 import com.margelo.nitro.syncprovider.SyncEvent
 import com.margelo.nitro.syncprovider.SyncEventType
@@ -83,6 +84,8 @@ internal class SyncDispatcherTest {
     credentials: () -> CredentialPolicy = { CredentialPolicy.TRUSTED },
     onCycleFinished: suspend (Long?) -> Unit = { finishedCycles += it },
     queue: SyncQueueStorage = storage,
+    minNetworkQuality: NetworkQuality? = null,
+    quality: () -> NetworkQuality = { NetworkQuality.GOOD },
   ): SyncDispatcher {
     val options = TestData.syncOptions(
       retryPolicy = TestData.retryPolicy(
@@ -93,6 +96,7 @@ internal class SyncDispatcherTest {
       ),
       requestTimeoutMs = requestTimeoutMs,
       batchSize = batchSize,
+      minNetworkQuality = minNetworkQuality,
     )
     return SyncDispatcher(
       storage = queue,
@@ -101,6 +105,7 @@ internal class SyncDispatcherTest {
       clock = clock::now,
       isPaused = isPaused,
       credentialPolicy = credentials,
+      networkQuality = quality,
       onCycleFinished = onCycleFinished,
     )
   }
@@ -655,5 +660,120 @@ internal class SyncDispatcherTest {
     assertThat(row(id).attempts).isEqualTo(0)
     assertThat(events).isEmpty()
     assertThat(finishedCycles).isEmpty()
+  }
+
+  /* -------------------------- network-quality gate -------------------------- */
+
+  @Test
+  fun `gate_unset_neverGates, so a manual flush on an offline link still dispatches`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(200))
+    enqueue()
+    var reads = 0
+    val dispatcher = newDispatcher(quality = { reads++; NetworkQuality.OFFLINE })
+
+    val outcome = dispatcher.flushWithOutcome()
+
+    assertThat(outcome).isInstanceOf(FlushOutcome.Ran::class.java)
+    assertThat(outcome.result.successCount).isEqualTo(1.0)
+    assertThat(server.requestCount).isEqualTo(1)
+    assertThat(reads).isEqualTo(0)
+  }
+
+  @Test
+  fun `gate_offlineMinimum_neverGates`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(200))
+    enqueue()
+    var reads = 0
+    val dispatcher = newDispatcher(
+      minNetworkQuality = NetworkQuality.OFFLINE,
+      quality = { reads++; NetworkQuality.OFFLINE },
+    )
+
+    val outcome = dispatcher.flushWithOutcome()
+
+    assertThat(outcome.result.successCount).isEqualTo(1.0)
+    assertThat(reads).isEqualTo(0)
+  }
+
+  @Test
+  fun `gate_belowMinimum_skipsCycle`() = runTest {
+    val id = enqueue()
+    val events = recordEvents()
+    val dispatcher = newDispatcher(
+      minNetworkQuality = NetworkQuality.GOOD,
+      quality = { NetworkQuality.MODERATE },
+    )
+
+    val outcome = dispatcher.flushWithOutcome()
+
+    assertThat(outcome).isEqualTo(FlushOutcome.Skipped(FlushSkip.NETWORK_QUALITY_TOO_LOW))
+    assertThat(outcome.isHeldByQualityGate).isTrue()
+    // The no-cycle result, the shape a paused flush resolves with.
+    assertThat(outcome.result).isEqualTo(SyncDispatcher.emptyResult())
+    assertThat(events.types()).containsExactly(SyncEventType.SYNC_FAILED)
+    assertThat(events.single().errorCode).isEqualTo(SyncErrorCode.NETWORK_QUALITY_TOO_LOW)
+    assertThat(server.requestCount).isEqualTo(0)
+    assertThat(storage.getLastResult()).isNull()
+    val untouched = row(id)
+    assertThat(untouched.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(untouched.attempts).isEqualTo(0)
+    assertThat(untouched.nextRetryAt).isEqualTo(0L)
+    assertThat(untouched.lastErrorCode).isNull()
+    assertThat(finishedCycles).isEmpty()
+    assertThat(dispatcher.flush()).isEqualTo(SyncDispatcher.emptyResult())
+  }
+
+  @Test
+  fun `the gate lets a link at or above the minimum through`() = runTest {
+    repeat(2) { server.enqueue(MockResponse().setResponseCode(200)) }
+    enqueue()
+    var quality = NetworkQuality.GOOD
+    val dispatcher = newDispatcher(minNetworkQuality = NetworkQuality.GOOD, quality = { quality })
+
+    assertThat(dispatcher.flushWithOutcome()).isInstanceOf(FlushOutcome.Ran::class.java)
+
+    enqueue()
+    quality = NetworkQuality.EXCELLENT
+    assertThat(dispatcher.flushWithOutcome()).isInstanceOf(FlushOutcome.Ran::class.java)
+    assertThat(server.requestCount).isEqualTo(2)
+  }
+
+  @Test
+  fun `POOR, the most permissive minimum, blocks only OFFLINE`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(200))
+    enqueue()
+    var quality = NetworkQuality.OFFLINE
+    val dispatcher = newDispatcher(minNetworkQuality = NetworkQuality.POOR, quality = { quality })
+
+    assertThat(dispatcher.flushWithOutcome().isHeldByQualityGate).isTrue()
+
+    quality = NetworkQuality.POOR
+    assertThat(dispatcher.flushWithOutcome()).isInstanceOf(FlushOutcome.Ran::class.java)
+    assertThat(server.requestCount).isEqualTo(1)
+  }
+
+  @Test
+  fun `the gate runs after the paused and the credential checks`() = runTest {
+    enqueue()
+    val events = recordEvents()
+    var reads = 0
+    val gated = { reads++; NetworkQuality.POOR }
+
+    val paused = newDispatcher(
+      isPaused = { true },
+      minNetworkQuality = NetworkQuality.GOOD,
+      quality = gated,
+    ).flushWithOutcome()
+    val noCredentials = newDispatcher(
+      credentials = { CredentialPolicy.UNAVAILABLE },
+      minNetworkQuality = NetworkQuality.GOOD,
+      quality = gated,
+    ).flushWithOutcome()
+
+    assertThat(paused).isEqualTo(FlushOutcome.Skipped(FlushSkip.PAUSED))
+    assertThat(noCredentials).isEqualTo(FlushOutcome.Skipped(FlushSkip.CREDENTIALS_UNAVAILABLE))
+    assertThat(reads).isEqualTo(0)
+    assertThat(events).isEmpty()
+    assertThat(server.requestCount).isEqualTo(0)
   }
 }

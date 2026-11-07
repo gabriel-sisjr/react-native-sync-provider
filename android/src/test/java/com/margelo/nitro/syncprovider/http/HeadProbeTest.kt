@@ -85,15 +85,16 @@ internal class HeadProbeTest {
   }
 
   @Test
-  fun `the probe sends no header beyond what every request carries`() = runBlocking<Unit> {
+  fun `the probe sends only no-cache beyond what every request carries`() = runBlocking<Unit> {
     server.enqueue(MockResponse().setResponseCode(200))
 
     probe.answer(url())
 
     val request = checkNotNull(server.takeRequest(1, TimeUnit.SECONDS))
-    val transportHeaders = setOf("host", "connection", "accept-encoding", "user-agent")
+    val allowed = setOf("host", "connection", "accept-encoding", "user-agent", "cache-control")
     val sent = request.headers.names().map { it.lowercase() }
-    assertThat(transportHeaders).containsAtLeastElementsIn(sent)
+    assertThat(allowed).containsAtLeastElementsIn(sent)
+    assertThat(request.getHeader("Cache-Control")).isEqualTo("no-cache")
     assertThat(request.getHeader("Authorization")).isNull()
     assertThat(request.getHeader("Cookie")).isNull()
     assertThat(request.bodySize).isEqualTo(0L)
