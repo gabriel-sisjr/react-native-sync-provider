@@ -1323,6 +1323,121 @@ internal class SyncProviderRuntimeTest {
     assertThat(runtime.connectivityMonitor.currentState().networkQuality).isEqualTo(NetworkQuality.EXCELLENT)
   }
 
+  /* ------------------------------- health check ------------------------------- */
+
+  /** `/health` answers 200 while [healthy] holds, else 503; items always answer 200. */
+  private fun healthDispatcher(healthy: () -> Boolean): Dispatcher = object : Dispatcher() {
+    override fun dispatch(request: RecordedRequest): MockResponse = when {
+      request.path == "/health" -> MockResponse().setResponseCode(if (healthy()) 200 else 503)
+      else -> MockResponse().setResponseCode(200)
+    }
+  }
+
+  /** An IP literal, so a failed request has no other address to fall back to. */
+  private fun healthUrl(): String = server.url("/health").newBuilder().host("127.0.0.1").build().toString()
+
+  private val heads = java.util.concurrent.atomic.AtomicInteger(0)
+
+  private fun countingHeads(inner: Dispatcher): Dispatcher = object : Dispatcher() {
+    override fun dispatch(request: RecordedRequest): MockResponse {
+      if (request.method == "HEAD") heads.incrementAndGet()
+      return inner.dispatch(request)
+    }
+  }
+
+  @Test
+  fun `a kick the health check skips succeeds and comes back after the backoff`() = runBlocking<Unit> {
+    server.dispatcher = countingHeads(healthDispatcher { false })
+    goOnline()
+    runtime.backgroundSyncManager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+    runtime.configure(TestData.syncOptions(healthCheckUrl = healthUrl(), healthCheckBackoffMs = 120_000.0))
+    insert("due", attempts = 1, nextRetryAt = 1L)
+    restartProcess()
+    val startedAt = System.currentTimeMillis()
+
+    val (result, events) = withEvents { events ->
+      val result = runWorker()
+      awaitUntil { events.any { it.type == SyncEventType.SYNC_FAILED } }
+      result to events.toList()
+    }
+
+    assertThat(result).isEqualTo(ListenableWorker.Result.success())
+    assertThat(heads.get()).isEqualTo(1)
+    assertThat(row("due")!!.attempts).isEqualTo(1)
+    assertThat(events.map { it.type }).containsExactly(SyncEventType.SYNC_FAILED)
+    assertThat(events.single().errorCode).isEqualTo(SyncErrorCode.HEALTH_CHECK_FAILED)
+    assertThat(kickFiresAt()).isAtLeast(startedAt + 120_000L)
+  }
+
+  @Test
+  fun `health_success_and_configure_clearBackoff, the configureSync half`() = runBlocking<Unit> {
+    var healthy = false
+    server.dispatcher = countingHeads(healthDispatcher { healthy })
+    // Offline as far as the system knows: no quality measurement shares the endpoint, and a
+    // manual flush sends anyway.
+    goOffline()
+    val options = TestData.syncOptions(healthCheckUrl = healthUrl(), healthCheckBackoffMs = 120_000.0)
+    runtime.configure(options)
+    insert("due")
+
+    runtime.dispatcher.flush()
+    runtime.dispatcher.flush()
+    assertThat(heads.get()).isEqualTo(1)
+
+    healthy = true
+    runtime.configure(options)
+    runtime.dispatcher.flush()
+
+    assertThat(heads.get()).isEqualTo(2)
+    assertThat(row("due")).isNull()
+  }
+
+  @Test
+  fun `nothing is emitted or probed while a health-check backoff runs`() = runBlocking<Unit> {
+    server.dispatcher = countingHeads(healthDispatcher { false })
+    goOnline()
+    attachEngineAndRecover()
+    runtime.configure(TestData.syncOptions(healthCheckUrl = healthUrl(), healthCheckBackoffMs = 120_000.0))
+
+    val events = withEvents { events ->
+      insert("due", attempts = 1, nextRetryAt = 1L)
+      runtime.dispatcher.flush()
+      // Due rows and every arm path from here on: none may wake before the backoff ends.
+      runtime.armRetryWake()
+      runtime.resume()
+      delay(QUIET_MS * 2)
+      events.toList()
+    }
+
+    assertThat(events.filter { it.type == SyncEventType.SYNC_FAILED }).hasSize(1)
+    assertThat(row("due")!!.attempts).isEqualTo(1)
+  }
+
+  @Test
+  fun `health_qualitySample2xx_refreshesLastHealthy through the shared probe`() = runBlocking<Unit> {
+    server.dispatcher = countingHeads(healthDispatcher { true })
+    val wifi = manager().activeNetwork!!
+    shadowOf(manager()).setNetworkCapabilities(
+      wifi,
+      capabilities(
+        NetworkCapabilities.NET_CAPABILITY_INTERNET,
+        NetworkCapabilities.NET_CAPABILITY_VALIDATED,
+        NetworkCapabilities.NET_CAPABILITY_NOT_METERED,
+      ),
+    )
+    runtime.configure(TestData.syncOptions(healthCheckUrl = healthUrl()))
+    attachEngineAndRecover()
+    shadowOf(manager()).networkCallbacks.forEach { it.onAvailable(wifi) }
+    awaitUntil { runtime.connectivityMonitor.currentState().networkQuality == NetworkQuality.EXCELLENT }
+    val measured = heads.get()
+
+    insert("due")
+    runtime.dispatcher.flush()
+
+    assertThat(heads.get()).isEqualTo(measured)
+    assertThat(row("due")).isNull()
+  }
+
   /* ------------------------------- dead letters ------------------------------- */
 
   @Test

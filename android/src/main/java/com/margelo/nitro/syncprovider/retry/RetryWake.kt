@@ -32,6 +32,8 @@ import java.util.concurrent.atomic.AtomicLong
  * @param isQualityGateOpen whether the current network quality passes `minNetworkQuality`.
  * @param scheduleGatedKick arms the kick for the check after [armAfterGate], carrying the
  *   number of consecutive kicks the gate turned back.
+ * @param healthBackoffUntil the end of a running health-check backoff, or `0`: like the
+ *   credential hold, no wake on any path fires before it.
  */
 @Suppress("LongParameterList")
 internal class RetryWake(
@@ -45,6 +47,7 @@ internal class RetryWake(
   private val scheduleGatedKick: (delayMs: Long, gateStreak: Int) -> Unit = { delayMs, _ ->
     scheduleKick(delayMs)
   },
+  private val healthBackoffUntil: () -> Long = { 0L },
 ) {
 
   /**
@@ -96,7 +99,7 @@ internal class RetryWake(
         return@withLock
       }
       val deadline = storage.nextRetryDeadline() ?: return@withLock
-      val notBefore = maxOf(clock() + GateRecheck.delayMs(gateStreak), credentialHoldUntil.get())
+      val notBefore = maxOf(clock() + GateRecheck.delayMs(gateStreak), notBeforeAny())
       scheduleGatedKick(delayUntil(maxOf(deadline, notBefore)), gateStreak + 1)
     }
   }
@@ -116,7 +119,7 @@ internal class RetryWake(
         timer.cancel()
         return@withLock
       }
-      val holdUntil = credentialHoldUntil.get()
+      val holdUntil = notBeforeAny()
       timer.arm(delayUntil(maxOf(pendingDeadline, holdUntil)))
       storage.nextRetryDeadline()?.let { scheduleKick(delayUntil(maxOf(it, holdUntil))) }
     }
@@ -142,10 +145,13 @@ internal class RetryWake(
       timer.cancel()
       return
     }
-    val delayMs = delayUntil(maxOf(deadline, credentialHoldUntil.get()))
+    val delayMs = delayUntil(maxOf(deadline, notBeforeAny()))
     if (isEngineLive()) timer.arm(delayMs)
     scheduleKick(delayMs)
   }
+
+  /** No wake before the credential hold or the health-check backoff ends. */
+  private fun notBeforeAny(): Long = maxOf(credentialHoldUntil.get(), healthBackoffUntil())
 
   private fun delayUntil(deadline: Long): Long = (deadline - clock()).coerceAtLeast(0L)
 }

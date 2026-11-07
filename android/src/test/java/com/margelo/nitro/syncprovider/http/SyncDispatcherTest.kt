@@ -3,6 +3,7 @@ package com.margelo.nitro.syncprovider.http
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.google.common.truth.Truth.assertThat
+import com.google.common.truth.Truth.assertWithMessage
 import com.margelo.nitro.syncprovider.HttpMethod
 import com.margelo.nitro.syncprovider.NetworkQuality
 import com.margelo.nitro.syncprovider.SyncErrorCode
@@ -32,6 +33,7 @@ import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
+import okhttp3.mockwebserver.SocketPolicy
 import org.junit.After
 import org.junit.Assert.assertThrows
 import org.junit.Before
@@ -86,6 +88,11 @@ internal class SyncDispatcherTest {
     queue: SyncQueueStorage = storage,
     minNetworkQuality: NetworkQuality? = null,
     quality: () -> NetworkQuality = { NetworkQuality.GOOD },
+    healthCheckUrl: String? = null,
+    healthCheckTtlMs: Double? = null,
+    healthCheckBackoffMs: Double? = null,
+    healthCheck: HealthCheck = this.healthCheck,
+    defaultHeaders: Map<String, String>? = null,
   ): SyncDispatcher {
     val options = TestData.syncOptions(
       retryPolicy = TestData.retryPolicy(
@@ -97,6 +104,10 @@ internal class SyncDispatcherTest {
       requestTimeoutMs = requestTimeoutMs,
       batchSize = batchSize,
       minNetworkQuality = minNetworkQuality,
+      healthCheckUrl = healthCheckUrl,
+      healthCheckTtlMs = healthCheckTtlMs,
+      healthCheckBackoffMs = healthCheckBackoffMs,
+      defaultHeaders = defaultHeaders,
     )
     return SyncDispatcher(
       storage = queue,
@@ -106,9 +117,22 @@ internal class SyncDispatcherTest {
       isPaused = isPaused,
       credentialPolicy = credentials,
       networkQuality = quality,
+      healthCheck = healthCheck,
+      onHealthCheckSkipped = { healthSkips++ },
       onCycleFinished = onCycleFinished,
     )
   }
+
+  /** On the test clock, so the reuse window and the backoff move with it. */
+  private val healthCheck: HealthCheck by lazy { healthCheck() }
+  private var healthSkips = 0
+
+  private fun healthCheck(timeoutMs: Long = HealthCheck.TIMEOUT_MS): HealthCheck = HealthCheck(
+    probe = HeadProbe(lazyOf(HeadProbe.newClient())),
+    wallClock = clock::now,
+    monotonicClock = clock::now,
+    timeoutMs = timeoutMs,
+  )
 
   /** Answers [code] after moving the clock by [attemptMs], as a real request would. */
   private fun respondAfter(attemptMs: Long, code: Int): Dispatcher = object : Dispatcher() {
@@ -775,5 +799,191 @@ internal class SyncDispatcherTest {
     assertThat(reads).isEqualTo(0)
     assertThat(events).isEmpty()
     assertThat(server.requestCount).isEqualTo(0)
+  }
+
+  /* ------------------------------- health check ------------------------------- */
+
+  /** `/health` answers [health]; every other path, an item, answers 200. */
+  private fun healthServer(health: () -> MockResponse) {
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest): MockResponse =
+        if (request.path == "/health") health() else MockResponse().setResponseCode(200)
+    }
+  }
+
+  private var taken = 0
+
+  /** The requests the server received since the last call. */
+  private fun recorded(): List<RecordedRequest> {
+    val received = server.requestCount
+    return List(received - taken) { checkNotNull(server.takeRequest(1, TimeUnit.SECONDS)) }
+      .also { taken = received }
+  }
+
+  private val healthUrl: String get() = server.url("/health").toString()
+
+  @Test
+  fun `health_unset_neverProbes`() = runTest {
+    healthServer { MockResponse().setResponseCode(200) }
+    enqueue()
+
+    newDispatcher().flush()
+
+    assertThat(recorded().map { it.method }).containsExactly("POST")
+  }
+
+  @Test
+  fun `health_2xx_proceeds_andIsCachedForTtl`() = runTest {
+    healthServer { MockResponse().setResponseCode(204) }
+    val dispatcher = newDispatcher(healthCheckUrl = healthUrl, healthCheckTtlMs = 60_000.0)
+
+    enqueue()
+    assertThat(dispatcher.flushWithOutcome()).isInstanceOf(FlushOutcome.Ran::class.java)
+    enqueue()
+    clock.advance(59_999L)
+    dispatcher.flush()
+    assertThat(recorded().map { it.method }).containsExactly("HEAD", "POST", "POST").inOrder()
+
+    enqueue()
+    clock.advance(1L)
+    dispatcher.flush()
+    assertThat(recorded().map { it.method }).containsExactly("HEAD", "POST").inOrder()
+  }
+
+  @Test
+  fun `a healthCheckTtlMs of 0 checks before every cycle`() = runTest {
+    healthServer { MockResponse().setResponseCode(200) }
+    val dispatcher = newDispatcher(healthCheckUrl = healthUrl, healthCheckTtlMs = 0.0)
+
+    repeat(2) {
+      enqueue()
+      dispatcher.flush()
+    }
+
+    assertThat(recorded().map { it.method }).containsExactly("HEAD", "POST", "HEAD", "POST").inOrder()
+  }
+
+  @Test
+  fun `health_failure_skipsCycle_andStartsBackoff, for 404, 500 and a timeout`() = runTest {
+    val failures = listOf(
+      "404" to { MockResponse().setResponseCode(404) },
+      "500" to { MockResponse().setResponseCode(500) },
+      "timeout" to { MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE) },
+    )
+    for ((name, failure) in failures) {
+      healthServer(failure)
+      val id = enqueue()
+      val events = recordEvents()
+      healthSkips = 0
+      val dispatcher = newDispatcher(
+        healthCheckUrl = healthUrl,
+        healthCheckBackoffMs = 30_000.0,
+        healthCheck = healthCheck(timeoutMs = 300L),
+      )
+
+      val failed = dispatcher.flushWithOutcome()
+      clock.advance(29_999L)
+      val backingOff = dispatcher.flushWithOutcome()
+
+      assertWithMessage(name).that(failed).isEqualTo(FlushOutcome.Skipped(FlushSkip.HEALTH_CHECK_FAILED))
+      assertWithMessage(name).that(backingOff)
+        .isEqualTo(FlushOutcome.Skipped(FlushSkip.HEALTH_CHECK_BACKOFF))
+      assertWithMessage(name).that(failed.result).isEqualTo(SyncDispatcher.emptyResult())
+      // One HEAD: none is sent during the backoff.
+      assertWithMessage(name).that(recorded().map { it.method }).containsExactly("HEAD")
+      assertWithMessage(name).that(events.types())
+        .containsExactly(SyncEventType.SYNC_FAILED, SyncEventType.SYNC_FAILED)
+      assertWithMessage(name).that(events.map { it.errorCode }.distinct())
+        .containsExactly(SyncErrorCode.HEALTH_CHECK_FAILED)
+      assertWithMessage(name).that(healthSkips).isEqualTo(2)
+      assertWithMessage(name).that(storage.getLastResult()).isNull()
+      assertWithMessage(name).that(row(id).attempts).isEqualTo(0)
+      assertWithMessage(name).that(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+
+      // The backoff over, the next flush checks again.
+      clock.advance(1L)
+      dispatcher.flushWithOutcome()
+      assertWithMessage(name).that(recorded().map { it.method }).containsExactly("HEAD")
+      storage.clear()
+    }
+  }
+
+  @Test
+  fun `health_success_and_configure_clearBackoff, the success half`() = runTest {
+    var healthy = false
+    healthServer { MockResponse().setResponseCode(if (healthy) 200 else 503) }
+    enqueue()
+    val dispatcher = newDispatcher(healthCheckUrl = healthUrl, healthCheckBackoffMs = 30_000.0)
+
+    dispatcher.flush()
+    assertThat(healthCheck.backoffUntil()).isEqualTo(clock.now() + 30_000L)
+
+    healthy = true
+    clock.advance(30_000L)
+    val outcome = dispatcher.flushWithOutcome()
+
+    assertThat(outcome).isInstanceOf(FlushOutcome.Ran::class.java)
+    assertThat(healthCheck.backoffUntil()).isEqualTo(0L)
+  }
+
+  @Test
+  fun `a redirect to a 2xx is healthy`() = runTest {
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+        "/health" -> MockResponse().setResponseCode(302).setHeader("Location", "/ok")
+        else -> MockResponse().setResponseCode(200)
+      }
+    }
+    enqueue()
+
+    val outcome = newDispatcher(healthCheckUrl = healthUrl).flushWithOutcome()
+
+    assertThat(outcome).isInstanceOf(FlushOutcome.Ran::class.java)
+  }
+
+  @Test
+  fun `health_qualitySample2xx_refreshesLastHealthy, so no extra HEAD is sent`() = runTest {
+    healthServer { MockResponse().setResponseCode(200) }
+    enqueue()
+    // What the network-quality probe reports after a 2xx sample.
+    healthCheck.recordHealthy(healthUrl)
+
+    newDispatcher(healthCheckUrl = healthUrl).flush()
+
+    assertThat(recorded().map { it.method }).containsExactly("POST")
+  }
+
+  @Test
+  fun `health_noAuthHeaders_and_noCache`() = runTest {
+    healthServer { MockResponse().setResponseCode(200) }
+    enqueue()
+
+    newDispatcher(
+      healthCheckUrl = healthUrl,
+      defaultHeaders = mapOf("Authorization" to "Bearer live"),
+    ).flush()
+
+    val (head, post) = recorded()
+    assertThat(head.method).isEqualTo("HEAD")
+    assertThat(head.getHeader("Authorization")).isNull()
+    assertThat(head.getHeader("Cache-Control")).isEqualTo("no-cache")
+    assertThat(head.getHeader("X-Test")).isNull()
+    assertThat(post.getHeader("Authorization")).isEqualTo("Bearer live")
+  }
+
+  @Test
+  fun `the quality gate runs before the health check`() = runTest {
+    healthServer { MockResponse().setResponseCode(200) }
+    enqueue()
+
+    val outcome = newDispatcher(
+      minNetworkQuality = NetworkQuality.GOOD,
+      quality = { NetworkQuality.POOR },
+      healthCheckUrl = healthUrl,
+    ).flushWithOutcome()
+
+    assertThat(outcome).isEqualTo(FlushOutcome.Skipped(FlushSkip.NETWORK_QUALITY_TOO_LOW))
+    assertThat(server.requestCount).isEqualTo(0)
+    assertThat(healthSkips).isEqualTo(0)
   }
 }

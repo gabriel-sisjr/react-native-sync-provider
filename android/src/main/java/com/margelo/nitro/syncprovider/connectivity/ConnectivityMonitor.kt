@@ -58,6 +58,8 @@ import kotlinx.coroutines.launch
  * @param clock monotonic millis, for the reuse window.
  * @param onDefaultNetworkChanged called when another network becomes the default, or the
  *   default one is lost.
+ * @param onHealthySample called with the URL when a kept measurement had a `2xx` answer, which
+ *   counts as a passed health check.
  */
 internal class ConnectivityMonitor(
   context: Context,
@@ -68,6 +70,7 @@ internal class ConnectivityMonitor(
   private val clock: () -> Long = SystemClock::elapsedRealtime,
   private val probeDebounceMs: Long = PROBE_DEBOUNCE_MS,
   private val onDefaultNetworkChanged: () -> Unit = {},
+  private val onHealthySample: (url: String) -> Unit = {},
 ) {
 
   private val appContext = context.applicationContext
@@ -290,10 +293,14 @@ internal class ConnectivityMonitor(
     try {
       delay(probeDebounceMs)
       // A cancelled probe throws here: its samples never reach the classifier.
-      val samples = LatencyProbe.latencies(measure(key.url))
+      val results = measure(key.url)
+      val samples = LatencyProbe.latencies(results)
       synchronized(probeLock) {
         if (probe?.key != key) return
         measurement = Measurement(key, samples, clock())
+      }
+      if (results.any { it is HeadResult.Response && it.statusCode in HEALTHY_STATUSES }) {
+        onHealthySample(key.url)
       }
       republish()
     } finally {
@@ -364,6 +371,8 @@ internal class ConnectivityMonitor(
 
     /** Collapses the callbacks of one network change into one probe. */
     const val PROBE_DEBOUNCE_MS: Long = 1_000L
+
+    private val HEALTHY_STATUSES = 200..299
 
     private fun unknownState() = ConnectionState(
       status = ConnectionStatus.UNKNOWN,

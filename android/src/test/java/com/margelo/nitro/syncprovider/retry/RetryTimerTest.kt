@@ -388,6 +388,27 @@ internal class RetryTimerTest {
   }
 
   @Test
+  fun `a health-check backoff holds a wake silently until it ends, outside the quality backoff`() =
+    runTest {
+      hold = WakeHold.Health(remainingMs = 45_000L)
+      val timer = gatedTimer()
+      timer.arm(0L)
+      runCurrent()
+
+      advance(44_999L)
+      assertThat(flushes).isEqualTo(0)
+      // The backoff ends while the quality gate is closed: the quality backoff starts at 30 s.
+      hold = WakeHold.Quality
+      advance(1L)
+      val before = holdChecks
+      advance(GateRecheck.FIRST_DELAY_MS - 1L)
+      assertThat(holdChecks).isEqualTo(before)
+      advance(1L)
+      assertThat(holdChecks).isGreaterThan(before)
+      assertThat(flushes).isEqualTo(0)
+    }
+
+  @Test
   fun `cancel forgets a held wake`() = runTest {
     hold = WakeHold.Quality
     val timer = gatedTimer()

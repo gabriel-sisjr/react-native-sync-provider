@@ -145,6 +145,31 @@ internal class SyncConfigStoreTest {
   }
 
   @Test
+  fun `damaged health-check values load as unset and keep the rest of the record`() {
+    val damaged = listOf(
+      Triple("healthCheckUrl", "not a url", null),
+      Triple("healthCheckTtlMs", null, -1.0),
+      Triple("healthCheckBackoffMs", null, Double.NaN),
+      Triple("healthCheckTtlMs", null, Double.POSITIVE_INFINITY),
+    )
+    for ((key, text, number) in damaged) {
+      store.save(fullOptions())
+      prefs().edit().apply {
+        if (number != null) putLong(key, number.toRawBits()) else putString(key, text)
+      }.commit()
+
+      val options = store.load()!!.options
+
+      val expected = when (key) {
+        "healthCheckUrl" -> fullOptions().copy(healthCheckUrl = null)
+        "healthCheckTtlMs" -> fullOptions().copy(healthCheckTtlMs = null)
+        else -> fullOptions().copy(healthCheckBackoffMs = null)
+      }
+      assertThat(options).isEqualTo(expected)
+    }
+  }
+
+  @Test
   fun `an unreadable minNetworkQuality is left unset and keeps the rest of the record`() {
     store.save(fullOptions())
     prefs().edit().putString("minNetworkQuality", "SUPERB").commit()

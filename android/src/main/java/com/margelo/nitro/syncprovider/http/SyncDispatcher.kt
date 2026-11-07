@@ -65,6 +65,9 @@ import kotlin.random.Random
  * @param credentialPolicy read once per cycle. See [CredentialPolicy].
  * @param networkQuality the classification the `minNetworkQuality` gate compares. Read only
  *   while a gate is configured.
+ * @param healthCheck run before the claim while `healthCheckUrl` is set.
+ * @param onHealthCheckSkipped called after every cycle the health check skipped, to arm the
+ *   next wake no earlier than its backoff.
  * @param onCycleFinished called after every cycle. Its argument, when present, is
  *   the earliest instant the next wake may fire. Failures are logged and never
  *   reject a cycle that already completed.
@@ -79,6 +82,8 @@ internal class SyncDispatcher(
   private val isPaused: () -> Boolean = { false },
   private val credentialPolicy: () -> CredentialPolicy = { CredentialPolicy.TRUSTED },
   private val networkQuality: () -> NetworkQuality = { NetworkQuality.GOOD },
+  private val healthCheck: HealthCheck = HealthCheck(HeadProbe()),
+  private val onHealthCheckSkipped: suspend () -> Unit = {},
   private val onCycleFinished: suspend (notBefore: Long?) -> Unit = {},
 ) {
   private val flushMutex = Mutex()
@@ -110,8 +115,11 @@ internal class SyncDispatcher(
    * 1. paused;
    * 2. default headers that cannot be recovered;
    * 3. the network-quality gate: with `minNetworkQuality` set to more than `OFFLINE` and
-   *    [networkQuality] below it, `SYNC_FAILED` is emitted with `NETWORK_QUALITY_TOO_LOW`.
-   *    No history row is written and no item changes.
+   *    [networkQuality] below it, `SYNC_FAILED` is emitted with `NETWORK_QUALITY_TOO_LOW`;
+   * 4. the health check, while `healthCheckUrl` is set: one `HEAD` unless a `2xx` answer is
+   *    younger than `healthCheckTtlMs`. A failure, and every flush during the backoff that
+   *    follows it, emits `SYNC_FAILED` with `HEALTH_CHECK_FAILED`.
+   * No history row is written and no item changes.
    */
   suspend fun flushWithOutcome(): FlushOutcome = flushMutex.withLock {
     if (isPaused()) return@withLock FlushOutcome.Skipped(FlushSkip.PAUSED)
@@ -130,6 +138,7 @@ internal class SyncDispatcher(
       )
       return@withLock FlushOutcome.Skipped(FlushSkip.NETWORK_QUALITY_TOO_LOW)
     }
+    healthCheckSkip(options)?.let { return@withLock FlushOutcome.Skipped(it) }
     FlushOutcome.Ran(runCycle(options, credentials))
   }
 
@@ -141,6 +150,30 @@ internal class SyncDispatcher(
   suspend fun resetInFlight(): Int = flushMutex.withLock { storage.resetInFlight() }
 
   /* ------------------------------ internals ----------------------------- */
+
+  /** Null when the cycle may run. Otherwise the event is emitted and the next wake armed. */
+  private suspend fun healthCheckSkip(options: SyncOptions): FlushSkip? {
+    val url = options.healthCheckUrl ?: return null
+    val verdict = healthCheck.check(
+      url = url,
+      ttlMs = options.healthCheckTtlMs?.toLong() ?: HealthCheck.DEFAULT_TTL_MS,
+      backoffMs = options.healthCheckBackoffMs?.toLong() ?: HealthCheck.DEFAULT_BACKOFF_MS,
+    )
+    val skip = when (verdict) {
+      HealthCheck.Verdict.Healthy -> return null
+      is HealthCheck.Verdict.Failed -> FlushSkip.HEALTH_CHECK_FAILED
+      is HealthCheck.Verdict.BackingOff -> FlushSkip.HEALTH_CHECK_BACKOFF
+    }
+    emitter.emit(
+      SyncEventEmitter.event(
+        type = SyncEventType.SYNC_FAILED,
+        errorCode = SyncErrorCode.HEALTH_CHECK_FAILED,
+      ),
+    )
+    runCatching { onHealthCheckSkipped() }
+      .onFailure { Log.w(TAG, "Could not arm the wake after the health check", it) }
+    return skip
+  }
 
   /** Reads [networkQuality] only while a gate is configured: unset and `OFFLINE` gate nothing. */
   private fun isBelowMinimumQuality(options: SyncOptions): Boolean {

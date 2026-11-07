@@ -16,6 +16,7 @@ import com.margelo.nitro.syncprovider.error.SyncException
 import com.margelo.nitro.syncprovider.events.SyncEventEmitter
 import com.margelo.nitro.syncprovider.http.CredentialPolicy
 import com.margelo.nitro.syncprovider.http.HeadProbe
+import com.margelo.nitro.syncprovider.http.HealthCheck
 import com.margelo.nitro.syncprovider.http.SyncDispatcher
 import com.margelo.nitro.syncprovider.retry.RetryTimer
 import com.margelo.nitro.syncprovider.retry.RetryWake
@@ -76,6 +77,9 @@ internal class SyncProviderRuntime private constructor(
   /** The one `HEAD` probe the latency measurement and the health check share, connections too. */
   val headProbe: HeadProbe = HeadProbe()
 
+  /** Shared with the quality measurement, whose `2xx` answers count as passed checks. */
+  val healthCheck: HealthCheck = HealthCheck(headProbe)
+
   val connectivityMonitor: ConnectivityMonitor = ConnectivityMonitor(
     context = appContext,
     emitter = emitter,
@@ -83,6 +87,7 @@ internal class SyncProviderRuntime private constructor(
     healthCheckUrl = { currentOptions().healthCheckUrl },
     measure = LatencyProbe(headProbe)::measure,
     onDefaultNetworkChanged = { retryTimer.resetGateBackoff() },
+    onHealthySample = { url -> healthCheck.recordHealthy(url) },
   )
 
   private val configStore = SyncConfigStore(appContext, secretStore)
@@ -115,6 +120,8 @@ internal class SyncProviderRuntime private constructor(
     isPaused = { pausedFlag.get() },
     credentialPolicy = { credentialPolicy() },
     networkQuality = { connectivityMonitor.qualityForGate() },
+    healthCheck = healthCheck,
+    onHealthCheckSkipped = { retryWake.arm() },
     onCycleFinished = { notBefore -> retryWake.arm(notBefore) },
   )
 
@@ -135,6 +142,7 @@ internal class SyncProviderRuntime private constructor(
     scheduleGatedKick = { delayMs, gateStreak ->
       backgroundSyncManager.scheduleOneTimeFlush(initialDelayMs = delayMs, gateStreak = gateStreak)
     },
+    healthBackoffUntil = { healthCheck.backoffUntil() },
   )
 
   init {
@@ -183,6 +191,7 @@ internal class SyncProviderRuntime private constructor(
       }
     }
     connectivityMonitor.onConfigurationChanged()
+    healthCheck.clearBackoff()
     if (options.strategy == SyncStrategy.MANUAL) backgroundSyncManager.cancelRetryKick()
     retryWake.arm()
   }
@@ -293,12 +302,16 @@ internal class SyncProviderRuntime private constructor(
   }
 
   /**
-   * The gate check a timer wake runs before dispatching, silently: a reading of the quality
-   * that also starts a new measurement when the last one is 30 s old.
+   * The checks a timer wake runs before dispatching, silently and in the dispatcher's order:
+   * the quality gate, whose reading also starts a new measurement when the last one is 30 s
+   * old, then a running health-check backoff.
    */
   private fun wakeHold(): WakeHold? {
     val minimum = currentOptions().minNetworkQuality
-    return if (connectivityMonitor.qualityForGate().meetsMinimum(minimum)) null else WakeHold.Quality
+    if (!connectivityMonitor.qualityForGate().meetsMinimum(minimum)) return WakeHold.Quality
+    val backoffUntil = healthCheck.backoffUntil()
+    if (backoffUntil > 0L) return WakeHold.Health(backoffUntil - System.currentTimeMillis())
+    return null
   }
 
   private fun isQualityGateOpen(): Boolean {

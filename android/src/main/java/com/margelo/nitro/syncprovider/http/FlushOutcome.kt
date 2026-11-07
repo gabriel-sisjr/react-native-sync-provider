@@ -25,4 +25,10 @@ internal enum class FlushSkip {
   PAUSED,
   CREDENTIALS_UNAVAILABLE,
   NETWORK_QUALITY_TOO_LOW,
+
+  /** The health check's `HEAD` failed now. */
+  HEALTH_CHECK_FAILED,
+
+  /** Inside the backoff after a failed health check: nothing was sent. */
+  HEALTH_CHECK_BACKOFF,
 }

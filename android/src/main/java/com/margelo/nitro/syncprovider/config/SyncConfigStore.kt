@@ -9,6 +9,7 @@ import com.margelo.nitro.syncprovider.RetryPolicy
 import com.margelo.nitro.syncprovider.SyncOptions
 import com.margelo.nitro.syncprovider.SyncStrategy
 import com.margelo.nitro.syncprovider.util.JsonMap
+import com.margelo.nitro.syncprovider.util.UrlValidator
 
 /** Where the active configuration came from. */
 internal enum class ConfigSource {
@@ -141,9 +142,9 @@ internal class SyncConfigStore(
         persistQueue = if (prefs.contains(KEY_PERSIST_QUEUE)) prefs.getBoolean(KEY_PERSIST_QUEUE, false) else null,
         defaultHeaders = null,
         minNetworkQuality = readNetworkQuality(),
-        healthCheckUrl = prefs.getString(KEY_HEALTH_CHECK_URL, null),
-        healthCheckTtlMs = readOptionalDouble(KEY_HEALTH_CHECK_TTL_MS),
-        healthCheckBackoffMs = readOptionalDouble(KEY_HEALTH_CHECK_BACKOFF_MS),
+        healthCheckUrl = readHealthCheckUrl(),
+        healthCheckTtlMs = readOptionalMs(KEY_HEALTH_CHECK_TTL_MS),
+        healthCheckBackoffMs = readOptionalMs(KEY_HEALTH_CHECK_BACKOFF_MS),
       )
     }.onFailure {
       Log.w(TAG, "Persisted configuration is unreadable; using defaults: ${it.javaClass.simpleName}")
@@ -167,6 +168,25 @@ internal class SyncConfigStore(
     val quality = NetworkQuality.entries.firstOrNull { it.name == name }
     if (quality == null) Log.w(TAG, "Persisted minNetworkQuality is unreadable; leaving it unset.")
     return quality
+  }
+
+  /**
+   * `configureSync` rejects a URL the probe cannot use, so only a damaged record holds one: it
+   * loads as unset, which means no health check, instead of a check that always fails.
+   */
+  private fun readHealthCheckUrl(): String? {
+    val url = prefs.getString(KEY_HEALTH_CHECK_URL, null) ?: return null
+    if (UrlValidator.isValid(url)) return url
+    Log.w(TAG, "Persisted healthCheckUrl is unusable; leaving it unset.")
+    return null
+  }
+
+  /** As for the URL: a negative or non-finite duration only a damaged record holds loads as unset. */
+  private fun readOptionalMs(key: String): Double? {
+    val value = readOptionalDouble(key) ?: return null
+    if (value.isFinite() && value >= 0.0) return value
+    Log.w(TAG, "Persisted $key is unusable; leaving it unset.")
+    return null
   }
 
   private fun readDouble(key: String): Double =

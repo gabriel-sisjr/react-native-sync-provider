@@ -61,6 +61,9 @@ internal class ConnectivityMonitorQualityTest {
     context = ApplicationProvider.getApplicationContext()
   }
 
+  /** The URL of every passed health check a measurement reported, in order. */
+  private val healthy = Collections.synchronizedList(mutableListOf<String>())
+
   private fun TestScope.monitor(
     started: Boolean = true,
     onDefaultNetworkChanged: () -> Unit = {},
@@ -77,6 +80,7 @@ internal class ConnectivityMonitorQualityTest {
     clock = { testScheduler.currentTime },
     probeDebounceMs = DEBOUNCE_MS,
     onDefaultNetworkChanged = onDefaultNetworkChanged,
+    onHealthySample = { healthy += it },
   ).also { if (started) it.start() }
 
   private fun manager(): ConnectivityManager = context.getSystemService(ConnectivityManager::class.java)
@@ -348,6 +352,22 @@ internal class ConnectivityMonitorQualityTest {
 
     assertThat(probed).hasSize(1)
   }
+
+  @Test
+  fun `health_qualitySample2xx_refreshesLastHealthy, any 2xx sample of a kept measurement counts`() =
+    runTest {
+      monitor()
+      answers = listOf(failure(), HeadResult.Response(204, 80), HeadResult.Response(503, 90))
+      callback().onAvailable(wifi())
+      settle()
+      assertThat(healthy).containsExactly(URL_A)
+
+      // Answers, but none 2xx: a latency sample, not a passed check.
+      answers = List(3) { HeadResult.Response(404, 60) }
+      callback().onAvailable(cellular())
+      settle()
+      assertThat(healthy).containsExactly(URL_A)
+    }
 
   /* ------------------------------ cancellation ------------------------------ */
 
