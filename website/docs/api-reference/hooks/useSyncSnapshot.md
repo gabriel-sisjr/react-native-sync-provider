@@ -44,9 +44,9 @@ Takes no parameters and always returns the full snapshot object. Consumers that 
 | `size` | `number` | `PENDING` items, cooling ones included, mirroring [`getQueueSize`](../functions.md#getqueuesize). |
 | `items` | [`SyncItem[]`](../types.md#syncitem) | Pending items snapshot, mirroring [`getPendingItems`](../functions.md#getpendingitems). |
 | `isSyncing` | `boolean` | `true` while a flush cycle is currently in progress. |
-| `isPaused` | `boolean` | `true` after a `PAUSED` event, until `RESUMED`. It starts `false` and cannot read a pause already in force. |
+| `isPaused` | `boolean` | `true` after a `PAUSED` event, until `RESUMED`. Starts `false` and follows those events only, because JS cannot read the pause flag: a hook mounted while an earlier `pauseSync()` in the same JS session is still in force reads `false` until the next `PAUSED`. A launch or JS reload clears the pause before JS can observe it, without a `RESUMED`, so `false` is accurate in a fresh session. |
 | `progress` | `number \| null` | Current flush progress in `[0, 1]`, or `null` when idle. `SYNC_PROGRESS` is iOS-only, so on Android it stays `0` during a cycle. |
-| `lastResult` | [`SyncResult`](../types.md#syncresult) `\| null` | Most recent persisted flush outcome, or `null` if none exists. |
+| `lastResult` | [`SyncResult`](../types.md#syncresult) `\| null` | Most recent flush outcome in the persisted sync history, so it survives restarts and can come from an earlier session. Read with [`getLastSyncResult`](../functions.md#getlastsyncresult) on mount and after every `SYNC_SUCCEEDED` / `SYNC_FAILED`. `null` until a read finds a recorded flush, and not reset by `clearSyncHistory()`. A `flush()` that ran no cycle, while paused for example, writes no history row and does not change it. |
 | `isWaitingForConnection` | `boolean` | `size > 0 && !connection.isOnline`. The "Waiting for connection..." sentinel. |
 | `error` | [`SyncError`](../errors.md) `\| null` | Last error captured by the hook, or `null` once cleared. |
 

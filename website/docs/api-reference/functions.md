@@ -144,7 +144,7 @@ const ids = await enqueueBatch([
 
 ### `removeItem`
 
-Remove a single item by id, in any status. This is the way to delete one item that failed permanently: take its id from an `ITEM_FAILED` event.
+Remove a single item by id, in any status: pending (including items waiting out a cooldown), in flight, or failed permanently. This is the way to delete one item that failed permanently: [`getPendingItems`](#getpendingitems) does not return failed items, so take its id from an `ITEM_FAILED` event.
 
 #### Signature
 
@@ -160,17 +160,21 @@ function removeItem(id: string): Promise<boolean>;
 
 #### Returns
 
-`Promise<boolean>` -- `true` if the row existed and was removed, `false` if the id is unknown or the item was already delivered.
+`Promise<boolean>` -- `true` if a row with that id existed and was removed, `false` if none exists: the item was already delivered, already removed or cleared, or never enqueued.
 
 #### Throws
 
 `NATIVE_MODULE_UNAVAILABLE`.
 
+:::warning Removal does not cancel a request
+An item that a running cycle has already taken into its batch can still be sent and reach the server. Its outcome event (`ITEM_SUCCEEDED`, `ITEM_RETRYING` or `ITEM_FAILED`) is still emitted, but nothing is written back to the queue. `ITEM_REMOVED` is emitted only when a row was removed.
+:::
+
 #### Example
 
 ```ts
 const ok = await removeItem('01HZX9V4MAYQ2XJ7C2K6Z1Q3D8');
-if (!ok) console.warn('item already drained');
+if (!ok) console.warn('already delivered or unknown id');
 ```
 
 ---
@@ -295,7 +299,7 @@ A successful `Promise` resolution does **not** mean every item synced. Inspect `
 - **Nothing eligible.** With an empty queue, or every item cooling, the cycle resolves with a 0/0 result, emits `SYNC_SUCCEEDED`, and adds a row to the sync history.
 - **Connectivity is not checked.** Calling `flush()` offline can spend retry attempts and mark valid items `FAILED`. On iOS the foreground session waits for connectivity, so the call may stay pending until the network returns instead. Check [`getConnectionStatus`](#getconnectionstatus) first, or use [`drainUntilEmpty`](#drainuntilempty), which does not flush while `DISCONNECTED`.
 - **While a cycle is running.** iOS returns the last result at once. Android waits, then runs its own cycle.
-- **Paused, or stored headers unreadable.** No cycle runs and nothing is dispatched. Counts are 0/0 on both platforms, but the timestamps differ: Android returns `0` for `startedAt` and `finishedAt`, iOS returns real timestamps.
+- **Paused, or stored headers unreadable.** No cycle runs: nothing is dispatched, no event is emitted and no history row is written. The counts are 0/0 on both platforms and do not say why. Android returns `0` for `startedAt` and `finishedAt`, the zeroed shape that [`getLastSyncResult`](#getlastsyncresult) reports as `undefined`; `flush()` returns it as is. iOS sets both to the time of the call, so the result looks like an empty cycle's: only the missing `SYNC_STARTED` event and history row tell them apart.
 
 #### Example
 
@@ -397,9 +401,9 @@ useEffect(() => {
 
 ### `pauseSync`
 
-Pause the engine without dropping the queue. `enqueue` keeps accepting items, but no cycle runs: `flush()` dispatches nothing, the retry timer is cancelled, and the Android retry kick is cancelled.
+Pause the engine without dropping the queue. `enqueue` keeps accepting items, but no cycle runs: `flush()` resolves with a 0/0 result and emits no event (see [`flush`](#flush) for the timestamps each platform returns), the retry timer is cancelled, and the Android retry kick is cancelled.
 
-The pause is persisted, so workers and BGTasks stay inert while the app is dead. It lasts until `resumeSync()` or the next launch that reaches the library, including a JS reload. A launch clears it without emitting `RESUMED`, and hooks start with `isPaused: false`. On iOS, React Native can start during a background launch, and if JS reaches the library there, that counts as a launch. To keep a pause across launches, call `pauseSync()` again at startup.
+The pause is persisted, so workers and BGTasks stay inert while the app is dead. It lasts until `resumeSync()` or the next launch that reaches the library, including a JS reload. A launch clears it without emitting `RESUMED`, so `isPaused: false` in a fresh session is correct. JS cannot read the pause flag, though: a hook mounted while an earlier `pauseSync()` is still in force reads `false` too, until the next `PAUSED`. On iOS, React Native can start during a background launch, and if JS reaches the library there, that counts as a launch. To keep a pause across launches, call `pauseSync()` again at startup.
 
 #### Signature
 
@@ -417,7 +421,7 @@ function pauseSync(): Promise<void>;
 
 Resume a paused engine and emit `RESUMED`. Unless the strategy is `MANUAL`, the retry timer is armed for the soonest pending item: items with no cooldown left are dispatched right away, and cooling items when their cooldown ends. If the device is offline at that moment, the flush waits until connectivity returns.
 
-During a [credential hold](../guides/background-sync.md#cold-start-configuration), iOS waits for the hold to end before dispatching. Android does not wait for it.
+During a [credential hold](../guides/background-sync.md#when-a-stored-token-expires), it waits for the hold to end before dispatching, on both platforms. The hold lives in memory, so a process restart drops it.
 
 #### Signature
 
@@ -509,9 +513,23 @@ function getSyncConfig(): Promise<SyncOptions>;
 
 `Promise<SyncOptions>` -- the active config: the defaults until `configureSync` first runs, then the last options applied, restored from disk in a new process. After a `configureSync` that omitted optional fields, iOS returns them filled with their defaults, including `defaultHeaders: {}`. Android returns them as `undefined`.
 
-:::warning Do not re-apply a config read while headers are unreadable
-While stored `defaultHeaders` cannot be read, `getSyncConfig()` returns none. Passing that value back to `configureSync` then deletes them, which acts as a logout. See [Troubleshooting](../troubleshooting.md#symptom-items-stay-pending-and-flush-returns-00).
+#### Throws
+
+`NATIVE_MODULE_UNAVAILABLE`.
+
+:::warning Do not pass the result back without setting `defaultHeaders`
+In a process where `configureSync` has not run yet, the result is the configuration an earlier process persisted, with the stored copy of the headers. While that copy cannot be read (the Android Keystore key was invalidated, the iOS device has not been unlocked since boot, or a backup was restored onto another device), the result carries no headers: `defaultHeaders` is `undefined` on Android and `{}` on iOS. That lasts until the library reads the copy again, which it retries on each flush while not paused, or until `configureSync` runs.
+
+`configureSync` replaces the whole configuration, so passing such a result back, for example `configureSync({ ...cfg, batchSize: 5 })`, deletes the stored headers, which acts as a logout. Later requests go out without them, and a 401 or 403 fails those items permanently. See [Troubleshooting](../troubleshooting.md#symptom-items-stay-pending-and-flush-returns-00).
 :::
+
+#### Example
+
+```ts
+const cfg = await getSyncConfig();
+// Take the credentials from the app's session, not from `cfg`.
+await configureSync({ ...cfg, batchSize: 5, defaultHeaders: session.headers });
+```
 
 ---
 

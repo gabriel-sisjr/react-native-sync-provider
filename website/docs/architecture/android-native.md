@@ -79,6 +79,8 @@ When paused, or with default headers that cannot be read, `flush()` returns an a
 - **`RetryTimer`** is a single-shot in-process timer, armed only while a JS engine is attached. If it fires offline it does not flush: it owes the wake and delivers it when connectivity returns.
 - **The retry kick** is a delayed `OneTimeWorkRequest` (`syncprovider-flush-now`, `ExistingWorkPolicy.REPLACE`) that survives process death. `scheduleOneTimeFlush` arms it only with background sync enabled and `foregroundOnly` off, under the same constraints as the periodic work.
 
+`RetryWake` also keeps the credential hold, in memory, as iOS does. After a rejected stored credential, every arm path waits for it, so neither the timer nor a replacement kick fires before the hold ends. `configureSync` clears it, and a new process starts without it. See [When a stored token expires](../guides/background-sync.md#when-a-stored-token-expires).
+
 See [Who wakes the queue](../guides/retry-policy.md#who-wakes-the-queue-and-when).
 
 ## Persisted Configuration

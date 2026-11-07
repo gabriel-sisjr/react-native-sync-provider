@@ -97,7 +97,7 @@ enum SyncStrategy {
 | Value | Description |
 |-------|-------------|
 | `AUTOMATIC` | The engine retries on its own: a failed item is dispatched again when its cooldown ends, and pending items are dispatched on `resumeSync()`. The default. |
-| `MANUAL` | The engine schedules nothing on its own: no retry timer and no Android retry kick. Items are dispatched by [`flush()`](./functions.md#flush), plus any OS windows enabled through [`enableBackgroundSync`](./functions.md#enablebackgroundsync): use `foregroundOnly` to stop those. |
+| `MANUAL` | The engine schedules nothing on its own: no retry timer and no Android retry kick. Items are dispatched by [`flush()`](./functions.md#flush), plus any OS windows enabled through [`enableBackgroundSync`](./functions.md#enablebackgroundsync): use `foregroundOnly` to stop those. [`useAutoSync`](./hooks/useAutoSync.md) does not read the strategy, so while it is mounted with `enabled: true` it keeps flushing under `MANUAL` too: pass `enabled: false` for a manual flow. |
 | `OPPORTUNISTIC` | Reserved for flushing only on opportunistic windows. Not implemented yet: it currently behaves like `AUTOMATIC`. |
 
 ---
@@ -207,8 +207,8 @@ enum SyncEventType {
 | `CONNECTION_CHANGED` | The native monitor reported a transition. | `connectionStatus` |
 | `PAUSED` | After `pauseSync`. | -- |
 | `RESUMED` | After `resumeSync`. iOS also emits it at launch when recovery put interrupted items back in the queue. A pause cleared by a launch emits nothing. | -- |
-| `BACKGROUND_SYNC_STARTED` | A background window starts: a BGTask on iOS, the periodic worker on Android. | -- |
-| `BACKGROUND_SYNC_COMPLETED` | The same window finishes. | -- |
+| `BACKGROUND_SYNC_STARTED` | A background window starts: a BGTask on iOS, the periodic worker on Android. Android's one-time retry kick emits neither background event. | iOS processing task: `metadata.kind` (`"processing"`). Otherwise base fields only. |
+| `BACKGROUND_SYNC_COMPLETED` | The same window finishes. iOS emits it whether the window's flush succeeded or failed. Android emits it only after the flush returns, so a worker whose flush throws emits none. | iOS: `metadata.kind` (`"refresh"` or `"processing"`), and `metadata.ok: "false"` when the flush failed. Android: base fields only. `errorCode` is never set: a failed flush reports its code on that cycle's `SYNC_FAILED`. |
 
 Events reach only listeners in a running JS engine. A worker or BGTask with no JS still dispatches, but nobody receives its events.
 

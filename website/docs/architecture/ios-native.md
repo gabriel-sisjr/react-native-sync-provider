@@ -93,7 +93,7 @@ The row stays `IN_FLIGHT` until launch recovery puts it back to `PENDING`, with 
 
 ## Retry Wake
 
-`RetryWakeTimer` is one single-shot wall-clock timer per engine. `SyncEngine` arms it for the soonest `nextRetryAt` when a cycle ends, when a hybrid attaches, on `configureSync` and on `resumeSync`. It runs only with a JS-facing hybrid attached, and not while paused or under `MANUAL`. If it fires offline, the wake waits for connectivity. After a rejected stored credential, no wake comes before the hold ends. See [Who wakes the queue](../guides/retry-policy.md#who-wakes-the-queue-and-when).
+`RetryWakeTimer` is one single-shot wall-clock timer per engine. `SyncEngine` arms it for the soonest `nextRetryAt` when a cycle ends, when a hybrid attaches, on `configureSync` and on `resumeSync`. It runs only with a JS-facing hybrid attached, and not while paused or under `MANUAL`. If it fires offline, the wake waits for connectivity. After a rejected stored credential, no wake comes before the hold ends: the hold lives in memory, and `configureSync` clears it (see [When a stored token expires](../guides/background-sync.md#when-a-stored-token-expires)). See [Who wakes the queue](../guides/retry-policy.md#who-wakes-the-queue-and-when).
 
 ## Persisted Configuration
 

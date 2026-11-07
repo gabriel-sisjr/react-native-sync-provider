@@ -39,7 +39,7 @@ function useSyncStatus(): UseSyncStatusResult
 | Property | Type | Description |
 |----------|------|-------------|
 | `isSyncing` | `boolean` | `true` between `SYNC_STARTED` and the next `SYNC_SUCCEEDED` / `SYNC_FAILED`. |
-| `isPaused` | `boolean` | `true` after a `PAUSED` event, until `RESUMED`. A pause cleared by a launch emits no event, and hooks start with `false`. |
+| `isPaused` | `boolean` | `true` after a `PAUSED` event, until `RESUMED`. Starts `false` and follows those events only, because JS cannot read the pause flag: a hook mounted while an earlier `pauseSync()` in the same JS session is still in force reads `false` until the next `PAUSED`. A launch or JS reload clears the pause before JS can observe it, without a `RESUMED`, so `false` is accurate in a fresh session. |
 | `progress` | `number \| null` | Last `SyncEvent.progress` value, in `[0, 1]`. `0` on `SYNC_STARTED`, `null` when idle. `SYNC_PROGRESS` is iOS-only, so on Android it stays `0` during a cycle. |
 | `lastResult` | [`SyncResult`](../types.md#syncresult) `\| null` | The most recent persisted flush, or `null` if none exists. |
 | `error` | [`SyncError`](../errors.md) `\| null` | Failure of the initial read, or `null`. The methods reject instead of setting it. |

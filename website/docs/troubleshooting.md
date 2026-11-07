@@ -154,15 +154,17 @@ If errors persist, delete `node_modules/@gabriel-sisjr/react-native-sync-provide
 - **Paused.** `pauseSync()` is in force. `flush()` dispatches nothing until `resumeSync()`.
 - **Stored headers cannot be read.** `defaultHeaders` were configured, but they cannot be recovered in this process, so nothing is dispatched: sending without them would fail every item. This happens when the Keystore key was invalidated, when the iOS device has not been unlocked since boot, or after a backup restore onto another device. With Android `allowBackup`, the ciphertext comes back but the key does not.
 
+A cycle that found nothing eligible emits `SYNC_STARTED` and `SYNC_SUCCEEDED` and adds a 0/0 row to the sync history. A `flush()` blocked by a pause or by unreadable headers runs no cycle, so it emits no event and writes no history row. On Android it also returns `0` for `startedAt` and `finishedAt`. On iOS both are the time of the call, so only the missing event and history row tell the two apart.
+
 **Fix:** For unreadable headers, call `configureSync` with the headers again, which ends the wait. The library also retries the read on each flush, so an iOS device resumes after the first unlock.
 
 :::warning Do not re-apply `getSyncConfig()` in this state
-While headers are unreadable, `getSyncConfig()` returns none, so `setConfig({ ...config })` or `configureSync(await getSyncConfig())` deletes them, which acts as a logout. Pass the headers explicitly.
+While headers are unreadable, `getSyncConfig()` returns none (`undefined` on Android, `{}` on iOS), so `setConfig({ ...config })` or `configureSync(await getSyncConfig())` deletes them, which acts as a logout. Pass `defaultHeaders` from your app's session.
 :::
 
 ### Symptom: Items stay pending and the server logs one 401 per wake
 
-**Cause:** A stored token expired. In a process that has not called `configureSync`, a 401 or 403 holds the item instead of failing it: it stays `PENDING`, no attempt is spent, the next try waits at least 60 seconds, and the cycle stops. You see `ITEM_RETRYING` with `UNAUTHORIZED`, if anything is listening. See [When a stored token expires](./guides/background-sync.md#when-a-stored-token-expires).
+**Cause:** A stored token expired. In a process that has not called `configureSync`, a 401 or 403 holds the item instead of failing it: it stays `PENDING`, no attempt is spent, the next try waits at least 60 seconds, and the cycle stops. You see `ITEM_RETRYING` with `UNAUTHORIZED`, if anything is listening. Retry wakes wait for the hold, but a process restart drops it, and a periodic worker or BGTask window does not wait for it, so each of those can cost one more request. See [When a stored token expires](./guides/background-sync.md#when-a-stored-token-expires).
 
 **Fix:** Call `configureSync` with a fresh token at launch and whenever it changes. The library does not refresh tokens, and a process with no JS cannot renew one. Each held item then dispatches once its hold ends.
 
@@ -170,7 +172,7 @@ While headers are unreadable, `getSyncConfig()` returns none, so `setConfig({ ..
 
 **Cause:** A pause lasts until `resumeSync()` or the next launch that reaches the library, including a JS reload. Workers and BGTasks stay inert while the app is dead. A launch clears the pause without emitting `RESUMED`, and on iOS, React Native can start during a background launch, which counts if JS reaches the library there.
 
-**Fix:** Call `resumeSync()` to end a pause. To keep one across launches, call `pauseSync()` again at startup. Hooks cannot read the persisted flag: `isPaused` starts `false` and follows events.
+**Fix:** Call `resumeSync()` to end a pause. To keep one across launches, call `pauseSync()` again at startup. Hooks cannot read the pause flag: `isPaused` starts `false` and follows `PAUSED` and `RESUMED`, so a hook mounted while an earlier `pauseSync()` is still in force reads `false` until the next `PAUSED`.
 
 ### Symptom: `drainUntilEmpty()` stops early
 
@@ -235,14 +237,14 @@ useSyncEvents({
 
 **Cause:** As of v0.2, a failed-retriable item gets a persisted `nextRetryAt` cooldown, measured from the end of the attempt, and is **skipped by the dispatcher until that deadline passes** — on both platforms, and across restarts/reboots. This is intentional: it prevents a hot retry loop against a degraded server. Before v0.2, iOS retried with no spacing and Android only spaced retries within a single flush cycle.
 
-**Fix:** This is by design. In a running app with a strategy other than `MANUAL`, the retry timer brings the item back on its own. Inspect the per-item deadline via `getPendingItems()` — `item.nextRetryAt` is `0` for an item never attempted, and otherwise the epoch-ms time it becomes eligible. A cooling item still counts toward `getQueueSize()`. To wait out cooldowns explicitly, use `drainUntilEmpty()`, which sleeps until the soonest `nextRetryAt` by itself. See the [retry-cooldown guide](./guides/retry-policy.md#retry-cooldown-across-restarts).
+**Fix:** This is by design. In a running app with a strategy other than `MANUAL`, the retry timer brings the item back on its own. Inspect the per-item deadline via `getPendingItems()` — `item.nextRetryAt` is `0` for an item that is eligible now, and otherwise the epoch-ms time it becomes eligible, after a cooldown or a credential hold. A cooling item still counts toward `getQueueSize()`. To wait out cooldowns explicitly, use `drainUntilEmpty()`, which sleeps until the soonest `nextRetryAt` by itself. See the [retry-cooldown guide](./guides/retry-policy.md#retry-cooldown-across-restarts).
 
 ```ts
 const pending = await getPendingItems();
 pending.forEach((item) => {
   const waitMs = Math.max(0, item.nextRetryAt - Date.now());
   console.log(
-    `${item.id}: ${item.attempts} attempt(s), eligible in ${waitMs}ms`
+    `${item.id}: ${item.attempts} recorded attempt(s), eligible in ${waitMs}ms`
   );
 });
 ```
