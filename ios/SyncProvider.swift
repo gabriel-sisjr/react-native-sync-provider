@@ -23,6 +23,14 @@ import NitroModules
 /// Although Nitro instantiates this class via the generated factory glue
 /// (so internal access would be enough for that path), we keep the class
 /// `public` so the host AppDelegate can call ``handleBackgroundURLSessionEvents(identifier:completionHandler:)``.
+///
+/// A call that answers from memory returns a promise it has already settled.
+/// The generated glue attaches its listeners to the returned promise only
+/// after the method returns, and Nitro's Swift `Promise` before 0.35.8 is not
+/// synchronized: from `Promise.async`, a body this short can settle on another
+/// thread while the glue is still attaching, and that listener is then never
+/// called, so the JS promise never settles. A call that does real work stays
+/// on `Promise.async`, off the JS thread.
 public final class HybridSyncProvider: HybridSyncProviderSpec {
     // MARK: - Components
 
@@ -149,10 +157,7 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
 
     // MARK: - Dead letters
     //
-    // These answer at once, so they return promises that are already settled.
-    // Nitro's `Promise` is not synchronized: from `Promise.async`, a body this
-    // short can settle on another thread while the caller is still attaching
-    // its listener, and the listener is then never called.
+    // These answer from memory, so their promises are settled on return.
 
     /// Nothing is moved to a dead-letter store yet: an item that fails for
     /// good still ends as a `FAILED` row in the queue store. So there is never
@@ -225,13 +230,9 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
         }
     }
 
+    /// Answers from memory: settled on return.
     public func getSyncConfig() throws -> Promise<SyncOptions> {
-        return Promise.async { [weak self] in
-            guard let self = self else {
-                return Self.translate(snapshot: .default)
-            }
-            return Self.translate(snapshot: self.engine.currentOptions())
-        }
+        return Promise.resolved(withResult: Self.translate(snapshot: engine.currentOptions()))
     }
 
     // MARK: - History ops
@@ -277,17 +278,16 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
 
     // MARK: - Connection
 
+    /// Answers from memory: settled on return.
     public func getConnectionStatus() throws -> Promise<ConnectionState> {
-        return Promise.async { [weak self] in
-            guard let self = self else {
-                return Self.translate(snapshot: .unknown)
-            }
-            return Self.translate(snapshot: self.engine.connectivity.current)
-        }
+        return Promise.resolved(withResult: Self.translate(snapshot: engine.connectivity.current))
     }
 
     // MARK: - Background sync
 
+    /// Stays asynchronous, unlike the other calls with no `await`:
+    /// `BGTaskScheduler` submit and cancel are blocking IPC calls that must
+    /// not run on the JS thread.
     public func enableBackgroundSync(options: BackgroundSyncOptions) throws -> Promise<Void> {
         return Promise.async { [weak self] in
             guard let self = self else { return }
@@ -300,48 +300,43 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
         }
     }
 
+    /// Stays asynchronous: see ``enableBackgroundSync(options:)``.
     public func disableBackgroundSync() throws -> Promise<Void> {
         return Promise.async { [weak self] in
             self?.engine.background.disable()
         }
     }
 
+    /// Answers from memory: settled on return.
     public func isBackgroundSyncEnabled() throws -> Promise<Bool> {
-        return Promise.async { [weak self] in
-            return self?.engine.background.isEnabled ?? false
-        }
+        return Promise.resolved(withResult: engine.background.isEnabled)
     }
 
     // MARK: - Events
 
+    /// Answers from memory: settled on return, rejected for an unknown channel.
     public func addListener(event: String,
                             callback: @escaping (_ event: SyncEvent) -> Void) throws -> Promise<String> {
-        return Promise.async { [weak self] in
-            guard let self = self else {
-                throw SyncProviderError(code: .nativeModuleUnavailable, message: "SyncProvider deallocated")
+        do {
+            let id = try engine.emitter.addListener(channel: event) { payload in
+                callback(Self.translate(payload: payload))
             }
-            do {
-                let id = try self.engine.emitter.addListener(channel: event) { payload in
-                    callback(Self.translate(payload: payload))
-                }
-                self.listenerLock.withLock {
-                    _ = self.listenerIds[event, default: []].insert(id)
-                }
-                return id
-            } catch {
-                throw wrapAsSyncProviderError(error)
+            listenerLock.withLock {
+                _ = listenerIds[event, default: []].insert(id)
             }
+            return Promise.resolved(withResult: id)
+        } catch {
+            return Promise.rejected(withError: wrapAsSyncProviderError(error))
         }
     }
 
+    /// Answers from memory: settled on return.
     public func removeListener(event: String, subscriptionId: String) throws -> Promise<Void> {
-        return Promise.async { [weak self] in
-            guard let self = self else { return }
-            self.listenerLock.withLock {
-                _ = self.listenerIds[event]?.remove(subscriptionId)
-            }
-            self.engine.emitter.removeListener(channel: event, id: subscriptionId)
+        listenerLock.withLock {
+            _ = listenerIds[event]?.remove(subscriptionId)
         }
+        engine.emitter.removeListener(channel: event, id: subscriptionId)
+        return Promise.resolved()
     }
 
     // MARK: - Public helper for AppDelegate

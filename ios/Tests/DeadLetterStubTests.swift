@@ -61,27 +61,6 @@ final class DeadLetterStubTests: XCTestCase {
 
     // MARK: - Helpers
 
-    /// Attaches a listener the way the bridge does and waits for it, failing
-    /// the test when it is not called within `timeout`.
-    private func settle<T>(_ promise: Promise<T>,
-                           timeout: TimeInterval = 2,
-                           file: StaticString = #filePath,
-                           line: UInt = #line) async -> Result<T, Error>? {
-        let settled = expectation(description: "the promise settles")
-        let outcome = OutcomeBox<T>()
-        promise
-            .then { value in
-                outcome.set(.success(value))
-                settled.fulfill()
-            }
-            .catch { error in
-                outcome.set(.failure(error))
-                settled.fulfill()
-            }
-        await fulfillment(of: [settled], timeout: timeout)
-        return outcome.value
-    }
-
     private func assertNotImplemented<T>(_ outcome: Result<T, Error>?,
                                          _ message: String,
                                          file: StaticString = #filePath,
@@ -91,19 +70,5 @@ final class DeadLetterStubTests: XCTestCase {
         }
         XCTAssertEqual((error as? SyncProviderError)?.codeName, "INVALID_PAYLOAD", file: file, line: line)
         XCTAssertEqual(error.localizedDescription, message, file: file, line: line)
-    }
-}
-
-/// A result written from whichever thread settles the promise.
-private final class OutcomeBox<T>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var stored: Result<T, Error>?
-
-    var value: Result<T, Error>? {
-        lock.withLock { stored }
-    }
-
-    func set(_ result: Result<T, Error>) {
-        lock.withLock { stored = result }
     }
 }
