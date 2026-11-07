@@ -23,6 +23,11 @@ let kBackgroundURLSessionIdentifier = "com.gabriel-sisjr.syncprovider.background
 /// does not advance on one, so backoff alone would stay at its first value.
 let kMinCredentialHoldMs = 60_000
 
+/// How long a flush behind a network-quality gate waits for the process's
+/// first path update. A BGTask launch flushes before it has one, and judging
+/// that unknown path would gate it as offline.
+let kFirstPathUpdateWaitMs = 1_500
+
 /// Knobs the dispatcher reads on each cycle. Updated by the bridge whenever
 /// `configureSync` is called.
 struct DispatcherConfig: Sendable {
@@ -38,6 +43,9 @@ struct DispatcherConfig: Sendable {
     /// `true` when default headers are declared but unreadable. Dispatch is
     /// suspended: sending without them would fail every item for no reason.
     var credentialsUnavailable: Bool = false
+    /// The lowest network quality a cycle may start at. `nil`, or `offline`,
+    /// means no gate.
+    var minNetworkQuality: NetworkQualityLevel? = nil
 
     static let `default` = DispatcherConfig(
         retryPolicy: .default,
@@ -71,6 +79,28 @@ enum FailureDisposition: Sendable {
     case credentialRejected(heldUntil: Int64)
 }
 
+/// Why a flush started no cycle.
+enum FlushSkipReason: Sendable, Equatable {
+    case paused
+    case credentialsUnavailable
+    case networkQualityTooLow
+}
+
+/// What one ``SyncDispatcher/flushOutcome()`` call did.
+enum FlushOutcome: Sendable {
+    /// A cycle ran, or the call joined the one already running.
+    case ran(StoredSyncResult)
+    /// No cycle ran. The result is the zero-count one a skipped flush returns.
+    case skipped(StoredSyncResult, FlushSkipReason)
+
+    var result: StoredSyncResult {
+        switch self {
+        case let .ran(result), let .skipped(result, _):
+            return result
+        }
+    }
+}
+
 /// Collaborators of ``SyncDispatcher`` that are set and read from outside the
 /// actor, synchronously. `BackgroundSyncManager` publishes `foregroundOnly`
 /// from a lock-protected, non-async path, so this cannot be actor state.
@@ -80,6 +110,7 @@ final class DispatcherHooks: @unchecked Sendable {
     private var pausedValue = false
     private var cycleFinished: (@Sendable (Int64?) async -> Void)?
     private var credentialRecovery: (@Sendable () -> [String: String]?)?
+    private var qualitySource: (@Sendable () -> NetworkQualityLevel)?
 
     /// When `true`, uploads never go through the background `URLSession`.
     var foregroundOnly: Bool {
@@ -107,6 +138,13 @@ final class DispatcherHooks: @unchecked Sendable {
     var recoverCredentials: (@Sendable () -> [String: String]?)? {
         get { lock.withLock { credentialRecovery } }
         set { lock.withLock { credentialRecovery = newValue } }
+    }
+
+    /// The engine's current network-quality grade. Without it the gate grades
+    /// the link alone, as if no measurement had been taken.
+    var networkQuality: (@Sendable () -> NetworkQualityLevel)? {
+        get { lock.withLock { qualitySource } }
+        set { lock.withLock { qualitySource = newValue } }
     }
 }
 
@@ -238,20 +276,32 @@ actor SyncDispatcher {
     /// cycle is running returns the last result instead of starting another.
     @discardableResult
     func flush() async throws -> StoredSyncResult {
-        if isPaused {
-            SyncLogger.debug("flush() called while paused; returning empty result", category: "dispatcher")
-            return Self.skippedResult(reason: "paused")
+        try await flushOutcome().result
+    }
+
+    /// ``flush()``, reporting why no cycle ran when none did.
+    ///
+    /// The checks before a cycle run in this order: paused, stored credentials,
+    /// a cycle already running, the network-quality gate. Only the gate emits
+    /// anything when it stops the flush: `SYNC_FAILED` with
+    /// `NETWORK_QUALITY_TOO_LOW`, with no `SYNC_STARTED` before it, no history
+    /// row and no item touched. A cycle already running is joined rather than
+    /// gated, so its listeners never see a `SYNC_FAILED` in the middle of it.
+    func flushOutcome() async throws -> FlushOutcome {
+        if let early = exitBeforeCycle() {
+            return early
         }
-        guard restoreCredentialsIfNeeded() else {
-            // Items stay PENDING and the caller sees a normal, empty result: a
-            // worker reports success instead of driving OS-level retries.
-            SyncLogger.error("Default headers could not be read; skipping dispatch until they can",
-                             category: "dispatcher")
-            return Self.skippedResult(reason: "credentials-unavailable")
+        // Only suspends while the path is still unknown, and during that wait
+        // a pause, a configuration or another flush can land.
+        let blockingQuality = await networkQualityBlock()
+        if let early = exitBeforeCycle() {
+            return early
         }
-        if isCycleRunning {
-            SyncLogger.debug("flush() called while cycle in progress; piggybacking", category: "dispatcher")
-            return lastResult ?? Self.emptyResult()
+        if let blockingQuality {
+            SyncLogger.info("Flush skipped: network quality \(blockingQuality.rawValue) is below the minimum \(config.minNetworkQuality?.rawValue ?? "-")",
+                            category: "dispatcher")
+            emitter.emit(.now(type: "SYNC_FAILED", errorCode: "NETWORK_QUALITY_TOO_LOW"))
+            return .skipped(Self.skippedResult(reason: "network-quality-too-low"), .networkQualityTooLow)
         }
 
         isCycleRunning = true
@@ -261,7 +311,7 @@ actor SyncDispatcher {
         do {
             let result = try await runCycle(startedAt: startedAt)
             await finishCycle()
-            return result
+            return .ran(result)
         } catch {
             // Listeners track a cycle from SYNC_STARTED to its terminal event,
             // so a cycle that dies must still end with one.
@@ -277,6 +327,45 @@ actor SyncDispatcher {
         let notBefore = credentialHeldUntil
         credentialHeldUntil = nil
         await hooks.onCycleFinished?(notBefore)
+    }
+
+    /// The outcome of a flush that must not start a cycle, or `nil` when one
+    /// may start: paused, credentials still unreadable, or a cycle already
+    /// running.
+    private func exitBeforeCycle() -> FlushOutcome? {
+        if isPaused {
+            SyncLogger.debug("flush() called while paused; returning empty result", category: "dispatcher")
+            return .skipped(Self.skippedResult(reason: "paused"), .paused)
+        }
+        guard restoreCredentialsIfNeeded() else {
+            // Items stay PENDING and the caller sees a normal, empty result: a
+            // worker reports success instead of driving OS-level retries.
+            SyncLogger.error("Default headers could not be read; skipping dispatch until they can",
+                             category: "dispatcher")
+            return .skipped(Self.skippedResult(reason: "credentials-unavailable"), .credentialsUnavailable)
+        }
+        if isCycleRunning {
+            SyncLogger.debug("flush() called while cycle in progress; piggybacking", category: "dispatcher")
+            return .ran(lastResult ?? Self.emptyResult())
+        }
+        return nil
+    }
+
+    /// The grade that keeps this flush from starting a cycle, or `nil` when it
+    /// may start one: no gate is set, or the network meets it.
+    ///
+    /// On a path that is still unknown, as in a process the OS just launched
+    /// for a BGTask, waits up to ``kFirstPathUpdateWaitMs`` for the first path
+    /// update. A path still unknown after that grades `offline`.
+    private func networkQualityBlock() async -> NetworkQualityLevel? {
+        guard let minimum = config.minNetworkQuality, minimum > .offline else { return nil }
+        if connectivity.current.status == .unknown {
+            await connectivity.waitUntilKnown(timeoutMs: kFirstPathUpdateWaitMs)
+        }
+        let quality = hooks.networkQuality?()
+            ?? NetworkQualityClassifier.classify(link: connectivity.current, samples: nil)
+        // Read again: a configuration can land during the wait.
+        return quality.satisfies(minimum: config.minNetworkQuality) ? nil : quality
     }
 
     private func runCycle(startedAt: Int64) async throws -> StoredSyncResult {

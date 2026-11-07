@@ -9,6 +9,8 @@ final class EngineFixture {
     let stack = InMemoryCoreDataStack.make()
     let secrets = InMemorySecretStore()
     let connectivity = FakeConnectivity()
+    /// Every measurement goes through it, with no debounce.
+    let probe = FakeHeadProbe()
     let scheduler = FakeBackgroundTaskScheduler()
     let clock = ManualClock()
     let timer = ManualWakeTimer()
@@ -48,6 +50,8 @@ final class EngineFixture {
                                 emitter: emitter,
                                 scheduler: scheduler,
                                 sessions: (foregroundSession, backgroundSession),
+                                probe: probe,
+                                qualityProbeDebounceMs: 0,
                                 clock: clock,
                                 retryTimer: timer,
                                 wrapWakeSource: wrapWakeSource)

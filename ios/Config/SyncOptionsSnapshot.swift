@@ -64,7 +64,8 @@ struct SyncOptionsSnapshot: Sendable, Equatable {
                          defaultHeaders: defaultHeaders,
                          source: source,
                          hasDefaultHeaders: !defaultHeaders.isEmpty || credentialsUnavailable,
-                         credentialsUnavailable: credentialsUnavailable)
+                         credentialsUnavailable: credentialsUnavailable,
+                         minNetworkQuality: minNetworkQuality)
     }
 }
 

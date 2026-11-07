@@ -1,8 +1,8 @@
 import XCTest
 @testable import SyncProvider
 
-/// The engine's mirror of `NetworkQuality`, and the provisional grade
-/// `getConnectionStatus()` reports until quality is measured.
+/// The engine's mirror of `NetworkQuality`, and what a gate at a given minimum
+/// lets through.
 final class NetworkQualityLevelTests: XCTestCase {
     func test_rawValues_areTheWireStrings_worstToBest() {
         XCTAssertEqual(NetworkQualityLevel.allCases.map(\.rawValue),
@@ -21,41 +21,23 @@ final class NetworkQualityLevelTests: XCTestCase {
         XCTAssertEqual(levels.min(), .offline)
     }
 
-    func test_provisionalGrade_followsTheLinkStatus() {
-        XCTAssertEqual(NetworkQualityLevel.provisional(for: snapshot(.connected)), .good)
-        XCTAssertEqual(NetworkQualityLevel.provisional(for: snapshot(.metered)), .good)
-        XCTAssertEqual(NetworkQualityLevel.provisional(for: snapshot(.disconnected)), .offline)
-        XCTAssertEqual(NetworkQualityLevel.provisional(for: .unknown), .offline,
-                       "Before the first path update the link is not known to be usable")
-    }
-
-    /// The spec's invariant: `OFFLINE` exactly when the status is
-    /// `DISCONNECTED` or `UNKNOWN`, whatever else the snapshot says.
-    func test_provisionalGrade_isOfflineExactlyWhenDisconnectedOrUnknown() {
-        let statuses: [ConnectionSnapshot.Status] = [.connected, .disconnected, .metered, .unknown]
-        let kinds: [ConnectionSnapshot.Kind] = [.unknown, .wifi, .cellular, .ethernet, .other, .none]
-        for status in statuses {
-            for kind in kinds {
-                for flag in [nil, false, true] as [Bool?] {
-                    let snapshot = ConnectionSnapshot(status: status, type: kind,
-                                                      isInternetReachable: flag, isExpensive: flag)
-
-                    let grade = NetworkQualityLevel.provisional(for: snapshot)
-
-                    let mustBeOffline = status == .disconnected || status == .unknown
-                    XCTAssertEqual(grade == .offline, mustBeOffline, "\(status) \(kind) \(String(describing: flag))")
-                    if !mustBeOffline {
-                        XCTAssertEqual(grade, .good, "Provisional: link status only, no measurement")
-                    }
-                }
-            }
+    /// No minimum, or `OFFLINE`, is no gate at all.
+    func test_unsetOrOfflineMinimum_letsEveryGradeThrough() {
+        for grade in NetworkQualityLevel.allCases {
+            XCTAssertTrue(grade.satisfies(minimum: nil), "\(grade)")
+            XCTAssertTrue(grade.satisfies(minimum: .offline), "\(grade)")
         }
     }
 
-    private func snapshot(_ status: ConnectionSnapshot.Status) -> ConnectionSnapshot {
-        ConnectionSnapshot(status: status,
-                           type: status == .disconnected ? .none : .wifi,
-                           isInternetReachable: status != .disconnected,
-                           isExpensive: status == .metered)
+    /// `POOR` is the most permissive gate: it stops only `OFFLINE`.
+    func test_minimum_letsThroughExactlyTheGradesAtOrAboveIt() {
+        let levels = NetworkQualityLevel.allCases
+        for minimum in levels where minimum > .offline {
+            for grade in levels {
+                XCTAssertEqual(grade.satisfies(minimum: minimum), grade >= minimum, "\(grade) vs \(minimum)")
+            }
+        }
+        XCTAssertFalse(NetworkQualityLevel.offline.satisfies(minimum: .poor))
+        XCTAssertTrue(NetworkQualityLevel.poor.satisfies(minimum: .poor))
     }
 }

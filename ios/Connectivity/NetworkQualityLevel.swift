@@ -31,12 +31,10 @@ enum NetworkQualityLevel: String, Sendable, CaseIterable, Comparable {
         }
     }
 
-    /// The grade reported while quality is not measured: read from the link
-    /// status alone. `offline` exactly when the link is not known to be usable
-    /// (disconnected, or unknown before the first path update), `good`
-    /// otherwise. Provisional: it never reports `poor`, `moderate` or
-    /// `excellent`.
-    static func provisional(for snapshot: ConnectionSnapshot) -> NetworkQualityLevel {
-        snapshot.isOnline ? .good : .offline
+    /// `true` when this grade lets a flush through a gate at `minimum`. No
+    /// minimum, or `offline` (which every grade meets), means no gate.
+    func satisfies(minimum: NetworkQualityLevel?) -> Bool {
+        guard let minimum, minimum > .offline else { return true }
+        return self >= minimum
     }
 }

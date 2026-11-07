@@ -280,7 +280,7 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
 
     /// Answers from memory: settled on return.
     public func getConnectionStatus() throws -> Promise<ConnectionState> {
-        return Promise.resolved(withResult: Self.translate(snapshot: engine.connectivity.current))
+        return Promise.resolved(withResult: Self.translate(network: engine.currentNetwork()))
     }
 
     // MARK: - Background sync
@@ -484,16 +484,17 @@ extension HybridSyncProvider {
                            healthCheckBackoffMs: snapshot.healthCheckBackoffMs)
     }
 
-    /// `networkQuality` is the provisional grade: `OFFLINE` exactly when the
-    /// status is `DISCONNECTED` or `UNKNOWN`, `GOOD` otherwise.
-    static func translate(snapshot: ConnectionSnapshot) -> ConnectionState {
-        let status = ConnectionStatus(fromString: snapshot.status.rawValue) ?? .unknown
-        let type = ConnectionType(fromString: snapshot.type.rawValue) ?? .unknown
+    /// `networkQuality` is the engine's grade, which is `OFFLINE` exactly when
+    /// the status is `DISCONNECTED` or `UNKNOWN`.
+    static func translate(network: NetworkState) -> ConnectionState {
+        let link = network.link
+        let status = ConnectionStatus(fromString: link.status.rawValue) ?? .unknown
+        let type = ConnectionType(fromString: link.type.rawValue) ?? .unknown
         return ConnectionState(status: status,
                                type: type,
-                               networkQuality: translate(level: .provisional(for: snapshot)),
-                               isInternetReachable: snapshot.isInternetReachable,
-                               isExpensive: snapshot.isExpensive)
+                               networkQuality: translate(level: network.quality),
+                               isInternetReachable: link.isInternetReachable,
+                               isExpensive: link.isExpensive)
     }
 
     static func translate(quality: NetworkQuality) -> NetworkQualityLevel {
