@@ -336,7 +336,7 @@ internal class SyncQueueStorageTest {
     val id = storage.enqueue(TestData.input(metadata = mapOf("k" to "v")))
     val queued = db.syncItemDao().findById(id)!!
 
-    deadLetter(queued)
+    assertThat(deadLetter(queued)).isTrue()
 
     assertThat(db.syncItemDao().findById(id)).isNull()
     val dead = db.syncDeadLetterDao().findById(id)!!
@@ -350,6 +350,36 @@ internal class SyncQueueStorageTest {
     assertThat(dead.lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
     assertThat(dead.lastErrorMessage).isEqualTo("HTTP 410 Gone")
     assertThat(dead.deadLetteredAt).isEqualTo(10_000L)
+  }
+
+  @Test
+  fun `dlq_moveOfARowPurgedAfterItsClaim_writesNothing`() = runTest {
+    val cleared = storage.enqueue(TestData.input())
+    val removed = storage.enqueue(TestData.input())
+    val claimed = storage.claimPending(2).associateBy { it.id }
+    assertThat(claimed.keys).containsExactly(cleared, removed)
+
+    assertThat(storage.removeItem(removed)).isTrue()
+    assertThat(deadLetter(claimed.getValue(removed))).isFalse()
+    storage.clear()
+    assertThat(deadLetter(claimed.getValue(cleared))).isFalse()
+
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(storage.count()).isEqualTo(0)
+  }
+
+  @Test
+  fun `dlq_replayedRow_purgedWhileInFlight_isNotDeadLetteredAgain`() = runTest {
+    val id = storage.enqueue(TestData.input())
+    deadLetter(db.syncItemDao().findById(id)!!)
+    assertThat(storage.replayDeadLetter(id)).isTrue()
+    val claimed = storage.claimPending(1).single()
+
+    storage.clear()
+
+    assertThat(deadLetter(claimed)).isFalse()
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(storage.count()).isEqualTo(0)
   }
 
   @Test

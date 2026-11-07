@@ -20,6 +20,7 @@ import com.margelo.nitro.syncprovider.testutil.MovingClock
 import com.margelo.nitro.syncprovider.testutil.TestData
 import io.mockk.coEvery
 import io.mockk.mockk
+import io.mockk.spyk
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -1028,6 +1029,129 @@ internal class SyncDispatcherTest {
     assertThat(itemEvents[0].errorCode).isEqualTo(SyncErrorCode.SERVER_ERROR)
     assertThat(itemEvents[1].errorCode).isEqualTo(SyncErrorCode.DEAD_LETTERED)
     assertThat(itemEvents[1].metadata).containsExactly("lastErrorCode", SyncErrorCode.SERVER_ERROR.name)
+  }
+
+  /** Holds every response until [release] opens, so a purge can land while requests are out. */
+  private fun holdResponses(release: CountDownLatch, code: Int): Dispatcher = object : Dispatcher() {
+    override fun dispatch(request: RecordedRequest): MockResponse {
+      release.await(20, TimeUnit.SECONDS)
+      return MockResponse().setResponseCode(code)
+    }
+  }
+
+  @Test
+  fun `dlq_clearQueue_whileInFlight_leavesNoDeadLetter`() = runTest {
+    // A logout: the queue is purged while a request still carries the old token, and the
+    // server then rejects that token under the live configuration.
+    val release = CountDownLatch(1)
+    server.dispatcher = holdResponses(release, code = 401)
+    val id = storage.enqueue(
+      TestData.input(
+        url = server.url("/secure").toString(),
+        headers = mapOf("Authorization" to "Bearer old-session"),
+        body = "private-body",
+      ),
+    )
+    val events = recordEvents()
+    val d = newDispatcher(credentials = { CredentialPolicy.TRUSTED })
+
+    val running = async(Dispatchers.IO) { d.flush() }
+    assertThat(server.takeRequest(20, TimeUnit.SECONDS)).isNotNull()
+    storage.clear()
+    release.countDown()
+    val result = running.await()
+
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(storage.count()).isEqualTo(0)
+    assertThat(events.types()).doesNotContain(SyncEventType.ITEM_DEAD_LETTERED)
+    // The request did go out and fail: that outcome is still reported and counted.
+    val failure = events.single { it.type == SyncEventType.ITEM_FAILED }
+    assertThat(failure.itemId).isEqualTo(id)
+    assertThat(failure.errorCode).isEqualTo(SyncErrorCode.UNAUTHORIZED)
+    assertThat(result.failedIds.toList()).containsExactly(id)
+  }
+
+  @Test
+  fun `dlq_removeItem_whileInFlight_leavesNoDeadLetter`() = runTest {
+    val release = CountDownLatch(1)
+    server.dispatcher = holdResponses(release, code = 404)
+    val id = enqueue("/missing")
+    val events = recordEvents()
+    val d = newDispatcher()
+
+    val running = async(Dispatchers.IO) { d.flush() }
+    assertThat(server.takeRequest(20, TimeUnit.SECONDS)).isNotNull()
+    assertThat(storage.removeItem(id)).isTrue()
+    release.countDown()
+    val result = running.await()
+
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(storage.count()).isEqualTo(0)
+    assertThat(events.types()).doesNotContain(SyncEventType.ITEM_DEAD_LETTERED)
+    val failure = events.single { it.type == SyncEventType.ITEM_FAILED }
+    assertThat(failure.itemId).isEqualTo(id)
+    assertThat(failure.errorCode).isEqualTo(SyncErrorCode.SERVER_ERROR)
+    assertThat(result.failedIds.toList()).containsExactly(id)
+  }
+
+  @Test
+  fun `dlq_removeItem_whileInFlight_sparesOnlyThatRow`() = runTest {
+    val release = CountDownLatch(1)
+    server.dispatcher = holdResponses(release, code = 422)
+    val removed = enqueue("/removed")
+    val kept = storage.enqueue(
+      TestData.input(
+        url = server.url("/kept").toString(),
+        headers = mapOf("X-Trace" to "kept"),
+        body = "kept-body",
+      ),
+    )
+    val keptRow = row(kept)
+    val events = recordEvents()
+    val d = newDispatcher()
+
+    val running = async(Dispatchers.IO) { d.flush() }
+    // Both requests are out at once: the batch dispatches concurrently.
+    repeat(2) { assertThat(server.takeRequest(20, TimeUnit.SECONDS)).isNotNull() }
+    assertThat(storage.removeItem(removed)).isTrue()
+    release.countDown()
+    val result = running.await()
+
+    assertThat(db.syncDeadLetterDao().findById(removed)).isNull()
+    val dead = deadLetter(kept)
+    assertThat(dead.headers).isEqualTo(keptRow.headers)
+    assertThat(dead.body).isEqualTo("kept-body")
+    assertThat(dead.lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
+    assertThat(events.filter { it.type == SyncEventType.ITEM_DEAD_LETTERED }.map { it.itemId })
+      .containsExactly(kept)
+    assertThat(events.filter { it.type == SyncEventType.ITEM_FAILED }.map { it.itemId })
+      .containsExactly(removed, kept)
+    assertThat(result.failedIds.toList()).containsExactly(removed, kept)
+  }
+
+  @Test
+  fun `dlq_spentBudget_rowPurgedAfterTheClaim_isNotRevived`() = runTest {
+    db.syncItemDao().insert(
+      TestData.entity(id = "spent", attempts = 7, url = server.url("/x").toString()),
+    )
+    // Purge the queue right after the cycle claimed the row, before the budget check. The
+    // claim runs on the real storage: mockk's callOriginal() cannot return from a suspension.
+    val purgingAfterClaim = spyk(storage)
+    coEvery { purgingAfterClaim.claimPending(any(), any()) } coAnswers {
+      storage.claimPending(firstArg(), secondArg()).also { storage.clear() }
+    }
+    val events = recordEvents()
+
+    val result = newDispatcher(maxAttempts = 5, queue = purgingAfterClaim).flush()
+
+    assertThat(server.requestCount).isEqualTo(0)
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(storage.count()).isEqualTo(0)
+    assertThat(events.types()).doesNotContain(SyncEventType.ITEM_DEAD_LETTERED)
+    val failure = events.single { it.type == SyncEventType.ITEM_FAILED }
+    assertThat(failure.itemId).isEqualTo("spent")
+    assertThat(failure.errorCode).isEqualTo(SyncErrorCode.MAX_ATTEMPTS_EXCEEDED)
+    assertThat(result.failedIds.toList()).containsExactly("spent")
   }
 
   @Test

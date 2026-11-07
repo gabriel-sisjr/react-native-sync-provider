@@ -160,10 +160,13 @@ internal class SyncQueueStorage(
 
   /**
    * A terminal failure: move the claimed row to the dead letters, in one transaction, with
-   * the outcome of its final attempt.
+   * the outcome of its final attempt. A row purged since the claim (`clearQueue()`,
+   * `removeItem(id)`) is not written back.
    *
    * @param attempts attempts made in total.
    * @param lastErrorMessage cut to [SyncDeadLetterEntity.MAX_ERROR_MESSAGE_LENGTH].
+   * @return true when the row was moved; false when it was no longer queued and nothing was
+   *   written.
    */
   @Suppress("LongParameterList")
   suspend fun moveToDeadLetters(
@@ -173,7 +176,7 @@ internal class SyncQueueStorage(
     lastErrorCode: SyncErrorCode,
     lastErrorMessage: String?,
     deadLetteredAt: Long,
-  ): Unit = withContext(Dispatchers.IO) {
+  ): Boolean = withContext(Dispatchers.IO) {
     deadLetterDao.moveFromQueue(
       SyncDeadLetterEntity(
         id = entity.id,

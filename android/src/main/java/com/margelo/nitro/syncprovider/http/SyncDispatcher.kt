@@ -413,6 +413,12 @@ internal class SyncDispatcher(
   /**
    * Move [entity] to the dead letters in one transaction, then report `ITEM_FAILED` with the
    * real code and, right after it, `ITEM_DEAD_LETTERED` carrying that code in its metadata.
+   *
+   * A row that `clearQueue()` or `removeItem(id)` purged after the claim, typically while
+   * its request was in flight, is not moved: nothing is written and no `ITEM_DEAD_LETTERED`
+   * follows. `ITEM_FAILED` still reports the outcome the item reached, as `ITEM_SUCCEEDED`
+   * and `ITEM_RETRYING` do for a purged row, and the cycle still counts it as failed. The
+   * same holds on iOS.
    */
   @Suppress("LongParameterList")
   private suspend fun deadLetter(
@@ -423,7 +429,7 @@ internal class SyncDispatcher(
     detail: String,
     statusCode: Int?,
   ) {
-    storage.moveToDeadLetters(
+    val moved = storage.moveToDeadLetters(
       entity = entity,
       attempts = attempts,
       lastAttemptAt = lastAttemptAt,
@@ -440,6 +446,7 @@ internal class SyncDispatcher(
         attempt = attempts,
       ),
     )
+    if (!moved) return
     emitter.emit(
       SyncEventEmitter.event(
         type = SyncEventType.ITEM_DEAD_LETTERED,

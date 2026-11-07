@@ -38,11 +38,21 @@ internal interface SyncDeadLetterDao {
   @Query("DELETE FROM sync_items")
   suspend fun clearQueued()
 
-  /** Move a queue row here: never in both tables, never in neither. */
+  /**
+   * Move a queue row here: never in both tables, never in neither, and nothing at all when
+   * the queue no longer has the row. The queue row is deleted first and the dead letter is
+   * written only when that delete removed it, so an item that `clearQueue()` or
+   * `removeItem(id)` purged while its request was in flight is not brought back with its
+   * headers and body.
+   *
+   * @return true when the row was moved; false when it was no longer queued, in which case
+   *   nothing was written.
+   */
   @Transaction
-  suspend fun moveFromQueue(row: SyncDeadLetterEntity) {
+  suspend fun moveFromQueue(row: SyncDeadLetterEntity): Boolean {
+    if (deleteQueued(row.id) == 0) return false
     insert(row)
-    deleteQueued(row.id)
+    return true
   }
 
   /** Empty the queue and the dead letters together. */
