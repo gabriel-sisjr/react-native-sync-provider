@@ -134,6 +134,22 @@ final class HeldWakeTests: XCTestCase {
         XCTAssertEqual(fixture.recheckTimer.delayMs, 30_000)
     }
 
+    /// Any new arm of the retry timer, as at the end of a cycle or when a
+    /// hybrid attaches, takes over from the re-check and restarts its backoff.
+    func test_heldWake_recheckBackoffResets_onAnyNewArm() async throws {
+        let engine = try await engineHoldingAWake()
+        await fixture.recheckTimer.fire()
+        await fixture.recheckTimer.fire()
+        XCTAssertEqual(fixture.recheckTimer.delayMs, 120_000)
+
+        await engine.rearmRetryTimer()
+
+        XCTAssertFalse(fixture.recheckTimer.isArmed)
+        await fixture.timer.fire()
+        XCTAssertTrue(engine.hasWakeAwaitingConnectivity)
+        XCTAssertEqual(fixture.recheckTimer.delayMs, 30_000)
+    }
+
     func test_heldWake_recheckBackoffResets_whenTheGatePasses() async throws {
         let engine = try await engineHoldingAWake()
         await fixture.recheckTimer.fire()

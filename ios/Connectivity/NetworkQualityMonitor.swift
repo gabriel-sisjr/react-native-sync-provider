@@ -74,6 +74,8 @@ final class NetworkQualityMonitor: @unchecked Sendable {
         let samples: [Int?]
         let identity: LinkIdentity
         let measuredAtMs: Int64
+        /// Some sample got a 2xx.
+        let sawHealthy: Bool
     }
 
     /// What `ConnectionState` carries. A change here is a `CONNECTION_CHANGED`.
@@ -138,8 +140,9 @@ final class NetworkQualityMonitor: @unchecked Sendable {
         set { lock.withLock { changeHandler = newValue } }
     }
 
-    /// Called with the probe URL for every sample that got a 2xx, kept or not:
-    /// it is what the health check counts as a healthy result.
+    /// Called with the probe URL when a measurement is kept and one of its
+    /// samples got a 2xx: the health check counts that as a passed check. A
+    /// measurement cancelled or replaced counts for nothing.
     var onHealthySample: (@Sendable (URL) -> Void)? {
         get { lock.withLock { healthySampleHandler } }
         set { lock.withLock { healthySampleHandler = newValue } }
@@ -270,33 +273,37 @@ final class NetworkQualityMonitor: @unchecked Sendable {
             try? await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
         }
         var samples: [Int?] = []
+        var sawHealthy = false
         while samples.count < kQualityProbeSamples, !Task.isCancelled {
             let result = await probe.head(url, timeoutMs: kQualityProbeTimeoutMs)
-            if result.isHealthy {
-                lock.withLock { healthySampleHandler }?(url)
-            }
             if Task.isCancelled { break }
             // Any status is a latency sample: what a status means is the
             // health check's business.
             samples.append(result.latencyMs)
+            sawHealthy = sawHealthy || result.isHealthy
         }
         let complete = samples.count == kQualityProbeSamples && !Task.isCancelled
-        finish(ticket: ticket, measurement: complete ? Measurement(samples: samples,
-                                                                   identity: identity,
-                                                                   measuredAtMs: clock.nowMs()) : nil)
+        finish(ticket: ticket,
+               url: url,
+               measurement: complete ? Measurement(samples: samples,
+                                                   identity: identity,
+                                                   measuredAtMs: clock.nowMs(),
+                                                   sawHealthy: sawHealthy) : nil)
     }
 
-    private func finish(ticket: UInt64, measurement newMeasurement: Measurement?) {
-        let (notify, handler) = lock.withLock { () -> (NetworkState?, (@Sendable (NetworkState) -> Void)?) in
+    private func finish(ticket: UInt64, url: URL, measurement newMeasurement: Measurement?) {
+        let (notify, handler, healthy) = lock.withLock {
+            () -> (NetworkState?, (@Sendable (NetworkState) -> Void)?, (@Sendable (URL) -> Void)?) in
             // A newer update cancelled this one, or will.
-            guard ticket == generation else { return (nil, nil) }
+            guard ticket == generation else { return (nil, nil, nil) }
             probeTask = nil
             guard let newMeasurement, link.isOnline, LinkIdentity(link) == newMeasurement.identity else {
-                return (nil, nil)
+                return (nil, nil, nil)
             }
             measurement = newMeasurement
-            return (publishLocked(), changeHandler)
+            return (publishLocked(), changeHandler, newMeasurement.sawHealthy ? healthySampleHandler : nil)
         }
+        healthy?(url)
         if let notify {
             handler?(notify)
         }

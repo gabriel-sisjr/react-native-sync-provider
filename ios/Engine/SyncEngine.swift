@@ -393,6 +393,10 @@ final class SyncEngine: @unchecked Sendable {
                 releaseHeldWakeLocked()
                 return
             }
+            // Any new arm restarts a held wake's re-check backoff: the timer
+            // takes over, and a wake it finds still held starts again at 30 s.
+            heldWakeTimer.cancel()
+            heldWakeRecheckMs = kHeldWakeRecheckInitialMs
             retryTimer.arm(afterMs: max(0, max(wakeAt, holdUntil, backoffUntil) - nowMs)) { [weak self] in
                 await self?.retryWakeFired()
             }

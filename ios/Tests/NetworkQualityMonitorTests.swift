@@ -363,6 +363,57 @@ final class NetworkQualityMonitorTests: XCTestCase {
         XCTAssertEqual(Array(probe.probedURLs.suffix(3)), [other, other, other])
     }
 
+    // MARK: - Healthy samples
+
+    /// A 2xx sample counts as a passed health check only from a measurement
+    /// that was kept: not from one cancelled or replaced.
+    func test_healthySample_countsOnlyFromAKeptMeasurement() async {
+        let healthy = URLLog()
+        monitor.onHealthySample = { healthy.record($0) }
+        probe.answer(latencyMs: 100, statusCode: 200)
+        probe.hold(fromCall: 1)
+        monitor.setProbeURL(url)
+        let held = await probe.waitUntilHeld()
+        XCTAssertTrue(held, "The first HEAD got its 2xx; the second waits")
+
+        connectivity.set(.disconnected)
+        probe.release()
+        await monitor.waitForProbe()
+        XCTAssertEqual(healthy.urls, [], "A cancelled measurement's 2xx is no passed check")
+
+        connectivity.set(snapshot: .link())
+        await monitor.waitForProbe()
+        XCTAssertEqual(healthy.urls, [url], "A kept one counts, once")
+    }
+
+    func test_healthySample_fromAReplacedMeasurement_doesNotCount() async {
+        let healthy = URLLog()
+        monitor.onHealthySample = { healthy.record($0) }
+        probe.answer(latencyMs: 100, statusCode: 200)
+        probe.hold(fromCall: 1)
+        monitor.setProbeURL(url)
+        _ = await probe.waitUntilHeld()
+        let other = URL(string: "https://other.test/health")!
+
+        monitor.setProbeURL(other)
+        probe.release()
+        await monitor.waitForProbe()
+
+        XCTAssertEqual(healthy.urls, [other], "Only the new URL's kept measurement counts")
+    }
+
+    func test_measurementWithoutA2xx_isNoPassedCheck() async {
+        let healthy = URLLog()
+        monitor.onHealthySample = { healthy.record($0) }
+        probe.answer(latencyMs: 100, statusCode: 503)
+
+        monitor.setProbeURL(url)
+        await monitor.waitForProbe()
+
+        XCTAssertEqual(quality, .excellent, "Still a latency sample")
+        XCTAssertEqual(healthy.urls, [])
+    }
+
     // MARK: - Reported changes
 
     func test_connection_qualityOnlyChange_isReported() async {
@@ -429,5 +480,19 @@ private final class ChangeLog: @unchecked Sendable {
 
     func record(_ state: NetworkState) {
         lock.withLock { recorded.append(state) }
+    }
+}
+
+/// Every URL reported as healthy, in order.
+private final class URLLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [URL] = []
+
+    var urls: [URL] {
+        lock.withLock { recorded }
+    }
+
+    func record(_ url: URL) {
+        lock.withLock { recorded.append(url) }
     }
 }

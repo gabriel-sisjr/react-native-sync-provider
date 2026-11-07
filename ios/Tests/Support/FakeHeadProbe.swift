@@ -10,6 +10,7 @@ final class FakeHeadProbe: HeadProbing, @unchecked Sendable {
     private var fallback: HeadProbeResult = .response(statusCode: 200, latencyMs: 100)
     private var calls: [(url: URL, timeoutMs: Int)] = []
     private var holding = false
+    private var holdFromCall: Int?
     private var held: [CheckedContinuation<Void, Never>] = []
 
     /// Every URL probed, in order.
@@ -50,6 +51,12 @@ final class FakeHeadProbe: HeadProbing, @unchecked Sendable {
         lock.withLock { holding = true }
     }
 
+    /// Makes every call from the `index`-th on (0-based) wait until
+    /// ``release()``; the earlier ones answer at once.
+    func hold(fromCall index: Int) {
+        lock.withLock { holdFromCall = index }
+    }
+
     /// Lets every held call, and every later one, through.
     func release() {
         let waiting = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
@@ -73,6 +80,10 @@ final class FakeHeadProbe: HeadProbing, @unchecked Sendable {
     func head(_ url: URL, timeoutMs: Int) async -> HeadProbeResult {
         let mustWait = lock.withLock { () -> Bool in
             calls.append((url, timeoutMs))
+            if let holdFromCall, calls.count - 1 >= holdFromCall {
+                holding = true
+                self.holdFromCall = nil
+            }
             return holding
         }
         if mustWait {
