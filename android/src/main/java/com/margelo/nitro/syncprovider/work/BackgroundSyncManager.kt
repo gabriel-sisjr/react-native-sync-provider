@@ -141,8 +141,10 @@ internal class BackgroundSyncManager(context: Context) {
    * Does nothing unless the consumer enabled background sync and did not ask for
    * `foregroundOnly`. It honors the same constraints as the periodic work.
    *
-   * [ExistingWorkPolicy.REPLACE] keeps one kick armed, always for the latest deadline.
-   * Delays are computed from absolute deadlines, so re-arming never postpones a wake.
+   * [ExistingWorkPolicy.REPLACE] keeps one kick armed, for the latest decision. The caller
+   * computes delays from absolute deadlines and never lets one end before an active
+   * credential hold: re-arming for the same deadline does not postpone the wake, and a
+   * replacement never brings it forward past a hold.
    *
    * A failure here is only logged: the callers run at the end of a flush cycle that
    * already completed, and it must not be rejected for this.
