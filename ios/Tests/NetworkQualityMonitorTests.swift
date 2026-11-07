@@ -149,20 +149,155 @@ final class NetworkQualityMonitorTests: XCTestCase {
         XCTAssertEqual(quality, .moderate)
     }
 
-    func test_losingTheLink_dropsTheMeasurement() async {
+    /// An offline blip cancels a measurement in flight but keeps the last
+    /// one: the same link back within 30 s reuses it.
+    func test_offlineBlip_keepsTheMeasurement_forTheSameLinkWithin30Seconds() async {
         probe.answer(latencyMs: 150)
         monitor.setProbeURL(url)
         await monitor.waitForProbe()
 
         connectivity.set(.disconnected)
         XCTAssertEqual(quality, .offline)
+        clock.advance(ms: kQualityMeasurementCacheMs - 1)
+        connectivity.set(snapshot: .link())
+        await monitor.waitForProbe()
+
+        XCTAssertEqual(quality, .excellent, "The same link, back within 30 s")
+        XCTAssertEqual(probe.callCount, 3, "Nothing measured again")
+    }
+
+    func test_offlineBlip_cancelsTheMeasurementInFlight_butKeepsTheLastOne() async {
+        probe.answer(latencyMs: 150)
+        monitor.setProbeURL(url)
+        await monitor.waitForProbe()
+        clock.advance(ms: kQualityMeasurementCacheMs)
         probe.hold()
         connectivity.set(snapshot: .link())
+        let held = await probe.waitUntilHeld()
+        XCTAssertTrue(held, "Stale on the same link: measuring again")
 
-        XCTAssertEqual(quality, .good, "back online: the link grades alone until measured again")
+        connectivity.set(.disconnected)
         probe.release()
         await monitor.waitForProbe()
+        connectivity.set(snapshot: .link())
+
+        XCTAssertEqual(quality, .excellent, "The cancelled set changed nothing; the last measurement stands")
+        await monitor.waitForProbe()
+    }
+
+    func test_offlineBlip_longerThan30Seconds_measuresTheSameLinkAgain() async {
+        probe.answer(latencyMs: 150)
+        monitor.setProbeURL(url)
+        await monitor.waitForProbe()
+        connectivity.set(.disconnected)
+        clock.advance(ms: kQualityMeasurementCacheMs)
+        probe.hold()
+
+        connectivity.set(snapshot: .link())
+
+        XCTAssertEqual(quality, .excellent, "A measurement never expires: it stands until the new one lands")
+        let held = await probe.waitUntilHeld()
+        XCTAssertTrue(held)
+        probe.answer(latencyMs: 600)
+        probe.release()
+        await monitor.waitForProbe()
+        XCTAssertEqual(quality, .moderate)
+    }
+
+    func test_offlineBlip_backOnAnotherNetwork_dropsTheMeasurement() async {
+        connectivity.set(snapshot: .link(gateway: "192.168.1.1"))
+        probe.answer(latencyMs: 150)
+        monitor.setProbeURL(url)
+        await monitor.waitForProbe()
+        connectivity.set(.disconnected)
+        probe.hold()
+
+        connectivity.set(snapshot: .link(gateway: "10.0.0.1"))
+
+        XCTAssertEqual(quality, .good, "Another network: graded by its link until measured")
+        probe.release()
+        await monitor.waitForProbe()
+    }
+
+    // MARK: - Telling networks apart
+
+    /// Wi-Fi to Wi-Fi of the same cost: only the gateway tells the networks
+    /// apart, and the new one is measured instead of inheriting a result.
+    func test_anotherWifiNetwork_ofTheSameCost_isMeasuredAfresh() async {
+        connectivity.set(snapshot: .link(gateway: "192.168.1.1"))
+        probe.answer(latencyMs: 150)
+        monitor.setProbeURL(url)
+        await monitor.waitForProbe()
         XCTAssertEqual(quality, .excellent)
+        probe.hold()
+
+        connectivity.set(snapshot: .link(gateway: "10.0.0.1"))
+
+        XCTAssertEqual(quality, .good, "The other network's 150 ms does not grade this one")
+        let held = await probe.waitUntilHeld()
+        XCTAssertTrue(held)
+        probe.release()
+        await monitor.waitForProbe()
+        XCTAssertEqual(probe.callCount, 6)
+    }
+
+    func test_sameWifiNetwork_reusesItsMeasurement() async {
+        connectivity.set(snapshot: .link(gateway: "192.168.1.1"))
+        probe.answer(latencyMs: 150)
+        monitor.setProbeURL(url)
+        await monitor.waitForProbe()
+
+        connectivity.set(snapshot: .link(gateway: "192.168.1.1"))
+        await monitor.waitForProbe()
+
+        XCTAssertEqual(probe.callCount, 3)
+        XCTAssertEqual(quality, .excellent)
+    }
+
+    // MARK: - The cache clock
+
+    /// The age runs on the wall clock, which can move back. A negative age is
+    /// stale, so a clock moved back defeats neither the reuse window nor the
+    /// stale re-measure.
+    func test_clockMovedBack_makesTheMeasurementStale() async {
+        probe.answer(latencyMs: 150)
+        monitor.setProbeURL(url)
+        await monitor.waitForProbe()
+
+        clock.advance(ms: -60_000)
+        connectivity.set(snapshot: .link())
+        await monitor.waitForProbe()
+
+        XCTAssertEqual(probe.callCount, 6, "Reused on a path update only when 0 <= age < 30 s")
+    }
+
+    func test_clockMovedBack_letsAGateEvaluationMeasureAgain() async {
+        probe.answer(latencyMs: 150)
+        monitor.setProbeURL(url)
+        await monitor.waitForProbe()
+
+        clock.advance(ms: -1)
+        monitor.refreshIfStale()
+        await monitor.waitForProbe()
+
+        XCTAssertEqual(probe.callCount, 6)
+    }
+
+    // MARK: - Debounce
+
+    /// 1000 ms on both platforms. Production waits it before a set.
+    func test_debounce_isOneSecond() async throws {
+        XCTAssertEqual(kQualityProbeDebounceMs, 1_000)
+        let debounced = NetworkQualityMonitor(connectivity: connectivity, probe: probe, clock: clock)
+        debounced.start()
+        defer { debounced.stop() }
+
+        debounced.setProbeURL(url)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(probe.callCount, 0, "Still inside the debounce")
+        await debounced.waitForProbe()
+
+        XCTAssertEqual(probe.callCount, 3)
     }
 
     func test_changingTheURL_dropsTheMeasurement_andMeasuresTheNewOne() async {

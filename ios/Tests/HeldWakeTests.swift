@@ -165,6 +165,23 @@ final class HeldWakeTests: XCTestCase {
         XCTAssertEqual(requestCount, 1)
     }
 
+    /// Accepted on both platforms: when the grade drops between the check that
+    /// releases a held wake and the flush it starts, that flush is a real
+    /// attempt, the gate reports it, and the wake is held again.
+    func test_heldWake_gradeDroppingBeforeItsFlush_isReportedByTheGate() async throws {
+        let engine = try await engineHoldingAWake()
+        // What the gate reads from now on: lower than what the release check reads.
+        engine.dispatcher.hooks.networkQuality = { .moderate }
+        emitter.clear()
+
+        fixture.connectivity.set(snapshot: .link())
+        await engine.waitForReconnectWake()
+
+        XCTAssertEqual(emitter.events(ofType: "SYNC_FAILED").map(\.errorCode), ["NETWORK_QUALITY_TOO_LOW"])
+        XCTAssertTrue(engine.hasWakeAwaitingConnectivity)
+        XCTAssertEqual(requestCount, 0)
+    }
+
     func test_pausing_dropsTheHeldWakeAndItsRecheck() async throws {
         let engine = try await engineHoldingAWake()
 

@@ -36,6 +36,11 @@ struct ConnectionSnapshot: Sendable, Equatable {
     /// Low Data Mode (`NWPath.isConstrained`). Engine-only: it caps the
     /// network-quality grade, and `ConnectionState` has no field for it.
     var isConstrained: Bool? = nil
+    /// The path's gateway addresses (`NWPath.gateways`), sorted. Engine-only:
+    /// `NWPath` names no network, so these are what tells one Wi-Fi network
+    /// from another of the same cost. Two networks behind the same gateway
+    /// address still look alike.
+    var gateways: [String]? = nil
 
     static let unknown = ConnectionSnapshot(status: .unknown,
                                             type: .unknown,
@@ -221,7 +226,8 @@ final class ConnectivityMonitor: ConnectivityProviding, @unchecked Sendable {
             type: type,
             isInternetReachable: path.status == .satisfied,
             isExpensive: path.isExpensive,
-            isConstrained: path.isConstrained
+            isConstrained: path.isConstrained,
+            gateways: path.gateways.map { String(describing: $0) }.sorted()
         )
     }
 }

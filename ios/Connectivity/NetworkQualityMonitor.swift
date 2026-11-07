@@ -10,8 +10,8 @@
 import Foundation
 
 /// The wait between a path update and the probe it triggers, so a burst of
-/// updates costs one measurement.
-let kQualityProbeDebounceMs = 500
+/// updates costs one measurement. The same on both platforms.
+let kQualityProbeDebounceMs = 1_000
 /// How long a measurement spares the same link another probe.
 let kQualityMeasurementCacheMs: Int64 = 30_000
 /// The timeout of each HEAD in a measurement.
@@ -34,11 +34,12 @@ struct NetworkState: Sendable, Equatable {
 ///   shared probe, a failure counting as infinitely slow. Until the first
 ///   measurement of a link completes, the grade comes from link signals.
 /// - A measurement belongs to the link it was taken on: its interface type,
-///   whether it is expensive, whether it is constrained. A path update on that
-///   same link reuses a measurement younger than
+///   whether it is expensive, whether it is constrained, its gateways. A path
+///   update on that same link reuses a measurement younger than
 ///   ``kQualityMeasurementCacheMs`` and re-probes once it is older. A
-///   different link drops it and is probed afresh; losing the link drops it
-///   too. Changing the probe URL drops it and probes the new URL.
+///   different link drops it and is probed afresh. Losing the link cancels a
+///   measurement in flight but keeps the last one, for the same link coming
+///   back. Changing the probe URL drops it and probes the new URL.
 /// - A measurement never expires on its own: the grade does not fall back to
 ///   link signals with age. A gate evaluation that finds it stale asks for a
 ///   new one through ``refreshIfStale()``.
@@ -51,16 +52,21 @@ struct NetworkState: Sendable, Equatable {
 /// not reported. A lock, not an actor, so the bridge reads ``current``
 /// synchronously.
 final class NetworkQualityMonitor: @unchecked Sendable {
-    /// What a measurement is valid for.
+    /// What a measurement is valid for: one network, as far as `NWPath` can
+    /// tell. It names no network, so the gateway addresses stand in for one;
+    /// two networks behind the same gateway address are taken for one, and a
+    /// stale measurement on them is taken again by ``refreshIfStale()``.
     private struct LinkIdentity: Equatable {
         let type: ConnectionSnapshot.Kind
         let expensive: Bool
         let constrained: Bool
+        let gateways: [String]
 
         init(_ link: ConnectionSnapshot) {
             type = link.type
             expensive = NetworkQualityClassifier.isMetered(link)
             constrained = link.isConstrained == true
+            gateways = link.gateways ?? []
         }
     }
 
@@ -189,8 +195,9 @@ final class NetworkQualityMonitor: @unchecked Sendable {
         update { () -> Bool in
             link = snapshot
             if !snapshot.isOnline {
+                // The measurement outlives an offline blip: the same link back
+                // within the cache window reuses it.
                 cancelProbeLocked()
-                measurement = nil
             } else if let measurement, measurement.identity != LinkIdentity(snapshot) {
                 cancelProbeLocked()
                 self.measurement = nil
@@ -217,7 +224,7 @@ final class NetworkQualityMonitor: @unchecked Sendable {
 
     private func scheduleProbeIfDueLocked(debounced: Bool = true) {
         guard probeTask == nil, let url = probeURL, link.isOnline else { return }
-        if let measurement, clock.nowMs() - measurement.measuredAtMs < kQualityMeasurementCacheMs {
+        if let measurement, isFresh(measurement) {
             return
         }
         generation &+= 1
@@ -234,6 +241,14 @@ final class NetworkQualityMonitor: @unchecked Sendable {
 
     private func retire(_ ticket: UInt64) {
         lock.withLock { _ = runningProbes.removeValue(forKey: ticket) }
+    }
+
+    /// Younger than the cache window. The clock is the wall clock, which the
+    /// uptime clocks' privacy declaration would be the price of avoiding, so
+    /// it can move back: a negative age counts as stale, not as fresh.
+    private func isFresh(_ measurement: Measurement) -> Bool {
+        let ageMs = clock.nowMs() - measurement.measuredAtMs
+        return ageMs >= 0 && ageMs < kQualityMeasurementCacheMs
     }
 
     private func cancelProbeLocked() {

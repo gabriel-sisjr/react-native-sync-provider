@@ -431,7 +431,9 @@ final class SyncEngine: @unchecked Sendable {
         }
         lock.withLock { releaseHeldWakeLocked() }
         do {
-            // The grade can drop between the check above and the gate.
+            // The grade can drop between the check above and the gate. That is
+            // a real attempt, so the gate reports it with `SYNC_FAILED`, as it
+            // does on Android; the wake is held again.
             if case .skipped(_, .networkQualityTooLow) = try await dispatcher.flushOutcome() {
                 holdWake(on: qualityMonitor.current)
             }
@@ -472,7 +474,10 @@ final class SyncEngine: @unchecked Sendable {
     }
 
     /// Runs for every change to what `ConnectionState` reports, the grade
-    /// included, synchronously from the path update or measurement behind it.
+    /// included, synchronously from the path update or measurement behind it:
+    /// `CONNECTION_CHANGED` is emitted before the update returns, and the
+    /// emitter calls listeners on the main thread. Android emits it
+    /// asynchronously.
     private func networkChanged(_ network: NetworkState) {
         emitter.emit(.now(type: "CONNECTION_CHANGED", connectionStatus: network.link.status.rawValue))
 

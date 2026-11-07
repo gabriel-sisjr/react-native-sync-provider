@@ -95,12 +95,14 @@ extension ConnectionSnapshot {
     /// A usable link with the given signals.
     static func link(_ type: Kind = .wifi,
                      expensive: Bool = false,
-                     constrained: Bool = false) -> ConnectionSnapshot {
+                     constrained: Bool = false,
+                     gateway: String? = nil) -> ConnectionSnapshot {
         ConnectionSnapshot(status: expensive ? .metered : .connected,
                            type: type,
                            isInternetReachable: true,
                            isExpensive: expensive,
-                           isConstrained: constrained)
+                           isConstrained: constrained,
+                           gateways: gateway.map { [$0] })
     }
 
     /// No link.
