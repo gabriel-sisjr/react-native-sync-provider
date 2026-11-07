@@ -164,6 +164,83 @@ final class DeadLetterStoreTests: XCTestCase {
         XCTAssertEqual(letters.first?.deadLetteredAt, clock.nowMs())
     }
 
+    // MARK: - A budget spent before the request
+
+    /// `maxAttempts` lowered below the attempts an item already made: the next
+    /// cycle dead-letters it without sending it again, with the attempts it
+    /// made and its last attempt's time.
+    func test_dlq_budgetSpentBeforeTheRequest_isDeadLetteredWithoutSending() async throws {
+        let engine = await engine(maxAttempts: 5)
+        let id = try await enqueue(in: engine)
+        URLProtocolStub.setHandler(stubResponse(503))
+        _ = try await engine.dispatcher.flush()
+        let firstAttemptAt = fixture.clock.nowMs()
+        await engine.configure(.sample(retryPolicy: .exact(maxAttempts: 1, baseDelayMs: 50)))
+        fixture.clock.advance(ms: 1_000)
+        URLProtocolStub.setHandler(stubResponse(200))
+        emitter.clear()
+
+        let result = try await engine.dispatcher.flush()
+
+        XCTAssertTrue(URLProtocolStub.capturedRequests.isEmpty, "No request once the budget is spent")
+        let queued = try await engine.storage.isQueued(id)
+        XCTAssertFalse(queued)
+        let letterValue = try await engine.storage.deadLetter(id)
+        let letter = try XCTUnwrap(letterValue)
+        XCTAssertEqual(letter.attempts, 1, "The attempts made, none added")
+        XCTAssertEqual(letter.lastAttemptAt, firstAttemptAt)
+        XCTAssertEqual(letter.deadLetteredAt, fixture.clock.nowMs())
+        XCTAssertEqual(letter.lastErrorCode, "MAX_ATTEMPTS_EXCEEDED")
+        XCTAssertEqual(letter.lastErrorMessage, "Retry budget exhausted")
+        XCTAssertEqual(emitter.emittedEvents.filter { $0.itemId == id }.map(\.type),
+                       ["ITEM_FAILED", "ITEM_DEAD_LETTERED"])
+        let failed = try XCTUnwrap(emitter.events(ofType: "ITEM_FAILED").first)
+        XCTAssertEqual(failed.errorCode, "MAX_ATTEMPTS_EXCEEDED")
+        XCTAssertEqual(failed.attempt, 1)
+        XCTAssertNil(failed.statusCode)
+        XCTAssertEqual(emitter.events(ofType: "ITEM_DEAD_LETTERED").first?.metadata,
+                       ["lastErrorCode": "MAX_ATTEMPTS_EXCEEDED"])
+        XCTAssertEqual(emitter.events(ofType: "SYNC_PROGRESS").last?.progress, 1)
+        XCTAssertEqual(result.itemsFailed, 1)
+        XCTAssertEqual(result.errorMessage, "Retry budget exhausted")
+    }
+
+    /// A spent budget with no attempt time on record, the shape of a row
+    /// migrated from an early store, is dated by the cycle that ends it.
+    func test_dlq_budgetSpentWithoutAnAttemptTime_isDatedByTheCheck() async throws {
+        let engine = await engine(maxAttempts: 2)
+        let dao = SyncItemDao(stack: fixture.stack, clock: fixture.clock)
+        try await dao.insert(StoredSyncItem(id: "01SPENT", method: "POST", url: "https://api.test/x", headers: nil,
+                                            body: "{}", contentType: "application/json", priority: "NORMAL",
+                                            createdAt: 1, attempts: 3, lastAttemptAt: nil, nextRetryAt: 0,
+                                            lastErrorCode: nil, status: "PENDING", metadata: nil))
+        fixture.clock.advance(ms: 5_000)
+        URLProtocolStub.setHandler(stubResponse(200))
+
+        _ = try await engine.dispatcher.flush()
+
+        XCTAssertTrue(URLProtocolStub.capturedRequests.isEmpty)
+        let letterValue = try await engine.storage.deadLetter("01SPENT")
+        let letter = try XCTUnwrap(letterValue)
+        XCTAssertEqual(letter.attempts, 3)
+        XCTAssertEqual(letter.lastAttemptAt, fixture.clock.nowMs())
+        XCTAssertEqual(letter.deadLetteredAt, fixture.clock.nowMs())
+    }
+
+    /// A `maxAttempts` below 1 still sends a fresh item once, as on Android.
+    func test_dlq_maxAttemptsBelowOne_stillSendsAFreshItemOnce() async throws {
+        let engine = await engine(maxAttempts: 0)
+        let id = try await enqueue(in: engine)
+        URLProtocolStub.setHandler(stubResponse(503))
+
+        _ = try await engine.dispatcher.flush()
+
+        XCTAssertEqual(URLProtocolStub.capturedRequests.count, 1)
+        let letter = try await engine.storage.deadLetter(id)
+        XCTAssertEqual(letter?.attempts, 1)
+        XCTAssertEqual(letter?.lastErrorCode, "MAX_ATTEMPTS_EXCEEDED")
+    }
+
     func test_dlq_damagedCode_listsAsMaxAttemptsExceeded() async throws {
         let stack = InMemoryCoreDataStack.make()
         try await stack.performBackgroundTask { context in

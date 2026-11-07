@@ -452,6 +452,19 @@ actor SyncDispatcher {
         dispatchLoop: for (index, item) in pending.enumerated() {
             if isPaused { break }
             attempted += 1
+
+            // A budget spent before this cycle, by a `maxAttempts` lowered
+            // since the last attempt say, ends the item without a request.
+            if Int(item.attempts) >= max(1, config.retryPolicy.maxAttempts) {
+                emitProgress(index: index, total: total)
+                try await deadLetterSpentBudget(item: item)
+                failedIds.append(item.id)
+                if firstError == nil {
+                    firstError = Self.spentBudgetMessage
+                }
+                continue
+            }
+
             inFlight.insert(item.id)
             try await storage.markInFlight(id: item.id)
 
@@ -461,12 +474,7 @@ actor SyncDispatcher {
             let outcome = await dispatchOne(item: item)
             inFlight.remove(item.id)
 
-            // Progress event.
-            let progress = Double(index + 1) / Double(total)
-            emitter.emit(.now(type: "SYNC_PROGRESS",
-                              progress: progress,
-                              metadata: ["index": String(index + 1),
-                                         "total": String(total)]))
+            emitProgress(index: index, total: total)
 
             if outcome.succeeded {
                 succeededIds.append(item.id)
@@ -519,7 +527,41 @@ actor SyncDispatcher {
         return result
     }
 
+    private func emitProgress(index: Int, total: Int) {
+        emitter.emit(.now(type: "SYNC_PROGRESS",
+                          progress: Double(index + 1) / Double(total),
+                          metadata: ["index": String(index + 1),
+                                     "total": String(total)]))
+    }
+
     // MARK: - Failure handling
+
+    /// What the dead letter of an item whose budget was spent before its
+    /// request says.
+    static let spentBudgetMessage = "Retry budget exhausted"
+
+    /// Ends an item whose attempts already reached `maxAttempts`, with no
+    /// request: it moves to the dead-letter store with the attempts it made
+    /// and its last attempt's time, then `ITEM_FAILED` with
+    /// `MAX_ATTEMPTS_EXCEEDED` and `ITEM_DEAD_LETTERED` follow, as after a
+    /// failed last attempt. `attempt` is the attempts made, none being added.
+    private func deadLetterSpentBudget(item: StoredSyncItem) async throws {
+        let code = "MAX_ATTEMPTS_EXCEEDED"
+        let moved = try await storage.moveToDeadLetters(id: item.id,
+                                                        errorCode: code,
+                                                        errorMessage: Self.spentBudgetMessage)
+        emitter.emit(.now(type: "ITEM_FAILED",
+                          itemId: item.id,
+                          errorCode: code,
+                          attempt: Double(item.attempts)))
+        // A row removed meanwhile has nothing to move.
+        if moved {
+            emitter.emit(.now(type: "ITEM_DEAD_LETTERED",
+                              itemId: item.id,
+                              errorCode: "DEAD_LETTERED",
+                              metadata: ["lastErrorCode": code]))
+        }
+    }
 
     /// Records the outcome of a **failed** dispatch: decides retry vs. terminal
     /// failure, persists the retry cooldown (`nextRetryAt`) via

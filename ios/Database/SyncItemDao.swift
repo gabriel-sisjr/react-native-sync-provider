@@ -275,7 +275,9 @@ final class SyncItemDao {
     /// nor in neither.
     ///
     /// The dead letter keeps the request, `createdAt`, the attempts made and
-    /// the last one's time. `errorMessage` is cut to
+    /// the last one's time. A row with no attempt time, one whose budget was
+    /// spent before it was ever claimed, takes the time of the move, which is
+    /// also its `deadLetteredAt`. `errorMessage` is cut to
     /// ``kDeadLetterMessageMaxLength`` characters. An older dead letter with
     /// the same id, from an earlier failure of a replayed item, is replaced.
     ///
@@ -287,6 +289,7 @@ final class SyncItemDao {
             if let older = try Self.fetchDeadLetter(id: id, in: context) {
                 context.delete(older)
             }
+            let nowMs = clock.nowMs()
             let letter = SyncDeadLetterEntity(context: context)
             letter.id = entity.id
             letter.method = entity.method
@@ -298,10 +301,10 @@ final class SyncItemDao {
             letter.createdAt = entity.createdAt
             letter.metadataJSON = entity.metadataJSON
             letter.attempts = entity.attempts
-            letter.lastAttemptAt = entity.lastAttemptAt
+            letter.lastAttemptAt = entity.lastAttemptAt > 0 ? entity.lastAttemptAt : nowMs
             letter.lastErrorCode = errorCode
             letter.lastErrorMessage = errorMessage.map { String($0.prefix(kDeadLetterMessageMaxLength)) }
-            letter.deadLetteredAt = clock.nowMs()
+            letter.deadLetteredAt = nowMs
             context.delete(entity)
             return true
         }
