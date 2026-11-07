@@ -111,6 +111,7 @@ final class DispatcherHooks: @unchecked Sendable {
     private var cycleFinished: (@Sendable (Int64?) async -> Void)?
     private var credentialRecovery: (@Sendable () -> [String: String]?)?
     private var qualitySource: (@Sendable () -> NetworkQualityLevel)?
+    private var qualityRefresh: (@Sendable () -> Void)?
 
     /// When `true`, uploads never go through the background `URLSession`.
     var foregroundOnly: Bool {
@@ -145,6 +146,13 @@ final class DispatcherHooks: @unchecked Sendable {
     var networkQuality: (@Sendable () -> NetworkQualityLevel)? {
         get { lock.withLock { qualitySource } }
         set { lock.withLock { qualitySource = newValue } }
+    }
+
+    /// Called on every gate evaluation, so a stale measurement is taken again
+    /// in the background. The evaluation itself uses the grade as it is.
+    var refreshStaleNetworkQuality: (@Sendable () -> Void)? {
+        get { lock.withLock { qualityRefresh } }
+        set { lock.withLock { qualityRefresh = newValue } }
     }
 }
 
@@ -362,6 +370,7 @@ actor SyncDispatcher {
         if connectivity.current.status == .unknown {
             await connectivity.waitUntilKnown(timeoutMs: kFirstPathUpdateWaitMs)
         }
+        hooks.refreshStaleNetworkQuality?()
         let quality = hooks.networkQuality?()
             ?? NetworkQualityClassifier.classify(link: connectivity.current, samples: nil)
         // Read again: a configuration can land during the wait.

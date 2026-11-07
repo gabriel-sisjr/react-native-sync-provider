@@ -39,6 +39,9 @@ struct NetworkState: Sendable, Equatable {
 ///   ``kQualityMeasurementCacheMs`` and re-probes once it is older. A
 ///   different link drops it and is probed afresh; losing the link drops it
 ///   too. Changing the probe URL drops it and probes the new URL.
+/// - A measurement never expires on its own: the grade does not fall back to
+///   link signals with age. A gate evaluation that finds it stale asks for a
+///   new one through ``refreshIfStale()``.
 /// - A measurement interrupted by any of those, or by ``stop()``, is
 ///   discarded whole: a cancelled HEAD reads as a failure, and a set with one
 ///   would grade the link `poor` for nothing.
@@ -161,6 +164,16 @@ final class NetworkQualityMonitor: @unchecked Sendable {
         }
     }
 
+    /// Measures again, in the background and without debounce, when the
+    /// measurement is ``kQualityMeasurementCacheMs`` old or older, or missing.
+    /// Every gate evaluation calls it: a measurement never expires on its own,
+    /// so without this a stable path would keep an old grade, and a wake held
+    /// on it, indefinitely. At most one measurement runs at a time, and never
+    /// without a URL or a usable link.
+    func refreshIfStale() {
+        lock.withLock { scheduleProbeIfDueLocked(debounced: false) }
+    }
+
     /// Returns once every measurement running now, a cancelled one included,
     /// has finished.
     func waitForProbe() async {
@@ -202,7 +215,7 @@ final class NetworkQualityMonitor: @unchecked Sendable {
 
     // MARK: - Measuring
 
-    private func scheduleProbeIfDueLocked() {
+    private func scheduleProbeIfDueLocked(debounced: Bool = true) {
         guard probeTask == nil, let url = probeURL, link.isOnline else { return }
         if let measurement, clock.nowMs() - measurement.measuredAtMs < kQualityMeasurementCacheMs {
             return
@@ -210,8 +223,9 @@ final class NetworkQualityMonitor: @unchecked Sendable {
         generation &+= 1
         let ticket = generation
         let identity = LinkIdentity(link)
+        let delayMs = debounced ? debounceMs : 0
         let task = Task { [weak self] in
-            await self?.measure(url: url, identity: identity, ticket: ticket)
+            await self?.measure(url: url, identity: identity, ticket: ticket, delayMs: delayMs)
             self?.retire(ticket)
         }
         probeTask = task
@@ -228,9 +242,9 @@ final class NetworkQualityMonitor: @unchecked Sendable {
         generation &+= 1
     }
 
-    private func measure(url: URL, identity: LinkIdentity, ticket: UInt64) async {
-        if debounceMs > 0 {
-            try? await Task.sleep(nanoseconds: UInt64(debounceMs) * 1_000_000)
+    private func measure(url: URL, identity: LinkIdentity, ticket: UInt64, delayMs: Int) async {
+        if delayMs > 0 {
+            try? await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
         }
         var samples: [Int?] = []
         while samples.count < kQualityProbeSamples, !Task.isCancelled {

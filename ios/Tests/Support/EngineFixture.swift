@@ -14,6 +14,8 @@ final class EngineFixture {
     let scheduler = FakeBackgroundTaskScheduler()
     let clock = ManualClock()
     let timer = ManualWakeTimer()
+    /// Re-checks a wake held below the network-quality minimum.
+    let recheckTimer = ManualWakeTimer()
     /// Set before building an engine to intercept its deadline queries.
     var wrapWakeSource: ((RetryWakeSource) -> RetryWakeSource)?
     let foregroundSession = URLSession.stubbed()
@@ -54,6 +56,7 @@ final class EngineFixture {
                                 qualityProbeDebounceMs: 0,
                                 clock: clock,
                                 retryTimer: timer,
+                                heldWakeTimer: recheckTimer,
                                 wrapWakeSource: wrapWakeSource)
         engines.append(engine)
         return engine
