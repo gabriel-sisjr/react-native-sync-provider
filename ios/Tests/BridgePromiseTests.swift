@@ -92,12 +92,6 @@ final class BridgePromiseTests: XCTestCase {
         XCTAssertEqual(received.calls, 1, "No call after the removal")
     }
 
-    func test_deadLetterCalls_areSettledOnReturn() throws {
-        assertResolvedOnReturn(try hybrid.listDeadLetter())
-        assertRejectedOnReturn(try hybrid.replayDeadLetter(id: "01HZZZZZZZZZZZZZZZZZZZZZZZ"))
-        assertRejectedOnReturn(try hybrid.discardDeadLetter(id: "01HZZZZZZZZZZZZZZZZZZZZZZZ"))
-    }
-
     // MARK: - What they settle with
 
     func test_getSyncConfig_echoesTheNetworkHealthOptionsOnlyWhenSet() async throws {
@@ -129,17 +123,6 @@ final class BridgePromiseTests: XCTestCase {
         let outcome = attachLikeTheBridge(promise)
         guard case .success? = outcome.value else {
             return XCTFail("Must have resolved inside the attach, got \(String(describing: outcome.value))",
-                           file: file, line: line)
-        }
-        XCTAssertEqual(outcome.calls, 1, file: file, line: line)
-    }
-
-    private func assertRejectedOnReturn<T>(_ promise: Promise<T>,
-                                           file: StaticString = #filePath,
-                                           line: UInt = #line) {
-        let outcome = attachLikeTheBridge(promise)
-        guard case .failure? = outcome.value else {
-            return XCTFail("Must have rejected inside the attach, got \(String(describing: outcome.value))",
                            file: file, line: line)
         }
         XCTAssertEqual(outcome.calls, 1, file: file, line: line)

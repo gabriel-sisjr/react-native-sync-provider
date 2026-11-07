@@ -88,6 +88,18 @@ struct StoredDeadLetter: Sendable, Equatable {
 /// The most a dead letter's `lastErrorMessage` keeps, in characters.
 let kDeadLetterMessageMaxLength = 1_024
 
+/// What ``SyncItemDao/replayDeadLetter(id:capacity:)`` did.
+enum DeadLetterReplay: Sendable, Equatable {
+    /// Back in the queue, and the dead letter gone.
+    case replayed
+    /// No dead letter has that id: nothing changed.
+    case unknown
+    /// A queue row already has that id: nothing changed.
+    case alreadyQueued
+    /// The queue is at capacity: nothing changed.
+    case queueFull
+}
+
 /// Asynchronous CRUD wrapper around `SyncItemEntity`, `SyncDeadLetterEntity`
 /// and `SyncResultEntity`.
 final class SyncItemDao {
@@ -306,6 +318,55 @@ final class SyncItemDao {
             letter.lastErrorMessage = errorMessage.map { String($0.prefix(kDeadLetterMessageMaxLength)) }
             letter.deadLetteredAt = nowMs
             context.delete(entity)
+            return true
+        }
+    }
+
+    /// Puts the dead letter `id` back in the queue, in one transaction: a
+    /// fresh `PENDING` row with the same id, request and `createdAt`, no
+    /// attempts, no deadline and no last error, and the dead letter deleted.
+    ///
+    /// Checked against `capacity` in the same transaction, counted the way
+    /// ``countPending()`` counts it for an enqueue; dead letters count toward
+    /// it no more than before. A queue row that already has `id`, which only
+    /// a replay racing this one or a damaged store can leave, is left alone,
+    /// and so is the dead letter.
+    func replayDeadLetter(id: String, capacity: Int) async throws -> DeadLetterReplay {
+        try await stack.performBackgroundTask { context in
+            guard let letter = try Self.fetchDeadLetter(id: id, in: context) else { return .unknown }
+            // The model makes `id` unique, and the merge policy would let this
+            // insert overwrite that row instead of failing.
+            guard try Self.fetchEntity(id: id, in: context) == nil else { return .alreadyQueued }
+            let pending = NSFetchRequest<NSNumber>(entityName: "SyncItemEntity")
+            pending.resultType = .countResultType
+            pending.predicate = NSPredicate(format: "status == %@", SyncItemStatus.pending.rawValue)
+            guard try context.count(for: pending) < capacity else { return .queueFull }
+            let entity = SyncItemEntity(context: context)
+            entity.id = letter.id
+            entity.method = letter.method
+            entity.url = letter.url
+            entity.headersJSON = letter.headersJSON
+            entity.body = letter.body
+            entity.contentType = letter.contentType
+            entity.priority = letter.priority
+            entity.createdAt = letter.createdAt
+            entity.metadataJSON = letter.metadataJSON
+            entity.attempts = 0
+            entity.lastAttemptAt = 0
+            entity.nextRetryAt = 0
+            entity.lastErrorCode = nil
+            entity.status = SyncItemStatus.pending.rawValue
+            context.delete(letter)
+            return .replayed
+        }
+    }
+
+    /// Deletes the dead letter `id`. `false` when there is none.
+    @discardableResult
+    func deleteDeadLetter(id: String) async throws -> Bool {
+        try await stack.performBackgroundTask { context in
+            guard let letter = try Self.fetchDeadLetter(id: id, in: context) else { return false }
+            context.delete(letter)
             return true
         }
     }

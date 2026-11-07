@@ -156,22 +156,52 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
     }
 
     // MARK: - Dead letters
-    //
-    // These answer from memory, so their promises are settled on return.
 
-    /// Nothing is moved to a dead-letter store yet: an item that fails for
-    /// good still ends as a `FAILED` row in the queue store. So there is never
-    /// a dead letter to list.
+    /// Every dead letter, `deadLetteredAt` ascending, then `id` ascending.
     public func listDeadLetter() throws -> Promise<[SyncDeadLetterItem]> {
-        return Promise.resolved(withResult: [])
+        return Promise.async { [weak self] in
+            guard let self = self else { return [] }
+            do {
+                let letters = try await self.engine.storage.getDeadLetters()
+                return letters.map(Self.translate(deadLetter:))
+            } catch {
+                throw wrapAsSyncProviderError(error)
+            }
+        }
     }
 
+    /// Puts a dead letter back in the queue under its id, as a fresh item,
+    /// and emits `ITEM_ENQUEUED`. Like an enqueue, it does not flush. Rejects
+    /// with `QUEUE_FULL` at the cap, keeping the dead letter. An unknown id
+    /// resolves with nothing changed.
     public func replayDeadLetter(id: String) throws -> Promise<Void> {
-        return Promise.rejected(withError: SyncProviderError.deadLetterNotImplemented("replay"))
+        return Promise.async { [weak self] in
+            guard let self = self else {
+                throw SyncProviderError(code: .nativeModuleUnavailable, message: "SyncProvider deallocated")
+            }
+            do {
+                if try await self.engine.storage.replayDeadLetter(id: id) {
+                    self.engine.emitter.emit(.now(type: "ITEM_ENQUEUED", itemId: id))
+                }
+            } catch {
+                throw wrapAsSyncProviderError(error)
+            }
+        }
     }
 
+    /// Deletes a dead letter for good and emits `ITEM_REMOVED`. An unknown id
+    /// resolves with nothing changed.
     public func discardDeadLetter(id: String) throws -> Promise<Void> {
-        return Promise.rejected(withError: SyncProviderError.deadLetterNotImplemented("discard"))
+        return Promise.async { [weak self] in
+            guard let self = self else { return }
+            do {
+                if try await self.engine.storage.discardDeadLetter(id: id) {
+                    self.engine.emitter.emit(.now(type: "ITEM_REMOVED", itemId: id))
+                }
+            } catch {
+                throw wrapAsSyncProviderError(error)
+            }
+        }
     }
 
     // MARK: - Sync ops
@@ -411,6 +441,25 @@ extension HybridSyncProvider {
                         attempts: Double(stored.attempts),
                         nextRetryAt: Double(stored.nextRetryAt),
                         metadata: stored.metadata)
+    }
+
+    static func translate(deadLetter stored: StoredDeadLetter) -> SyncDeadLetterItem {
+        SyncDeadLetterItem(id: stored.id,
+                           method: HttpMethod(fromString: stored.method) ?? .post,
+                           url: stored.url,
+                           headers: stored.headers,
+                           body: stored.body,
+                           contentType: stored.contentType,
+                           priority: SyncPriority(fromString: stored.priority),
+                           createdAt: Double(stored.createdAt),
+                           metadata: stored.metadata,
+                           attempts: Double(stored.attempts),
+                           lastAttemptAt: Double(stored.lastAttemptAt),
+                           // A code this build does not know, from a newer one
+                           // say, reads as the code of a dead letter with none.
+                           lastErrorCode: SyncErrorCode(fromString: stored.lastErrorCode) ?? .maxAttemptsExceeded,
+                           lastErrorMessage: stored.lastErrorMessage,
+                           deadLetteredAt: Double(stored.deadLetteredAt))
     }
 
     static func translate(result: StoredSyncResult) -> SyncResult {

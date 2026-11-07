@@ -121,6 +121,29 @@ actor SyncQueueStorage {
         try await dao.fetchDeadLetters()
     }
 
+    /// Puts the dead letter `id` back in the queue as a fresh item. `false`
+    /// when nothing changed: no dead letter has that id, or a queue row
+    /// already has it.
+    /// - Throws: `SyncProviderError(.queueFull)` when the queue is at its cap;
+    ///   the dead letter stays.
+    @discardableResult
+    func replayDeadLetter(id: String) async throws -> Bool {
+        switch try await dao.replayDeadLetter(id: id, capacity: capacity) {
+        case .replayed:
+            return true
+        case .unknown, .alreadyQueued:
+            return false
+        case .queueFull:
+            throw SyncProviderError.queueFull(limit: capacity)
+        }
+    }
+
+    /// Deletes the dead letter `id`. `false` when there is none.
+    @discardableResult
+    func discardDeadLetter(id: String) async throws -> Bool {
+        try await dao.deleteDeadLetter(id: id)
+    }
+
     /// Reset an item to PENDING for retry and persist its backoff cooldown.
     ///
     /// - Parameters:

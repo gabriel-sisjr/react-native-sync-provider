@@ -103,14 +103,6 @@ struct SyncProviderError: LocalizedError, CustomNSError {
         SyncProviderError(code: .backgroundTaskRegistrationFailed,
                           message: "Background task registration failed: \(reason)")
     }
-
-    /// A dead-letter operation this build cannot perform yet. `operation` is
-    /// `"replay"` or `"discard"`. `INVALID_PAYLOAD`, the code the facade gives
-    /// every native rejection of these calls; the message matches Android's.
-    static func deadLetterNotImplemented(_ operation: String) -> SyncProviderError {
-        SyncProviderError(code: .invalidPayload,
-                          message: "Dead-letter \(operation) is not implemented yet.")
-    }
 }
 
 /// Map an arbitrary Swift / NSError thrown anywhere in the iOS implementation
