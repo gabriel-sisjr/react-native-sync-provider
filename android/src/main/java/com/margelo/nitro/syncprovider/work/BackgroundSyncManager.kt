@@ -148,8 +148,11 @@ internal class BackgroundSyncManager(context: Context) {
    *
    * A failure here is only logged: the callers run at the end of a flush cycle that
    * already completed, and it must not be rejected for this.
+   *
+   * @param gateStreak consecutive kicks the network-quality gate turned back, carried to the
+   *   next one so its re-arm backs off further. `0` for every other arm.
    */
-  fun scheduleOneTimeFlush(initialDelayMs: Long = 0L) {
+  fun scheduleOneTimeFlush(initialDelayMs: Long = 0L, gateStreak: Int = 0) {
     if (!isEnabled() || isForegroundOnly()) return
     try {
       val builder = OneTimeWorkRequestBuilder<SyncWorker>()
@@ -157,6 +160,9 @@ internal class BackgroundSyncManager(context: Context) {
         .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 1, TimeUnit.MINUTES)
       if (initialDelayMs > 0L) {
         builder.setInitialDelay(initialDelayMs, TimeUnit.MILLISECONDS)
+      }
+      if (gateStreak > 0) {
+        builder.setInputData(Data.Builder().putInt(SyncWorker.KEY_GATE_STREAK, gateStreak).build())
       }
       workManager.enqueueUniqueWork(UNIQUE_ONE_TIME, ExistingWorkPolicy.REPLACE, builder.build())
     } catch (t: Throwable) {

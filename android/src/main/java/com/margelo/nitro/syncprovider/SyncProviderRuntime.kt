@@ -19,6 +19,7 @@ import com.margelo.nitro.syncprovider.http.HeadProbe
 import com.margelo.nitro.syncprovider.http.SyncDispatcher
 import com.margelo.nitro.syncprovider.retry.RetryTimer
 import com.margelo.nitro.syncprovider.retry.RetryWake
+import com.margelo.nitro.syncprovider.retry.WakeHold
 import com.margelo.nitro.syncprovider.storage.SyncQueueStorage
 import com.margelo.nitro.syncprovider.work.BackgroundSyncManager
 import kotlinx.coroutines.CoroutineScope
@@ -81,6 +82,7 @@ internal class SyncProviderRuntime private constructor(
     scope = scope,
     healthCheckUrl = { currentOptions().healthCheckUrl },
     measure = LatencyProbe(headProbe)::measure,
+    onDefaultNetworkChanged = { retryTimer.resetGateBackoff() },
   )
 
   private val configStore = SyncConfigStore(appContext, secretStore)
@@ -120,7 +122,7 @@ internal class SyncProviderRuntime private constructor(
     scope = scope,
     isOffline = { connectivityMonitor.isOffline() },
     flush = { flushForWake() },
-    canDispatch = { !connectivityMonitor.isOffline() && isQualityGateOpen() },
+    holdReason = { wakeHold() },
   )
 
   private val retryWake = RetryWake(
@@ -130,6 +132,9 @@ internal class SyncProviderRuntime private constructor(
     isHalted = { isWakeHalted() },
     isEngineLive = { isEngineAttached },
     isQualityGateOpen = { isQualityGateOpen() },
+    scheduleGatedKick = { delayMs, gateStreak ->
+      backgroundSyncManager.scheduleOneTimeFlush(initialDelayMs = delayMs, gateStreak = gateStreak)
+    },
   )
 
   init {
@@ -201,11 +206,11 @@ internal class SyncProviderRuntime private constructor(
   }
 
   /**
-   * Re-arm after the network-quality gate held an automatic wake back. See
+   * Re-arm a kick the network-quality gate turned back, [gateStreak] kicks in a row. See
    * [RetryWake.armAfterGate].
    */
-  suspend fun armAfterQualityGate() {
-    retryWake.armAfterGate()
+  suspend fun armAfterQualityGate(gateStreak: Int) {
+    retryWake.armAfterGate(gateStreak)
   }
 
   /**
@@ -279,9 +284,21 @@ internal class SyncProviderRuntime private constructor(
       .coerceAtLeast(1)
   }
 
-  /** A timer wake runs one flush; a wake the quality gate holds back is held, not lost. */
+  /**
+   * A timer wake runs one flush. The timer checked the gate before it; should the quality
+   * have dropped since, the dispatcher turns the flush back, and the wake is held after all.
+   */
   private suspend fun flushForWake() {
-    if (dispatcher.flushWithOutcome().isHeldByQualityGate) retryWake.armAfterGate()
+    if (dispatcher.flushWithOutcome().isHeldByQualityGate) retryTimer.holdForQuality()
+  }
+
+  /**
+   * The gate check a timer wake runs before dispatching, silently: a reading of the quality
+   * that also starts a new measurement when the last one is 30 s old.
+   */
+  private fun wakeHold(): WakeHold? {
+    val minimum = currentOptions().minNetworkQuality
+    return if (connectivityMonitor.qualityForGate().meetsMinimum(minimum)) null else WakeHold.Quality
   }
 
   private fun isQualityGateOpen(): Boolean {

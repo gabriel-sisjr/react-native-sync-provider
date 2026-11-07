@@ -10,6 +10,7 @@ import kotlinx.coroutines.withTimeout
 import okhttp3.Authenticator
 import okhttp3.Call
 import okhttp3.CookieJar
+import okhttp3.Dns
 import okhttp3.EventListener
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -18,6 +19,7 @@ import org.junit.After
 import org.junit.Assert.assertThrows
 import org.junit.Before
 import org.junit.Test
+import java.net.InetAddress
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -74,7 +76,7 @@ internal class HeadProbeTest {
 
   @Test
   fun `4xx and 5xx statuses are answers too, and none is retried`() = runBlocking<Unit> {
-    val codes = listOf(400, 401, 404, 405, 408, 429, 500, 503)
+    val codes = listOf(400, 401, 404, 405, 429, 500, 503)
     codes.forEach { server.enqueue(MockResponse().setResponseCode(it)) }
 
     val answers = codes.map { probe.answer(url()) }
@@ -82,6 +84,34 @@ internal class HeadProbeTest {
     assertThat(answers.map { it.statusCode }).containsExactlyElementsIn(codes).inOrder()
     assertThat(answers.map { it.latencyMs }.all { it in 0L until 2_000L }).isTrue()
     assertThat(server.requestCount).isEqualTo(codes.size)
+  }
+
+  @Test
+  fun `a 408 is repeated once, as OkHttp does with connection retries on`() = runBlocking<Unit> {
+    server.enqueue(MockResponse().setResponseCode(408))
+    server.enqueue(MockResponse().setResponseCode(204))
+
+    val answer = probe.answer(url())
+
+    assertThat(answer.statusCode).isEqualTo(204)
+    assertThat(server.requestCount).isEqualTo(2)
+  }
+
+  @Test
+  fun `a host whose first address refuses is reached through the next one`() = runBlocking<Unit> {
+    server.enqueue(MockResponse().setResponseCode(204))
+    // The server listens on IPv4 only: the IPv6 loopback refuses, as a broken IPv6 path would.
+    val dualStack = object : Dns {
+      override fun lookup(hostname: String): List<InetAddress> = listOf(
+        InetAddress.getByName("::1"),
+        InetAddress.getByName("127.0.0.1"),
+      )
+    }
+    val client = HeadProbe.newClient().newBuilder().dns(dualStack).build()
+
+    val answer = HeadProbe(lazyOf(client)).answer("http://dual-stack.test:${server.port}/health")
+
+    assertThat(answer.statusCode).isEqualTo(204)
   }
 
   @Test
@@ -226,7 +256,7 @@ internal class HeadProbeTest {
   /* ---------------------------- client settings --------------------------- */
 
   @Test
-  fun `the probe client adds nothing to a request and retries nothing`() {
+  fun `the probe client adds nothing to a request and falls back across addresses`() {
     val client = HeadProbe.newClient()
 
     assertThat(client.interceptors).isEmpty()
@@ -236,7 +266,8 @@ internal class HeadProbeTest {
     assertThat(client.authenticator).isSameInstanceAs(Authenticator.NONE)
     assertThat(client.followRedirects).isTrue()
     assertThat(client.followSslRedirects).isTrue()
-    assertThat(client.retryOnConnectionFailure).isFalse()
+    // On: a failed address falls back to the host's next one. The call timeout bounds it all.
+    assertThat(client.retryOnConnectionFailure).isTrue()
     // The per-call timeout is the only clock.
     assertThat(client.callTimeoutMillis).isEqualTo(0)
     assertThat(client.connectTimeoutMillis).isEqualTo(0)

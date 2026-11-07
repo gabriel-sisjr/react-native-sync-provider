@@ -44,9 +44,11 @@ internal class SyncWorker(
       if (!runtime.isEngineAttached) runtime.dispatcher.resetInFlight()
       val outcome = runtime.dispatcher.flushWithOutcome()
       // A kick the network-quality gate held re-arms itself for when the gate decides
-      // again, never through Result.retry(): WorkManager's backoff would take the timing
-      // away from the library. A periodic run leaves it to the next period.
-      if (outcome.isHeldByQualityGate && !isPeriodic) runtime.armAfterQualityGate()
+      // again, backing off, never through Result.retry(): WorkManager's backoff would take
+      // the timing away from the library. A periodic run leaves it to the next period.
+      if (outcome.isHeldByQualityGate && !isPeriodic) {
+        runtime.armAfterQualityGate(inputData.getInt(KEY_GATE_STREAK, 0))
+      }
       if (isPeriodic) {
         emitter.emit(SyncEventEmitter.event(SyncEventType.BACKGROUND_SYNC_COMPLETED))
       }
@@ -66,5 +68,8 @@ internal class SyncWorker(
   companion object {
     private const val TAG = "SyncWorker"
     const val KEY_PERIODIC = "periodic"
+
+    /** Consecutive kicks the network-quality gate turned back before this one. */
+    const val KEY_GATE_STREAK = "gateStreak"
   }
 }

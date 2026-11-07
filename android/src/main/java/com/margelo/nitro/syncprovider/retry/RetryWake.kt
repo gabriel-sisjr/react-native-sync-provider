@@ -1,6 +1,5 @@
 package com.margelo.nitro.syncprovider.retry
 
-import com.margelo.nitro.syncprovider.connectivity.ConnectivityMonitor
 import com.margelo.nitro.syncprovider.storage.SyncQueueStorage
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -31,8 +30,8 @@ import java.util.concurrent.atomic.AtomicLong
  *   started only for a worker or a boot broadcast relies on the kick: a timer there
  *   would dispatch outside the constraints the consumer asked WorkManager to honor.
  * @param isQualityGateOpen whether the current network quality passes `minNetworkQuality`.
- * @param gateRecheckMs how long a wake the quality gate held waits before the gate decides
- *   again: the reuse window of a quality measurement, so a new one can be taken by then.
+ * @param scheduleGatedKick arms the kick for the check after [armAfterGate], carrying the
+ *   number of consecutive kicks the gate turned back.
  */
 @Suppress("LongParameterList")
 internal class RetryWake(
@@ -43,7 +42,9 @@ internal class RetryWake(
   private val isEngineLive: () -> Boolean,
   private val clock: () -> Long = { System.currentTimeMillis() },
   private val isQualityGateOpen: () -> Boolean = { true },
-  private val gateRecheckMs: Long = ConnectivityMonitor.QUALITY_CACHE_TTL_MS,
+  private val scheduleGatedKick: (delayMs: Long, gateStreak: Int) -> Unit = { delayMs, _ ->
+    scheduleKick(delayMs)
+  },
 ) {
 
   /**
@@ -76,15 +77,15 @@ internal class RetryWake(
   }
 
   /**
-   * Re-arm after the network-quality gate held an automatic wake back: no earlier than
-   * [gateRecheckMs] from now, nor before a credential hold ends. The timer, with an engine
-   * live, also owes the wake and delivers it as soon as the gate would let it through.
+   * Re-arm the kick after the network-quality gate turned it back, [gateStreak] kicks in a
+   * row: no earlier than the next [GateRecheck] step, nor before a credential hold ends. The
+   * next kick carries `gateStreak + 1`, so the delay doubles up to its cap; any other arm
+   * schedules a kick without it, which starts the backoff over.
    *
-   * The timer considers every `PENDING` row, as the wake it replaces may have been a resume
-   * wake for rows without a cooldown. The kick keeps to rows with one, as [armForResume]
-   * does. A gate that opened meanwhile, through a `configureSync`, makes this a plain [arm].
+   * The in-process timer is left alone: it checks the gate itself and holds its own wakes.
+   * A gate that opened meanwhile, through a `configureSync`, makes this a plain [arm].
    */
-  suspend fun armAfterGate() {
+  suspend fun armAfterGate(gateStreak: Int) {
     armMutex.withLock {
       if (isHalted()) {
         timer.cancel()
@@ -94,13 +95,9 @@ internal class RetryWake(
         armLocked()
         return@withLock
       }
-      val notBefore = maxOf(clock() + gateRecheckMs, credentialHoldUntil.get())
-      val pendingDeadline = storage.nextPendingDeadline()
-      when {
-        pendingDeadline == null -> timer.cancel()
-        isEngineLive() -> timer.hold(delayUntil(maxOf(pendingDeadline, notBefore)))
-      }
-      storage.nextRetryDeadline()?.let { scheduleKick(delayUntil(maxOf(it, notBefore))) }
+      val deadline = storage.nextRetryDeadline() ?: return@withLock
+      val notBefore = maxOf(clock() + GateRecheck.delayMs(gateStreak), credentialHoldUntil.get())
+      scheduleGatedKick(delayUntil(maxOf(deadline, notBefore)), gateStreak + 1)
     }
   }
 

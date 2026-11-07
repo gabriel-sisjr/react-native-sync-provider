@@ -146,7 +146,18 @@ internal class SyncWorkerTest {
     val result = worker.doWork()
 
     assertThat(result).isEqualTo(ListenableWorker.Result.success())
-    coVerify(exactly = 1) { runtime.armAfterQualityGate() }
+    coVerify(exactly = 1) { runtime.armAfterQualityGate(0) }
+  }
+
+  @Test
+  fun `a kick the gate turned back before passes its streak on`() = runTest {
+    coEvery { dispatcher.flushWithOutcome() } returns FlushOutcome.Skipped(FlushSkip.NETWORK_QUALITY_TOO_LOW)
+    val input = Data.Builder().putInt(SyncWorker.KEY_GATE_STREAK, 2).build()
+    val worker = TestListenableWorkerBuilder<SyncWorker>(context).setInputData(input).build()
+
+    worker.doWork()
+
+    coVerify(exactly = 1) { runtime.armAfterQualityGate(2) }
   }
 
   @Test
@@ -158,7 +169,7 @@ internal class SyncWorkerTest {
     val result = worker.doWork()
 
     assertThat(result).isEqualTo(ListenableWorker.Result.success())
-    coVerify(exactly = 0) { runtime.armAfterQualityGate() }
+    coVerify(exactly = 0) { runtime.armAfterQualityGate(any()) }
   }
 
   @Test
@@ -168,7 +179,7 @@ internal class SyncWorkerTest {
 
     worker.doWork()
 
-    coVerify(exactly = 0) { runtime.armAfterQualityGate() }
+    coVerify(exactly = 0) { runtime.armAfterQualityGate(any()) }
   }
 
   @Test

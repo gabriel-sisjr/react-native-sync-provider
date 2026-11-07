@@ -1233,6 +1233,27 @@ internal class SyncProviderRuntimeTest {
   }
 
   @Test
+  fun `a kick the gate turned back again waits twice as long and carries the streak on`() =
+    runBlocking<Unit> {
+      goOnline()
+      runtime.backgroundSyncManager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+      runtime.configure(TestData.syncOptions(minNetworkQuality = NetworkQuality.MODERATE))
+      insert("due", attempts = 1, nextRetryAt = 1L)
+      restartProcess()
+      val startedAt = System.currentTimeMillis()
+
+      TestListenableWorkerBuilder<SyncWorker>(context)
+        .setInputData(Data.Builder().putInt(SyncWorker.KEY_GATE_STREAK, 1).build())
+        .build()
+        .doWork()
+
+      val spec = WorkManagerImpl.getInstance(context).workDatabase.workSpecDao()
+        .getWorkSpec(oneTimeWork().single().id.toString())!!
+      assertThat(spec.lastEnqueueTime + spec.initialDelay).isAtLeast(startedAt + 60_000L)
+      assertThat(spec.input.getInt(SyncWorker.KEY_GATE_STREAK, 0)).isEqualTo(2)
+    }
+
+  @Test
   fun `a periodic run the quality gate holds leaves the kick as it was`() = runBlocking<Unit> {
     goOnline()
     runtime.backgroundSyncManager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
@@ -1281,11 +1302,15 @@ internal class SyncProviderRuntimeTest {
     // Every HEAD fails, so the measurement classifies the link POOR.
     awaitUntil { runtime.connectivityMonitor.currentState().networkQuality == NetworkQuality.POOR }
 
-    withEvents { events ->
+    // The timer checks the gate before dispatching: the wake is held, and nothing is emitted.
+    val emitted = withEvents { events ->
       insert("due", attempts = 1, nextRetryAt = 1L)
       runtime.armRetryWake()
-      awaitUntil { events.any { it.errorCode == SyncErrorCode.NETWORK_QUALITY_TOO_LOW } }
+      delay(QUIET_MS)
+      events.toList()
     }
+    assertThat(emitted.filter { it.type == SyncEventType.SYNC_FAILED }).isEmpty()
+    assertThat(runtime.isRetryTimerArmed).isTrue()
     assertThat(row("due")!!.attempts).isEqualTo(1)
 
     // A better network becomes the default and is measured at once: the held wake runs.

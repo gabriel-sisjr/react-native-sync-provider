@@ -11,11 +11,14 @@ import com.margelo.nitro.syncprovider.http.HeadResult
  * Cancelling the caller cancels the request in flight and throws, so a partial set is never
  * returned.
  */
-internal class LatencyProbe(private val probe: HeadProbe) {
+internal class LatencyProbe(
+  private val probe: HeadProbe,
+  private val sampleTimeoutMs: Long = SAMPLE_TIMEOUT_MS,
+) {
 
   /** One result per request, in order. */
   suspend fun measure(url: String): List<HeadResult> =
-    List(SAMPLES) { probe.head(url, SAMPLE_TIMEOUT_MS) }
+    List(SAMPLES) { probe.head(url, sampleTimeoutMs) }
 
   companion object {
     const val SAMPLES: Int = 3

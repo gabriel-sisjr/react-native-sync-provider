@@ -12,6 +12,9 @@ import com.margelo.nitro.syncprovider.SyncEvent
 import com.margelo.nitro.syncprovider.SyncEventType
 import com.margelo.nitro.syncprovider.events.SyncEventEmitter
 import com.margelo.nitro.syncprovider.http.HeadResult
+import com.margelo.nitro.syncprovider.retry.GateRecheck
+import com.margelo.nitro.syncprovider.retry.RetryTimer
+import com.margelo.nitro.syncprovider.retry.WakeHold
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.launch
@@ -58,7 +61,10 @@ internal class ConnectivityMonitorQualityTest {
     context = ApplicationProvider.getApplicationContext()
   }
 
-  private fun TestScope.monitor(started: Boolean = true): ConnectivityMonitor = ConnectivityMonitor(
+  private fun TestScope.monitor(
+    started: Boolean = true,
+    onDefaultNetworkChanged: () -> Unit = {},
+  ): ConnectivityMonitor = ConnectivityMonitor(
     context = context,
     emitter = emitter,
     scope = backgroundScope,
@@ -70,6 +76,7 @@ internal class ConnectivityMonitorQualityTest {
     },
     clock = { testScheduler.currentTime },
     probeDebounceMs = DEBOUNCE_MS,
+    onDefaultNetworkChanged = onDefaultNetworkChanged,
   ).also { if (started) it.start() }
 
   private fun manager(): ConnectivityManager = context.getSystemService(ConnectivityManager::class.java)
@@ -156,6 +163,56 @@ internal class ConnectivityMonitorQualityTest {
     settle()
     assertThat(monitor.state.value.networkQuality).isEqualTo(NetworkQuality.EXCELLENT)
     assertThat(probed).hasSize(1)
+  }
+
+  @Test
+  fun `the initial state is reported without an event`() = runTest {
+    url = null
+    shadowOf(manager()).setNetworkCapabilities(
+      manager().activeNetwork,
+      capabilities(NetworkCapabilities.TRANSPORT_WIFI, INTERNET, VALIDATED, NOT_METERED),
+    )
+    val events = recordConnectionEvents()
+
+    val monitor = monitor()
+    runCurrent()
+
+    assertThat(monitor.state.value.status).isEqualTo(ConnectionStatus.CONNECTED)
+    assertThat(events).isEmpty()
+  }
+
+  @Test
+  fun `a callback that repeats the reported state emits nothing`() = runTest {
+    url = null
+    monitor()
+    val wifi = wifi()
+    callback().onAvailable(wifi)
+    runCurrent()
+    val events = recordConnectionEvents()
+
+    repeat(3) {
+      callback().onCapabilitiesChanged(wifi, checkNotNull(manager().getNetworkCapabilities(wifi)))
+    }
+    callback().onAvailable(wifi)
+    runCurrent()
+
+    assertThat(events).isEmpty()
+  }
+
+  @Test
+  fun `a change of default network, and only that, is reported to the owner`() = runTest {
+    var changes = 0
+    monitor(onDefaultNetworkChanged = { changes++ })
+    val wifi = wifi()
+
+    callback().onAvailable(wifi)
+    callback().onCapabilitiesChanged(wifi, checkNotNull(manager().getNetworkCapabilities(wifi)))
+    callback().onAvailable(wifi)
+    val cellular = cellular()
+    callback().onAvailable(cellular)
+    callback().onLost(cellular)
+
+    assertThat(changes).isEqualTo(3)
   }
 
   /* ------------------------------ when to probe ----------------------------- */
@@ -341,6 +398,79 @@ internal class ConnectivityMonitorQualityTest {
   }
 
   /* --------------------------- the gate's reading --------------------------- */
+
+  @Test
+  fun `while the first measurement is pending, the gate compares the link signals as they are`() =
+    runTest {
+      val monitor = monitor()
+      callback().onAvailable(wifi())
+      runCurrent()
+
+      val pending = monitor.qualityForGate()
+
+      assertThat(probed).isEmpty()
+      assertThat(pending).isEqualTo(NetworkQuality.GOOD)
+      assertThat(pending.meetsMinimum(NetworkQuality.GOOD)).isTrue()
+      assertThat(pending.meetsMinimum(NetworkQuality.EXCELLENT)).isFalse()
+    }
+
+  @Test
+  fun `old results start one new measurement at a time, however often the gate reads`() = runTest {
+    val monitor = monitor()
+    callback().onAvailable(wifi())
+    settle()
+    advanceTimeBy(ConnectivityMonitor.QUALITY_CACHE_TTL_MS)
+    inFlight = CompletableDeferred()
+
+    repeat(3) { monitor.qualityForGate() }
+    settle()
+    repeat(3) { monitor.qualityForGate() }
+    settle()
+
+    assertThat(probed).hasSize(2)
+    checkNotNull(inFlight).complete(Unit)
+    runCurrent()
+  }
+
+  @Test
+  fun `a held wake whose check finds the result 30 s old is released by the new measurement`() =
+    runTest {
+      val monitor = monitor()
+      answers = latencies(1_200, 1_300, 1_400)
+      callback().onAvailable(wifi())
+      settle()
+      assertThat(monitor.state.value.networkQuality).isEqualTo(NetworkQuality.POOR)
+      var dispatched = 0
+      // Wired as the runtime does: the timer checks the gate, and the minimum releases it.
+      val timer = RetryTimer(
+        scope = backgroundScope,
+        isOffline = { false },
+        flush = { dispatched++ },
+        holdReason = {
+          if (monitor.qualityForGate().meetsMinimum(NetworkQuality.EXCELLENT)) null else WakeHold.Quality
+        },
+      )
+      backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+        monitor.state.collect {
+          if (it.networkQuality.meetsMinimum(NetworkQuality.EXCELLENT)) timer.onDispatchPossible()
+        }
+      }
+
+      timer.arm(0L)
+      runCurrent()
+      assertThat(dispatched).isEqualTo(0)
+      assertThat(probed).hasSize(1)
+
+      // The held wake's check finds the result 30 s old and starts a new measurement.
+      answers = latencies(50, 60, 70)
+      advanceTimeBy(GateRecheck.FIRST_DELAY_MS)
+      runCurrent()
+      assertThat(dispatched).isEqualTo(0)
+      settle()
+
+      assertThat(probed).hasSize(2)
+      assertThat(dispatched).isEqualTo(1)
+    }
 
   @Test
   fun `without an engine, the gate's reading starts the first measurement`() = runTest {

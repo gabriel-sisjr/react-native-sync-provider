@@ -56,6 +56,8 @@ import kotlinx.coroutines.launch
  * @param healthCheckUrl read on every request, so a new configuration applies at once.
  * @param measure one latency measurement, cancellable. Production uses [LatencyProbe].
  * @param clock monotonic millis, for the reuse window.
+ * @param onDefaultNetworkChanged called when another network becomes the default, or the
+ *   default one is lost.
  */
 internal class ConnectivityMonitor(
   context: Context,
@@ -65,6 +67,7 @@ internal class ConnectivityMonitor(
   private val measure: suspend (url: String) -> List<HeadResult> = { emptyList() },
   private val clock: () -> Long = SystemClock::elapsedRealtime,
   private val probeDebounceMs: Long = PROBE_DEBOUNCE_MS,
+  private val onDefaultNetworkChanged: () -> Unit = {},
 ) {
 
   private val appContext = context.applicationContext
@@ -99,9 +102,11 @@ internal class ConnectivityMonitor(
       // Also how a new default network replaces the previous one: the system
       // reports no loss for the network it replaced.
       override fun onAvailable(network: Network) {
+        val changed = network != defaultNetwork
         defaultNetwork = network
         publish(linkState(network), network)
         requestMeasurement()
+        if (changed) onDefaultNetworkChanged()
       }
 
       // On a default-network callback, only once no default network is left.
@@ -110,6 +115,7 @@ internal class ConnectivityMonitor(
         defaultNetwork = null
         publish(disconnectedState(), null)
         requestMeasurement()
+        onDefaultNetworkChanged()
       }
 
       override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
@@ -119,9 +125,11 @@ internal class ConnectivityMonitor(
       }
 
       override fun onUnavailable() {
+        val changed = defaultNetwork != null
         defaultNetwork = null
         publish(disconnectedState(), null)
         requestMeasurement()
+        if (changed) onDefaultNetworkChanged()
       }
     }
 
@@ -322,7 +330,12 @@ internal class ConnectivityMonitor(
     }
   }
 
-  /** Caller holds [stateLock]. */
+  /**
+   * Publish [next] when it differs from the reported state in any field; the seed of [start]
+   * passes `emit = false`. The `CONNECTION_CHANGED` event is launched on [scope], after
+   * [state] already holds the new value, so it reaches listeners asynchronously; iOS delivers
+   * its event synchronously. Caller holds [stateLock].
+   */
   private fun set(next: ConnectionState, emit: Boolean) {
     if (_state.value == next) return
     _state.value = next

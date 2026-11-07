@@ -57,12 +57,15 @@ internal sealed interface HeadResult {
  *   queue's default headers or credentials. The one header it adds,
  *   `Cache-Control: no-cache`, keeps an intermediary from answering from its cache;
  * - redirects are followed, so [HeadResult.Response.statusCode] is the final status;
- * - no retry after a connection failure: a failed probe must read as a failure;
+ * - after a connection failure, the next address of the host: a host that resolves to
+ *   IPv4 and IPv6 is reached through whichever works, as other platform clients do. The
+ *   per-call timeout still bounds the whole exchange. A `408` is also repeated once, as
+ *   OkHttp does whenever these retries are on;
  * - a single timeout, set per call, spanning DNS, connect, TLS, the request, the
  *   response headers and every redirect, so nothing inherits the dispatcher's timeouts;
  * - a short-lived connection pool. Back-to-back samples share a connection, and a later
- *   probe never picks up one the server may have closed meanwhile, which, without
- *   retries, would read as a failed probe.
+ *   probe never picks up one the server may have closed meanwhile, which would add a
+ *   silent retry to the time measured.
  *
  * @param client what to send with. Production shares [sharedClient], built once per
  *   process on first use; tests pass their own.
@@ -137,7 +140,7 @@ internal class HeadProbe(client: Lazy<OkHttpClient> = sharedClient) {
     fun newClient(): OkHttpClient = OkHttpClient.Builder()
       .followRedirects(true)
       .followSslRedirects(true)
-      .retryOnConnectionFailure(false)
+      .retryOnConnectionFailure(true)
       .cache(null)
       .cookieJar(CookieJar.NO_COOKIES)
       .connectionPool(

@@ -44,11 +44,12 @@ internal class LatencyProbeTest {
   @Test
   fun `any status is a sample, and a request without an answer counts as infinite`() = runBlocking<Unit> {
     server.enqueue(MockResponse().setResponseCode(503))
-    // Read, then hung up on: the pooled connection dies, so the next request opens another.
-    server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST))
+    // Never answered: a timeout, which is not retried.
+    server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
     server.enqueue(MockResponse().setResponseCode(404))
+    val quick = LatencyProbe(HeadProbe(lazyOf(HeadProbe.newClient())), sampleTimeoutMs = 300L)
 
-    val latencies = LatencyProbe.latencies(probe.measure(server.url("/health").toString()))
+    val latencies = LatencyProbe.latencies(quick.measure(server.url("/health").toString()))
 
     assertThat(latencies).hasSize(3)
     assertThat(latencies[0]).isNotNull()

@@ -33,8 +33,8 @@ internal class RetryWakeTest {
   private val armed = mutableListOf<Long>()
   private val kicks = mutableListOf<Long>()
 
-  /** The delay of every hold the quality gate asked for, in order. */
-  private val held = mutableListOf<Long>()
+  /** Every kick armed after the quality gate turned one back: its delay and streak. */
+  private val gatedKicks = mutableListOf<Pair<Long, Int>>()
   private var gateOpen = false
   private val clock = MovingClock()
   private var halted = false
@@ -50,7 +50,7 @@ internal class RetryWakeTest {
       isEngineLive = { live },
       clock = clock::now,
       isQualityGateOpen = { gateOpen },
-      gateRecheckMs = RECHECK_MS,
+      scheduleGatedKick = { delayMs, streak -> gatedKicks += delayMs to streak },
     )
   }
 
@@ -62,7 +62,6 @@ internal class RetryWakeTest {
     ).allowMainThreadQueries().build()
     storage = SyncQueueStorage.from(db)
     every { timer.arm(capture(armed)) } just Runs
-    every { timer.hold(capture(held)) } just Runs
   }
 
   @After
@@ -307,70 +306,71 @@ internal class RetryWakeTest {
   /* ------------------------- after the quality gate ------------------------- */
 
   @Test
-  fun `a wake the gate held comes back no earlier than the re-check, timer and kick`() = runTest {
+  fun `a kick the gate turned back comes back after the next backoff step, carrying the streak`() =
+    runTest {
+      insert("due", clock.now() - 1L)
+
+      wake.armAfterGate(gateStreak = 0)
+      wake.armAfterGate(gateStreak = 1)
+      wake.armAfterGate(gateStreak = 9)
+
+      assertThat(gatedKicks).containsExactly(
+        30_000L to 1,
+        60_000L to 2,
+        GateRecheck.MAX_DELAY_MS to 10,
+      ).inOrder()
+      assertThat(kicks).isEmpty()
+    }
+
+  @Test
+  fun `the in-process timer is left to hold its own wakes`() = runTest {
     insert("due", clock.now() - 1L)
 
-    wake.armAfterGate()
+    wake.armAfterGate(gateStreak = 0)
 
-    assertThat(held).containsExactly(RECHECK_MS)
-    assertThat(kicks).containsExactly(RECHECK_MS)
     assertThat(armed).isEmpty()
+    verify(exactly = 0) { timer.cancel() }
   }
 
   @Test
-  fun `a later retry deadline wins over the re-check`() = runTest {
+  fun `a later retry deadline wins over the backoff step`() = runTest {
     insert("later", clock.now() + 90_000L)
 
-    wake.armAfterGate()
+    wake.armAfterGate(gateStreak = 0)
 
-    assertThat(held).containsExactly(90_000L)
-    assertThat(kicks).containsExactly(90_000L)
+    assertThat(gatedKicks).containsExactly(90_000L to 1)
   }
 
   @Test
-  fun `a wake the gate held still waits for the credential hold`() = runTest {
+  fun `a kick the gate turned back still waits for the credential hold`() = runTest {
     insert("due", clock.now() - 1L)
     wake.arm(notBefore = clock.now() + HOLD_MS)
-    armed.clear()
     kicks.clear()
 
-    wake.armAfterGate()
+    wake.armAfterGate(gateStreak = 0)
 
-    assertThat(held).containsExactly(HOLD_MS)
-    assertThat(kicks).containsExactly(HOLD_MS)
+    assertThat(gatedKicks).containsExactly(HOLD_MS to 1)
   }
 
   @Test
-  fun `the timer holds for rows without a cooldown, the kick only for rows with one`() = runTest {
+  fun `no row with a cooldown, no kick after the gate`() = runTest {
     insert("fresh", nextRetryAt = 0L)
 
-    wake.armAfterGate()
+    wake.armAfterGate(gateStreak = 0)
 
-    assertThat(held).containsExactly(RECHECK_MS)
-    assertThat(kicks).isEmpty()
+    assertThat(gatedKicks).isEmpty()
   }
 
   @Test
-  fun `a gate that opened meanwhile makes it a plain arm`() = runTest {
+  fun `a gate that opened meanwhile makes it a plain arm, which starts the backoff over`() = runTest {
     insert("due", clock.now() - 1L)
     gateOpen = true
 
-    wake.armAfterGate()
+    wake.armAfterGate(gateStreak = 3)
 
-    assertThat(held).isEmpty()
+    assertThat(gatedKicks).isEmpty()
     assertThat(armed).containsExactly(0L)
     assertThat(kicks).containsExactly(0L)
-  }
-
-  @Test
-  fun `with no JS engine only the kick is re-armed after the gate`() = runTest {
-    live = false
-    insert("due", clock.now() - 1L)
-
-    wake.armAfterGate()
-
-    assertThat(held).isEmpty()
-    assertThat(kicks).containsExactly(RECHECK_MS)
   }
 
   @Test
@@ -378,15 +378,14 @@ internal class RetryWakeTest {
     halted = true
     insert("due", clock.now() - 1L)
 
-    wake.armAfterGate()
+    wake.armAfterGate(gateStreak = 0)
 
-    assertThat(held).isEmpty()
+    assertThat(gatedKicks).isEmpty()
     assertThat(kicks).isEmpty()
     verify { timer.cancel() }
   }
 
   private companion object {
     const val HOLD_MS = 60_000L
-    const val RECHECK_MS = 30_000L
   }
 }
