@@ -45,6 +45,12 @@ export interface UseConnectionResult {
   isOnline: boolean;
   /** Convenience flag — `true` when {@link ConnectionStatus.METERED}. */
   isMetered: boolean;
+  /**
+   * Coarse quality of the current link (mirrors
+   * {@link ConnectionState.networkQuality}). `OFFLINE` whenever `isOnline` is
+   * `false`, including before the first snapshot arrives.
+   */
+  networkQuality: NetworkQuality;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -256,10 +262,11 @@ export interface UseAutoSyncOptions {
 /**
  * Result returned by `useSyncSnapshot` — the read-only dashboard aggregator.
  *
- * Combines connection, queue, and sync-engine state into a single reactive
- * object driven by ONE native subscription. Unlike {@link UseOfflineQueueResult}
- * it exposes NO action methods (`enqueue`, `flush`, etc.) — it is a pure,
- * render-friendly snapshot intended for status dashboards and badges.
+ * Combines connection, queue, dead-letter and sync-engine state into a single
+ * reactive object driven by ONE native subscription. Unlike
+ * {@link UseOfflineQueueResult} it exposes NO action methods (`enqueue`,
+ * `flush`, etc.) — it is a pure, render-friendly snapshot intended for status
+ * dashboards and badges.
  */
 export interface UseSyncSnapshotResult {
   /** Connection snapshot — same as {@link UseConnectionResult}. */
@@ -297,15 +304,19 @@ export interface UseSyncSnapshotResult {
   /** Last error captured by the hook, or `null` once cleared. */
   error: SyncError | null;
   /**
-   * Forward field: coarse {@link NetworkQuality}
-   * classification. ALWAYS `undefined` in v0.2 — populated once the v0.3
-   * network-quality classifier ships.
+   * Coarse {@link NetworkQuality} of the current link, mirroring
+   * {@link ConnectionState.networkQuality}. `undefined` until the first
+   * `getConnectionStatus()` read succeeds, then read again on every
+   * `CONNECTION_CHANGED`. `connection.networkQuality` holds the same value
+   * once loaded, and `OFFLINE` before.
    */
   networkQuality?: NetworkQuality;
   /**
-   * Forward field: items moved to the dead-letter queue
-   * after exhausting their retry budget. ALWAYS `undefined` in v0.2 —
-   * populated once the v0.3 dead-letter store ships.
+   * The dead-letter queue, as `listDeadLetter()` returns it: oldest first.
+   * `undefined` until the first `listDeadLetter()` read succeeds, then read
+   * again on `ITEM_DEAD_LETTERED`, `ITEM_REMOVED`, `ITEM_ENQUEUED` and
+   * `QUEUE_CLEARED`. A failed read keeps the last list, and a read that finds
+   * the same list does not re-render.
    */
   deadLetter?: readonly SyncDeadLetterItem[];
 }

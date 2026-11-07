@@ -144,27 +144,73 @@ export type BackoffStrategy =
   (typeof BackoffStrategy)[keyof typeof BackoffStrategy];
 
 /**
- * Coarse network-quality classification (worst → best).
+ * Coarse network-quality classification, ordered worst → best:
+ * `OFFLINE < POOR < MODERATE < GOOD < EXCELLENT`.
  *
- * Slated for v0.3. It is introduced early so consumer types can depend on its
- * final shape, but in v0.2 it is surfaced ONLY as the optional
- * {@link UseSyncSnapshotResult.networkQuality} field and is ALWAYS `undefined`
- * until the v0.3 classifier ships and begins emitting real measurements.
+ * Reported as {@link ConnectionState.networkQuality} by `getConnectionStatus()`
+ * and `useConnection`, and used as the threshold of
+ * {@link SyncOptions.minNetworkQuality}. `Object.values(NetworkQuality)` lists
+ * the levels in that order, so compare two levels by their index in it, never
+ * as strings.
  *
- * @remarks
- * The ordering of the value set is significant (worst → best) so consumers can
- * compare or threshold on it once the v0.3 classifier populates it.
+ * Both platforms classify with the same fixed table:
+ *
+ * - **Measured**, only when {@link SyncOptions.healthCheckUrl} is set: three
+ *   sequential `HEAD` requests to that URL, 2 s timeout each, a failure or a
+ *   timeout counting as infinitely slow. The median picks the level: under
+ *   200 ms → `EXCELLENT`, 200–499 ms → `GOOD`, 500–999 ms → `MODERATE`,
+ *   1000 ms or more (including two or more failures) → `POOR`. Any HTTP status
+ *   counts as a latency sample: a `5xx` is the health check's concern, not the
+ *   classifier's.
+ * - **Not measured**, because there is no `healthCheckUrl` or the first
+ *   measurement is still pending: an unmetered link → `GOOD`, a metered one →
+ *   `MODERATE`.
+ * - **No link**, or a link the OS has not reported yet → `OFFLINE`.
+ * - **Caps**, applied last: an Android link without
+ *   `NET_CAPABILITY_VALIDATED` → at most `POOR`; a metered (Android) or
+ *   expensive (iOS) link → at most `GOOD`; iOS Low Data Mode → at most
+ *   `MODERATE`.
+ *
+ * Without `healthCheckUrl` nothing is measured, so the classification never
+ * reaches `EXCELLENT` and `minNetworkQuality: EXCELLENT` never passes. With
+ * it, the measurement is taken again when the network changes and a result is
+ * reused for 30 s. Nothing is sent while the device is offline, and nothing at
+ * all without `healthCheckUrl`.
+ *
+ * @example
+ * const LEVELS = Object.values(NetworkQuality);
+ * const isAtLeast = (quality: NetworkQuality, min: NetworkQuality) =>
+ *   LEVELS.indexOf(quality) >= LEVELS.indexOf(min);
+ *
+ * const { networkQuality } = await getConnectionStatus();
+ * if (isAtLeast(networkQuality, NetworkQuality.GOOD)) startUpload();
  */
 export const NetworkQuality = {
-  /** No usable network path — equivalent to {@link ConnectionStatus.DISCONNECTED}. */
+  /**
+   * No link, or a link the OS has not reported yet: the status is
+   * {@link ConnectionStatus.DISCONNECTED} or {@link ConnectionStatus.UNKNOWN}.
+   * The only level `minNetworkQuality: POOR` blocks.
+   */
   OFFLINE: 'OFFLINE',
-  /** Connected but throughput/latency is poor — sync should be conservative. */
+  /**
+   * Online, but slow: a median of 1000 ms or more, two or more failed probes,
+   * or an Android link without `NET_CAPABILITY_VALIDATED`.
+   */
   POOR: 'POOR',
-  /** Usable mid-tier link — acceptable for most foreground sync. */
+  /**
+   * A median of 500–999 ms, a metered link with no measurement, or a faster
+   * link held back by iOS Low Data Mode.
+   */
   MODERATE: 'MODERATE',
-  /** Healthy link — suitable for normal background and foreground sync. */
+  /**
+   * A median of 200–499 ms, or an unmetered link with no measurement. The
+   * highest level a metered or expensive link reaches.
+   */
   GOOD: 'GOOD',
-  /** Best-tier link (typically unmetered Wi-Fi/ethernet) — no constraints. */
+  /**
+   * A median under 200 ms on a link no cap lowers. Only reported with
+   * `healthCheckUrl` set.
+   */
   EXCELLENT: 'EXCELLENT',
 } as const;
 /** See {@link NetworkQuality} value set. */
@@ -203,9 +249,16 @@ export type HttpMethod = (typeof HttpMethod)[keyof typeof HttpMethod];
  * to its TSDoc for which optional fields are populated for which event type.
  */
 export const SyncEventType = {
-  /** A new item was accepted into the queue. `itemId` is set. */
+  /**
+   * An item was accepted into the queue, by `enqueue()` / `enqueueBatch()` or
+   * by `replayDeadLetter()` putting a dead letter back. `itemId` is set.
+   */
   ITEM_ENQUEUED: 'ITEM_ENQUEUED',
-  /** An item was removed by `removeItem()`. `itemId` is set. */
+  /**
+   * A row was deleted by `removeItem()`, whether a queued item or a dead
+   * letter, or by `discardDeadLetter()`. `itemId` is set. Not emitted when no
+   * row had that id.
+   */
   ITEM_REMOVED: 'ITEM_REMOVED',
   /** A flush cycle has begun. */
   SYNC_STARTED: 'SYNC_STARTED',
@@ -222,9 +275,17 @@ export const SyncEventType = {
    */
   SYNC_SUCCEEDED: 'SYNC_SUCCEEDED',
   /**
-   * The current flush cycle finished with at least one permanent failure, or
-   * died. `errorCode` is set only when it died: per-item failures are on
-   * `ITEM_FAILED`.
+   * The current flush cycle finished with at least one permanent failure or
+   * died, or a check at the start of the flush skipped the cycle. Per-item
+   * failures are on `ITEM_FAILED`, so `errorCode` is set only when:
+   *
+   * - the cycle died, with the code of the failure;
+   * - the network-quality gate skipped it: `NETWORK_QUALITY_TOO_LOW` (see
+   *   `SyncOptions.minNetworkQuality`);
+   * - the health check skipped it, or its backoff was running:
+   *   `HEALTH_CHECK_FAILED` (see `SyncOptions.healthCheckUrl`).
+   *
+   * A skipped cycle has no `SYNC_STARTED` before it and writes no history row.
    */
   SYNC_FAILED: 'SYNC_FAILED',
   /**
@@ -235,7 +296,8 @@ export const SyncEventType = {
   /**
    * A single item failed permanently: a non-retryable failure, or a retriable
    * one with no attempts left. `itemId`, `errorCode` and `attempt` are set, plus
-   * `statusCode` when applicable.
+   * `statusCode` when applicable. The item has already left the queue for the
+   * dead-letter queue, and `ITEM_DEAD_LETTERED` follows right after.
    */
   ITEM_FAILED: 'ITEM_FAILED',
   /**
@@ -243,11 +305,16 @@ export const SyncEventType = {
    * `itemId`, `attempt` and `errorCode` are set.
    */
   ITEM_RETRYING: 'ITEM_RETRYING',
-  /** The queue was cleared via `clearQueue()`. */
+  /**
+   * The queue was cleared via `clearQueue()`, dead letters included. Emitted
+   * once per call.
+   */
   QUEUE_CLEARED: 'QUEUE_CLEARED',
   /**
-   * Network connectivity changed. `connectionStatus` is set; richer detail is
-   * available via `getConnectionStatus()`.
+   * Network connectivity or its quality changed. `connectionStatus` is set.
+   * A change of `networkQuality` alone also emits it, with an unchanged
+   * `connectionStatus`: read `getConnectionStatus()` for the new quality and
+   * the rest of the snapshot. Not emitted when nothing changed.
    */
   CONNECTION_CHANGED: 'CONNECTION_CHANGED',
   /** Sync was paused via `pauseSync()`. */
@@ -270,6 +337,16 @@ export const SyncEventType = {
    * throws emits none. `errorCode` is not set on either platform.
    */
   BACKGROUND_SYNC_COMPLETED: 'BACKGROUND_SYNC_COMPLETED',
+  /**
+   * A permanently failed item was moved to the dead-letter queue. Emitted
+   * synchronously right after that item's `ITEM_FAILED`. `itemId` is set,
+   * `errorCode` is `DEAD_LETTERED`, and `metadata.lastErrorCode` carries the
+   * real failure code, the same one `ITEM_FAILED` reported. Read the dead
+   * letter with `listDeadLetter()`.
+   */
+  ITEM_DEAD_LETTERED: 'ITEM_DEAD_LETTERED',
+  // New members go at the end: nitrogen numbers the generated native enum
+  // cases by position.
 } as const;
 /** See {@link SyncEventType} value set. */
 export type SyncEventType = (typeof SyncEventType)[keyof typeof SyncEventType];

@@ -9,6 +9,7 @@ import android.util.Log
 import com.margelo.nitro.syncprovider.ConnectionState
 import com.margelo.nitro.syncprovider.ConnectionStatus
 import com.margelo.nitro.syncprovider.ConnectionType
+import com.margelo.nitro.syncprovider.NetworkQuality
 import com.margelo.nitro.syncprovider.SyncEventType
 import com.margelo.nitro.syncprovider.events.SyncEventEmitter
 import kotlinx.coroutines.CoroutineScope
@@ -139,6 +140,7 @@ internal class ConnectivityMonitor(
     return ConnectionState(
       status = status,
       type = type,
+      networkQuality = provisionalQuality(status),
       isInternetReachable = validated,
       isExpensive = !unmetered,
     )
@@ -186,6 +188,7 @@ internal class ConnectivityMonitor(
     private fun unknownState() = ConnectionState(
       status = ConnectionStatus.UNKNOWN,
       type = ConnectionType.UNKNOWN,
+      networkQuality = NetworkQuality.OFFLINE,
       isInternetReachable = null,
       isExpensive = null,
     )
@@ -193,8 +196,19 @@ internal class ConnectivityMonitor(
     private fun disconnectedState() = ConnectionState(
       status = ConnectionStatus.DISCONNECTED,
       type = ConnectionType.NONE,
+      networkQuality = NetworkQuality.OFFLINE,
       isInternetReachable = false,
       isExpensive = false,
     )
+
+    /**
+     * Provisional, from the link status alone, until latency measurements classify
+     * live links: `OFFLINE` exactly when the status is `DISCONNECTED` or `UNKNOWN`,
+     * as the public contract requires, and `GOOD` for every live link.
+     */
+    private fun provisionalQuality(status: ConnectionStatus): NetworkQuality = when (status) {
+      ConnectionStatus.DISCONNECTED, ConnectionStatus.UNKNOWN -> NetworkQuality.OFFLINE
+      ConnectionStatus.CONNECTED, ConnectionStatus.METERED -> NetworkQuality.GOOD
+    }
   }
 }

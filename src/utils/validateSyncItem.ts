@@ -1,29 +1,13 @@
-import { SyncError } from '../errors/SyncError';
 import { SyncErrorCode } from '../errors/SyncErrorCode';
 import type { ValidationIssue } from '../errors/ValidationIssue';
 import { HttpMethod, SyncPriority } from '../types/enums';
 import type { SyncItemInput } from '../types/sync';
 
+import type { CollectedIssue } from './validation';
+import { isAbsoluteHttpUrl, throwOnIssues, toPublicIssue } from './validation';
+
 const ALLOWED_METHODS = new Set<string>(Object.values(HttpMethod));
 const ALLOWED_PRIORITIES = new Set<string>(Object.values(SyncPriority));
-
-/**
- * Internal issue shape — a public {@link ValidationIssue} plus what the legacy
- * single-throw path used for *that* issue. {@link validateSyncItem} consumes
- * these to reproduce the first-violation throw byte-for-byte, and both are
- * stripped from the public list.
- */
-interface CollectedIssue extends ValidationIssue {
-  code: SyncErrorCode;
-  /** Thrown message, when it must differ from the public `reason`. */
-  message?: string;
-}
-
-function toPublicIssue(issue: CollectedIssue): ValidationIssue {
-  const out: ValidationIssue = { field: issue.field, reason: issue.reason };
-  if (issue.value !== undefined) out.value = issue.value;
-  return out;
-}
 
 /**
  * Run every {@link SyncItemInput} contract check and collect *all* violations,
@@ -72,7 +56,7 @@ function collectIssuesWithCode(input: SyncItemInput): CollectedIssue[] {
       field: 'url',
       reason: 'SyncItemInput.url must be a non-empty string.',
     });
-  } else if (!/^https?:\/\/[^\s]+$/i.test(input.url)) {
+  } else if (!isAbsoluteHttpUrl(input.url)) {
     // Only reachable when `url` is a non-empty string — matches the legacy
     // sequential `if` guards (the absolute-URL check never ran on a bad type).
     issues.push({
@@ -205,14 +189,5 @@ export function collectSyncItemIssues(input: SyncItemInput): ValidationIssue[] {
  * @internal
  */
 export function validateSyncItem(input: SyncItemInput): void {
-  const collected = collectIssuesWithCode(input);
-  const first = collected[0];
-  if (first) {
-    throw new SyncError(
-      first.code,
-      first.message ?? first.reason,
-      undefined,
-      collected.map(toPublicIssue)
-    );
-  }
+  throwOnIssues(collectIssuesWithCode(input));
 }

@@ -1,13 +1,25 @@
 import { act, renderHook, waitFor } from '@testing-library/react-native';
 import { describe, expect, it } from '@jest/globals';
 
+import { SyncErrorCode } from '../../errors/SyncErrorCode';
 import { useSyncSnapshot } from '../../hooks/useSyncSnapshot';
-import { ConnectionStatus, HttpMethod, SyncEventType } from '../../types/enums';
-import type { SyncItem, SyncResult } from '../../types/sync';
+import {
+  ConnectionStatus,
+  ConnectionType,
+  HttpMethod,
+  NetworkQuality,
+  SyncEventType,
+} from '../../types/enums';
+import type {
+  SyncDeadLetterItem,
+  SyncItem,
+  SyncResult,
+} from '../../types/sync';
 
 interface SyncMock {
   getQueueSize: jest.Mock;
   getPendingItems: jest.Mock;
+  listDeadLetter: jest.Mock;
   isSyncing: jest.Mock;
   getLastSyncResult: jest.Mock;
   getConnectionStatus: jest.Mock;
@@ -26,6 +38,21 @@ const makeItem = (id: string, overrides: Partial<SyncItem> = {}): SyncItem => ({
   createdAt: Date.now(),
   attempts: 0,
   nextRetryAt: 0,
+  ...overrides,
+});
+
+const makeDeadLetter = (
+  id: string,
+  overrides: Partial<SyncDeadLetterItem> = {}
+): SyncDeadLetterItem => ({
+  id,
+  method: HttpMethod.POST,
+  url: 'https://api.example.com/events',
+  createdAt: 1,
+  attempts: 5,
+  lastAttemptAt: 2,
+  lastErrorCode: SyncErrorCode.MAX_ATTEMPTS_EXCEEDED,
+  deadLetteredAt: 3,
   ...overrides,
 });
 
@@ -189,12 +216,290 @@ describe('useSyncSnapshot', () => {
     expect(result.current.size).toBe(3);
   });
 
-  it('leaves networkQuality and deadLetter undefined in v0.2', async () => {
+  it('leaves networkQuality and deadLetter undefined until their first read', () => {
     const { result } = renderHook(() => useSyncSnapshot());
 
-    await waitFor(() => expect(result.current.size).toBe(0));
     expect(result.current.networkQuality).toBeUndefined();
     expect(result.current.deadLetter).toBeUndefined();
+    expect(result.current.connection.networkQuality).toBe(
+      NetworkQuality.OFFLINE
+    );
+  });
+
+  it('populates networkQuality and deadLetter from their first read', async () => {
+    const mock = getMock();
+    const rows = [makeDeadLetter('dead-1'), makeDeadLetter('dead-2')];
+    mock.listDeadLetter.mockResolvedValueOnce(rows);
+
+    const { result } = renderHook(() => useSyncSnapshot());
+
+    await waitFor(() => expect(result.current.deadLetter).toEqual(rows));
+    expect(result.current.networkQuality).toBe(NetworkQuality.GOOD);
+    expect(result.current.connection.networkQuality).toBe(NetworkQuality.GOOD);
+    expect(mock.listDeadLetter).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows an empty dead-letter queue as an empty list, not undefined', async () => {
+    const { result } = renderHook(() => useSyncSnapshot());
+
+    await waitFor(() => expect(result.current.deadLetter).toEqual([]));
+  });
+
+  it('follows a CONNECTION_CHANGED that changes only the network quality', async () => {
+    const mock = getMock();
+
+    const { result } = renderHook(() => useSyncSnapshot());
+    await waitFor(() =>
+      expect(result.current.networkQuality).toBe(NetworkQuality.GOOD)
+    );
+    await drainSubscription();
+
+    mock.getConnectionStatus.mockResolvedValueOnce({
+      status: ConnectionStatus.CONNECTED,
+      type: ConnectionType.WIFI,
+      networkQuality: NetworkQuality.POOR,
+    });
+
+    await act(async () => {
+      mock.__emit({
+        type: SyncEventType.CONNECTION_CHANGED,
+        timestamp: 1,
+        connectionStatus: ConnectionStatus.CONNECTED,
+      });
+    });
+
+    await waitFor(() =>
+      expect(result.current.networkQuality).toBe(NetworkQuality.POOR)
+    );
+    expect(result.current.connection).toMatchObject({
+      status: ConnectionStatus.CONNECTED,
+      isOnline: true,
+      networkQuality: NetworkQuality.POOR,
+    });
+  });
+
+  it.each([
+    SyncEventType.ITEM_DEAD_LETTERED,
+    SyncEventType.ITEM_REMOVED,
+    SyncEventType.ITEM_ENQUEUED,
+    SyncEventType.QUEUE_CLEARED,
+  ])('reads the dead-letter queue again on %s', async (type) => {
+    const mock = getMock();
+
+    const { result } = renderHook(() => useSyncSnapshot());
+    await waitFor(() => expect(result.current.deadLetter).toEqual([]));
+    await drainSubscription();
+
+    const rows = [makeDeadLetter('dead-1')];
+    mock.listDeadLetter.mockResolvedValueOnce(rows);
+
+    await act(async () => {
+      mock.__emit({ type, timestamp: 1, itemId: 'dead-1' });
+    });
+
+    await waitFor(() => expect(result.current.deadLetter).toEqual(rows));
+    expect(mock.listDeadLetter).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    SyncEventType.ITEM_FAILED,
+    SyncEventType.SYNC_SUCCEEDED,
+    SyncEventType.SYNC_FAILED,
+    SyncEventType.CONNECTION_CHANGED,
+  ])('does not read the dead-letter queue again on %s', async (type) => {
+    const mock = getMock();
+
+    const { result } = renderHook(() => useSyncSnapshot());
+    await waitFor(() => expect(result.current.deadLetter).toEqual([]));
+    await drainSubscription();
+
+    await act(async () => {
+      mock.__emit({
+        type,
+        timestamp: 1,
+        connectionStatus: ConnectionStatus.CONNECTED,
+      });
+    });
+
+    expect(mock.listDeadLetter).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads the queue again on ITEM_DEAD_LETTERED, since the item left it', async () => {
+    const mock = getMock();
+    mock.getQueueSize.mockResolvedValueOnce(1);
+    mock.getPendingItems.mockResolvedValueOnce([makeItem('a')]);
+
+    const { result } = renderHook(() => useSyncSnapshot());
+    await waitFor(() => expect(result.current.size).toBe(1));
+    await drainSubscription();
+
+    mock.getQueueSize.mockResolvedValueOnce(0);
+    mock.getPendingItems.mockResolvedValueOnce([]);
+
+    await act(async () => {
+      mock.__emit({
+        type: SyncEventType.ITEM_DEAD_LETTERED,
+        timestamp: 1,
+        itemId: 'a',
+        errorCode: SyncErrorCode.DEAD_LETTERED,
+        metadata: { lastErrorCode: SyncErrorCode.SERVER_ERROR },
+      });
+    });
+
+    await waitFor(() => expect(result.current.size).toBe(0));
+    expect(result.current.items).toEqual([]);
+  });
+
+  it('keeps the same deadLetter list when a read finds the same rows', async () => {
+    const mock = getMock();
+    mock.listDeadLetter.mockImplementation(async () => [
+      makeDeadLetter('dead-1'),
+    ]);
+
+    const { result } = renderHook(() => useSyncSnapshot());
+    await waitFor(() => expect(result.current.deadLetter).toHaveLength(1));
+    await drainSubscription();
+    const shown = result.current.deadLetter;
+
+    await act(async () => {
+      mock.__emit({
+        type: SyncEventType.ITEM_ENQUEUED,
+        timestamp: 1,
+        itemId: 'x',
+      });
+    });
+    await drainSubscription();
+
+    expect(mock.listDeadLetter).toHaveBeenCalledTimes(2);
+    // Each native read returns a new array: the hook kept the old one.
+    expect(result.current.deadLetter).toBe(shown);
+  });
+
+  it('replaces the list when the same id comes back as a new dead letter', async () => {
+    const mock = getMock();
+    mock.listDeadLetter.mockResolvedValueOnce([
+      makeDeadLetter('dead-1', { deadLetteredAt: 10 }),
+    ]);
+
+    const { result } = renderHook(() => useSyncSnapshot());
+    await waitFor(() => expect(result.current.deadLetter).toHaveLength(1));
+    await drainSubscription();
+
+    const again = [makeDeadLetter('dead-1', { deadLetteredAt: 20 })];
+    mock.listDeadLetter.mockResolvedValueOnce(again);
+
+    await act(async () => {
+      mock.__emit({
+        type: SyncEventType.ITEM_DEAD_LETTERED,
+        timestamp: 2,
+        itemId: 'dead-1',
+      });
+    });
+
+    await waitFor(() => expect(result.current.deadLetter).toEqual(again));
+  });
+
+  it('applies only the latest dead-letter read when reads finish out of order', async () => {
+    const mock = getMock();
+
+    const { result } = renderHook(() => useSyncSnapshot());
+    await waitFor(() => expect(result.current.deadLetter).toEqual([]));
+    await drainSubscription();
+
+    let finishStaleRead: (rows: SyncDeadLetterItem[]) => void = () => {};
+    mock.listDeadLetter
+      .mockImplementationOnce(
+        () =>
+          new Promise<SyncDeadLetterItem[]>((resolve) => {
+            finishStaleRead = resolve;
+          })
+      )
+      .mockResolvedValueOnce([]);
+
+    await act(async () => {
+      // A failed item is dead-lettered, then replayed at once.
+      mock.__emit({
+        type: SyncEventType.ITEM_DEAD_LETTERED,
+        timestamp: 1,
+        itemId: 'a',
+      });
+      mock.__emit({
+        type: SyncEventType.ITEM_ENQUEUED,
+        timestamp: 2,
+        itemId: 'a',
+      });
+    });
+    await act(async () => {
+      finishStaleRead([makeDeadLetter('a')]);
+    });
+    await drainSubscription();
+
+    expect(mock.listDeadLetter).toHaveBeenCalledTimes(3);
+    expect(result.current.deadLetter).toEqual([]);
+  });
+
+  it('keeps the last dead-letter list when a read fails, without reporting an error', async () => {
+    const mock = getMock();
+    const rows = [makeDeadLetter('dead-1')];
+    mock.listDeadLetter.mockResolvedValueOnce(rows);
+
+    const { result } = renderHook(() => useSyncSnapshot());
+    await waitFor(() => expect(result.current.deadLetter).toEqual(rows));
+    await drainSubscription();
+
+    mock.listDeadLetter.mockRejectedValueOnce(new Error('store unavailable'));
+
+    await act(async () => {
+      mock.__emit({
+        type: SyncEventType.QUEUE_CLEARED,
+        timestamp: 1,
+      });
+    });
+    await drainSubscription();
+
+    expect(mock.listDeadLetter).toHaveBeenCalledTimes(2);
+    expect(result.current.deadLetter).toEqual(rows);
+    expect(result.current.error).toBeNull();
+  });
+
+  it('stays undefined when the first dead-letter read fails', async () => {
+    const mock = getMock();
+    mock.listDeadLetter.mockRejectedValueOnce(new Error('store unavailable'));
+
+    const { result } = renderHook(() => useSyncSnapshot());
+    await waitFor(() =>
+      expect(result.current.networkQuality).toBe(NetworkQuality.GOOD)
+    );
+    await drainSubscription();
+
+    expect(result.current.deadLetter).toBeUndefined();
+    expect(result.current.error).toBeNull();
+  });
+
+  it('re-renders a bounded number of times for one dead-letter event', async () => {
+    const mock = getMock();
+
+    let renderCount = 0;
+    const { result } = renderHook(() => {
+      renderCount++;
+      return useSyncSnapshot();
+    });
+    await waitFor(() => expect(result.current.deadLetter).toEqual([]));
+    await drainSubscription();
+    const baseline = renderCount;
+
+    mock.listDeadLetter.mockResolvedValueOnce([makeDeadLetter('a')]);
+    await act(async () => {
+      mock.__emit({
+        type: SyncEventType.ITEM_DEAD_LETTERED,
+        timestamp: 1,
+        itemId: 'a',
+      });
+    });
+    await waitFor(() => expect(result.current.deadLetter).toHaveLength(1));
+
+    // One render for the queue read, one for the new list, at most.
+    expect(renderCount - baseline).toBeLessThanOrEqual(2);
   });
 
   it('does not cause a per-field re-render storm for a single event (single-subscription guarantee)', async () => {

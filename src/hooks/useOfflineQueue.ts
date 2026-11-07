@@ -5,6 +5,7 @@ import { SyncErrorCode } from '../errors/SyncErrorCode';
 import {
   ConnectionStatus,
   ConnectionType,
+  NetworkQuality,
   SyncEventType,
 } from '../types/enums';
 import type { UseOfflineQueueResult } from '../types/hooks';
@@ -30,6 +31,8 @@ const QUEUE_REFRESH_EVENTS: ReadonlySet<string> = new Set<string>([
   SyncEventType.SYNC_FAILED,
   SyncEventType.ITEM_SUCCEEDED,
   SyncEventType.ITEM_FAILED,
+  // Dead-lettered items leave the pending queue.
+  SyncEventType.ITEM_DEAD_LETTERED,
 ]);
 
 /**
@@ -37,6 +40,10 @@ const QUEUE_REFRESH_EVENTS: ReadonlySet<string> = new Set<string>([
  * offline-first UIs. Composes {@link useConnection}, {@link useSyncQueue}, and
  * a slice of {@link useSyncStatus} into a single reactive object so a single
  * subscription drives all three.
+ *
+ * `connection` is read again on every `CONNECTION_CHANGED`, including the ones
+ * emitted when only `networkQuality` changed. The queue is read again on the
+ * same events as {@link useSyncQueue}, `ITEM_DEAD_LETTERED` included.
  *
  * @returns a {@link UseOfflineQueueResult}.
  *
@@ -54,6 +61,9 @@ export function useOfflineQueue(): UseOfflineQueueResult {
   );
   const [connectionType, setConnectionType] = useState<ConnectionType>(
     ConnectionType.UNKNOWN
+  );
+  const [networkQuality, setNetworkQuality] = useState<NetworkQuality>(
+    NetworkQuality.OFFLINE
   );
   const [error, setError] = useState<SyncError | null>(null);
   const cancelledRef = useRef(false);
@@ -89,6 +99,7 @@ export function useOfflineQueue(): UseOfflineQueueResult {
       if (cancelledRef.current) return;
       setConnectionStatus(snap.status);
       setConnectionType(snap.type);
+      setNetworkQuality(snap.networkQuality);
     } catch {
       // ignore — keep last known
     }
@@ -146,6 +157,7 @@ export function useOfflineQueue(): UseOfflineQueueResult {
     type: connectionType,
     isOnline,
     isMetered,
+    networkQuality,
   };
 
   const isWaitingForConnection = size > 0 && !isOnline;

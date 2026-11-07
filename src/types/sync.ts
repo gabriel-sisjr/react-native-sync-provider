@@ -3,6 +3,7 @@ import type {
   BackoffStrategy,
   ConnectionStatus,
   HttpMethod,
+  NetworkQuality,
   SyncEventType,
   SyncPriority,
   SyncStrategy,
@@ -153,19 +154,36 @@ export interface SyncItem {
 }
 
 /**
- * An item that exhausted its retry budget and was moved to the dead-letter
- * queue instead of being dropped.
+ * A request that failed permanently and was moved out of the queue into the
+ * dead-letter queue, instead of being dropped. Returned by `listDeadLetter()`
+ * and by `useSyncSnapshot().deadLetter`.
  *
- * Slated for v0.3. It mirrors {@link SyncItem} and adds the failure bookkeeping
- * needed to inspect, re-drive, or discard a dead-lettered request.
+ * It mirrors {@link SyncItem} without the retry schedule (`nextRetryAt`), and
+ * adds the failure bookkeeping needed to inspect, replay or discard the request.
  *
  * @remarks
- * Introduced early so consumer types can depend on its final shape. In v0.2 it
- * is never produced — {@link UseSyncSnapshotResult.deadLetter} is ALWAYS
- * `undefined` until the v0.3 dead-letter store ships.
+ * An item becomes a dead letter whenever it fails permanently: for example when
+ * its attempts run out, when the server answers with a status that is not
+ * retried, or on a 401 or 403 under credentials set in the current process. The
+ * move is atomic, so an item is never in the queue and in the dead-letter queue
+ * at once. It is followed by `ITEM_FAILED`, then by `ITEM_DEAD_LETTERED`.
+ *
+ * Items that failed permanently before the upgrade to this version are moved
+ * here too, when the upgraded library first opens its store. Those have no
+ * {@link SyncDeadLetterItem.lastErrorMessage}, and their
+ * {@link SyncDeadLetterItem.deadLetteredAt} is their last attempt time, or
+ * their enqueue time when no attempt was recorded.
+ *
+ * A dead letter keeps the request's headers and body until
+ * `replayDeadLetter()`, `discardDeadLetter()`, `removeItem()` or `clearQueue()`
+ * deletes it. Nothing prunes the dead-letter queue, and it counts toward no
+ * capacity cap, so discard what you do not replay.
  */
 export interface SyncDeadLetterItem {
-  /** ULID assigned by the native layer at enqueue time. */
+  /**
+   * ULID assigned by the native layer at enqueue time. `replayDeadLetter()`
+   * puts the item back under the same id.
+   */
   id: string;
   /** HTTP verb used to dispatch the request. */
   method: HttpMethod;
@@ -185,21 +203,41 @@ export interface SyncDeadLetterItem {
    */
   priority?: SyncPriority;
   /**
-   * Epoch-millisecond timestamp captured by the native layer at enqueue time.
-   * Monotonic with respect to enqueue order.
+   * Epoch-millisecond timestamp captured by the native layer at enqueue time,
+   * kept from the original enqueue. A replay keeps it too.
    */
   createdAt: number;
   /** Optional opaque metadata, mirroring what was enqueued. */
   metadata?: Record<string, string>;
-  /** Total number of dispatch attempts made before dead-lettering. */
+  /**
+   * Number of dispatch attempts recorded before the item was dead-lettered.
+   * The platforms record attempts at different moments: see
+   * {@link SyncItem.attempts}. A replay starts again from `0`.
+   */
   attempts: number;
-  /** Epoch-millisecond timestamp of the final (failing) dispatch attempt. */
+  /**
+   * Epoch-millisecond timestamp of the final, failing dispatch attempt, or `0`
+   * when none was recorded.
+   */
   lastAttemptAt: number;
-  /** Failure code from the final attempt — the reason it was dead-lettered. */
+  /**
+   * Failure code of the final attempt: the reason the item was dead-lettered,
+   * as reported on its `ITEM_FAILED` event. Never `DEAD_LETTERED`. An item
+   * dead-lettered by an earlier version that recorded no code reports
+   * `MAX_ATTEMPTS_EXCEEDED`.
+   */
   lastErrorCode: SyncErrorCode;
-  /** Optional human-readable detail accompanying {@link lastErrorCode}. */
+  /**
+   * Optional detail of the final failure, such as the HTTP status line or the
+   * transport error message, cut to 1024 characters. It never contains request
+   * or response headers or bodies. Absent for items dead-lettered by an earlier
+   * version, and when the platform reported no detail.
+   */
   lastErrorMessage?: string;
-  /** Epoch-millisecond timestamp at which the item was moved to dead-letter. */
+  /**
+   * Epoch-millisecond timestamp at which the item was moved to the dead-letter
+   * queue. `listDeadLetter()` sorts by it, oldest first.
+   */
   deadLetteredAt: number;
 }
 
@@ -267,8 +305,8 @@ export interface SyncOptions {
   /**
    * Maximum number of items the queue may hold. Defaults to `10000` when
    * omitted, and any value below `1` is treated as `1`, so there is no way to
-   * remove the cap. New enqueues are rejected once it is reached. Android counts
-   * failed items toward it, iOS does not.
+   * remove the cap. New enqueues and `replayDeadLetter()` are rejected once it
+   * is reached. Dead letters count toward it on neither platform.
    */
   maxQueueSize?: number;
   /**
@@ -301,6 +339,84 @@ export interface SyncOptions {
    * request.
    */
   defaultHeaders?: Record<string, string>;
+  /**
+   * Lowest {@link NetworkQuality} at which a flush cycle may run. Unset, the
+   * default, means no quality gate at all.
+   *
+   * When set, every flush checks the current
+   * {@link ConnectionState.networkQuality} first: `flush()`, `useAutoSync`,
+   * the retry timer, the Android retry kick, and the background windows
+   * enabled by `enableBackgroundSync`. The check runs after the pause and
+   * stored-credentials checks and before the health check. Below the minimum no
+   * cycle runs: `SYNC_FAILED` is emitted with `errorCode:
+   * NETWORK_QUALITY_TOO_LOW`, without `SYNC_STARTED` and without a history row,
+   * no item changes, and `flush()` resolves with the no-cycle result described
+   * on {@link SyncResult}. An automatic wake the gate blocks is not lost: it runs
+   * once the quality reaches the minimum, the same way a wake that found the
+   * device offline runs once it is back online.
+   *
+   * `POOR` is the most permissive value: it blocks only `OFFLINE`, so it stops
+   * flushes while the device has no link or the link is not known yet. `OFFLINE`
+   * lets every flush through, like leaving the field unset. Without
+   * {@link SyncOptions.healthCheckUrl} the classification never reaches
+   * `EXCELLENT`, so `minNetworkQuality: EXCELLENT` then blocks every flush.
+   *
+   * On iOS the gate first waits briefly for the system's first network report,
+   * so a background launch is not spent on a link that is not known yet.
+   *
+   * Persisted for background workers. `getSyncConfig()` returns it only when it
+   * was set. `configureSync` rejects a value that is not a `NetworkQuality`
+   * with `INVALID_PAYLOAD`.
+   */
+  minNetworkQuality?: NetworkQuality;
+  /**
+   * Absolute http(s) URL of an endpoint the engine checks before dispatching.
+   * Unset, the default, means no health check and no latency measurement.
+   *
+   * Before claiming the first item of a cycle, the engine sends one `HEAD`
+   * request to this URL, unless a healthy result younger than
+   * {@link SyncOptions.healthCheckTtlMs} is cached. A final `2xx` status, after
+   * redirects, is healthy. Any other status, a transport error or a timeout is
+   * not. The request carries neither `defaultHeaders` nor any item header, so
+   * point it at an endpoint that answers without authentication.
+   *
+   * When the check fails, the cycle is skipped: `SYNC_FAILED` is emitted with
+   * `errorCode: HEALTH_CHECK_FAILED`, without `SYNC_STARTED` and without a
+   * history row, no item changes, and `flush()` resolves with the no-cycle
+   * result described on {@link SyncResult}. For
+   * {@link SyncOptions.healthCheckBackoffMs} after that, every cycle is skipped
+   * the same way without sending a request, and the next retry wake is not
+   * armed before the backoff ends. Every `configureSync` call ends the backoff
+   * early.
+   *
+   * The same URL is the target of the network-quality measurement (see
+   * {@link NetworkQuality}). The two share one cache: a `2xx` answer to either
+   * one counts as a healthy check, so the endpoint is not hit twice. Without
+   * this field neither one sends a request.
+   *
+   * Persisted for background workers. `getSyncConfig()` returns it only when it
+   * was set. `configureSync` rejects a value that is not an absolute http(s)
+   * URL with `INVALID_URL`.
+   */
+  healthCheckUrl?: string;
+  /**
+   * How long a healthy health-check result is reused, in ms, before the next
+   * cycle checks again. Defaults to `60000`. `0` checks before every cycle.
+   * Ignored without {@link SyncOptions.healthCheckUrl}.
+   *
+   * `getSyncConfig()` returns it only when it was set. `configureSync` rejects
+   * a value that is not a finite number of at least `0` with `INVALID_PAYLOAD`.
+   */
+  healthCheckTtlMs?: number;
+  /**
+   * How long cycles are skipped after a failed health check, in ms. Defaults to
+   * `30000`. `0` means no backoff: the next cycle checks again. Ignored without
+   * {@link SyncOptions.healthCheckUrl}.
+   *
+   * `getSyncConfig()` returns it only when it was set. `configureSync` rejects
+   * a value that is not a finite number of at least `0` with `INVALID_PAYLOAD`.
+   */
+  healthCheckBackoffMs?: number;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -312,9 +428,17 @@ export interface SyncOptions {
  * sync history (see `getSyncHistory`).
  *
  * @remarks
- * A `flush()` that runs no cycle, because the engine is paused or stored
- * `defaultHeaders` cannot be read, still resolves with a `SyncResult`, but
- * nothing is dispatched, no event is emitted and no history row is written.
+ * A `flush()` that runs no cycle still resolves with a `SyncResult`, but
+ * nothing is dispatched, no item changes, no `SYNC_STARTED` is emitted and no
+ * history row is written. That happens when:
+ *
+ * - the engine is paused, or stored `defaultHeaders` cannot be read: no event
+ *   is emitted at all;
+ * - the network quality is below {@link SyncOptions.minNetworkQuality}:
+ *   `SYNC_FAILED` is emitted with `errorCode: NETWORK_QUALITY_TOO_LOW`;
+ * - the health check fails, or its backoff is running:
+ *   `SYNC_FAILED` is emitted with `errorCode: HEALTH_CHECK_FAILED`.
+ *
  * Both counts are `0`, and the result does not say why. Android sets
  * `startedAt` and `finishedAt` to `0`. iOS sets both to the time of the call,
  * so there the result alone cannot be told apart from an empty cycle: only the
@@ -333,7 +457,10 @@ export interface SyncResult {
   finishedAt: number;
   /** Number of items that succeeded in this cycle. */
   successCount: number;
-  /** Number of items that failed permanently in this cycle. */
+  /**
+   * Number of items that failed permanently in this cycle. Each one is now in
+   * the dead-letter queue: see `listDeadLetter`.
+   */
   failureCount: number;
   /** ULIDs of items that succeeded. Always empty on iOS. */
   succeededIds: string[];
@@ -362,12 +489,18 @@ export interface SyncResult {
  * - `ITEM_ENQUEUED` / `ITEM_REMOVED` — `itemId` set.
  * - `SYNC_STARTED` / `SYNC_SUCCEEDED` — base fields only.
  * - `SYNC_PROGRESS` — `progress` (0..1) set. iOS only.
- * - `SYNC_FAILED` — `errorCode` set only when the cycle itself died.
+ * - `SYNC_FAILED` — `errorCode` set only when the cycle itself died, or when
+ *   the network-quality gate (`NETWORK_QUALITY_TOO_LOW`) or the health check
+ *   (`HEALTH_CHECK_FAILED`) skipped it.
  * - `ITEM_SUCCEEDED` — `itemId`, `statusCode`, `attempt` set.
  * - `ITEM_FAILED` — `itemId`, `errorCode`, `attempt`, `statusCode?` set.
+ * - `ITEM_DEAD_LETTERED` — `itemId` set, `errorCode` is `DEAD_LETTERED`, and
+ *   `metadata.lastErrorCode` holds the real failure code. Follows the item's
+ *   `ITEM_FAILED`, on both platforms.
  * - `ITEM_RETRYING` — `itemId`, `attempt`, `errorCode`, `statusCode?` set.
  * - `QUEUE_CLEARED` — base fields only.
- * - `CONNECTION_CHANGED` — `connectionStatus` set.
+ * - `CONNECTION_CHANGED` — `connectionStatus` set. Also emitted when only the
+ *   network quality changed: read it with `getConnectionStatus()`.
  * - `PAUSED` / `RESUMED` — base fields only.
  * - `BACKGROUND_SYNC_STARTED` / `BACKGROUND_SYNC_COMPLETED` — base fields
  *   only on Android. On iOS, `metadata.kind` (`"refresh"` or `"processing"`) is
@@ -388,8 +521,10 @@ export interface SyncEvent {
   /** Coarse flush progress in `[0, 1]`. Only set for `SYNC_PROGRESS`. */
   progress?: number;
   /**
-   * Failure code. Set for `ITEM_FAILED` and `ITEM_RETRYING`, and for
-   * `SYNC_FAILED` only when the cycle itself died.
+   * Failure code. Set for `ITEM_FAILED` and `ITEM_RETRYING`, to
+   * `DEAD_LETTERED` for `ITEM_DEAD_LETTERED`, and for `SYNC_FAILED` only when
+   * the cycle itself died or was skipped by the network-quality gate
+   * (`NETWORK_QUALITY_TOO_LOW`) or the health check (`HEALTH_CHECK_FAILED`).
    */
   errorCode?: SyncErrorCode;
   /** HTTP status code, when applicable. */
@@ -402,9 +537,11 @@ export interface SyncEvent {
   /** Connection status snapshot. Only set for `CONNECTION_CHANGED`. */
   connectionStatus?: ConnectionStatus;
   /**
-   * Engine diagnostics, on iOS only, for cycle-level events and the
-   * `BACKGROUND_SYNC_*` events. This is not {@link SyncItemInput.metadata}:
-   * item metadata is not echoed on events.
+   * Engine diagnostics. On both platforms, `ITEM_DEAD_LETTERED` sets
+   * `lastErrorCode`, the {@link SyncErrorCode} the item failed with. iOS also
+   * sets diagnostics on cycle-level events and the `BACKGROUND_SYNC_*` events.
+   * This is not {@link SyncItemInput.metadata}: item metadata is not echoed on
+   * events.
    */
   metadata?: Record<string, string>;
 }

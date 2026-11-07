@@ -2,6 +2,7 @@ import {
   ConnectionStatus,
   ConnectionType,
   HttpMethod,
+  NetworkQuality,
 } from '../../types/enums';
 import type { SyncItem, SyncResult } from '../../types/sync';
 
@@ -185,6 +186,7 @@ export function installFakeNativeQueue(
       ? ConnectionStatus.DISCONNECTED
       : ConnectionStatus.CONNECTED,
     type: fake.offline ? ConnectionType.NONE : ConnectionType.WIFI,
+    networkQuality: fake.offline ? NetworkQuality.OFFLINE : NetworkQuality.GOOD,
   }));
   mock.flush.mockImplementation(async () => {
     if (fake.paused) {

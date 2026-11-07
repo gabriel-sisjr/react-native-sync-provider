@@ -26,6 +26,8 @@ const REFRESH_EVENTS: ReadonlySet<string> = new Set<string>([
   SyncEventType.SYNC_FAILED,
   SyncEventType.ITEM_SUCCEEDED,
   SyncEventType.ITEM_FAILED,
+  // Dead-lettered items leave the pending queue.
+  SyncEventType.ITEM_DEAD_LETTERED,
 ]);
 
 /**
@@ -34,12 +36,15 @@ const REFRESH_EVENTS: ReadonlySet<string> = new Set<string>([
  * Surfaces the live queue size + pending items, plus the canonical write
  * operations (`enqueue`, `enqueueBatch`, `removeItem`, `clearQueue`) so
  * components can drive the queue without going through the bare facade.
+ * Dead letters are not part of `items`: read them with `listDeadLetter()` or
+ * `useSyncSnapshot().deadLetter`.
  *
  * The hook auto-refreshes whenever the native layer emits an event that may
  * have changed queue contents (`ITEM_ENQUEUED`, `ITEM_REMOVED`,
  * `QUEUE_CLEARED`, `SYNC_SUCCEEDED`, `SYNC_FAILED`, `ITEM_SUCCEEDED`,
- * `ITEM_FAILED`). It is safe to call before native loads — callbacks will
- * reject with {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE}.
+ * `ITEM_FAILED`, `ITEM_DEAD_LETTERED`). It is safe to call before native
+ * loads — callbacks will reject with
+ * {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE}.
  *
  * @returns a {@link UseSyncQueueResult}.
  *

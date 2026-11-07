@@ -8,7 +8,9 @@
  *
  * Native codes do not reach JS through a rejection yet: the facade maps every
  * native rejection to one fallback code per function. Codes a per-item failure
- * reports arrive on `ITEM_FAILED` and `ITEM_RETRYING` events.
+ * reports arrive on `ITEM_FAILED` and `ITEM_RETRYING` events and are kept as a
+ * dead letter's `lastErrorCode`. Codes for a cycle skipped at the start of a
+ * flush arrive on `SYNC_FAILED`.
  */
 export const SyncErrorCode = {
   /**
@@ -28,20 +30,22 @@ export const SyncErrorCode = {
    */
   SERVER_ERROR: 'SERVER_ERROR',
   /**
-   * The supplied {@link SyncItemInput} is malformed, with the detail in
-   * `SyncError.validationErrors`. Permanent — not retried. Also the code most
-   * facade functions reject with when native rejects a call, with no
-   * `validationErrors`.
+   * The supplied {@link SyncItemInput} or {@link SyncOptions} is malformed,
+   * with the detail in `SyncError.validationErrors`. Permanent — not retried.
+   * Also the code most facade functions reject with when native rejects a call,
+   * with no `validationErrors`.
    *
-   * Thrown by: `enqueue`, `enqueueBatch`, and as that fallback.
+   * Thrown by: `enqueue`, `enqueueBatch`, `configureSync` (for
+   * `minNetworkQuality`, `healthCheckTtlMs` and `healthCheckBackoffMs`), and as
+   * that fallback.
    */
   INVALID_PAYLOAD: 'INVALID_PAYLOAD',
   /**
    * The queue is at `SyncOptions.maxQueueSize`. Permanent — the consumer
    * must drain the queue (`flush`) or raise the cap before retrying.
    *
-   * Raised by native only, so `enqueue` and `enqueueBatch` currently reject with
-   * `INVALID_PAYLOAD` and no `validationErrors` instead.
+   * Raised by native only, so `enqueue`, `enqueueBatch` and `replayDeadLetter`
+   * currently reject with `INVALID_PAYLOAD` and no `validationErrors` instead.
    */
   QUEUE_FULL: 'QUEUE_FULL',
   /**
@@ -61,17 +65,18 @@ export const SyncErrorCode = {
    */
   BACKGROUND_TASK_REGISTRATION_FAILED: 'BACKGROUND_TASK_REGISTRATION_FAILED',
   /**
-   * `SyncItemInput.url` is not a valid absolute http(s) URL. Permanent — not
-   * retried. `enqueueBatch` reports URL problems under `INVALID_PAYLOAD`, in
-   * `SyncError.validationErrors`.
+   * `SyncItemInput.url` or `SyncOptions.healthCheckUrl` is not a valid absolute
+   * http(s) URL. Permanent — not retried. `enqueueBatch` reports URL problems
+   * under `INVALID_PAYLOAD`, in `SyncError.validationErrors`.
    *
-   * Thrown by: `enqueue`.
+   * Thrown by: `enqueue`, `configureSync`.
    */
   INVALID_URL: 'INVALID_URL',
   /**
    * The server responded with `401 Unauthorized` or `403 Forbidden`. Permanent
-   * — the consumer is expected to refresh credentials before re-enqueueing. The
-   * exception is a process running on stored `defaultHeaders`: see
+   * — the item becomes a dead letter, and the consumer is expected to refresh
+   * credentials (`configureSync`) before replaying it with `replayDeadLetter`.
+   * The exception is a process running on stored `defaultHeaders`: see
    * {@link SyncOptions.defaultHeaders}.
    *
    * Reported on item events.
@@ -89,7 +94,8 @@ export const SyncErrorCode = {
    * A retriable failure with no attempts left in `RetryPolicy.maxAttempts`. A
    * non-retryable failure keeps its real code instead, even on the last attempt.
    *
-   * Reported on `ITEM_FAILED`.
+   * Reported on `ITEM_FAILED`. Also the `lastErrorCode` of a dead letter whose
+   * item failed under an earlier version that recorded no code.
    */
   MAX_ATTEMPTS_EXCEEDED: 'MAX_ATTEMPTS_EXCEEDED',
   /**
@@ -106,6 +112,34 @@ export const SyncErrorCode = {
    * Thrown by: `drainUntilEmpty`.
    */
   DRAIN_ALREADY_ACTIVE: 'DRAIN_ALREADY_ACTIVE',
+  /**
+   * A flush cycle was skipped because the current network quality is below
+   * `SyncOptions.minNetworkQuality`. No item changes and no attempt is spent.
+   * An automatic wake the gate blocks runs once the quality reaches the
+   * minimum; a `flush()` call is not repeated.
+   *
+   * Reported on `SYNC_FAILED`.
+   */
+  NETWORK_QUALITY_TOO_LOW: 'NETWORK_QUALITY_TOO_LOW',
+  /**
+   * A flush cycle was skipped because the `HEAD` request to
+   * `SyncOptions.healthCheckUrl` did not end with a `2xx` status, or because
+   * the backoff after such a failure (`SyncOptions.healthCheckBackoffMs`) was
+   * still running. No item changes and no attempt is spent.
+   *
+   * Reported on `SYNC_FAILED`.
+   */
+  HEALTH_CHECK_FAILED: 'HEALTH_CHECK_FAILED',
+  /**
+   * The item was moved to the dead-letter queue. It is never a dead letter's
+   * `lastErrorCode`: the event's `metadata.lastErrorCode` and the dead letter
+   * carry the real failure code.
+   *
+   * Reported on `ITEM_DEAD_LETTERED`.
+   */
+  DEAD_LETTERED: 'DEAD_LETTERED',
+  // New members go at the end: nitrogen numbers the generated native enum
+  // cases by position.
 } as const;
 /** See {@link SyncErrorCode} value set. */
 export type SyncErrorCode = (typeof SyncErrorCode)[keyof typeof SyncErrorCode];

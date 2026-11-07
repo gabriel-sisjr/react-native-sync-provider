@@ -7,7 +7,8 @@
  * test can stub specific method behaviors without redeclaring the mock.
  */
 
-export {};
+import type { ConnectionState } from '../types/connection';
+import type { SyncOptions } from '../types/sync';
 
 const mockAppStateListeners: Array<(state: string) => void> = [];
 
@@ -61,6 +62,9 @@ interface MockHybrid {
   clearQueue: jest.Mock;
   getQueueSize: jest.Mock;
   getPendingItems: jest.Mock;
+  listDeadLetter: jest.Mock;
+  replayDeadLetter: jest.Mock;
+  discardDeadLetter: jest.Mock;
   flush: jest.Mock;
   pauseSync: jest.Mock;
   resumeSync: jest.Mock;
@@ -96,7 +100,10 @@ function createMockHybrid(): MockHybrid {
     errors: {},
   };
 
-  const defaultConfig = {
+  // Typed, so the mock cannot drift from the public type. Like native, it
+  // leaves out the options that were never set: `getSyncConfig()` returns
+  // `minNetworkQuality` and the health-check fields only when set.
+  const defaultConfig: SyncOptions = {
     strategy: 'AUTOMATIC',
     retryPolicy: {
       maxAttempts: 3,
@@ -108,6 +115,15 @@ function createMockHybrid(): MockHybrid {
     },
   };
 
+  // An unmetered Wi-Fi link with no `healthCheckUrl`: link signals only.
+  const defaultConnection: ConnectionState = {
+    status: 'CONNECTED',
+    type: 'WIFI',
+    networkQuality: 'GOOD',
+    isInternetReachable: true,
+    isExpensive: false,
+  };
+
   const hybrid: MockHybrid = {
     enqueue: jest.fn(async () => 'mock-ulid-1'),
     enqueueBatch: jest.fn(async (items: unknown[]) =>
@@ -117,6 +133,9 @@ function createMockHybrid(): MockHybrid {
     clearQueue: jest.fn(async () => undefined),
     getQueueSize: jest.fn(async () => 0),
     getPendingItems: jest.fn(async () => []),
+    listDeadLetter: jest.fn(async () => []),
+    replayDeadLetter: jest.fn(async () => undefined),
+    discardDeadLetter: jest.fn(async () => undefined),
     flush: jest.fn(async () => ({
       startedAt: Date.now(),
       finishedAt: Date.now(),
@@ -134,12 +153,7 @@ function createMockHybrid(): MockHybrid {
     getLastSyncResult: jest.fn(async () => sentinelLastResult),
     getSyncHistory: jest.fn(async () => []),
     clearSyncHistory: jest.fn(async () => undefined),
-    getConnectionStatus: jest.fn(async () => ({
-      status: 'CONNECTED',
-      type: 'WIFI',
-      isInternetReachable: true,
-      isExpensive: false,
-    })),
+    getConnectionStatus: jest.fn(async () => ({ ...defaultConnection })),
     enableBackgroundSync: jest.fn(async () => undefined),
     disableBackgroundSync: jest.fn(async () => undefined),
     isBackgroundSyncEnabled: jest.fn(async () => false),

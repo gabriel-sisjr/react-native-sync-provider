@@ -7,8 +7,10 @@ import com.margelo.nitro.syncprovider.config.EngineConfig
 import com.margelo.nitro.syncprovider.config.KeystoreSecretStore
 import com.margelo.nitro.syncprovider.config.SecretStore
 import com.margelo.nitro.syncprovider.config.SyncConfigStore
+import com.margelo.nitro.syncprovider.config.SyncOptionsValidator
 import com.margelo.nitro.syncprovider.connectivity.ConnectivityMonitor
 import com.margelo.nitro.syncprovider.database.SyncDatabase
+import com.margelo.nitro.syncprovider.error.SyncException
 import com.margelo.nitro.syncprovider.events.SyncEventEmitter
 import com.margelo.nitro.syncprovider.http.CredentialPolicy
 import com.margelo.nitro.syncprovider.http.SyncDispatcher
@@ -138,8 +140,12 @@ internal class SyncProviderRuntime private constructor(
   /**
    * Apply a `configureSync` from JS: it takes effect now, and in every later process.
    * Every call also lifts the credential hold, whether or not the headers changed.
+   *
+   * Invalid options are rejected before anything is applied or persisted; see
+   * [SyncOptionsValidator].
    */
   suspend fun configure(options: SyncOptions) {
+    SyncOptionsValidator.validate(options)
     configureMutex.withLock {
       configRef.set(
         EngineConfig(
@@ -176,6 +182,19 @@ internal class SyncProviderRuntime private constructor(
   suspend fun armRetryWake() {
     retryWake.arm()
   }
+
+  /**
+   * Dead letters, oldest first. Provisional: nothing moves to a dead-letter store yet
+   * (a terminal failure still stays in the queue as a `FAILED` row), so the list is
+   * always empty.
+   */
+  suspend fun listDeadLetter(): List<SyncDeadLetterItem> = emptyList()
+
+  /** Provisional: rejects until replaying a dead letter is implemented. */
+  suspend fun replayDeadLetter(id: String): Unit = throw deadLetterNotImplemented("replay")
+
+  /** Provisional: rejects until discarding a dead letter is implemented. */
+  suspend fun discardDeadLetter(id: String): Unit = throw deadLetterNotImplemented("discard")
 
   /**
    * True when a background worker must do nothing: the engine is paused, or the consumer
@@ -293,6 +312,16 @@ internal class SyncProviderRuntime private constructor(
       maxQueueSize = SyncQueueStorage.DEFAULT_MAX_QUEUE_SIZE.toDouble(),
       persistQueue = true,
       defaultHeaders = null,
+      // Unset: no quality gate and no health check. Their defaults apply where they are used.
+      minNetworkQuality = null,
+      healthCheckUrl = null,
+      healthCheckTtlMs = null,
+      healthCheckBackoffMs = null,
+    )
+
+    private fun deadLetterNotImplemented(operation: String) = SyncException(
+      SyncErrorCode.INVALID_PAYLOAD,
+      "Dead-letter $operation is not implemented yet.",
     )
   }
 }

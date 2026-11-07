@@ -7,8 +7,11 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import androidx.test.core.app.ApplicationProvider
 import com.google.common.truth.Truth.assertThat
+import com.google.common.truth.Truth.assertWithMessage
+import com.margelo.nitro.syncprovider.ConnectionState
 import com.margelo.nitro.syncprovider.ConnectionStatus
 import com.margelo.nitro.syncprovider.ConnectionType
+import com.margelo.nitro.syncprovider.NetworkQuality
 import com.margelo.nitro.syncprovider.SyncEvent
 import com.margelo.nitro.syncprovider.SyncEventType
 import com.margelo.nitro.syncprovider.events.SyncEventEmitter
@@ -309,6 +312,77 @@ internal class ConnectivityMonitorTest {
 
     assertThat(state.status).isEqualTo(ConnectionStatus.CONNECTED)
     assertThat(state.isExpensive).isFalse()
+  }
+
+  /* ----------------------------- network quality ----------------------------- */
+
+  private fun assertQualityInvariant(state: ConnectionState) {
+    val offline = state.status == ConnectionStatus.DISCONNECTED ||
+      state.status == ConnectionStatus.UNKNOWN
+    // Provisional: every live link reads GOOD until latency measurements classify it.
+    val expected = if (offline) NetworkQuality.OFFLINE else NetworkQuality.GOOD
+    assertWithMessage("networkQuality for ${state.status}")
+      .that(state.networkQuality)
+      .isEqualTo(expected)
+  }
+
+  @Test
+  fun `every reported state is OFFLINE exactly when it is DISCONNECTED or UNKNOWN`() {
+    val seen = mutableListOf(monitor.state.value)
+    monitor.start()
+    val wifi = network(WIFI_ID, NetworkCapabilities.TRANSPORT_WIFI, *INTERNET, NOT_METERED)
+    val cellular = network(CELLULAR_ID, NetworkCapabilities.TRANSPORT_CELLULAR, *INTERNET)
+
+    callback().onAvailable(wifi)
+    seen += monitor.state.value
+    callback().onAvailable(cellular)
+    seen += monitor.state.value
+    callback().onCapabilitiesChanged(cellular, capabilities(NetworkCapabilities.TRANSPORT_CELLULAR))
+    seen += monitor.state.value
+    callback().onAvailable(wifi)
+    callback().onLost(wifi)
+    seen += monitor.state.value
+
+    assertThat(seen.map { it.status }).containsExactly(
+      ConnectionStatus.UNKNOWN,
+      ConnectionStatus.CONNECTED,
+      ConnectionStatus.METERED,
+      ConnectionStatus.DISCONNECTED,
+      ConnectionStatus.DISCONNECTED,
+    ).inOrder()
+    seen.forEach(::assertQualityInvariant)
+  }
+
+  @Test
+  fun `getConnectionStatus honors the quality invariant before any callback`() {
+    val shadow = shadowOf(manager())
+
+    shadow.setDefaultNetworkActive(false)
+    val noNetwork = monitor.currentState()
+    shadow.setDefaultNetworkActive(true)
+    shadow.setNetworkCapabilities(
+      manager().activeNetwork,
+      capabilities(NetworkCapabilities.TRANSPORT_WIFI, *INTERNET, NOT_METERED),
+    )
+    val unmetered = monitor.currentState()
+    shadow.setNetworkCapabilities(
+      manager().activeNetwork,
+      capabilities(NetworkCapabilities.TRANSPORT_CELLULAR, *INTERNET),
+    )
+    val metered = monitor.currentState()
+    shadow.setNetworkCapabilities(
+      manager().activeNetwork,
+      capabilities(NetworkCapabilities.TRANSPORT_WIFI),
+    )
+    val noInternet = monitor.currentState()
+
+    assertThat(listOf(noNetwork, unmetered, metered, noInternet).map { it.status }).containsExactly(
+      ConnectionStatus.DISCONNECTED,
+      ConnectionStatus.CONNECTED,
+      ConnectionStatus.METERED,
+      ConnectionStatus.DISCONNECTED,
+    ).inOrder()
+    listOf(noNetwork, unmetered, metered, noInternet).forEach(::assertQualityInvariant)
   }
 
   /** The stock shadow, counting which registration call the monitor makes. */

@@ -19,3 +19,4 @@ export { computeNextDelayMs } from './retryBackoff';
 export type { ComputeNextDelayArgs } from './retryBackoff';
 export { serializeSyncItem } from './serializeSyncItem';
 export { collectSyncItemIssues, validateSyncItem } from './validateSyncItem';
+export { validateSyncOptions } from './validateSyncOptions';

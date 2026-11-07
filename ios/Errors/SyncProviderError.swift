@@ -58,6 +58,9 @@ struct SyncProviderError: LocalizedError, CustomNSError {
         case .maxAttemptsExceeded: return 10
         case .duplicateItem: return 11
         case .drainAlreadyActive: return 12
+        case .networkQualityTooLow: return 13
+        case .healthCheckFailed: return 14
+        case .deadLettered: return 15
         @unknown default: return 0
         }
     }
@@ -99,6 +102,14 @@ struct SyncProviderError: LocalizedError, CustomNSError {
     static func backgroundRegistrationFailed(_ reason: String) -> SyncProviderError {
         SyncProviderError(code: .backgroundTaskRegistrationFailed,
                           message: "Background task registration failed: \(reason)")
+    }
+
+    /// A dead-letter operation this build cannot perform yet. `operation` is
+    /// `"replay"` or `"discard"`. `INVALID_PAYLOAD`, the code the facade gives
+    /// every native rejection of these calls; the message matches Android's.
+    static func deadLetterNotImplemented(_ operation: String) -> SyncProviderError {
+        SyncProviderError(code: .invalidPayload,
+                          message: "Dead-letter \(operation) is not implemented yet.")
     }
 }
 

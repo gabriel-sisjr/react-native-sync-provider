@@ -147,6 +147,28 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
         }
     }
 
+    // MARK: - Dead letters
+    //
+    // These answer at once, so they return promises that are already settled.
+    // Nitro's `Promise` is not synchronized: from `Promise.async`, a body this
+    // short can settle on another thread while the caller is still attaching
+    // its listener, and the listener is then never called.
+
+    /// Nothing is moved to a dead-letter store yet: an item that fails for
+    /// good still ends as a `FAILED` row in the queue store. So there is never
+    /// a dead letter to list.
+    public func listDeadLetter() throws -> Promise<[SyncDeadLetterItem]> {
+        return Promise.resolved(withResult: [])
+    }
+
+    public func replayDeadLetter(id: String) throws -> Promise<Void> {
+        return Promise.rejected(withError: SyncProviderError.deadLetterNotImplemented("replay"))
+    }
+
+    public func discardDeadLetter(id: String) throws -> Promise<Void> {
+        return Promise.rejected(withError: SyncProviderError.deadLetterNotImplemented("discard"))
+    }
+
     // MARK: - Sync ops
 
     public func flush() throws -> Promise<SyncResult> {
@@ -188,10 +210,18 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
 
     // MARK: - Config ops
 
+    /// Checked before anything is applied or persisted: a rejected
+    /// configuration leaves the active one in place.
     public func configureSync(options: SyncOptions) throws -> Promise<Void> {
         return Promise.async { [weak self] in
             guard let self = self else { return }
-            await self.engine.configure(Self.translate(options: options))
+            do {
+                let snapshot = Self.translate(options: options)
+                try snapshot.validateNetworkHealth()
+                await self.engine.configure(snapshot)
+            } catch {
+                throw wrapAsSyncProviderError(error)
+            }
         }
     }
 
@@ -425,7 +455,13 @@ extension HybridSyncProvider {
             requestTimeoutMs: options.requestTimeoutMs ?? 30_000,
             maxQueueSize: options.maxQueueSize ?? Double(kDefaultQueueCapacity),
             persistQueue: options.persistQueue ?? true,
-            defaultHeaders: options.defaultHeaders ?? [:]
+            defaultHeaders: options.defaultHeaders ?? [:],
+            // Unset stays `nil`: the defaults are filled in at use, so
+            // `getSyncConfig()` can echo only what was set.
+            minNetworkQuality: options.minNetworkQuality.map(Self.translate(quality:)),
+            healthCheckUrl: options.healthCheckUrl,
+            healthCheckTtlMs: options.healthCheckTtlMs,
+            healthCheckBackoffMs: options.healthCheckBackoffMs
         )
     }
 
@@ -446,16 +482,43 @@ extension HybridSyncProvider {
                            requestTimeoutMs: snapshot.requestTimeoutMs,
                            maxQueueSize: snapshot.maxQueueSize,
                            persistQueue: snapshot.persistQueue,
-                           defaultHeaders: snapshot.defaultHeaders)
+                           defaultHeaders: snapshot.defaultHeaders,
+                           minNetworkQuality: snapshot.minNetworkQuality.map(Self.translate(level:)),
+                           healthCheckUrl: snapshot.healthCheckUrl,
+                           healthCheckTtlMs: snapshot.healthCheckTtlMs,
+                           healthCheckBackoffMs: snapshot.healthCheckBackoffMs)
     }
 
+    /// `networkQuality` is the provisional grade: `OFFLINE` exactly when the
+    /// status is `DISCONNECTED` or `UNKNOWN`, `GOOD` otherwise.
     static func translate(snapshot: ConnectionSnapshot) -> ConnectionState {
         let status = ConnectionStatus(fromString: snapshot.status.rawValue) ?? .unknown
         let type = ConnectionType(fromString: snapshot.type.rawValue) ?? .unknown
         return ConnectionState(status: status,
                                type: type,
+                               networkQuality: translate(level: .provisional(for: snapshot)),
                                isInternetReachable: snapshot.isInternetReachable,
                                isExpensive: snapshot.isExpensive)
+    }
+
+    static func translate(quality: NetworkQuality) -> NetworkQualityLevel {
+        switch quality {
+        case .offline: return .offline
+        case .poor: return .poor
+        case .moderate: return .moderate
+        case .good: return .good
+        case .excellent: return .excellent
+        }
+    }
+
+    static func translate(level: NetworkQualityLevel) -> NetworkQuality {
+        switch level {
+        case .offline: return .offline
+        case .poor: return .poor
+        case .moderate: return .moderate
+        case .good: return .good
+        case .excellent: return .excellent
+        }
     }
 
     static func translate(options: BackgroundSyncOptions) -> BackgroundSyncOptionsValue {

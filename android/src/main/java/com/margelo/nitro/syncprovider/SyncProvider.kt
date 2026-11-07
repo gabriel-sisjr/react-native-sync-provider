@@ -102,6 +102,20 @@ class SyncProvider : HybridSyncProviderSpec() {
     runtime.storage.getPending().toTypedArray()
   }
 
+  /* ---------------------------- Dead letters ---------------------------- */
+
+  override fun listDeadLetter(): Promise<Array<SyncDeadLetterItem>> = promise {
+    runtime.listDeadLetter().toTypedArray()
+  }
+
+  override fun replayDeadLetter(id: String): Promise<Unit> = promise {
+    runtime.replayDeadLetter(id)
+  }
+
+  override fun discardDeadLetter(id: String): Promise<Unit> = promise {
+    runtime.discardDeadLetter(id)
+  }
+
   /* ------------------------------ Sync ops ------------------------------ */
 
   override fun flush(): Promise<SyncResult> = promise {

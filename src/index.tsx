@@ -8,7 +8,7 @@
  *
  * This module re-exports the entire public surface:
  *
- *   - 21 facade functions: 19 wrap the Nitro `SyncProvider` HybridObject, plus
+ *   - 24 facade functions: 22 wrap the Nitro `SyncProvider` HybridObject, plus
  *     `drainUntilEmpty` and `cancelDrain`, which are JS-side.
  *   - 2 listener helpers (`addSyncEventListener`, `removeSyncEventListener`).
  *   - 9 React hooks (`useConnection`, `useSyncQueue`, `useSyncStatus`,
@@ -29,6 +29,7 @@ import { SyncErrorCode } from './errors/SyncErrorCode';
 import type { ValidationIssue } from './errors/ValidationIssue';
 import type {
   BackgroundSyncOptions,
+  SyncDeadLetterItem,
   SyncEvent,
   SyncItem,
   SyncItemInput,
@@ -45,6 +46,7 @@ import {
   collectSyncItemIssues,
   validateSyncItem,
 } from './utils/validateSyncItem';
+import { validateSyncOptions } from './utils/validateSyncOptions';
 
 /* -------------------------------------------------------------------------- */
 /*                                  Re-exports                                */
@@ -204,14 +206,15 @@ export async function enqueueBatch(items: SyncItemInput[]): Promise<string[]> {
 
 /**
  * Remove a single item by ULID, in any status: pending (including items
- * waiting out a cooldown), in flight, or failed permanently. Failed items are
- * not returned by {@link getPendingItems}, so take a failed item's id from its
- * `ITEM_FAILED` event.
+ * waiting out a cooldown) or in flight. When no queued item has that id, the
+ * dead letter with that id is removed instead, so this also works on an item
+ * that failed permanently: take its id from {@link listDeadLetter} or from its
+ * `ITEM_FAILED` / `ITEM_DEAD_LETTERED` event.
  *
  * @param id — ULID returned by {@link enqueue} / {@link enqueueBatch}.
- * @returns `true` if a row with that id existed and was removed, `false` if
- *   none exists (already delivered, already removed or cleared, or never
- *   enqueued).
+ * @returns `true` if a queued item or a dead letter with that id existed and
+ *   was removed, `false` if neither exists (already delivered, already removed
+ *   or cleared, or never enqueued).
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
  *
@@ -238,10 +241,14 @@ export async function removeItem(id: string): Promise<boolean> {
 }
 
 /**
- * Remove every item from the queue, in any status: pending, in flight, or failed
- * permanently. Does not affect the sync history.
+ * Remove every item from the queue, in any status (pending or in flight), and
+ * every dead letter. Emits one `QUEUE_CLEARED`. Does not affect the sync
+ * history.
  *
- * @returns resolves once the queue is empty.
+ * Dead letters keep their request headers and body, so this is the call that
+ * purges every stored request, for example on logout.
+ *
+ * @returns resolves once the queue and the dead-letter queue are empty.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
  *
@@ -264,7 +271,7 @@ export async function clearQueue(): Promise<void> {
  *
  * @returns the number of items currently waiting to be dispatched: `PENDING`
  *   items, including those waiting out a retry cooldown. Items in flight and
- *   items that failed permanently are not counted.
+ *   dead letters are not counted.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
  *
@@ -287,7 +294,8 @@ export async function getQueueSize(): Promise<number> {
  *
  * @returns the `PENDING` items in dispatch order, including those waiting out
  *   a retry cooldown, with `id` and `createdAt` populated by the native layer.
- *   Items in flight and items that failed permanently are not returned.
+ *   Items in flight and dead letters are not returned: read dead letters with
+ *   {@link listDeadLetter}.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
  *
@@ -318,6 +326,117 @@ export async function getPendingItems(): Promise<SyncItem[]> {
 }
 
 /* -------------------------------------------------------------------------- */
+/*                                Dead letters                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Read every dead letter: the items that failed permanently and were moved out
+ * of the queue, with the original request and its failure bookkeeping.
+ *
+ * An item becomes a dead letter whenever it fails permanently. The move is
+ * atomic and is followed by `ITEM_FAILED`, then `ITEM_DEAD_LETTERED`. Items
+ * that failed permanently before the upgrade to this version are moved here
+ * too. See {@link SyncDeadLetterItem}.
+ *
+ * @returns every dead letter, oldest first: ordered by `deadLetteredAt`, then
+ *   by `id`.
+ * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
+ *   the native module is not loaded.
+ * @throws {SyncError} {@link SyncErrorCode.INVALID_PAYLOAD} when native rejects
+ *   the call.
+ *
+ * @remarks
+ * The dead-letter queue is unbounded: nothing prunes it, and it counts toward
+ * no capacity cap, so {@link discardDeadLetter} what you do not
+ * {@link replayDeadLetter}. Each dead letter keeps its request's headers and
+ * body until it is replayed, discarded, removed with {@link removeItem} or
+ * cleared with {@link clearQueue}.
+ *
+ * `useSyncSnapshot().deadLetter` keeps this list up to date for a component.
+ *
+ * @example
+ * const deadLetters = await listDeadLetter();
+ * for (const item of deadLetters) {
+ *   console.warn(`${item.method} ${item.url} failed: ${item.lastErrorCode}`);
+ * }
+ *
+ * @public
+ */
+export async function listDeadLetter(): Promise<SyncDeadLetterItem[]> {
+  const native = nativeOrThrow();
+  try {
+    return await native!.listDeadLetter();
+  } catch (err) {
+    wrapNativeError(err, SyncErrorCode.INVALID_PAYLOAD);
+  }
+}
+
+/**
+ * Put a dead letter back into the queue for another try.
+ *
+ * In one transaction, the item is re-inserted under the same id, with its
+ * original `createdAt`, as a pending item with `attempts: 0`, `nextRetryAt: 0`
+ * and no last error code, and the dead letter is deleted. Emits
+ * `ITEM_ENQUEUED`. Like {@link enqueue}, it does not dispatch the item: that
+ * takes a flush, from {@link flush}, `useAutoSync`, or an OS background
+ * window.
+ *
+ * An unknown id resolves with no change, so replaying the same id twice, or an
+ * id that was already discarded, is harmless.
+ *
+ * @param id — the dead letter's id, from {@link listDeadLetter} or an
+ *   `ITEM_DEAD_LETTERED` event.
+ * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
+ *   the native module is not loaded.
+ * @throws {SyncError} {@link SyncErrorCode.INVALID_PAYLOAD} when native rejects
+ *   the call, and the dead letter stays in place. That includes a queue at
+ *   `SyncOptions.maxQueueSize`: native reports `QUEUE_FULL`, but native codes
+ *   do not reach JS yet.
+ *
+ * @example
+ * await replayDeadLetter(deadLetter.id);
+ * await flush();
+ *
+ * @public
+ */
+export async function replayDeadLetter(id: string): Promise<void> {
+  const native = nativeOrThrow();
+  try {
+    await native!.replayDeadLetter(id);
+  } catch (err) {
+    wrapNativeError(err, SyncErrorCode.INVALID_PAYLOAD);
+  }
+}
+
+/**
+ * Delete a dead letter for good, with its stored request.
+ *
+ * Emits `ITEM_REMOVED` when a row was deleted. An unknown id resolves with no
+ * change, so discarding the same id twice is harmless. {@link removeItem} does
+ * the same for a dead letter and also reports whether a row was deleted.
+ *
+ * @param id — the dead letter's id, from {@link listDeadLetter} or an
+ *   `ITEM_DEAD_LETTERED` event.
+ * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
+ *   the native module is not loaded.
+ * @throws {SyncError} {@link SyncErrorCode.INVALID_PAYLOAD} when native rejects
+ *   the call.
+ *
+ * @example
+ * await discardDeadLetter(deadLetter.id);
+ *
+ * @public
+ */
+export async function discardDeadLetter(id: string): Promise<void> {
+  const native = nativeOrThrow();
+  try {
+    await native!.discardDeadLetter(id);
+  } catch (err) {
+    wrapNativeError(err, SyncErrorCode.INVALID_PAYLOAD);
+  }
+}
+
+/* -------------------------------------------------------------------------- */
 /*                                  Sync ops                                  */
 /* -------------------------------------------------------------------------- */
 
@@ -339,17 +458,30 @@ export async function getPendingItems(): Promise<SyncItem[]> {
  * down) resolves with a 0/0 result, is recorded in the sync history, and ends
  * with `SYNC_SUCCEEDED`.
  *
- * While the engine is paused, or while stored `defaultHeaders` cannot be read,
- * no cycle runs: nothing is dispatched, no event is emitted and no history row
- * is written. The result counts are 0/0 on both platforms and do not say why.
- * Android returns `0` for `startedAt` and `finishedAt`, the zeroed shape that
+ * Before a cycle starts, the flush checks, in this order, the pause, the stored
+ * credentials, the network-quality gate and the health check. When one of them
+ * fails, no cycle runs: nothing is dispatched, no item changes, no
+ * `SYNC_STARTED` is emitted and no history row is written.
+ *
+ * - Paused, or with stored `defaultHeaders` that cannot be read: no event at
+ *   all.
+ * - Network quality below `SyncOptions.minNetworkQuality`: `SYNC_FAILED` with
+ *   `errorCode: NETWORK_QUALITY_TOO_LOW`.
+ * - Health check failed, or its backoff still running (see
+ *   `SyncOptions.healthCheckUrl`): `SYNC_FAILED` with
+ *   `errorCode: HEALTH_CHECK_FAILED`.
+ *
+ * The result counts are then 0/0 on both platforms and do not say why. Android
+ * returns `0` for `startedAt` and `finishedAt`, the zeroed shape that
  * {@link getLastSyncResult} reports as `undefined`; `flush()` returns it as is.
  * iOS sets both to the time of the call, so the result looks like an empty
  * cycle's.
  *
- * `flush()` does not check connectivity first, so calling it offline can spend
- * retry attempts. {@link drainUntilEmpty} waits for the network instead, and
- * `useAutoSync` skips its interval and foreground flushes while `DISCONNECTED`.
+ * Unless `SyncOptions.minNetworkQuality` is set, `flush()` does not check
+ * connectivity first, so calling it offline can spend retry attempts. Any
+ * `minNetworkQuality` other than `OFFLINE` blocks an offline flush instead.
+ * {@link drainUntilEmpty} waits for the network, and `useAutoSync` skips its
+ * interval and foreground flushes while `DISCONNECTED`.
  *
  * While a cycle is running, iOS returns the last result at once, and Android
  * waits and then runs its own cycle.
@@ -412,6 +544,12 @@ export async function flush(): Promise<SyncResult> {
  * no {@link DrainResult} is returned. Items dispatched before the failure stay
  * dispatched: re-read {@link getQueueSize} / {@link getPendingItems} for the
  * remaining queue.
+ *
+ * **Skipped cycles:** a `flush()` that the network-quality gate or the health
+ * check skips (see {@link flush}) still uses up an iteration and makes no
+ * progress. On a link below `SyncOptions.minNetworkQuality`, or while a
+ * health-check backoff runs, the loop therefore ends with `MAX_ITERATIONS` or
+ * `TIMEOUT`.
  *
  * @example
  * const result = await drainUntilEmpty({ maxIterations: 10 });
@@ -552,10 +690,17 @@ export async function isSyncing(): Promise<boolean> {
  * running cycle. A request already in flight keeps the previous config.
  *
  * @param options — new library-wide configuration.
+ * @throws {SyncError} {@link SyncErrorCode.INVALID_URL} when `healthCheckUrl`
+ *   is not an absolute http(s) URL, with `validationErrors` set. Checked
+ *   before any native call.
+ * @throws {SyncError} {@link SyncErrorCode.INVALID_PAYLOAD} when
+ *   `minNetworkQuality` is not a {@link NetworkQuality} value,
+ *   `healthCheckTtlMs` or `healthCheckBackoffMs` is not a finite number of at
+ *   least `0`, or `options` is not an object, with `validationErrors` set.
+ *   Checked before any native call. Also, with no `validationErrors`, when
+ *   native rejects the call.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
- * @throws {SyncError} {@link SyncErrorCode.INVALID_PAYLOAD} when native rejects
- *   the call.
  *
  * @remarks
  * The options are persisted, so a background worker started without JS uses
@@ -566,7 +711,14 @@ export async function isSyncing(): Promise<boolean> {
  * Every call also clears a credential hold, whether or not the headers
  * changed, so the retry wake stops waiting for it. From then on the app owns
  * the token in this process, so a 401 or 403 is terminal, as under any
- * configuration set in the process: the item fails with `UNAUTHORIZED`.
+ * configuration set in the process: the item fails with `UNAUTHORIZED`. Every
+ * call also ends a running health-check backoff (see
+ * {@link SyncOptions.healthCheckBackoffMs}).
+ *
+ * Only `minNetworkQuality`, `healthCheckUrl`, `healthCheckTtlMs` and
+ * `healthCheckBackoffMs` are validated in JS, in that order and only when
+ * present; the other fields go to native as they are. When several are
+ * invalid, the first one sets the code, and `validationErrors` lists them all.
  *
  * @example
  * await configureSync({
@@ -584,6 +736,7 @@ export async function isSyncing(): Promise<boolean> {
  * @public
  */
 export async function configureSync(options: SyncOptions): Promise<void> {
+  validateSyncOptions(options);
   const native = nativeOrThrow();
   try {
     await native!.configureSync(options);
@@ -595,7 +748,9 @@ export async function configureSync(options: SyncOptions): Promise<void> {
 /**
  * Read the active sync configuration from the native singleton.
  *
- * @returns the currently active {@link SyncOptions}.
+ * @returns the currently active {@link SyncOptions}. `minNetworkQuality`,
+ *   `healthCheckUrl`, `healthCheckTtlMs` and `healthCheckBackoffMs` are present
+ *   only when they were set: their defaults are not filled in.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
  *
@@ -712,13 +867,25 @@ export async function clearSyncHistory(): Promise<void> {
 /**
  * Read the current connectivity snapshot from the native layer.
  *
- * @returns the live {@link ConnectionState} as reported by the OS.
+ * @returns the live {@link ConnectionState} as reported by the OS, including
+ *   the engine's {@link ConnectionState.networkQuality}, which is always
+ *   present and is `OFFLINE` exactly when `status` is `DISCONNECTED` or
+ *   `UNKNOWN`. See {@link NetworkQuality} for how it is classified.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
+ *
+ * @remarks
+ * `CONNECTION_CHANGED` carries only `connectionStatus`, and is also emitted
+ * when only the network quality changed: call this again on that event, or use
+ * `useConnection`, which does.
  *
  * @example
  * const conn = await getConnectionStatus();
  * if (conn.status === 'CONNECTED') await flush();
+ *
+ * @example
+ * const { networkQuality } = await getConnectionStatus();
+ * if (networkQuality === NetworkQuality.POOR) showSlowNetworkBanner();
  *
  * @public
  */

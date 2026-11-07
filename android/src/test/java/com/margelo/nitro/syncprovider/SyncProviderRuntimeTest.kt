@@ -19,6 +19,7 @@ import com.google.common.truth.Truth.assertWithMessage
 import com.margelo.nitro.syncprovider.config.ConfigSource
 import com.margelo.nitro.syncprovider.config.SecretStore
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
+import com.margelo.nitro.syncprovider.error.SyncException
 import com.margelo.nitro.syncprovider.http.SyncDispatcher
 import com.margelo.nitro.syncprovider.retry.RetryTimer
 import com.margelo.nitro.syncprovider.testutil.InMemorySecretStore
@@ -1104,6 +1105,91 @@ internal class SyncProviderRuntimeTest {
     insert("failed", status = SyncItemEntity.STATUS_FAILED)
 
     assertThat(runtime.queueSize()).isEqualTo(2)
+  }
+
+  /* ------------------- network-quality and health-check options ------------------- */
+
+  private fun gateAndHealthCheck(): SyncOptions = TestData.syncOptions(
+    minNetworkQuality = NetworkQuality.MODERATE,
+    healthCheckUrl = "https://api.example.com/health",
+    healthCheckTtlMs = 0.0,
+    healthCheckBackoffMs = 15_000.0,
+  )
+
+  @Test
+  fun `the gate and health-check options are echoed and reach a cold start`() = runBlocking<Unit> {
+    val options = gateAndHealthCheck()
+
+    runtime.configure(options)
+    assertThat(runtime.currentOptions()).isEqualTo(options)
+
+    restartProcess()
+
+    assertThat(runtime.configSource).isEqualTo(ConfigSource.PERSISTED)
+    assertThat(runtime.currentOptions()).isEqualTo(options)
+  }
+
+  @Test
+  fun `options left unset are not echoed, before or after a restart`() = runBlocking<Unit> {
+    val defaults = runtime.currentOptions()
+    runtime.configure(gateAndHealthCheck())
+    // A later configureSync without them clears them, as for every optional field.
+    runtime.configure(TestData.syncOptions())
+    val live = runtime.currentOptions()
+    restartProcess()
+    val persisted = runtime.currentOptions()
+
+    listOf(defaults, live, persisted).forEach { options ->
+      assertThat(options.minNetworkQuality).isNull()
+      assertThat(options.healthCheckUrl).isNull()
+      assertThat(options.healthCheckTtlMs).isNull()
+      assertThat(options.healthCheckBackoffMs).isNull()
+    }
+  }
+
+  @Test
+  fun `invalid health-check options are rejected before anything changes`() = runBlocking<Unit> {
+    val applied = gateAndHealthCheck()
+    runtime.configure(applied)
+
+    val rejections = listOf(
+      TestData.syncOptions(healthCheckUrl = "not a url"),
+      TestData.syncOptions(healthCheckTtlMs = Double.NaN),
+      TestData.syncOptions(healthCheckBackoffMs = -1.0),
+    ).map { invalid -> runCatching { runtime.configure(invalid) }.exceptionOrNull() as? SyncException }
+
+    assertThat(rejections.map { it?.code }).containsExactly(
+      SyncErrorCode.INVALID_URL,
+      SyncErrorCode.INVALID_PAYLOAD,
+      SyncErrorCode.INVALID_PAYLOAD,
+    ).inOrder()
+    assertThat(runtime.currentOptions()).isEqualTo(applied)
+    restartProcess()
+    assertThat(runtime.currentOptions()).isEqualTo(applied)
+  }
+
+  /* ------------------------------- dead letters ------------------------------- */
+
+  @Test
+  fun `no item is a dead letter yet, a FAILED row included`() = runBlocking<Unit> {
+    insert("failed", status = SyncItemEntity.STATUS_FAILED)
+
+    assertThat(runtime.listDeadLetter()).isEmpty()
+  }
+
+  @Test
+  fun `replaying or discarding a dead letter rejects and changes nothing`() = runBlocking<Unit> {
+    insert("failed", status = SyncItemEntity.STATUS_FAILED)
+
+    val replay = runCatching { runtime.replayDeadLetter("failed") }.exceptionOrNull()
+    val discard = runCatching { runtime.discardDeadLetter("failed") }.exceptionOrNull()
+
+    listOf(replay to "replay", discard to "discard").forEach { (error, operation) ->
+      assertThat(error).isInstanceOf(SyncException::class.java)
+      assertThat((error as SyncException).rawMessage)
+        .isEqualTo("Dead-letter $operation is not implemented yet.")
+    }
+    assertThat(row("failed")?.status).isEqualTo(SyncItemEntity.STATUS_FAILED)
   }
 
   private companion object {
