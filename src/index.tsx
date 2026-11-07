@@ -203,17 +203,28 @@ export async function enqueueBatch(items: SyncItemInput[]): Promise<string[]> {
 }
 
 /**
- * Remove a single pending item by ULID.
+ * Remove a single item by ULID, in any status: pending (including items
+ * waiting out a cooldown), in flight, or failed permanently. Failed items are
+ * not returned by {@link getPendingItems}, so take a failed item's id from its
+ * `ITEM_FAILED` event.
  *
  * @param id — ULID returned by {@link enqueue} / {@link enqueueBatch}.
- * @returns `true` if the item was found and removed, `false` if no item with
- *   that id exists in the queue (already drained, removed, or never present).
+ * @returns `true` if a row with that id existed and was removed, `false` if
+ *   none exists (already delivered, already removed or cleared, or never
+ *   enqueued).
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
  *
+ * @remarks
+ * Removal does not cancel a request. An item that a running cycle has already
+ * taken into its batch can still be sent and reach the server. Its outcome
+ * event (`ITEM_SUCCEEDED`, `ITEM_RETRYING` or `ITEM_FAILED`) is still emitted,
+ * but nothing is written back to the queue. `ITEM_REMOVED` is emitted only when
+ * a row was removed.
+ *
  * @example
  * const removed = await removeItem(id);
- * if (!removed) console.warn('already drained or unknown id');
+ * if (!removed) console.warn('already delivered or unknown id');
  *
  * @public
  */
@@ -286,9 +297,10 @@ export async function getQueueSize(): Promise<number> {
  * {@link SyncItem}. This is deliberately asymmetric with
  * {@link getLastSyncResult}, which maps the native sentinel
  * (`startedAt === 0 && finishedAt === 0`) to `undefined` via `isLastSyncSentinel`.
- * For a `SyncItem`, `attempts === 0` ("never tried") and `nextRetryAt === 0`
- * ("never attempted, eligible now") are real values — see
- * {@link SyncItem.attempts} and {@link SyncItem.nextRetryAt}.
+ * For a `SyncItem`, `attempts === 0` ("no attempt recorded") and
+ * `nextRetryAt === 0` ("eligible now") are real values, and neither one means
+ * the item was never tried — see {@link SyncItem.attempts} and
+ * {@link SyncItem.nextRetryAt}.
  *
  * @example
  * const pending = await getPendingItems();
@@ -324,7 +336,16 @@ export async function getPendingItems(): Promise<SyncItem[]> {
  *
  * @remarks
  * A cycle with nothing eligible (the queue is empty, or every item is cooling
- * down) resolves with a 0/0 result and ends with `SYNC_SUCCEEDED`.
+ * down) resolves with a 0/0 result, is recorded in the sync history, and ends
+ * with `SYNC_SUCCEEDED`.
+ *
+ * While the engine is paused, or while stored `defaultHeaders` cannot be read,
+ * no cycle runs: nothing is dispatched, no event is emitted and no history row
+ * is written. The result counts are 0/0 on both platforms and do not say why.
+ * Android returns `0` for `startedAt` and `finishedAt`, the zeroed shape that
+ * {@link getLastSyncResult} reports as `undefined`; `flush()` returns it as is.
+ * iOS sets both to the time of the call, so the result looks like an empty
+ * cycle's.
  *
  * `flush()` does not check connectivity first, so calling it offline can spend
  * retry attempts. {@link drainUntilEmpty} waits for the network instead, and
@@ -444,8 +465,9 @@ export function cancelDrain(): void {
 
 /**
  * Pause the sync engine. While paused, `enqueue`/`enqueueBatch` continue to
- * accept items but no flush cycles run: `flush()` resolves with an empty result
- * and the retry timer is cancelled.
+ * accept items but no flush cycle runs: `flush()` resolves with a 0/0 result
+ * and emits no event (see {@link flush} for the timestamps each platform
+ * returns), and the retry timer is cancelled.
  *
  * The pause is persisted, so background workers stay inert while the app is
  * dead. It lasts until {@link resumeSync} or the next launch that reaches the
@@ -475,6 +497,12 @@ export async function pauseSync(): Promise<void> {
  * soonest pending item: items with no cooldown left are dispatched right away,
  * and cooling items when their cooldown ends. If the device is offline at that
  * moment, the flush waits until connectivity is restored.
+ *
+ * During a credential hold, set after a 401 or 403 on a request sent with
+ * headers restored from storage, that flush waits for the hold to end before
+ * dispatching, on both platforms, even when items are already due. The hold
+ * lives in memory, so a process restart drops it. See
+ * {@link SyncOptions.defaultHeaders}.
  *
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
@@ -535,6 +563,11 @@ export async function isSyncing(): Promise<boolean> {
  * without `defaultHeaders` deletes the stored copy, which makes it the way to
  * clear credentials on logout. See {@link SyncOptions.defaultHeaders}.
  *
+ * Every call also clears a credential hold, whether or not the headers
+ * changed, so the retry wake stops waiting for it. From then on the app owns
+ * the token in this process, so a 401 or 403 is terminal, as under any
+ * configuration set in the process: the item fails with `UNAUTHORIZED`.
+ *
  * @example
  * await configureSync({
  *   strategy: 'AUTOMATIC',
@@ -566,8 +599,28 @@ export async function configureSync(options: SyncOptions): Promise<void> {
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
  *
+ * @remarks
+ * Do not pass the result back to {@link configureSync} without setting
+ * `defaultHeaders` yourself.
+ *
+ * In a process where `configureSync` has not run yet, the result is the
+ * configuration an earlier process persisted, if any, with the stored copy of
+ * the headers. While that copy cannot be read (the Android Keystore key was
+ * invalidated, the iOS device has not been unlocked since boot, or a backup
+ * was restored onto another device), the result carries no headers:
+ * `defaultHeaders` is `undefined` on Android and `{}` on iOS. That lasts until
+ * the library reads the copy again, which it retries on each flush while not
+ * paused, or until `configureSync` runs.
+ *
+ * `configureSync` replaces the whole configuration, so passing such a result
+ * back, for example `configureSync({ ...cfg, batchSize: 5 })`, deletes the
+ * stored headers, which acts as a logout. Later requests then go out without
+ * them, and a 401 or 403 fails those items permanently.
+ *
  * @example
  * const cfg = await getSyncConfig();
+ * // Take the credentials from the app's session, not from `cfg`.
+ * await configureSync({ ...cfg, batchSize: 5, defaultHeaders: session.headers });
  *
  * @public
  */

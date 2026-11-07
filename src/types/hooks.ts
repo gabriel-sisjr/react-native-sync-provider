@@ -93,7 +93,13 @@ export interface UseSyncStatusResult {
    * follows events only, so a cycle already running at mount is not reflected.
    */
   isSyncing: boolean;
-  /** `true` after a `PAUSED` event, until `RESUMED`. Starts `false`. */
+  /**
+   * `true` after a `PAUSED` event, until `RESUMED`. Starts `false` and follows
+   * those events only, because JS cannot read the pause flag: a hook mounted
+   * while a pause is already in force reads `false` until the next `PAUSED`. A
+   * launch or JS reload that reaches the library clears the pause before JS can
+   * observe it, without a `RESUMED`, so `false` is accurate in a fresh session.
+   */
   isPaused: boolean;
   /**
    * Current flush progress in `[0, 1]`, or `null` when idle. `SYNC_PROGRESS` is
@@ -184,13 +190,20 @@ export interface UseSyncEventsOptions {
  * through `configureSync()` and refetches.
  */
 export interface UseSyncConfigResult {
-  /** Currently active configuration, or `null` while loading. */
+  /**
+   * Currently active configuration, or `null` while loading. It can lack the
+   * stored `defaultHeaders`: see `getSyncConfig`.
+   */
   config: SyncOptions | null;
   /** `true` while the initial fetch is in flight. */
   isLoading: boolean;
   /** Last error captured by the hook, or `null` once cleared. */
   error: SyncError | null;
-  /** Apply a new configuration via `configureSync()`. */
+  /**
+   * Apply a new configuration via `configureSync()`. It replaces the whole
+   * configuration, so set `defaultHeaders` explicitly instead of copying them
+   * from `config`.
+   */
   setConfig: (next: SyncOptions) => Promise<void>;
   /** Force-refresh `config` from the native layer. */
   refresh: () => Promise<void>;
@@ -208,6 +221,9 @@ export interface UseAutoSyncOptions {
   /**
    * If `false`, the orchestrator is inert (no flushes are triggered, no
    * subscriptions are created). Defaults to `false`: pass `true` to turn it on.
+   *
+   * The hook does not read `SyncOptions.strategy`, so this is what turns it
+   * off: it also flushes under `MANUAL`.
    */
   enabled?: boolean;
   /**
@@ -254,11 +270,23 @@ export interface UseSyncSnapshotResult {
   items: SyncItem[];
   /** `true` while a flush cycle is currently in progress. */
   isSyncing: boolean;
-  /** `true` after `pauseSync()` and before `resumeSync()`. */
+  /**
+   * `true` after a `PAUSED` event, until `RESUMED`. Starts `false` and follows
+   * those events only, because JS cannot read the pause flag: a hook mounted
+   * while a pause is already in force reads `false` until the next `PAUSED`. A
+   * launch or JS reload that reaches the library clears the pause before JS can
+   * observe it, without a `RESUMED`, so `false` is accurate in a fresh session.
+   */
   isPaused: boolean;
   /** Current flush progress in `[0, 1]`, or `null` when idle. */
   progress: number | null;
-  /** Most recent flush outcome, or `null` if no flush has run yet this session. */
+  /**
+   * Most recent flush outcome in the persisted sync history, so it survives
+   * restarts and can come from an earlier session. Read with
+   * `getLastSyncResult()` on mount and after every `SYNC_SUCCEEDED` /
+   * `SYNC_FAILED`. `null` until a read finds a recorded flush, and not reset by
+   * `clearSyncHistory()`.
+   */
   lastResult: SyncResult | null;
   /**
    * `true` when there are pending items but the device is offline — useful

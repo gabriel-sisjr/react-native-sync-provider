@@ -28,11 +28,21 @@ import {
  * defaults). Only the calling hook updates: other `useSyncConfig` instances and
  * the Provider's context value catch up on their next read.
  *
+ * `setConfig` replaces the whole configuration, like `configureSync`. Set
+ * `defaultHeaders` from the app's own session instead of copying them from
+ * `config`, which can lack the stored headers (see {@link getSyncConfig}): a
+ * config passed without them deletes the stored copy, which acts as a logout.
+ *
  * @returns a {@link UseSyncConfigResult}.
  *
  * @example
  * const { config, setConfig } = useSyncConfig();
- * await setConfig({ ...config!, batchSize: 25 });
+ *
+ * const applySmallBatches = async () => {
+ *   if (!config) return;
+ *   // `config` can lack the stored headers: pass them from the app's session.
+ *   await setConfig({ ...config, batchSize: 5, defaultHeaders: session.headers });
+ * };
  *
  * @public
  */
