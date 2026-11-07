@@ -51,4 +51,53 @@ internal interface SyncDeadLetterDao {
     clearQueued()
     clear()
   }
+
+  @Insert(onConflict = OnConflictStrategy.ABORT)
+  suspend fun insertQueued(item: SyncItemEntity)
+
+  @Query("SELECT COUNT(*) FROM sync_items")
+  suspend fun countQueued(): Int
+
+  /**
+   * Put a dead letter back in the queue as a fresh item: same id, its original
+   * `createdAt`, `PENDING` with no attempt, cooldown or error recorded. The capacity check,
+   * the insert and the delete run in one transaction.
+   */
+  @Transaction
+  suspend fun replay(id: String, maxQueueSize: Int): ReplayOutcome {
+    val row = findById(id) ?: return ReplayOutcome.UNKNOWN
+    if (countQueued() >= maxQueueSize) return ReplayOutcome.QUEUE_FULL
+    insertQueued(
+      SyncItemEntity(
+        id = row.id,
+        method = row.method,
+        url = row.url,
+        headers = row.headers,
+        body = row.body,
+        contentType = row.contentType,
+        priority = row.priority,
+        priorityWeight = row.priorityWeight,
+        createdAt = row.createdAt,
+        attempts = 0,
+        lastAttemptAt = null,
+        lastErrorCode = null,
+        status = SyncItemEntity.STATUS_PENDING,
+        metadata = row.metadata,
+        nextRetryAt = 0L,
+      ),
+    )
+    deleteById(id)
+    return ReplayOutcome.REPLAYED
+  }
+}
+
+/** What [SyncDeadLetterDao.replay] did. */
+internal enum class ReplayOutcome {
+  REPLAYED,
+
+  /** No dead letter with that id: nothing changed. */
+  UNKNOWN,
+
+  /** The queue is at its cap: the dead letter stays. */
+  QUEUE_FULL,
 }

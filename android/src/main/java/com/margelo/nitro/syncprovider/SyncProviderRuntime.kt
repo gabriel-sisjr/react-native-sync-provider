@@ -12,7 +12,6 @@ import com.margelo.nitro.syncprovider.connectivity.ConnectivityMonitor
 import com.margelo.nitro.syncprovider.connectivity.LatencyProbe
 import com.margelo.nitro.syncprovider.connectivity.meetsMinimum
 import com.margelo.nitro.syncprovider.database.SyncDatabase
-import com.margelo.nitro.syncprovider.error.SyncException
 import com.margelo.nitro.syncprovider.events.SyncEventEmitter
 import com.margelo.nitro.syncprovider.http.CredentialPolicy
 import com.margelo.nitro.syncprovider.http.HeadProbe
@@ -222,17 +221,42 @@ internal class SyncProviderRuntime private constructor(
     retryWake.armAfterGate(gateStreak)
   }
 
+  /** Remove a queued item, or else a dead letter with that id. Emits `ITEM_REMOVED` when one went. */
+  suspend fun removeItem(id: String): Boolean {
+    val removed = storage.removeItem(id)
+    if (removed) emitter.emit(SyncEventEmitter.event(SyncEventType.ITEM_REMOVED, itemId = id))
+    return removed
+  }
+
+  /** Empty the queue and the dead letters together, with one `QUEUE_CLEARED`. */
+  suspend fun clearQueue() {
+    storage.clear()
+    emitter.emit(SyncEventEmitter.event(SyncEventType.QUEUE_CLEARED))
+  }
+
+  /** Dead letters, by `deadLetteredAt` then id. */
+  suspend fun listDeadLetter(): List<SyncDeadLetterItem> = storage.listDeadLetters()
+
   /**
-   * Dead letters, oldest first. Provisional: terminal failures are kept in the dead-letter
-   * table, but not listed yet, so the list is always empty.
+   * Put a dead letter back in the queue under its id, as a fresh item: `PENDING`, no attempt,
+   * no cooldown, its original `createdAt`. Emits `ITEM_ENQUEUED`. Like an enqueue, it does
+   * not flush. An unknown id changes nothing.
+   *
+   * @throws com.margelo.nitro.syncprovider.error.SyncException `QUEUE_FULL` when the queue is
+   *   full; the dead letter stays.
    */
-  suspend fun listDeadLetter(): List<SyncDeadLetterItem> = emptyList()
+  suspend fun replayDeadLetter(id: String) {
+    if (storage.replayDeadLetter(id)) {
+      emitter.emit(SyncEventEmitter.event(SyncEventType.ITEM_ENQUEUED, itemId = id))
+    }
+  }
 
-  /** Provisional: rejects until replaying a dead letter is implemented. */
-  suspend fun replayDeadLetter(id: String): Unit = throw deadLetterNotImplemented("replay")
-
-  /** Provisional: rejects until discarding a dead letter is implemented. */
-  suspend fun discardDeadLetter(id: String): Unit = throw deadLetterNotImplemented("discard")
+  /** Delete a dead letter for good. Emits `ITEM_REMOVED` when one was deleted. */
+  suspend fun discardDeadLetter(id: String) {
+    if (storage.discardDeadLetter(id)) {
+      emitter.emit(SyncEventEmitter.event(SyncEventType.ITEM_REMOVED, itemId = id))
+    }
+  }
 
   /**
    * True when a background worker must do nothing: the engine is paused, or the consumer
@@ -386,11 +410,6 @@ internal class SyncProviderRuntime private constructor(
       healthCheckUrl = null,
       healthCheckTtlMs = null,
       healthCheckBackoffMs = null,
-    )
-
-    private fun deadLetterNotImplemented(operation: String) = SyncException(
-      SyncErrorCode.INVALID_PAYLOAD,
-      "Dead-letter $operation is not implemented yet.",
     )
   }
 }

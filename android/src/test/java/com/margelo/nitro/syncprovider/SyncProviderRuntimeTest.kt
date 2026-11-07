@@ -1446,26 +1446,194 @@ internal class SyncProviderRuntimeTest {
 
   /* ------------------------------- dead letters ------------------------------- */
 
-  @Test
-  fun `dead letters are not listed yet`() = runBlocking<Unit> {
-    insert("failed", status = SyncItemEntity.STATUS_FAILED)
+  private suspend fun deadLetterRow(id: String, deadLetteredAt: Long, code: String = "SERVER_ERROR") =
+    runtime.database.syncDeadLetterDao().insert(
+      SyncDeadLetterEntity(
+        id = id,
+        method = "PUT",
+        url = server.url("/$id").toString(),
+        headers = """{"X-Test":"1"}""",
+        body = """{"a":1}""",
+        contentType = "application/json",
+        priority = "HIGH",
+        priorityWeight = 0,
+        createdAt = 1_000L,
+        metadata = """{"k":"v"}""",
+        attempts = 3,
+        lastAttemptAt = 2_000L,
+        lastErrorCode = code,
+        lastErrorMessage = "HTTP 500 Internal Server Error",
+        deadLetteredAt = deadLetteredAt,
+      ),
+    )
 
-    assertThat(runtime.listDeadLetter()).isEmpty()
+  private suspend fun deadLetterCount(): Int = runtime.database.syncDeadLetterDao().count()
+
+  @Test
+  fun `dlq_list_orderedByDeadLetteredAtThenId, every field mapped`() = runBlocking<Unit> {
+    deadLetterRow("b", deadLetteredAt = 20L)
+    deadLetterRow("c", deadLetteredAt = 10L)
+    deadLetterRow("a", deadLetteredAt = 20L)
+
+    val listed = runtime.listDeadLetter()
+
+    assertThat(listed.map { it.id }).containsExactly("c", "a", "b").inOrder()
+    with(listed.first()) {
+      assertThat(method).isEqualTo(HttpMethod.PUT)
+      assertThat(url).isEqualTo(server.url("/c").toString())
+      assertThat(headers).containsExactly("X-Test", "1")
+      assertThat(body).isEqualTo("""{"a":1}""")
+      assertThat(contentType).isEqualTo("application/json")
+      assertThat(priority).isEqualTo(SyncPriority.HIGH)
+      assertThat(createdAt).isEqualTo(1_000.0)
+      assertThat(metadata).containsExactly("k", "v")
+      assertThat(attempts).isEqualTo(3.0)
+      assertThat(lastAttemptAt).isEqualTo(2_000.0)
+      assertThat(lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR)
+      assertThat(lastErrorMessage).isEqualTo("HTTP 500 Internal Server Error")
+      assertThat(deadLetteredAt).isEqualTo(10.0)
+    }
   }
 
   @Test
-  fun `replaying or discarding a dead letter rejects and changes nothing`() = runBlocking<Unit> {
-    insert("failed", status = SyncItemEntity.STATUS_FAILED)
+  fun `a stored code this version does not know lists as MAX_ATTEMPTS_EXCEEDED`() = runBlocking<Unit> {
+    deadLetterRow("future", deadLetteredAt = 1L, code = "SOME_FUTURE_CODE")
 
-    val replay = runCatching { runtime.replayDeadLetter("failed") }.exceptionOrNull()
-    val discard = runCatching { runtime.discardDeadLetter("failed") }.exceptionOrNull()
+    assertThat(runtime.listDeadLetter().single().lastErrorCode).isEqualTo(SyncErrorCode.MAX_ATTEMPTS_EXCEEDED)
+  }
 
-    listOf(replay to "replay", discard to "discard").forEach { (error, operation) ->
-      assertThat(error).isInstanceOf(SyncException::class.java)
-      assertThat((error as SyncException).rawMessage)
-        .isEqualTo("Dead-letter $operation is not implemented yet.")
+  @Test
+  fun `dlq_replay_requeuesFresh, sent by the next flush`() = runBlocking<Unit> {
+    server.enqueue(MockResponse().setResponseCode(200))
+    deadLetterRow("dead", deadLetteredAt = 50L)
+
+    val events = withEvents { events ->
+      runtime.replayDeadLetter("dead")
+      awaitUntil { events.any { it.type == SyncEventType.ITEM_ENQUEUED } }
+      delay(QUIET_MS)
+      events.toList()
     }
-    assertThat(row("failed")?.status).isEqualTo(SyncItemEntity.STATUS_FAILED)
+
+    val queued = checkNotNull(row("dead"))
+    assertThat(queued.createdAt).isEqualTo(1_000L)
+    assertThat(queued.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(queued.attempts).isEqualTo(0)
+    assertThat(queued.nextRetryAt).isEqualTo(0L)
+    assertThat(queued.lastErrorCode).isNull()
+    assertThat(queued.lastAttemptAt).isNull()
+    assertThat(queued.headers).isEqualTo("""{"X-Test":"1"}""")
+    assertThat(deadLetter("dead")).isNull()
+    assertThat(events.map { it.type }).containsExactly(SyncEventType.ITEM_ENQUEUED)
+    assertThat(events.single().itemId).isEqualTo("dead")
+    // Like an enqueue, a replay does not flush by itself.
+    assertThat(server.requestCount).isEqualTo(0)
+
+    runtime.dispatcher.flush()
+
+    assertThat(server.takeRequest(1, TimeUnit.SECONDS)?.path).isEqualTo("/dead")
+    assertThat(row("dead")).isNull()
+  }
+
+  @Test
+  fun `dlq_replay_queueFull_rejectsAndKeepsRow`() = runBlocking<Unit> {
+    runtime.configure(TestData.syncOptions(maxQueueSize = 1))
+    insert("queued")
+    deadLetterRow("dead", deadLetteredAt = 1L)
+
+    val rejected = runCatching { runtime.replayDeadLetter("dead") }.exceptionOrNull()
+
+    assertThat((rejected as SyncException).code).isEqualTo(SyncErrorCode.QUEUE_FULL)
+    assertThat(deadLetter("dead")).isNotNull()
+    assertThat(row("dead")).isNull()
+    assertThat(runtime.storage.count()).isEqualTo(1)
+  }
+
+  @Test
+  fun `dlq_replay_and_discard_unknownId_resolve`() = runBlocking<Unit> {
+    deadLetterRow("dead", deadLetteredAt = 1L)
+
+    val events = withEvents { events ->
+      runtime.replayDeadLetter("unknown")
+      runtime.discardDeadLetter("unknown")
+      delay(QUIET_MS)
+      events.toList()
+    }
+
+    assertThat(events).isEmpty()
+    assertThat(deadLetterCount()).isEqualTo(1)
+    assertThat(runtime.storage.count()).isEqualTo(0)
+  }
+
+  @Test
+  fun `dlq_discard_emitsItemRemoved`() = runBlocking<Unit> {
+    deadLetterRow("dead", deadLetteredAt = 1L)
+
+    val events = withEvents { events ->
+      runtime.discardDeadLetter("dead")
+      awaitUntil { events.isNotEmpty() }
+      events.toList()
+    }
+
+    assertThat(events.map { it.type }).containsExactly(SyncEventType.ITEM_REMOVED)
+    assertThat(events.single().itemId).isEqualTo("dead")
+    assertThat(deadLetterCount()).isEqualTo(0)
+  }
+
+  @Test
+  fun `dlq_clearQueue_clearsDeadLetters, with one QUEUE_CLEARED`() = runBlocking<Unit> {
+    deadLetterRow("dead", deadLetteredAt = 1L)
+    insert("queued")
+
+    val events = withEvents { events ->
+      runtime.clearQueue()
+      awaitUntil { events.isNotEmpty() }
+      delay(QUIET_MS)
+      events.toList()
+    }
+
+    assertThat(events.map { it.type }).containsExactly(SyncEventType.QUEUE_CLEARED)
+    assertThat(deadLetterCount()).isEqualTo(0)
+    assertThat(runtime.storage.count()).isEqualTo(0)
+  }
+
+  @Test
+  fun `dlq_removeItem_fallsThroughToDeadLetters, reporting the removal`() = runBlocking<Unit> {
+    deadLetterRow("dead", deadLetteredAt = 1L)
+
+    val (removed, events) = withEvents { events ->
+      val removed = runtime.removeItem("dead")
+      awaitUntil { events.isNotEmpty() }
+      removed to events.toList()
+    }
+
+    assertThat(removed).isTrue()
+    assertThat(events.map { it.type }).containsExactly(SyncEventType.ITEM_REMOVED)
+    assertThat(deadLetterCount()).isEqualTo(0)
+    assertThat(runtime.removeItem("dead")).isFalse()
+  }
+
+  @Test
+  fun `a terminal failure, listed then replayed, is sent again`() = runBlocking<Unit> {
+    var accept = false
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest): MockResponse =
+        MockResponse().setResponseCode(if (accept) 200 else 400)
+    }
+    insert("item")
+
+    runtime.dispatcher.flush()
+    val listed = runtime.listDeadLetter().single()
+    assertThat(listed.id).isEqualTo("item")
+    assertThat(listed.lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR)
+    assertThat(row("item")).isNull()
+
+    accept = true
+    runtime.replayDeadLetter("item")
+    runtime.dispatcher.flush()
+
+    assertThat(server.requestCount).isEqualTo(2)
+    assertThat(row("item")).isNull()
+    assertThat(runtime.listDeadLetter()).isEmpty()
   }
 
   private companion object {

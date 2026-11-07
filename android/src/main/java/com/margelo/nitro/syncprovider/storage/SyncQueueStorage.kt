@@ -1,6 +1,7 @@
 package com.margelo.nitro.syncprovider.storage
 
 import com.margelo.nitro.syncprovider.HttpMethod
+import com.margelo.nitro.syncprovider.SyncDeadLetterItem
 import com.margelo.nitro.syncprovider.SyncErrorCode
 import com.margelo.nitro.syncprovider.SyncItem
 import com.margelo.nitro.syncprovider.SyncItemInput
@@ -12,6 +13,7 @@ import com.margelo.nitro.syncprovider.database.SyncDeadLetterEntity
 import com.margelo.nitro.syncprovider.database.SyncItemDao
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
 import com.margelo.nitro.syncprovider.database.SyncResultDao
+import com.margelo.nitro.syncprovider.database.ReplayOutcome
 import com.margelo.nitro.syncprovider.database.SyncResultEntity
 import com.margelo.nitro.syncprovider.error.SyncException
 import com.margelo.nitro.syncprovider.util.JsonMap
@@ -197,6 +199,36 @@ internal class SyncQueueStorage(
     itemDao.resetInFlight()
   }
 
+  /* ---------------------------- dead letters ---------------------------- */
+
+  /** Every dead letter, by `deadLetteredAt` then id. */
+  suspend fun listDeadLetters(): List<SyncDeadLetterItem> = withContext(Dispatchers.IO) {
+    deadLetterDao.listAll().map(::toDeadLetterItem)
+  }
+
+  /**
+   * Put the dead letter [id] back in the queue as a fresh item, under [maxQueueSize].
+   *
+   * @return true when it was replayed, false when no dead letter has that id.
+   * @throws SyncException [SyncErrorCode.QUEUE_FULL] when the queue is full; the dead letter
+   *   stays.
+   */
+  suspend fun replayDeadLetter(id: String): Boolean = withContext(Dispatchers.IO) {
+    when (deadLetterDao.replay(id, maxQueueSize)) {
+      ReplayOutcome.REPLAYED -> true
+      ReplayOutcome.UNKNOWN -> false
+      ReplayOutcome.QUEUE_FULL -> throw SyncException(
+        SyncErrorCode.QUEUE_FULL,
+        "Queue is full (max=$maxQueueSize); the dead letter stays.",
+      )
+    }
+  }
+
+  /** @return true when a dead letter with that id was deleted. */
+  suspend fun discardDeadLetter(id: String): Boolean = withContext(Dispatchers.IO) {
+    deadLetterDao.deleteById(id) > 0
+  }
+
   fun observeAll(): Flow<List<SyncItem>> =
     itemDao.observeAll().map { rows -> rows.map(::toSyncItem) }
 
@@ -274,6 +306,27 @@ internal class SyncQueueStorage(
     nextRetryAt = entity.nextRetryAt.toDouble(),
     metadata = JsonMap.decode(entity.metadata),
   )
+
+  private fun toDeadLetterItem(entity: SyncDeadLetterEntity): SyncDeadLetterItem = SyncDeadLetterItem(
+    id = entity.id,
+    method = parseMethod(entity.method),
+    url = entity.url,
+    headers = JsonMap.decode(entity.headers),
+    body = entity.body,
+    contentType = entity.contentType,
+    priority = parsePriority(entity.priority),
+    createdAt = entity.createdAt.toDouble(),
+    metadata = JsonMap.decode(entity.metadata),
+    attempts = entity.attempts.toDouble(),
+    lastAttemptAt = entity.lastAttemptAt.toDouble(),
+    lastErrorCode = parseErrorCode(entity.lastErrorCode),
+    lastErrorMessage = entity.lastErrorMessage,
+    deadLetteredAt = entity.deadLetteredAt.toDouble(),
+  )
+
+  /** A code this version does not know reads as the one a migrated row without a code gets. */
+  private fun parseErrorCode(name: String): SyncErrorCode =
+    SyncErrorCode.entries.firstOrNull { it.name == name } ?: SyncErrorCode.MAX_ATTEMPTS_EXCEEDED
 
   private fun toSyncResult(entity: SyncResultEntity): SyncResult = SyncResult(
     startedAt = entity.startedAt.toDouble(),
