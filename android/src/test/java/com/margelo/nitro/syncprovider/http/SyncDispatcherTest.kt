@@ -596,7 +596,7 @@ internal class SyncDispatcherTest {
       assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
       assertThat(row(id).attempts).isEqualTo(0)
       assertThat(row(id).lastErrorCode).isNull()
-      // Still reads as "never attempted".
+      // Still eligible now, with nothing recorded.
       assertThat(row(id).nextRetryAt).isEqualTo(0L)
     }
   }

@@ -181,7 +181,8 @@ final class SyncEngineRetryTimerTests: XCTestCase {
     }
 
     /// A full batch leaves fresh rows behind. Those wait for the next external
-    /// flush, as they always did; the timer only re-drives attempted rows.
+    /// flush, as they always did; the timer only re-drives rows with a
+    /// deadline (`nextRetryAt > 0`).
     func test_neverAttemptedRows_doNotArmTheTimer() async throws {
         let engine = await fixture.makeEngine()
         _ = try await engine.storage.enqueue(input: .sample())

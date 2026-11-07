@@ -18,16 +18,21 @@ import androidx.room.PrimaryKey
  *   `application/json` for write methods when unset.
  * @property priority `HIGH | NORMAL | LOW`; mapped to a sort weight on read.
  * @property createdAt Epoch-millis timestamp of enqueue.
- * @property attempts Total number of dispatch attempts (success or failure).
+ * @property attempts Attempts recorded for this item. An attempt is recorded together
+ *   with its outcome, so a request cut short by a process kill leaves the count as it
+ *   was, and a rejection of a credential restored from disk keeps the count from before
+ *   the dispatch. `0` means no attempt recorded, not that no request was ever sent.
  * @property lastAttemptAt Epoch-millis of the most recent attempt, or `null`.
  * @property lastErrorCode Last [com.margelo.nitro.syncprovider.SyncErrorCode]
  *   name observed on this row, or `null` if never failed.
  * @property status One of `PENDING`, `IN_FLIGHT`, `FAILED`.
  * @property metadata Free-form JSON blob attached by the consumer.
- * @property nextRetryAt Epoch-millis earliest time this item is eligible for
- *   re-dispatch (its retry cooldown). `0` means "never attempted"; any
- *   positive value means "attempted, retry pending". Either way the row is
- *   eligible once `nextRetryAt <= now`. Indexed with [status] via
+ * @property nextRetryAt Epoch-millis before which a `PENDING` row is not eligible for
+ *   dispatch. `0` means "eligible now": no cooldown or credential hold is pending. A
+ *   positive value is a retry cooldown or a credential hold, and the row is eligible
+ *   again once `nextRetryAt <= now`. `0` does not mean "never attempted": a request cut
+ *   short by a process kill records nothing, and a row migrated from the v1 schema
+ *   keeps its `attempts` with `nextRetryAt = 0`. Indexed with [status] via
  *   `index_sync_items_status_nextRetryAt`, which serves the claim query.
  */
 @Keep
@@ -87,9 +92,10 @@ internal data class SyncItemEntity(
   val metadata: String?,
 
   /**
-   * Epoch-millis retry-eligibility deadline; `0` (default) means "never
-   * attempted". The SQL `DEFAULT 0` keeps the v1 -> v2 `ALTER TABLE ADD COLUMN`
-   * in sync with the fresh-install schema so Room's migration validation passes.
+   * Epoch-millis retry-eligibility deadline; `0` (default) means "eligible now", with
+   * no cooldown or credential hold pending. The SQL `DEFAULT 0` keeps the v1 -> v2
+   * `ALTER TABLE ADD COLUMN` in sync with the fresh-install schema so Room's migration
+   * validation passes.
    */
   @ColumnInfo(name = "nextRetryAt", defaultValue = "0")
   val nextRetryAt: Long,

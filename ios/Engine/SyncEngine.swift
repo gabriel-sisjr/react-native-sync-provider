@@ -23,10 +23,12 @@ extension SyncQueueStorage: RetryWakeSource {}
 
 /// Which rows decide when the retry timer wakes.
 enum RetryWakeScope: Sendable {
-    /// Rows already attempted. Fresh rows left behind by a full batch do not
-    /// start a new cycle by themselves.
+    /// Rows that carry a deadline (`nextRetryAt > 0`: a retry cooldown or a
+    /// credential hold). Fresh rows left behind by a full batch do not start a
+    /// new cycle by themselves.
     case attempted
-    /// Every `PENDING` row, so never-attempted rows dispatch at once.
+    /// Every `PENDING` row, so rows with no deadline (`nextRetryAt = 0`,
+    /// eligible now) dispatch at once.
     case allPending
 }
 
@@ -63,8 +65,24 @@ final class SyncEngine: @unchecked Sendable {
     /// is one: a background launch answers to the OS, and a timer there would
     /// dispatch outside the constraints the consumer asked for.
     private var attachedHybrids = 0
-    /// No wake before this moment, whatever else is due: a persisted credential
-    /// was rejected, and waking sooner would spend another request on it.
+    /// The credential hold for this process: no retry-timer wake before this
+    /// epoch-ms moment, whatever else is due. `0` means no hold. It is set when
+    /// a cycle ends after a request sent with default headers restored from
+    /// storage (a persisted configuration, not one `configure` set in this
+    /// process) got a 401/403. Waking sooner would spend another request on
+    /// the rejected credential.
+    ///
+    /// - Every retry-timer arm waits for it: the timer fires at the later of
+    ///   the row deadline and this value, and a new hold never shortens an
+    ///   older one.
+    /// - It lives only in memory, so a process relaunch drops it. The held row
+    ///   keeps its persisted `nextRetryAt`, but another due row can wake the
+    ///   queue and spend one request with the stored, rejected credential,
+    ///   which sets a new hold.
+    /// - Every `configure` clears it, whether or not the headers changed.
+    /// - Only retry-timer arms read it. BGTask runs are not retry wakes and do
+    ///   not consult it (a rejection during one still sets it), and neither
+    ///   does a JS `flush()`.
     private var credentialHoldUntil: Int64 = 0
     private var connectivityToken: UUID?
     private var startup: Task<Void, Never>?

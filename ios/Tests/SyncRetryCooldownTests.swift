@@ -6,8 +6,9 @@ import XCTest
 ///   * `fetchPending` excludes items still in cooldown and includes them once
 ///     the deadline elapses;
 ///   * `countPending` keeps counting cooling items (capacity is unchanged);
-///   * `resetInFlightToPending` / `markInFlight` leave `nextRetryAt` (and
-///     `attempts`) untouched;
+///   * `markInFlight` leaves `nextRetryAt` untouched (it only counts the
+///     attempt), and `resetInFlightToPending` leaves both `nextRetryAt` and
+///     `attempts` untouched;
 ///   * the retry timer's next-wake queries.
 final class SyncRetryCooldownTests: XCTestCase {
     private var clock: ManualClock!
@@ -71,7 +72,7 @@ final class SyncRetryCooldownTests: XCTestCase {
 
         try await storage.markPendingForRetry(id: id, errorCode: "SERVER_ERROR", retryDelayMs: 0)
 
-        // `0` is reserved for "never attempted".
+        // `0` is reserved for "eligible now, no deadline pending".
         let written = try await item(id).nextRetryAt
         XCTAssertEqual(written, clock.nowMs())
 
@@ -246,7 +247,7 @@ final class SyncRetryCooldownTests: XCTestCase {
 
         _ = try await storage.enqueue(input: makeInput(url: "https://a.test/fresh"))
         let withFresh = try await storage.earliestPendingAt()
-        XCTAssertEqual(withFresh, 0, "a never-attempted row is due now")
+        XCTAssertEqual(withFresh, 0, "a row with no deadline is due now")
     }
 
     // MARK: - Stale credential

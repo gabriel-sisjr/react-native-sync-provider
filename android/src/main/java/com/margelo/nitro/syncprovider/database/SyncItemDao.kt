@@ -102,12 +102,12 @@ internal interface SyncItemDao {
   suspend fun markInFlight(ids: List<String>)
 
   /**
-   * Earliest retry deadline among `PENDING` rows that were already attempted, or
-   * `null` when there are none. Drives every retry wake.
+   * Earliest deadline among `PENDING` rows with a retry cooldown or a credential hold
+   * (`nextRetryAt > 0`), or `null` when there are none. Drives every retry wake.
    *
    * A deadline in the past is returned on purpose: its row is due now and would
-   * otherwise be stranded. Never-attempted rows (`nextRetryAt = 0`) stay out, so
-   * rows left over from a full batch do not wake the engine by themselves.
+   * otherwise be stranded. Rows with no deadline (`nextRetryAt = 0`, eligible now) stay
+   * out, so rows left over from a full batch do not wake the engine by themselves.
    */
   @Query(
     """
@@ -119,8 +119,8 @@ internal interface SyncItemDao {
 
   /**
    * Earliest `nextRetryAt` across **all** `PENDING` rows, or `null` when there are
-   * none. Returns `0` as soon as one never-attempted row exists, which is what
-   * lets `resumeSync` dispatch those rows at once.
+   * none. Returns `0` as soon as one row is eligible with no deadline, which is what
+   * lets `resumeSync` wake for such rows too.
    */
   @Query(
     """
