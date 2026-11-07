@@ -62,7 +62,7 @@ final class SyncDispatcherCooldownTests: XCTestCase {
         let dispatcher = makeDispatcher(.exact(maxAttempts: 4, baseDelayMs: 300, maxDelayMs: 5_000))
 
         var flushes = 0
-        while try await item(id).status != "FAILED", flushes < 500 {
+        while try await storage.isQueued(id), flushes < 500 {
             _ = try await dispatcher.flush()
             flushes += 1
             clock.advance(ms: 20)
@@ -72,9 +72,8 @@ final class SyncDispatcherCooldownTests: XCTestCase {
         XCTAssertGreaterThan(flushes, log.times.count, "the loop must outpace the cooldown")
         // 300, 600, 1200 ms, seen through a 20 ms flush interval.
         XCTAssertEqual(log.gaps, [300, 600, 1_200])
-        let last = try await item(id)
-        XCTAssertEqual(last.status, "FAILED")
-        XCTAssertEqual(last.lastErrorCode, "MAX_ATTEMPTS_EXCEEDED")
+        let last = try await storage.deadLetter(id)
+        XCTAssertEqual(last?.lastErrorCode, "MAX_ATTEMPTS_EXCEEDED")
     }
 
     // MARK: - Cooldown write
@@ -159,9 +158,8 @@ final class SyncDispatcherCooldownTests: XCTestCase {
 
             _ = try await makeDispatcher(.exact(maxAttempts: 1, baseDelayMs: 1)).flush()
 
-            let stored = try await item(id)
-            XCTAssertEqual(stored.status, "FAILED")
-            XCTAssertEqual(stored.lastErrorCode, code, "HTTP \(status)")
+            let stored = try await storage.deadLetter(id)
+            XCTAssertEqual(stored?.lastErrorCode, code, "HTTP \(status)")
             try await storage.remove(id: id)
         }
     }
@@ -172,9 +170,8 @@ final class SyncDispatcherCooldownTests: XCTestCase {
 
         _ = try await makeDispatcher(.exact(maxAttempts: 1, baseDelayMs: 1)).flush()
 
-        let stored = try await item(id)
-        XCTAssertEqual(stored.status, "FAILED")
-        XCTAssertEqual(stored.lastErrorCode, "MAX_ATTEMPTS_EXCEEDED")
+        let stored = try await storage.deadLetter(id)
+        XCTAssertEqual(stored?.lastErrorCode, "MAX_ATTEMPTS_EXCEEDED")
         XCTAssertEqual(emitter.events(ofType: "ITEM_FAILED").first?.attempt, 1)
     }
 

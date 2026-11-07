@@ -144,14 +144,15 @@ final class SyncQueueStorageTests: XCTestCase {
         XCTAssertEqual(item.lastErrorCode, "NETWORK_ERROR")
     }
 
-    func test_markFailed_persistsTerminalStatus() async throws {
+    func test_moveToDeadLetters_takesTheRowOutOfTheQueue() async throws {
         let id = try await storage.enqueue(input: makeInput())
-        try await storage.markFailed(id: id, errorCode: "MAX_ATTEMPTS_EXCEEDED")
+        try await storage.moveToDeadLetters(id: id, errorCode: "MAX_ATTEMPTS_EXCEEDED", errorMessage: "HTTP 503")
 
-        let items = try await storage.getAll()
-        let item = try XCTUnwrap(items.first(where: { $0.id == id }))
-        XCTAssertEqual(item.status, "FAILED")
-        XCTAssertEqual(item.lastErrorCode, "MAX_ATTEMPTS_EXCEEDED")
+        let queued = try await storage.isQueued(id)
+        XCTAssertFalse(queued)
+        let dead = try await storage.deadLetter(id)
+        XCTAssertEqual(dead?.lastErrorCode, "MAX_ATTEMPTS_EXCEEDED")
+        XCTAssertEqual(dead?.lastErrorMessage, "HTTP 503")
     }
 
     func test_resetInFlightToPending_returnsResetCount() async throws {

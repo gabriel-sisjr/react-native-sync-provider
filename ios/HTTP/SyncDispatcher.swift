@@ -523,8 +523,14 @@ actor SyncDispatcher {
 
     /// Records the outcome of a **failed** dispatch: decides retry vs. terminal
     /// failure, persists the retry cooldown (`nextRetryAt`) via
-    /// ``RetryPolicyEvaluator`` when retrying, marks the item terminally FAILED
-    /// otherwise, and emits the matching event.
+    /// ``RetryPolicyEvaluator`` when retrying, and otherwise moves the item to
+    /// the dead-letter store, then emits the matching events.
+    ///
+    /// A terminal failure emits `ITEM_FAILED` with the real code, then, right
+    /// after, `ITEM_DEAD_LETTERED` with `DEAD_LETTERED` and that code in
+    /// `metadata.lastErrorCode`. The dead letter keeps the failure's message
+    /// (a status line or an error's description, never a header or a body),
+    /// cut to ``kDeadLetterMessageMaxLength`` characters.
     ///
     /// This is the single source of truth for failure handling. The background
     /// `URLSession` delegate does not use it yet: a completion delivered after
@@ -573,14 +579,24 @@ actor SyncDispatcher {
             let finalErrorCode = isRetryable
                 ? "MAX_ATTEMPTS_EXCEEDED"
                 : (outcome.errorCode ?? "NETWORK_ERROR")
-            try await storage.markFailed(id: item.id, errorCode: finalErrorCode)
+            let message = outcome.errorMessage ?? finalErrorCode
+            let moved = try await storage.moveToDeadLetters(id: item.id,
+                                                            errorCode: finalErrorCode,
+                                                            errorMessage: Self.deadLetterMessage(for: outcome,
+                                                                                                 fallback: message))
             emitter.emit(.now(type: "ITEM_FAILED",
                               itemId: item.id,
                               errorCode: finalErrorCode,
                               statusCode: outcome.statusCode.map(Double.init),
                               attempt: Double(attemptsAfter)))
-            return .failed(errorCode: finalErrorCode,
-                           message: outcome.errorMessage ?? finalErrorCode)
+            // A row removed while its request was out has nothing to move.
+            if moved {
+                emitter.emit(.now(type: "ITEM_DEAD_LETTERED",
+                                  itemId: item.id,
+                                  errorCode: "DEAD_LETTERED",
+                                  metadata: ["lastErrorCode": finalErrorCode]))
+            }
+            return .failed(errorCode: finalErrorCode, message: message)
         }
 
         // Retryable and attempts remain: park the item behind a backoff
@@ -596,6 +612,19 @@ actor SyncDispatcher {
                           statusCode: outcome.statusCode.map(Double.init),
                           attempt: Double(attemptsAfter)))
         return .retrying(attempt: attemptsAfter)
+    }
+
+    /// What a dead letter says about the failure that ended it: for an HTTP
+    /// failure, the status line with its reason phrase (`HTTP 404 Not Found`,
+    /// the phrase as Foundation localizes it), otherwise the error's message.
+    /// Built from the outcome alone, never from a header or a body. The result
+    /// and history keep the shorter `HTTP 404`.
+    static func deadLetterMessage(for outcome: ItemDispatchOutcome, fallback: String) -> String {
+        guard let status = outcome.statusCode,
+              outcome.errorCode == "SERVER_ERROR" || outcome.errorCode == "UNAUTHORIZED" else {
+            return fallback
+        }
+        return "HTTP \(status) \(HTTPURLResponse.localizedString(forStatusCode: status).capitalized)"
     }
 
     /// `true` for a 401/403 sent with default headers read back from storage.

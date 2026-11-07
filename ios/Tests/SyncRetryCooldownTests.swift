@@ -176,7 +176,7 @@ final class SyncRetryCooldownTests: XCTestCase {
         try await storage.markInFlight(id: cooling)
         try await storage.markPendingForRetry(id: cooling, errorCode: "SERVER_ERROR", retryDelayMs: 60_000)
         try await storage.markInFlight(id: inFlight)
-        try await storage.markFailed(id: failed, errorCode: "SERVER_ERROR")
+        try await storage.moveToDeadLetters(id: failed, errorCode: "SERVER_ERROR", errorMessage: nil)
 
         let queued = try await storage.getQueued()
         XCTAssertEqual(Set(queued.map(\.id)), [fresh, cooling])
@@ -217,10 +217,10 @@ final class SyncRetryCooldownTests: XCTestCase {
         let id = try await storage.enqueue(input: makeInput())
         try await storage.markInFlight(id: id)
         try await storage.markPendingForRetry(id: id, errorCode: "SERVER_ERROR", retryDelayMs: 60_000)
-        try await storage.markFailed(id: id, errorCode: "SERVER_ERROR")
+        try await storage.markInFlight(id: id)
 
         let wake = try await storage.earliestRetryAt()
-        XCTAssertNil(wake)
+        XCTAssertNil(wake, "an IN_FLIGHT row keeps its deadline but is not pending")
     }
 
     func test_earliestRetryAt_returnsAnElapsedDeadline() async throws {

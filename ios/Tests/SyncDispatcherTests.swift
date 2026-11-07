@@ -174,10 +174,10 @@ final class SyncDispatcherTests: XCTestCase {
         XCTAssertEqual(result.itemsSucceeded, 0)
         XCTAssertEqual(result.itemsFailed, 1)
 
-        let items = try await storage.getAll()
-        let item = try XCTUnwrap(items.first(where: { $0.id == id }))
-        XCTAssertEqual(item.status, "FAILED")
-        XCTAssertEqual(item.lastErrorCode, "SERVER_ERROR")
+        let dead = try await storage.deadLetter(id)
+        XCTAssertEqual(dead?.lastErrorCode, "SERVER_ERROR")
+        let queued = try await storage.isQueued(id)
+        XCTAssertFalse(queued, "a terminal failure leaves the queue")
 
         let failed = emitter.events(ofType: "ITEM_FAILED")
         XCTAssertEqual(failed.count, 1)
@@ -196,10 +196,10 @@ final class SyncDispatcherTests: XCTestCase {
 
         XCTAssertEqual(result.itemsFailed, 1)
 
-        let items = try await storage.getAll()
-        let item = try XCTUnwrap(items.first(where: { $0.id == id }))
-        XCTAssertEqual(item.status, "FAILED")
-        XCTAssertEqual(item.lastErrorCode, "UNAUTHORIZED")
+        let dead = try await storage.deadLetter(id)
+        XCTAssertEqual(dead?.lastErrorCode, "UNAUTHORIZED")
+        let queued = try await storage.isQueued(id)
+        XCTAssertFalse(queued, "a terminal failure leaves the queue")
 
         let failed = emitter.events(ofType: "ITEM_FAILED")
         XCTAssertEqual(failed.first?.errorCode, "UNAUTHORIZED")
@@ -264,10 +264,10 @@ final class SyncDispatcherTests: XCTestCase {
 
         XCTAssertEqual(result.itemsFailed, 1)
 
-        let items = try await storage.getAll()
-        let item = try XCTUnwrap(items.first(where: { $0.id == id }))
-        XCTAssertEqual(item.status, "FAILED")
-        XCTAssertEqual(item.lastErrorCode, "MAX_ATTEMPTS_EXCEEDED")
+        let dead = try await storage.deadLetter(id)
+        XCTAssertEqual(dead?.lastErrorCode, "MAX_ATTEMPTS_EXCEEDED")
+        let queued = try await storage.isQueued(id)
+        XCTAssertFalse(queued, "a terminal failure leaves the queue")
     }
 
     // MARK: - Headers + body capture

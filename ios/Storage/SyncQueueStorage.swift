@@ -58,11 +58,14 @@ actor SyncQueueStorage {
         return stored.map(\.id)
     }
 
+    /// Removes the queued item with `id`, or else the dead letter with it.
+    /// `true` when either store deleted a row.
     @discardableResult
     func remove(id: String) async throws -> Bool {
         try await dao.delete(id: id)
     }
 
+    /// Removes every item, queued or dead-lettered.
     func clear() async throws {
         try await dao.clear()
     }
@@ -107,8 +110,15 @@ actor SyncQueueStorage {
         try await dao.markInFlight(id: id)
     }
 
-    func markFailed(id: String, errorCode: String) async throws {
-        try await dao.markFailed(id: id, errorCode: errorCode)
+    /// See ``SyncItemDao/moveToDeadLetters(id:errorCode:errorMessage:)``.
+    @discardableResult
+    func moveToDeadLetters(id: String, errorCode: String, errorMessage: String?) async throws -> Bool {
+        try await dao.moveToDeadLetters(id: id, errorCode: errorCode, errorMessage: errorMessage)
+    }
+
+    /// Every dead letter, `deadLetteredAt` ascending, then `id` ascending.
+    func getDeadLetters() async throws -> [StoredDeadLetter] {
+        try await dao.fetchDeadLetters()
     }
 
     /// Reset an item to PENDING for retry and persist its backoff cooldown.

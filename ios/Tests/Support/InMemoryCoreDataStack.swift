@@ -32,12 +32,41 @@ enum InMemoryCoreDataStack {
             attribute("lastErrorCode", type: .stringAttributeType, optional: true),
             attribute("metadataJSON", type: .binaryDataAttributeType, optional: true),
             attribute("method", type: .stringAttributeType, optional: false, defaultValue: "POST"),
-            // Mirrors Core Data model v2 (`SyncProvider 2.xcdatamodel`). Every
+            // Added in Core Data model v2 (`SyncProvider 2.xcdatamodel`). Every
             // schema change is made twice: real model + this test model.
             attribute("nextRetryAt", type: .integer64AttributeType, optional: false, defaultValue: 0),
             attribute("priority", type: .stringAttributeType, optional: false, defaultValue: "NORMAL"),
             attribute("status", type: .stringAttributeType, optional: false, defaultValue: "PENDING"),
             attribute("url", type: .stringAttributeType, optional: false)
+        ]
+        item.uniquenessConstraints = [["id"]]
+
+        // Added in Core Data model v3 (`SyncProvider 3.xcdatamodel`).
+        let deadLetter = NSEntityDescription()
+        deadLetter.name = "SyncDeadLetterEntity"
+        deadLetter.managedObjectClassName = "SyncDeadLetterEntity"
+        let deadLetteredAt = attribute("deadLetteredAt", type: .integer64AttributeType, optional: false, defaultValue: 0)
+        deadLetter.properties = [
+            attribute("attempts", type: .integer32AttributeType, optional: false, defaultValue: 0),
+            attribute("body", type: .stringAttributeType, optional: true),
+            attribute("contentType", type: .stringAttributeType, optional: true),
+            attribute("createdAt", type: .integer64AttributeType, optional: false, defaultValue: 0),
+            deadLetteredAt,
+            attribute("headersJSON", type: .binaryDataAttributeType, optional: true),
+            attribute("id", type: .stringAttributeType, optional: false),
+            attribute("lastAttemptAt", type: .integer64AttributeType, optional: false, defaultValue: 0),
+            attribute("lastErrorCode", type: .stringAttributeType, optional: false, defaultValue: "MAX_ATTEMPTS_EXCEEDED"),
+            attribute("lastErrorMessage", type: .stringAttributeType, optional: true),
+            attribute("metadataJSON", type: .binaryDataAttributeType, optional: true),
+            attribute("method", type: .stringAttributeType, optional: false, defaultValue: "POST"),
+            attribute("priority", type: .stringAttributeType, optional: false, defaultValue: "NORMAL"),
+            attribute("url", type: .stringAttributeType, optional: false)
+        ]
+        deadLetter.uniquenessConstraints = [["id"]]
+        deadLetter.indexes = [
+            NSFetchIndexDescription(name: "byDeadLetteredAt",
+                                    elements: [NSFetchIndexElementDescription(property: deadLetteredAt,
+                                                                              collationType: .binary)])
         ]
 
         let result = NSEntityDescription()
@@ -53,8 +82,9 @@ enum InMemoryCoreDataStack {
             attribute("itemsSucceeded", type: .integer32AttributeType, optional: false, defaultValue: 0),
             attribute("startedAt", type: .integer64AttributeType, optional: false, defaultValue: 0)
         ]
+        result.uniquenessConstraints = [["id"]]
 
-        model.entities = [item, result]
+        model.entities = [item, deadLetter, result]
         return model
     }
 

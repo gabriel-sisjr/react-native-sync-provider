@@ -63,7 +63,33 @@ struct StoredSyncResult: Sendable, Equatable {
     let errorMessage: String?
 }
 
-/// Asynchronous CRUD wrapper around `SyncItemEntity` / `SyncResultEntity`.
+/// An item that failed for good, out of the queue. All values are `Sendable`.
+struct StoredDeadLetter: Sendable, Equatable {
+    let id: String
+    let method: String
+    let url: String
+    let headers: [String: String]?
+    let body: String?
+    let contentType: String?
+    let priority: String
+    /// When the item was first enqueued.
+    let createdAt: Int64
+    let metadata: [String: String]?
+    /// Every attempt made.
+    let attempts: Int32
+    let lastAttemptAt: Int64
+    /// The code of the failure that ended it.
+    let lastErrorCode: String
+    /// What that failure said, bounded; never a header or a body.
+    let lastErrorMessage: String?
+    let deadLetteredAt: Int64
+}
+
+/// The most a dead letter's `lastErrorMessage` keeps, in characters.
+let kDeadLetterMessageMaxLength = 1_024
+
+/// Asynchronous CRUD wrapper around `SyncItemEntity`, `SyncDeadLetterEntity`
+/// and `SyncResultEntity`.
 final class SyncItemDao {
     private let stack: CoreDataStack
     private let clock: SyncClock
@@ -243,11 +269,53 @@ final class SyncItemDao {
         }
     }
 
-    func markFailed(id: String, errorCode: String) async throws {
+    /// Moves an item that failed for good out of the queue, into the
+    /// dead-letter store, in one transaction: the queue row is deleted and the
+    /// dead letter written by the same save, so no copy is ever left in both,
+    /// nor in neither.
+    ///
+    /// The dead letter keeps the request, `createdAt`, the attempts made and
+    /// the last one's time. `errorMessage` is cut to
+    /// ``kDeadLetterMessageMaxLength`` characters. An older dead letter with
+    /// the same id, from an earlier failure of a replayed item, is replaced.
+    ///
+    /// - Returns: `false` when no queue row has `id`, removed meanwhile.
+    @discardableResult
+    func moveToDeadLetters(id: String, errorCode: String, errorMessage: String?) async throws -> Bool {
+        try await stack.performBackgroundTask { [clock] context in
+            guard let entity = try Self.fetchEntity(id: id, in: context) else { return false }
+            if let older = try Self.fetchDeadLetter(id: id, in: context) {
+                context.delete(older)
+            }
+            let letter = SyncDeadLetterEntity(context: context)
+            letter.id = entity.id
+            letter.method = entity.method
+            letter.url = entity.url
+            letter.headersJSON = entity.headersJSON
+            letter.body = entity.body
+            letter.contentType = entity.contentType
+            letter.priority = entity.priority
+            letter.createdAt = entity.createdAt
+            letter.metadataJSON = entity.metadataJSON
+            letter.attempts = entity.attempts
+            letter.lastAttemptAt = entity.lastAttemptAt
+            letter.lastErrorCode = errorCode
+            letter.lastErrorMessage = errorMessage.map { String($0.prefix(kDeadLetterMessageMaxLength)) }
+            letter.deadLetteredAt = clock.nowMs()
+            context.delete(entity)
+            return true
+        }
+    }
+
+    /// Every dead letter, `deadLetteredAt` ascending, then `id` ascending.
+    func fetchDeadLetters() async throws -> [StoredDeadLetter] {
         try await stack.performBackgroundTask { context in
-            guard let entity = try Self.fetchEntity(id: id, in: context) else { return }
-            entity.status = SyncItemStatus.failed.rawValue
-            entity.lastErrorCode = errorCode
+            let request = NSFetchRequest<SyncDeadLetterEntity>(entityName: "SyncDeadLetterEntity")
+            request.sortDescriptors = [
+                NSSortDescriptor(key: "deadLetteredAt", ascending: true),
+                NSSortDescriptor(key: "id", ascending: true)
+            ]
+            return try context.fetch(request).map(Self.materialize)
         }
     }
 
@@ -333,23 +401,31 @@ final class SyncItemDao {
 
     // MARK: - Deletes
 
-    /// Delete a single item by id. Returns `true` if a row was removed.
+    /// Delete a single item by id: the queued one, or else the dead letter
+    /// with that id. Returns `true` if a row was removed from either store.
     @discardableResult
     func delete(id: String) async throws -> Bool {
         try await stack.performBackgroundTask { context in
-            guard let entity = try Self.fetchEntity(id: id, in: context) else { return false }
-            context.delete(entity)
+            if let entity = try Self.fetchEntity(id: id, in: context) {
+                context.delete(entity)
+                return true
+            }
+            guard let letter = try Self.fetchDeadLetter(id: id, in: context) else { return false }
+            context.delete(letter)
             return true
         }
     }
 
-    /// Delete every item.
+    /// Delete every item, in the queue and in the dead-letter store: a purge
+    /// such as a logout must leave no request behind.
     func clear() async throws {
         try await stack.performBackgroundTask { context in
-            let fetch: NSFetchRequest<NSFetchRequestResult> = NSFetchRequest(entityName: "SyncItemEntity")
-            let batch = NSBatchDeleteRequest(fetchRequest: fetch)
-            batch.resultType = .resultTypeStatusOnly
-            _ = try context.execute(batch)
+            for entityName in ["SyncItemEntity", "SyncDeadLetterEntity"] {
+                let fetch: NSFetchRequest<NSFetchRequestResult> = NSFetchRequest(entityName: entityName)
+                let batch = NSBatchDeleteRequest(fetchRequest: fetch)
+                batch.resultType = .resultTypeStatusOnly
+                _ = try context.execute(batch)
+            }
             // Reset the context after a batch delete so it reflects the change.
             context.reset()
         }
@@ -405,11 +481,37 @@ final class SyncItemDao {
 
     // MARK: - Helpers
 
+    private static func fetchDeadLetter(id: String, in context: NSManagedObjectContext) throws -> SyncDeadLetterEntity? {
+        let request = NSFetchRequest<SyncDeadLetterEntity>(entityName: "SyncDeadLetterEntity")
+        request.predicate = NSPredicate(format: "id == %@", id)
+        request.fetchLimit = 1
+        return try context.fetch(request).first
+    }
+
     private static func fetchEntity(id: String, in context: NSManagedObjectContext) throws -> SyncItemEntity? {
         let request = NSFetchRequest<SyncItemEntity>(entityName: "SyncItemEntity")
         request.predicate = NSPredicate(format: "id == %@", id)
         request.fetchLimit = 1
         return try context.fetch(request).first
+    }
+
+    private static func materialize(_ entity: SyncDeadLetterEntity) throws -> StoredDeadLetter {
+        StoredDeadLetter(id: entity.id ?? "",
+                         method: entity.method ?? "POST",
+                         url: entity.url ?? "",
+                         headers: try decodeJSON(entity.headersJSON),
+                         body: entity.body,
+                         contentType: entity.contentType,
+                         priority: entity.priority ?? "NORMAL",
+                         createdAt: entity.createdAt,
+                         metadata: try decodeJSON(entity.metadataJSON),
+                         attempts: entity.attempts,
+                         lastAttemptAt: entity.lastAttemptAt,
+                         // An empty or missing code, which only a damaged row
+                         // can have, reads as the legacy fallback.
+                         lastErrorCode: entity.lastErrorCode.flatMap { $0.isEmpty ? nil : $0 } ?? kLegacyDeadLetterErrorCode,
+                         lastErrorMessage: entity.lastErrorMessage,
+                         deadLetteredAt: entity.deadLetteredAt)
     }
 
     private static func materialize(_ entity: SyncItemEntity) throws -> StoredSyncItem {

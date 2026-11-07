@@ -118,8 +118,8 @@ final class SyncEngineRetryTimerTests: XCTestCase {
         XCTAssertEqual(timer.delayMs, 40)
         await fireWhenDue()
 
-        let stored = try await item(id, in: engine)
-        XCTAssertEqual(stored.status, "FAILED")
+        let dead = try await engine.storage.deadLetter(id)
+        XCTAssertNotNil(dead)
         XCTAssertEqual(requestCount, 3)
         XCTAssertFalse(timer.isArmed, "nothing is left to wake for")
     }

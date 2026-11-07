@@ -29,6 +29,15 @@ const versions = readdirSync(MODEL_DIR).filter((entry) =>
   entry.endsWith('.xcdatamodel')
 );
 
+// "SyncProvider.xcdatamodel" is version 1, "SyncProvider 3.xcdatamodel" is 3.
+const versionNumber = (version) =>
+  Number(/ (\d+)\.xcdatamodel$/.exec(version)?.[1] ?? 1);
+const newest = versions.reduce(
+  (best, version) =>
+    versionNumber(version) > versionNumber(best) ? version : best,
+  versions[0]
+);
+
 const required = [
   ...new Set([
     MARKER,
@@ -44,6 +53,9 @@ const problems = [
   ...packed
     .filter((path) => NATIVE_TESTS.test(path))
     .map((path) => `native test in the tarball: ${path}`),
+  ...(current === newest
+    ? []
+    : [`${MARKER} names ${current}, not the newest version ${newest}`]),
 ];
 
 if (problems.length > 0) {
