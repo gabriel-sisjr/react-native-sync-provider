@@ -25,7 +25,8 @@ import androidx.room.PrimaryKey
  * @property lastAttemptAt Epoch-millis of the most recent attempt, or `null`.
  * @property lastErrorCode Last [com.margelo.nitro.syncprovider.SyncErrorCode]
  *   name observed on this row, or `null` if never failed.
- * @property status One of `PENDING`, `IN_FLIGHT`, `FAILED`.
+ * @property status `PENDING` or `IN_FLIGHT`. Schemas before v3 also held `FAILED` rows; the
+ *   v2 -> v3 migration moves them to [SyncDeadLetterEntity], as every terminal failure now is.
  * @property metadata Free-form JSON blob attached by the consumer.
  * @property nextRetryAt Epoch-millis before which a `PENDING` row is not eligible for
  *   dispatch. `0` means "eligible now": no cooldown or credential hold is pending. A
@@ -103,6 +104,7 @@ internal data class SyncItemEntity(
   companion object {
     const val STATUS_PENDING = "PENDING"
     const val STATUS_IN_FLIGHT = "IN_FLIGHT"
+    /** Only in schemas before v3, which the v2 -> v3 migration moves to the dead letters. */
     const val STATUS_FAILED = "FAILED"
 
     fun priorityWeight(priority: String): Int = when (priority.uppercase()) {

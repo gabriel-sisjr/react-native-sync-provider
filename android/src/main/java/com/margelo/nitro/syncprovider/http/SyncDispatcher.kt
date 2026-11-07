@@ -316,23 +316,19 @@ internal class SyncDispatcher(
     val startedAt = clock()
 
     // Defensive: a row that already exhausted its budget must not be re-attempted.
-    // Terminal rows are FAILED (not claimable), so this only fires if maxAttempts
+    // Terminal rows leave the queue for the dead letters, so this only fires if maxAttempts
     // was lowered via configureSync between cycles.
     if (entity.attempts >= maxAttempts) {
-      storage.markFailed(entity.id, entity.attempts, startedAt, SyncErrorCode.MAX_ATTEMPTS_EXCEEDED)
-      emitter.emit(
-        SyncEventEmitter.event(
-          type = SyncEventType.ITEM_FAILED,
-          itemId = entity.id,
-          errorCode = SyncErrorCode.MAX_ATTEMPTS_EXCEEDED,
-          attempt = entity.attempts,
-        ),
+      val message = "Retry budget exhausted"
+      deadLetter(
+        entity = entity,
+        attempts = entity.attempts,
+        lastAttemptAt = entity.lastAttemptAt?.takeIf { it > 0L } ?: startedAt,
+        code = SyncErrorCode.MAX_ATTEMPTS_EXCEEDED,
+        detail = message,
+        statusCode = null,
       )
-      return ItemOutcome.Failed(
-        entity.id,
-        SyncErrorCode.MAX_ATTEMPTS_EXCEEDED,
-        "Retry budget exhausted",
-      )
+      return ItemOutcome.Failed(entity.id, SyncErrorCode.MAX_ATTEMPTS_EXCEEDED, message)
     }
 
     return when (val outcome = runOnce(entity, timeoutMs, options.defaultHeaders)) {
@@ -410,17 +406,48 @@ internal class SyncDispatcher(
     // A non-retryable failure keeps its real code; only a retriable one can run out
     // of budget.
     val terminalCode = if (outcome.retryable) SyncErrorCode.MAX_ATTEMPTS_EXCEEDED else outcome.code
-    storage.markFailed(entity.id, attempt, startedAt, terminalCode)
+    deadLetter(entity, attempt, startedAt, terminalCode, outcome.detail, outcome.statusCode)
+    return ItemOutcome.Failed(entity.id, terminalCode, outcome.message)
+  }
+
+  /**
+   * Move [entity] to the dead letters in one transaction, then report `ITEM_FAILED` with the
+   * real code and, right after it, `ITEM_DEAD_LETTERED` carrying that code in its metadata.
+   */
+  @Suppress("LongParameterList")
+  private suspend fun deadLetter(
+    entity: SyncItemEntity,
+    attempts: Int,
+    lastAttemptAt: Long,
+    code: SyncErrorCode,
+    detail: String,
+    statusCode: Int?,
+  ) {
+    storage.moveToDeadLetters(
+      entity = entity,
+      attempts = attempts,
+      lastAttemptAt = lastAttemptAt,
+      lastErrorCode = code,
+      lastErrorMessage = detail,
+      deadLetteredAt = clock(),
+    )
     emitter.emit(
       SyncEventEmitter.event(
         type = SyncEventType.ITEM_FAILED,
         itemId = entity.id,
-        errorCode = terminalCode,
-        statusCode = outcome.statusCode,
-        attempt = attempt,
+        errorCode = code,
+        statusCode = statusCode,
+        attempt = attempts,
       ),
     )
-    return ItemOutcome.Failed(entity.id, terminalCode, outcome.message)
+    emitter.emit(
+      SyncEventEmitter.event(
+        type = SyncEventType.ITEM_DEAD_LETTERED,
+        itemId = entity.id,
+        errorCode = SyncErrorCode.DEAD_LETTERED,
+        metadata = mapOf(METADATA_LAST_ERROR_CODE to code.name),
+      ),
+    )
   }
 
   private suspend fun emitRetrying(
@@ -474,6 +501,8 @@ internal class SyncDispatcher(
           httpResponse.use { resp ->
             val code = resp.code
             val policy = getOptions().retryPolicy
+            // The status line only: the response's headers and body stay out of it.
+            val statusLine = "HTTP $code ${resp.message}".trim()
             when {
               code in 200..299 -> AttemptResult.Success(code)
               code == 401 || code == 403 -> AttemptResult.Failure(
@@ -481,24 +510,28 @@ internal class SyncDispatcher(
                 message = "HTTP $code",
                 statusCode = code,
                 retryable = false,
+                detail = statusLine,
               )
               RetryPolicyEvaluator.shouldRetryStatus(code, policy) -> AttemptResult.Failure(
                 code = SyncErrorCode.SERVER_ERROR,
                 message = "HTTP $code",
                 statusCode = code,
                 retryable = true,
+                detail = statusLine,
               )
               code in 400..499 -> AttemptResult.Failure(
                 code = SyncErrorCode.SERVER_ERROR,
                 message = "HTTP $code",
                 statusCode = code,
                 retryable = false,
+                detail = statusLine,
               )
               else -> AttemptResult.Failure(
                 code = SyncErrorCode.SERVER_ERROR,
                 message = "HTTP $code",
                 statusCode = code,
                 retryable = false,
+                detail = statusLine,
               )
             }
           }
@@ -597,11 +630,16 @@ internal class SyncDispatcher(
 
   private sealed interface AttemptResult {
     data class Success(val statusCode: Int) : AttemptResult
+    /**
+     * @property detail what a dead letter records: the status line, reason phrase included,
+     *   or the exception message. Never a header or a body.
+     */
     data class Failure(
       val code: SyncErrorCode,
       val message: String,
       val statusCode: Int?,
       val retryable: Boolean,
+      val detail: String = message,
     ) : AttemptResult
   }
 
@@ -632,6 +670,9 @@ internal class SyncDispatcher(
 
     /** Floor for the wait after a restored credential is rejected. */
     const val MIN_CREDENTIAL_HOLD_MS: Long = 60_000L
+
+    /** Where `ITEM_DEAD_LETTERED` carries the real failure code. */
+    const val METADATA_LAST_ERROR_CODE = "lastErrorCode"
 
     /**
      * The zeroed result that means "no cycle ran". `flush()` returns it to JS unchanged

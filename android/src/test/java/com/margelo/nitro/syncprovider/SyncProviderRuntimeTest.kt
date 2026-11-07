@@ -19,6 +19,7 @@ import com.google.common.truth.Truth.assertWithMessage
 import com.margelo.nitro.syncprovider.config.ConfigSource
 import com.margelo.nitro.syncprovider.config.SecretStore
 import com.margelo.nitro.syncprovider.connectivity.ConnectivityMonitor
+import com.margelo.nitro.syncprovider.database.SyncDeadLetterEntity
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
 import com.margelo.nitro.syncprovider.error.SyncException
 import com.margelo.nitro.syncprovider.http.SyncDispatcher
@@ -155,6 +156,9 @@ internal class SyncProviderRuntimeTest {
   }
 
   private suspend fun row(id: String): SyncItemEntity? = runtime.database.syncItemDao().findById(id)
+
+  private suspend fun deadLetter(id: String): SyncDeadLetterEntity? =
+    runtime.database.syncDeadLetterDao().findById(id)
 
   private suspend fun awaitGone(id: String) {
     val gone = withTimeoutOrNull(AWAIT_TIMEOUT_MS) {
@@ -797,7 +801,8 @@ internal class SyncProviderRuntimeTest {
 
     runtime.dispatcher.flush()
 
-    assertThat(row("auth")!!.status).isEqualTo(SyncItemEntity.STATUS_FAILED)
+    assertThat(row("auth")).isNull()
+    assertThat(deadLetter("auth")?.lastErrorCode).isEqualTo(SyncErrorCode.UNAUTHORIZED.name)
   }
 
   @Test
@@ -809,7 +814,8 @@ internal class SyncProviderRuntimeTest {
     restartProcess()
     runWorker()
 
-    assertThat(row("auth")!!.status).isEqualTo(SyncItemEntity.STATUS_FAILED)
+    assertThat(row("auth")).isNull()
+    assertThat(deadLetter("auth")?.lastErrorCode).isEqualTo(SyncErrorCode.UNAUTHORIZED.name)
   }
 
   @Test
@@ -1441,7 +1447,7 @@ internal class SyncProviderRuntimeTest {
   /* ------------------------------- dead letters ------------------------------- */
 
   @Test
-  fun `no item is a dead letter yet, a FAILED row included`() = runBlocking<Unit> {
+  fun `dead letters are not listed yet`() = runBlocking<Unit> {
     insert("failed", status = SyncItemEntity.STATUS_FAILED)
 
     assertThat(runtime.listDeadLetter()).isEmpty()

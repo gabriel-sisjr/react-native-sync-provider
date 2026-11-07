@@ -12,7 +12,7 @@ import java.util.concurrent.atomic.AtomicReference
  * Single-shot, in-process retry timer. A new [arm] replaces the previous one.
  *
  * The dispatcher never checks connectivity, so a timer that flushed offline would
- * spend every attempt and mark valid items `FAILED` while the device simply has no
+ * spend every attempt and dead-letter valid items while the device simply has no
  * network. When the timer fires offline it therefore does not flush: it remembers
  * the wake, and [onNetworkAvailable] delivers it.
  *

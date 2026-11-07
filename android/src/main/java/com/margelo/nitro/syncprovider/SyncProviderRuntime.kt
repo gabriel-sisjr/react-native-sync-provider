@@ -223,9 +223,8 @@ internal class SyncProviderRuntime private constructor(
   }
 
   /**
-   * Dead letters, oldest first. Provisional: nothing moves to a dead-letter store yet
-   * (a terminal failure still stays in the queue as a `FAILED` row), so the list is
-   * always empty.
+   * Dead letters, oldest first. Provisional: terminal failures are kept in the dead-letter
+   * table, but not listed yet, so the list is always empty.
    */
   suspend fun listDeadLetter(): List<SyncDeadLetterItem> = emptyList()
 

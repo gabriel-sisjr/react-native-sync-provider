@@ -11,6 +11,7 @@ import com.margelo.nitro.syncprovider.SyncEvent
 import com.margelo.nitro.syncprovider.SyncEventType
 import com.margelo.nitro.syncprovider.SyncResult
 import com.margelo.nitro.syncprovider.database.SyncDatabase
+import com.margelo.nitro.syncprovider.database.SyncDeadLetterEntity
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
 import com.margelo.nitro.syncprovider.error.SyncException
 import com.margelo.nitro.syncprovider.events.SyncEventEmitter
@@ -157,6 +158,12 @@ internal class SyncDispatcherTest {
 
   private suspend fun row(id: String): SyncItemEntity = db.syncItemDao().findById(id)!!
 
+  /** The dead letter [id] became; it is no longer queued. */
+  private suspend fun deadLetter(id: String): SyncDeadLetterEntity {
+    assertThat(db.syncItemDao().findById(id)).isNull()
+    return checkNotNull(db.syncDeadLetterDao().findById(id))
+  }
+
   /* ---------------------------- plain dispatch ---------------------------- */
 
   @Test
@@ -270,8 +277,7 @@ internal class SyncDispatcherTest {
     val result = d.flush()
     assertThat(result.failureCount.toInt()).isEqualTo(1)
     assertThat(result.failedIds.toList()).containsExactly(id)
-    val failed = row(id)
-    assertThat(failed.status).isEqualTo(SyncItemEntity.STATUS_FAILED)
+    val failed = deadLetter(id)
     assertThat(failed.attempts).isEqualTo(2)
     assertThat(result.errors[id] ?: "").contains(SyncErrorCode.MAX_ATTEMPTS_EXCEEDED.name)
     assertThat(server.requestCount).isEqualTo(2)
@@ -289,9 +295,8 @@ internal class SyncDispatcherTest {
     }
 
     assertThat(server.requestCount).isEqualTo(3)
-    assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_FAILED)
-    assertThat(row(id).attempts).isEqualTo(3)
-    assertThat(row(id).lastErrorCode).isEqualTo(SyncErrorCode.MAX_ATTEMPTS_EXCEEDED.name)
+    assertThat(deadLetter(id).attempts).isEqualTo(3)
+    assertThat(deadLetter(id).lastErrorCode).isEqualTo(SyncErrorCode.MAX_ATTEMPTS_EXCEEDED.name)
   }
 
   @Test
@@ -302,8 +307,7 @@ internal class SyncDispatcherTest {
     val result = newDispatcher(maxAttempts = 5).flush()
 
     assertThat(server.requestCount).isEqualTo(0)
-    assertThat(row("spent").status).isEqualTo(SyncItemEntity.STATUS_FAILED)
-    assertThat(row("spent").attempts).isEqualTo(7)
+    assertThat(deadLetter("spent").attempts).isEqualTo(7)
     assertThat(result.failedIds.toList()).containsExactly("spent")
     val failure = events.single { it.type == SyncEventType.ITEM_FAILED }
     assertThat(failure.errorCode).isEqualTo(SyncErrorCode.MAX_ATTEMPTS_EXCEEDED)
@@ -342,7 +346,7 @@ internal class SyncDispatcherTest {
 
     newDispatcher(maxAttempts = 1).flush()
 
-    assertThat(row(id).lastErrorCode).isEqualTo(SyncErrorCode.UNAUTHORIZED.name)
+    assertThat(deadLetter(id).lastErrorCode).isEqualTo(SyncErrorCode.UNAUTHORIZED.name)
   }
 
   /* --------------------------- cycle semantics ---------------------------- */
@@ -667,8 +671,8 @@ internal class SyncDispatcherTest {
 
     newDispatcher(credentials = { CredentialPolicy.TRUSTED }).flush()
 
-    assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_FAILED)
-    assertThat(row(id).attempts).isEqualTo(1)
+    assertThat(deadLetter(id).attempts).isEqualTo(1)
+    assertThat(deadLetter(id).lastErrorCode).isEqualTo(SyncErrorCode.UNAUTHORIZED.name)
   }
 
   @Test
@@ -985,5 +989,102 @@ internal class SyncDispatcherTest {
     assertThat(outcome).isEqualTo(FlushOutcome.Skipped(FlushSkip.NETWORK_QUALITY_TOO_LOW))
     assertThat(server.requestCount).isEqualTo(0)
     assertThat(healthSkips).isEqualTo(0)
+  }
+
+  /* ------------------------------- dead letters ------------------------------- */
+
+  @Test
+  fun `dlq_terminalFailure_movesRow_andEmitsFailedThenDeadLettered`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(400))
+    val id = storage.enqueue(
+      TestData.input(url = server.url("/x").toString(), metadata = mapOf("origin" to "test")),
+    )
+    val queued = row(id)
+    val events = recordEvents()
+    val startedAt = clock.now()
+
+    val result = newDispatcher().flush()
+
+    val dead = deadLetter(id)
+    assertThat(dead.method).isEqualTo(queued.method)
+    assertThat(dead.url).isEqualTo(queued.url)
+    assertThat(dead.headers).isEqualTo(queued.headers)
+    assertThat(dead.body).isEqualTo(queued.body)
+    assertThat(dead.contentType).isEqualTo(queued.contentType)
+    assertThat(dead.priority).isEqualTo(queued.priority)
+    assertThat(dead.priorityWeight).isEqualTo(queued.priorityWeight)
+    assertThat(dead.createdAt).isEqualTo(queued.createdAt)
+    assertThat(dead.metadata).isEqualTo(queued.metadata)
+    assertThat(dead.attempts).isEqualTo(1)
+    assertThat(dead.lastAttemptAt).isEqualTo(startedAt)
+    assertThat(dead.lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
+    assertThat(dead.lastErrorMessage).startsWith("HTTP 400")
+    assertThat(dead.deadLetteredAt).isAtLeast(dead.lastAttemptAt)
+    assertThat(result.failedIds.toList()).containsExactly(id)
+
+    val itemEvents = events.filter { it.itemId == id }
+    assertThat(itemEvents.map { it.type })
+      .containsExactly(SyncEventType.ITEM_FAILED, SyncEventType.ITEM_DEAD_LETTERED).inOrder()
+    assertThat(itemEvents[0].errorCode).isEqualTo(SyncErrorCode.SERVER_ERROR)
+    assertThat(itemEvents[1].errorCode).isEqualTo(SyncErrorCode.DEAD_LETTERED)
+    assertThat(itemEvents[1].metadata).containsExactly("lastErrorCode", SyncErrorCode.SERVER_ERROR.name)
+  }
+
+  @Test
+  fun `every terminal failure moves its row, with the code it failed with`() = runTest {
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+        "/spent" -> MockResponse().setResponseCode(503)
+        "/unauthorized" -> MockResponse().setResponseCode(401)
+        else -> MockResponse().setResponseCode(422)
+      }
+    }
+    val spent = enqueue("/spent")
+    val unauthorized = enqueue("/unauthorized")
+    val rejected = enqueue("/rejected")
+
+    newDispatcher(maxAttempts = 1, credentials = { CredentialPolicy.TRUSTED }).flush()
+
+    assertThat(deadLetter(spent).lastErrorCode).isEqualTo(SyncErrorCode.MAX_ATTEMPTS_EXCEEDED.name)
+    assertThat(deadLetter(unauthorized).lastErrorCode).isEqualTo(SyncErrorCode.UNAUTHORIZED.name)
+    assertThat(deadLetter(rejected).lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
+    assertThat(storage.count()).isEqualTo(0)
+  }
+
+  @Test
+  fun `dlq_lastErrorMessage_capturedBoundedAndRedacted`() = runTest {
+    server.enqueue(
+      MockResponse()
+        .setStatus("HTTP/1.1 400 " + "x".repeat(2_000))
+        .setHeader("X-Secret", "header-secret")
+        .setBody("body-secret"),
+    )
+    val id = storage.enqueue(
+      TestData.input(
+        url = server.url("/x").toString(),
+        headers = mapOf("Authorization" to "Bearer request-secret"),
+        body = "request-body-secret",
+      ),
+    )
+
+    newDispatcher().flush()
+
+    val message = checkNotNull(deadLetter(id).lastErrorMessage)
+    assertThat(message).startsWith("HTTP 400 x")
+    assertThat(message.length).isEqualTo(SyncDeadLetterEntity.MAX_ERROR_MESSAGE_LENGTH)
+    listOf("header-secret", "body-secret", "request-secret", "request-body-secret").forEach {
+      assertThat(message).doesNotContain(it)
+    }
+  }
+
+  @Test
+  fun `a transport failure records its exception message`() = runTest {
+    server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST))
+    val id = enqueue()
+
+    newDispatcher(maxAttempts = 1).flush()
+
+    assertThat(deadLetter(id).lastErrorCode).isEqualTo(SyncErrorCode.MAX_ATTEMPTS_EXCEEDED.name)
+    assertThat(deadLetter(id).lastErrorMessage).isNotEmpty()
   }
 }
