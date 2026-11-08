@@ -3,7 +3,7 @@ PODS:
   - hermes-engine (250829098.0.10):
     - hermes-engine/Pre-built (= 250829098.0.10)
   - hermes-engine/Pre-built (250829098.0.10)
-  - NitroModules (0.35.6):
+  - NitroModules (0.35.8):
     - hermes-engine
     - RCTRequired
     - RCTTypeSafety
@@ -2227,7 +2227,7 @@ EXTERNAL SOURCES:
 SPEC CHECKSUMS:
   FBLazyVector: c00c20551d40126351a6783c47ce75f5b374851b
   hermes-engine: 0f83d9f620cdc5a4c5d76a1c7eaa50e742b346aa
-  NitroModules: c41b7b778d6557f1e517a80ec681a670321fa001
+  NitroModules: 8afa153f9de751e72aeac51d8fa647192be006e7
   RCTDeprecation: 3bb167081b134461cfeb875ff7ae1945f8635257
   RCTRequired: 74839f55d5058a133a0bc4569b0afec750957f64
   RCTSwiftUI: 87a316382f3eab4dd13d2a0d0fd2adcce917361a

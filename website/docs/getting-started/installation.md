@@ -33,15 +33,21 @@ The library is autolinked through Nitro Modules on RN 0.74+ with the New Archite
 |---|---|---|
 | `react` | >= 18.2 | Hooks API |
 | `react-native` | >= 0.74 | New Architecture required |
-| `react-native-nitro-modules` | ^0.35.6 | Bridge runtime |
+| `react-native-nitro-modules` | ^0.35.8 | Bridge runtime. 0.35.8 or later, below 0.36 |
 | `react-native-mmkv` | optional | Used by integration patterns; not a direct dependency |
 | `@react-native-community/netinfo` | optional | Use the lib's `useConnection` instead -- this is only needed if you already use it elsewhere |
 
 Install the required peer:
 
 ```bash
-yarn add react-native-nitro-modules
+yarn add "react-native-nitro-modules@^0.35.8"
+# or
+npm install "react-native-nitro-modules@^0.35.8"
 ```
+
+:::note Why 0.35.8
+In 0.35.6 and 0.35.7, Nitro's Swift `Promise` had no lock, so an iOS call could leave its JS promise pending forever. The fix, [Nitro PR #1338](https://github.com/margelo/nitro/pull/1338), was first published in 0.35.8 on npm. Nitro's GitHub has no v0.35.8 release: the fix is listed in the [v0.35.9 release notes](https://github.com/margelo/nitro/releases/tag/v0.35.9).
+:::
 
 ## iOS Setup
 

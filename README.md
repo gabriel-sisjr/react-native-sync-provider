@@ -82,14 +82,14 @@ If `react-native-background-location` is what you reach for when you need GPS th
 | React Native                 | 0.74+                          |
 | React                        | 18.2+                          |
 | New Architecture             | **required**                   |
-| `react-native-nitro-modules` | ^0.35.6                        |
+| `react-native-nitro-modules` | ^0.35.8 (below 0.36)           |
 
 ## Installation
 
 ```sh
-npm install @gabriel-sisjr/react-native-sync-provider react-native-nitro-modules
+npm install @gabriel-sisjr/react-native-sync-provider "react-native-nitro-modules@^0.35.8"
 # or
-yarn add @gabriel-sisjr/react-native-sync-provider react-native-nitro-modules
+yarn add @gabriel-sisjr/react-native-sync-provider "react-native-nitro-modules@^0.35.8"
 ```
 
 ### Android Setup

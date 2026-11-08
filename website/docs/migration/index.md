@@ -20,7 +20,7 @@ The canonical list of breaking and behavior changes lives in [`BREAKING_CHANGES.
 
 ## v0.2 → v0.3 {#v0-2-to-v0-3}
 
-No function, hook or error code was removed, and the quality gate and the health check are opt-in. Three things change for every app: permanently failed items move to a dead-letter queue, `networkQuality` is a required field, and connection events fire only on real changes. Read the whole list before you ship.
+No function, hook or error code was removed, and the quality gate and the health check are opt-in. Four things change for every app: `react-native-nitro-modules` must be 0.35.8 or later, permanently failed items move to a dead-letter queue, `networkQuality` is a required field, and connection events fire only on real changes. Read the whole list before you ship.
 
 :::danger Roll-forward only
 The upgrade migrates the stores in place, and there is no supported downgrade. Downgrading an Android install wipes the queue and the dead letters. See [Rolling back](#rolling-back-from-v03).
@@ -28,7 +28,7 @@ The upgrade migrates the stores in place, and there is no supported downgrade. D
 
 ### Step 1: Upgrade and rebuild
 
-1. Upgrade the package. The `react-native-nitro-modules` peer range is unchanged.
+1. Upgrade the package, and `react-native-nitro-modules` to 0.35.8 or later, below 0.36: `yarn add "react-native-nitro-modules@^0.35.8"`. In 0.35.6 and 0.35.7, an iOS call could leave its JS promise pending forever. The fix was first published in 0.35.8 on npm. Nitro's GitHub has no v0.35.8 release and lists the fix in its v0.35.9 notes.
 2. On iOS, run `cd ios && bundle exec pod install`, then rebuild. The pod ships a new Core Data model version.
 3. On Android, rebuild. No new permission is needed.
 
@@ -108,7 +108,7 @@ See [Dead-letter flows](../guides/error-handling.md#dead-letter-flows) for more 
 | `CONNECTION_CHANGED` | Fires only when a reported field changes, never for a duplicate, and on Android never for its starting state. iOS starts at `UNKNOWN`, so its first path report emits one. iOS used to emit it on every path update. Also fires when only `networkQuality` changed, with the same `connectionStatus`. iOS delivers it synchronously, Android asynchronously. | Read the initial state with `getConnectionStatus()`. Compare `connectionStatus` with the previous value before acting on a transition, as `useAutoSync` does. |
 | Android connectivity | Follows the default network only: losing a secondary network no longer reports `DISCONNECTED`. | Expect fewer false disconnects. |
 | Android 11 (API 30) and later | A temporarily unmetered link reads as `CONNECTED` with `isExpensive: false`, not `METERED`. | Check `type === 'CELLULAR'` too if you must tell cellular apart. |
-| iOS synchronous calls | `getSyncConfig`, `getConnectionStatus`, `isBackgroundSyncEnabled`, `addListener` and `removeListener` return settled promises, which fixes a promise that could stay pending forever with `react-native-nitro-modules` 0.35.6 and 0.35.7. | Nothing. |
+| iOS synchronous calls | `getSyncConfig`, `getConnectionStatus`, `isBackgroundSyncEnabled`, `addListener` and `removeListener` return settled promises, which fixes a promise that could stay pending forever with `react-native-nitro-modules` 0.35.6 and 0.35.7. The required 0.35.8 fixes it upstream too. | Nothing. |
 
 ### Step 6: Adopt the quality gate and the health check (optional)
 

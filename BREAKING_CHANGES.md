@@ -53,7 +53,32 @@ Use the table at the bottom of each entry to enumerate every renamed, removed, o
 >
 > **Changelog:** see the [`[Unreleased]` entries in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
 
-No function, hook or error code was removed, and the quality gate and the health check are opt-in. The blast radius is one compile-time change for hand-built connection values, one persisted-data migration that moves permanently failed items to a new dead-letter queue, and two connectivity behavior changes. The upgrade is roll-forward only.
+No function, hook or error code was removed, and the quality gate and the health check are opt-in. The blast radius is a raised `react-native-nitro-modules` floor, one compile-time change for hand-built connection values, one persisted-data migration that moves permanently failed items to a new dead-letter queue, and two connectivity behavior changes. The upgrade is roll-forward only.
+
+### `react-native-nitro-modules` 0.35.8 or later
+
+> **Category:** dependency-requirement change (**not** a JS/TS API break). Pre-1.0.
+>
+> **Changelog:** see the [`[Unreleased]` Changed entry in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+
+The `react-native-nitro-modules` peer range is raised from `^0.35.6` to `^0.35.8`: 0.35.8 or later, and still below 0.36, as before. Apps on 0.35.6 or 0.35.7 must upgrade, and package managers that check peer ranges warn about or reject those versions. Apps already on 0.35.8 or a later 0.35.x release have nothing to do.
+
+**Rationale:** in 0.35.6 and 0.35.7, Nitro's Swift `Promise` had no lock, so a promise could settle before the generated bridge attached its listeners, and the JS promise never settled. The fix, [Nitro PR #1338](https://github.com/margelo/nitro/pull/1338) ("Fix `Promise<void> was destroyed!` race condition by synchronizing Swift `Promise` operations"), was first published in 0.35.8 on npm. Nitro's GitHub has no v0.35.8 release: the fix is listed in the [v0.35.9 release notes](https://github.com/margelo/nitro/releases/tag/v0.35.9), which compare v0.35.7 with v0.35.9, so 0.35.8 is the right floor. The library's own iOS change, which returns already-settled promises from its synchronous calls, stays and protects apps either way.
+
+#### Migration steps
+
+1. Upgrade the peer: `yarn add "react-native-nitro-modules@^0.35.8"`, or `npm install "react-native-nitro-modules@^0.35.8"`.
+2. On iOS, run `cd ios && bundle exec pod install`, then rebuild.
+3. On Android, rebuild.
+
+No JS/TS code changes are required.
+
+#### Affected symbols
+
+| Symbol / surface                        | Change                                     |
+| --------------------------------------- | ------------------------------------------ |
+| `react-native-nitro-modules` peer range | `^0.35.6` --> `^0.35.8`, still below 0.36  |
+| Public TypeScript API                   | none (no JS break)                         |
 
 ### Required `networkQuality` on `ConnectionState` and `UseConnectionResult`, and new enum members
 
