@@ -41,6 +41,36 @@ const renderForegroundHook = () =>
     })
   );
 
+/** Lets every pending promise chain run, without moving the fake clock. */
+const settle = async () => {
+  await act(async () => {
+    for (let i = 0; i < 10; i += 1) {
+      await Promise.resolve();
+    }
+  });
+};
+
+const emitStatus = async (status: ConnectionStatus) => {
+  await act(async () => {
+    getMock().__emit({
+      type: SyncEventType.CONNECTION_CHANGED,
+      timestamp: 1,
+      connectionStatus: status,
+    });
+  });
+  await settle();
+};
+
+const renderReconnectHook = (flushOnMetered = false) =>
+  renderHook(() =>
+    useAutoSync({
+      enabled: true,
+      intervalMs: 60_000,
+      flushOnReconnect: true,
+      flushOnMetered,
+    })
+  );
+
 const returnToForeground = async () => {
   await act(async () => {
     (
@@ -212,6 +242,10 @@ describe('useAutoSync', () => {
   it('flushes on CONNECTED transition when flushOnReconnect=true', async () => {
     const mock = getMock();
     mock.isSyncing.mockResolvedValue(false);
+    // The status at mount is the starting point: a transition needs a change.
+    mock.getConnectionStatus.mockResolvedValue(
+      connection(ConnectionStatus.DISCONNECTED, ConnectionType.NONE)
+    );
 
     renderHook(() =>
       useAutoSync({
@@ -356,5 +390,163 @@ describe('useAutoSync', () => {
     await returnToForeground();
 
     expect(mock.flush).not.toHaveBeenCalled();
+  });
+
+  describe('reconnect trigger', () => {
+    beforeEach(() => {
+      getMock().isSyncing.mockResolvedValue(false);
+    });
+
+    it('does not flush on a quality-only change right after mount', async () => {
+      const mock = getMock();
+      // Already CONNECTED at mount: native reports no event for that state.
+      renderReconnectHook();
+      await settle();
+
+      // The first measurement changed only `networkQuality`.
+      await emitStatus(ConnectionStatus.CONNECTED);
+
+      expect(mock.getConnectionStatus).toHaveBeenCalledTimes(1);
+      expect(mock.flush).not.toHaveBeenCalled();
+    });
+
+    it('flushes once on a real offline-to-online transition, not on the quality-only changes after it', async () => {
+      const mock = getMock();
+      mock.getConnectionStatus.mockResolvedValue(
+        connection(ConnectionStatus.DISCONNECTED, ConnectionType.NONE)
+      );
+      renderReconnectHook();
+      await settle();
+
+      await emitStatus(ConnectionStatus.CONNECTED);
+      expect(mock.flush).toHaveBeenCalledTimes(1);
+
+      await emitStatus(ConnectionStatus.CONNECTED);
+      await emitStatus(ConnectionStatus.CONNECTED);
+      expect(mock.flush).toHaveBeenCalledTimes(1);
+
+      await emitStatus(ConnectionStatus.DISCONNECTED);
+      await emitStatus(ConnectionStatus.CONNECTED);
+      expect(mock.flush).toHaveBeenCalledTimes(2);
+    });
+
+    it('still flushes on a change from METERED to CONNECTED', async () => {
+      const mock = getMock();
+      mock.getConnectionStatus.mockResolvedValue(
+        connection(ConnectionStatus.METERED, ConnectionType.CELLULAR)
+      );
+      renderReconnectHook();
+      await settle();
+
+      await emitStatus(ConnectionStatus.CONNECTED);
+
+      expect(mock.flush).toHaveBeenCalledTimes(1);
+    });
+
+    it('with flushOnMetered, flushes on a change to METERED but not on a METERED quality-only change', async () => {
+      const mock = getMock();
+      mock.getConnectionStatus.mockResolvedValue(
+        connection(ConnectionStatus.METERED, ConnectionType.CELLULAR)
+      );
+      renderReconnectHook(true);
+      await settle();
+
+      await emitStatus(ConnectionStatus.METERED);
+      expect(mock.flush).not.toHaveBeenCalled();
+
+      await emitStatus(ConnectionStatus.DISCONNECTED);
+      await emitStatus(ConnectionStatus.METERED);
+      expect(mock.flush).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      [ConnectionStatus.DISCONNECTED, 1],
+      [ConnectionStatus.CONNECTED, 0],
+    ])(
+      'judges an event that arrives before the starting status (%s) is read against it',
+      async (startingStatus, flushes) => {
+        const mock = getMock();
+        let resolveStart: (value: unknown) => void = () => undefined;
+        mock.getConnectionStatus.mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              resolveStart = resolve;
+            })
+        );
+        renderReconnectHook();
+        await settle();
+
+        // The listener is registered; the starting status is still unread.
+        await emitStatus(ConnectionStatus.CONNECTED);
+        expect(mock.flush).not.toHaveBeenCalled();
+
+        await act(async () => {
+          resolveStart(connection(startingStatus));
+        });
+        await settle();
+
+        expect(mock.flush).toHaveBeenCalledTimes(flushes);
+      }
+    );
+
+    it('only records the first event when the starting status cannot be read', async () => {
+      const mock = getMock();
+      mock.getConnectionStatus.mockRejectedValueOnce(
+        new Error('native rejected')
+      );
+      renderReconnectHook();
+      await settle();
+
+      await emitStatus(ConnectionStatus.CONNECTED);
+      expect(mock.flush).not.toHaveBeenCalled();
+
+      await emitStatus(ConnectionStatus.DISCONNECTED);
+      await emitStatus(ConnectionStatus.CONNECTED);
+      expect(mock.flush).toHaveBeenCalledTimes(1);
+    });
+
+    it('reads the starting status again when it is enabled again', async () => {
+      const mock = getMock();
+      mock.getConnectionStatus.mockResolvedValue(
+        connection(ConnectionStatus.DISCONNECTED, ConnectionType.NONE)
+      );
+      const { rerender } = renderHook(
+        ({ enabled }: { enabled: boolean }) =>
+          useAutoSync({ enabled, intervalMs: 60_000, flushOnReconnect: true }),
+        { initialProps: { enabled: true } }
+      );
+      await settle();
+
+      rerender({ enabled: false });
+      await settle();
+      // The device came online while the hook was off.
+      mock.getConnectionStatus.mockResolvedValue(
+        connection(ConnectionStatus.CONNECTED)
+      );
+      rerender({ enabled: true });
+      await settle();
+
+      await emitStatus(ConnectionStatus.CONNECTED);
+
+      expect(mock.getConnectionStatus).toHaveBeenCalledTimes(2);
+      expect(mock.flush).not.toHaveBeenCalled();
+    });
+
+    it('reads no starting status when flushOnReconnect is false', async () => {
+      const mock = getMock();
+      renderHook(() =>
+        useAutoSync({
+          enabled: true,
+          intervalMs: 60_000,
+          flushOnReconnect: false,
+        })
+      );
+      await settle();
+
+      await emitStatus(ConnectionStatus.CONNECTED);
+
+      expect(mock.getConnectionStatus).not.toHaveBeenCalled();
+      expect(mock.flush).not.toHaveBeenCalled();
+    });
   });
 });
