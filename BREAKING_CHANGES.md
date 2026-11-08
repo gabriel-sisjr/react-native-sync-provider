@@ -45,6 +45,164 @@ One-paragraph overview: what changed, why, and the blast radius (compile-time on
 
 Use the table at the bottom of each entry to enumerate every renamed, removed, or reshaped public symbol so consumers can grep for what they import.
 
+## [Unreleased] - Required network quality, a dead-letter queue for failed items, connection events on real changes only
+
+> **Upgrade path:** v0.2.z --> v0.3.0
+>
+> **Full migration guide:** [`docs/migration#v0-2-to-v0-3`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/migration#v0-2-to-v0-3)
+>
+> **Changelog:** see the [`[Unreleased]` entries in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+
+No function, hook or error code was removed, and the quality gate and the health check are opt-in. The blast radius is one compile-time change for hand-built connection values, one persisted-data migration that moves permanently failed items to a new dead-letter queue, and two connectivity behavior changes. The upgrade is roll-forward only.
+
+### Required `networkQuality` on `ConnectionState` and `UseConnectionResult`, and new enum members
+
+> **Category:** compile-time change. Pre-1.0.
+>
+> **Changelog:** see the [`[Unreleased]` Changed entry in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+
+`ConnectionState.networkQuality` and `UseConnectionResult.networkQuality` are required. Runtime code that only reads these types is unaffected. Hand-built values, usually test fixtures and mocks of `getConnectionStatus`, stop compiling.
+
+`SyncEventType` gains `ITEM_DEAD_LETTERED`, and `SyncErrorCode` gains `NETWORK_QUALITY_TOO_LOW`, `HEALTH_CHECK_FAILED` and `DEAD_LETTERED`. An exhaustive `switch` that ends in a `never` check stops compiling until it handles them.
+
+#### Before
+
+```ts
+const connection: ConnectionState = { status: 'CONNECTED', type: 'WIFI' };
+```
+
+#### After
+
+```ts
+const connection: ConnectionState = {
+  status: 'CONNECTED',
+  type: 'WIFI',
+  networkQuality: 'GOOD', // 'OFFLINE' for DISCONNECTED or UNKNOWN
+};
+```
+
+#### Migration steps
+
+1. Add `networkQuality` to hand-built `ConnectionState` and `UseConnectionResult` values. Keep the invariant the library keeps: `OFFLINE` exactly when `status` is `DISCONNECTED` or `UNKNOWN`. For an online link with no `healthCheckUrl`, `GOOD` (unmetered) or `MODERATE` (metered) matches what the engine usually reports; the caps can lower it, to `POOR` for an Android network that is not validated and to `MODERATE` in iOS Low Data Mode.
+2. Add the new cases to exhaustive `switch` statements over `SyncEventType` and `SyncErrorCode`.
+
+#### Affected symbols
+
+| Symbol                                 | Change                                       |
+| -------------------------------------- | -------------------------------------------- |
+| `ConnectionState.networkQuality`       | New, required.                               |
+| `UseConnectionResult.networkQuality`   | New, required. Also on `connection` of `useOfflineQueue` and `useSyncSnapshot`. |
+| `SyncEventType.ITEM_DEAD_LETTERED`     | New member.                                  |
+| `SyncErrorCode.NETWORK_QUALITY_TOO_LOW`, `HEALTH_CHECK_FAILED`, `DEAD_LETTERED` | New members. |
+
+### Permanently failed items move to a dead-letter queue
+
+> **Category:** observable behavior change and persisted-data migration (**not** a JS/TS API removal). Pre-1.0.
+>
+> **Changelog:** see the [`[Unreleased]` Added and Changed entries in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+
+An item that fails permanently used to stay in the queue store as a `FAILED` row that JS could not list. It now moves, in one transaction, to a separate dead-letter store, and `ITEM_FAILED` is followed by `ITEM_DEAD_LETTERED`. That covers attempts exhausted, responses that are not retried, and a 401 or 403 under a configuration set in the current process. JS can list, replay and discard dead letters. They count toward no capacity cap, and nothing prunes them.
+
+Three consequences to check:
+
+- **Storage migration.** Existing `FAILED` rows move to the dead-letter store when the upgraded library first opens it: Room v2→v3 on Android, v1→v2→v3 included, and Core Data model v3 on iOS, with explicit mappings from v1 and v2. Pending rows are untouched. A migrated row has no `lastErrorMessage` and takes its last attempt time, or else its enqueue time, as `deadLetteredAt`, and one with no usable error code reports `MAX_ATTEMPTS_EXCEEDED`. On iOS the migration runs before the store loads, BGTask launches included. If it fails, the original store is untouched, that launch runs without a store, with every call rejecting `NATIVE_MODULE_UNAVAILABLE`, and the next launch retries. An iOS store written by the 0.1.0-beta prerelease is not a recognized source and fails to load the same way.
+- **Android `QUEUE_FULL` accounting.** Android counted `FAILED` rows toward `maxQueueSize`. Dead letters count toward no cap, so a queue that used to be full of failed rows accepts items again. The Android cap now counts pending and in-flight items, and the iOS cap `PENDING` items, as before.
+- **`removeItem` and `clearQueue`.** `removeItem(id)` falls through to the dead letter with that id, and `clearQueue()` deletes every dead letter too, with one `QUEUE_CLEARED`. Code that removed failed items by id keeps working.
+
+:::danger Roll-forward only
+Once shipped, the v3 schema has no supported downgrade. Downgrading an Android install to a v0.2 build triggers `fallbackToDestructiveMigrationOnDowngrade()` and wipes the store, queue and dead letters included. A v0.2 iOS build cannot open a v3 store: the load fails as incompatible, every call rejects with `NATIVE_MODULE_UNAVAILABLE`, and the store file is kept. That iOS outcome follows from the code and has not been exercised in a test.
+:::
+
+#### Before
+
+```ts
+// v0.2: a permanently failed item stayed in the store, unlisted.
+// Apps removed it by id to keep Android under the cap.
+useSyncEvents({
+  types: ['ITEM_FAILED'],
+  onEvent: (e) => {
+    if (e.itemId) void removeItem(e.itemId);
+  },
+});
+```
+
+#### After
+
+```ts
+// v0.3: it is a dead letter. Inspect it, then replay or discard it.
+for (const item of await listDeadLetter()) {
+  if (item.lastErrorCode === SyncErrorCode.UNAUTHORIZED) {
+    await replayDeadLetter(item.id); // back to the queue, attempts 0
+  } else {
+    await discardDeadLetter(item.id);
+  }
+}
+```
+
+#### Migration steps
+
+1. Upgrade. The migration runs automatically on first launch, and pending items are not touched.
+2. Decide what to do with dead letters: list them with `listDeadLetter()` or `useSyncSnapshot().deadLetter`, replay with `replayDeadLetter(id)` once the cause is fixed, discard with `discardDeadLetter(id)`. A replay does not flush by itself, and it respects `maxQueueSize`.
+3. If you removed failed items on `ITEM_FAILED` only to stay under the Android cap, that is no longer needed. Keep discarding what you will not replay, because the dead-letter queue is unbounded.
+4. Keep `clearQueue()` in your logout path: dead letters keep their request headers and body, and it purges them. It does not need to wait for a running cycle: an item whose request has not started is not sent, and a request already in flight is not cancelled, but its item is never written back, as a queue row or as a dead letter.
+5. If you must roll back, drain the queue first and handle the dead letters, which the older build cannot read. See the [migration guide](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/migration#v0-2-to-v0-3).
+
+#### Affected symbols
+
+| Symbol / surface                                   | Change                                                                 |
+| -------------------------------------------------- | ---------------------------------------------------------------------- |
+| Permanent failure outcome                          | Moves to the dead-letter queue instead of staying as a `FAILED` row.  |
+| `listDeadLetter`, `replayDeadLetter`, `discardDeadLetter` | New functions.                                                  |
+| `ITEM_DEAD_LETTERED` event                         | New. Follows `ITEM_FAILED`, except for an item removed or cleared while its request was in flight. |
+| `removeItem(id)`                                   | Also removes the dead letter with that id.                             |
+| `clearQueue()`                                     | Also deletes every dead letter.                                        |
+| `maxQueueSize` on Android                          | No longer counts failed items.                                         |
+| Android Room schema                                | `v2` → `v3`, a new dead-letter table. Downgrade = destructive wipe.    |
+| iOS Core Data model                                | New `v3` model version, with explicit mappings from `v1` and `v2`.     |
+
+### `CONNECTION_CHANGED` fires only when a reported field changes
+
+> **Category:** observable behavior change, on iOS (**not** a JS/TS API break). Pre-1.0.
+>
+> **Changelog:** see the [`[Unreleased]` Changed entry in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+
+iOS emitted `CONNECTION_CHANGED` on every path update, including the first one and repeats of the same state. Both platforms now emit it only when `status`, `type`, `isInternetReachable`, `isExpensive` or `networkQuality` changes, never for a duplicate. Android already behaved this way, and never emits it for the state it starts in. iOS starts at `UNKNOWN`, so its first path report, which replaces that, still emits one. The event is also emitted when only `networkQuality` changed, with an unchanged `connectionStatus`. iOS delivers it synchronously, Android asynchronously.
+
+#### Migration steps
+
+1. Do not wait for a `CONNECTION_CHANGED` to learn the initial state: call `getConnectionStatus()` on mount, as `useConnection` does.
+2. If you act on the event, for example to flush on reconnect, compare `connectionStatus` with the previous value, starting from `getConnectionStatus()`: a quality-only change repeats the same status. `useAutoSync` does this: it reads the starting status when it is enabled and flushes only when the status really changes to `CONNECTED`, or to `METERED` with `flushOnMetered`, so a quality-only event never flushes.
+
+#### Affected symbols
+
+| Symbol / surface                 | Change                                                              |
+| -------------------------------- | ------------------------------------------------------------------- |
+| `CONNECTION_CHANGED` (iOS)       | No duplicate emissions. The first path report, replacing `UNKNOWN`, still emits one. |
+| `CONNECTION_CHANGED` (both)      | Also emitted on a `networkQuality`-only change.                     |
+
+### Android: connectivity follows the default network, and temporarily unmetered links are unmetered
+
+> **Category:** observable behavior change, on Android (**not** a JS/TS API break). Pre-1.0.
+>
+> **Changelog:** see the [`[Unreleased]` Changed entries in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+
+Android now tracks only the default network, the one the app's traffic uses. Losing a secondary network, such as cellular alongside Wi-Fi or a VPN that does not apply to the app, no longer reports `DISCONNECTED`, and a VPN that was the default network hands over without a false disconnect.
+
+On Android 11 (API 30) and later, a temporarily unmetered link, as some 5G plans provide, reads as `CONNECTED` with `isExpensive: false`. It used to read as `METERED` with `isExpensive: true`. When the OS withdraws the exemption, it reads as `METERED` again.
+
+#### Migration steps
+
+1. If you treated a brief `DISCONNECTED` while Wi-Fi stayed up as a real outage, expect fewer of them.
+2. If you avoid large uploads on metered links, a temporarily unmetered 5G link now counts as unmetered. Check `type === 'CELLULAR'` as well if you need to tell them apart.
+
+#### Affected symbols
+
+| Symbol / surface                         | Change                                                                 |
+| ---------------------------------------- | ---------------------------------------------------------------------- |
+| `ConnectionStatus` on Android            | Follows the default network only. API 30+: temporarily unmetered is `CONNECTED`. |
+| `ConnectionState.isExpensive` on Android | `false` on a temporarily unmetered link, API 30+.                      |
+| `NetworkQuality` on Android              | Follows the same link: an unmetered link with no measurement is `GOOD`. |
+
 ## [v0.2.0] - 2026-11-03 - No app-side BGTaskScheduler registration, iOS 15.0 minimum, persisted retries and configuration
 
 > **Upgrade path:** v0.1.z --> v0.2.0
