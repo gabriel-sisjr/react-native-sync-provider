@@ -163,6 +163,23 @@ internal class ConnectivityMonitorTest {
   }
 
   @Test
+  @Config(shadows = [EagerConnectivityManager::class])
+  fun `a first onAvailable that arrives during registration reports no change`() {
+    val wifi = checkNotNull(manager().activeNetwork)
+    shadowOf(manager()).setNetworkCapabilities(
+      wifi,
+      capabilities(NetworkCapabilities.TRANSPORT_WIFI, *INTERNET, NOT_METERED),
+    )
+    val events = recordConnectionEvents()
+
+    monitor.start()
+
+    // The initial value is the seed, never a change.
+    assertThat(monitor.state.value.status).isEqualTo(ConnectionStatus.CONNECTED)
+    assertThat(events).isEmpty()
+  }
+
+  @Test
   fun `losing a network that is not the default one keeps the device online`() {
     monitor.start()
     val wifi = network(WIFI_ID, NetworkCapabilities.TRANSPORT_WIFI, *INTERNET, NOT_METERED)
@@ -407,6 +424,21 @@ internal class ConnectivityMonitorTest {
     ) {
       requestCallbacks++
       super.registerNetworkCallback(request, networkCallback)
+    }
+  }
+
+  /**
+   * The stock shadow, delivering the first `onAvailable` before registration returns, as the
+   * system's callback thread can when it runs first.
+   */
+  @Implements(ConnectivityManager::class)
+  class EagerConnectivityManager : ShadowConnectivityManager() {
+    @Implementation
+    override fun registerDefaultNetworkCallback(
+      networkCallback: ConnectivityManager.NetworkCallback,
+    ) {
+      super.registerDefaultNetworkCallback(networkCallback)
+      activeNetwork?.let(networkCallback::onAvailable)
     }
   }
 

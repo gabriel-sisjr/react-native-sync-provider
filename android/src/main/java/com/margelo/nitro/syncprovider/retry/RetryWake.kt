@@ -32,8 +32,9 @@ import java.util.concurrent.atomic.AtomicLong
  * @param isQualityGateOpen whether the current network quality passes `minNetworkQuality`.
  * @param scheduleGatedKick arms the kick for the check after [armAfterGate], carrying the
  *   number of consecutive kicks the gate turned back.
- * @param healthBackoffUntil the end of a running health-check backoff, or `0`: like the
- *   credential hold, no wake on any path fires before it.
+ * @param healthBackoffUntil when wakes may run again after a failed health check, or `0`: the
+ *   end of its backoff, and at least a second after the failure, so a backoff of `0` cannot
+ *   re-arm a wake at once. Like the credential hold, no wake on any path fires before it.
  */
 @Suppress("LongParameterList")
 internal class RetryWake(

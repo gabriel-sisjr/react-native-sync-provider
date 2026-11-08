@@ -141,7 +141,7 @@ internal class SyncProviderRuntime private constructor(
     scheduleGatedKick = { delayMs, gateStreak ->
       backgroundSyncManager.scheduleOneTimeFlush(initialDelayMs = delayMs, gateStreak = gateStreak)
     },
-    healthBackoffUntil = { healthCheck.backoffUntil() },
+    healthBackoffUntil = { healthCheck.wakeNotBefore() },
   )
 
   init {
@@ -324,18 +324,9 @@ internal class SyncProviderRuntime private constructor(
     if (dispatcher.flushWithOutcome().isHeldByQualityGate) retryTimer.holdForQuality()
   }
 
-  /**
-   * The checks a timer wake runs before dispatching, silently and in the dispatcher's order:
-   * the quality gate, whose reading also starts a new measurement when the last one is 30 s
-   * old, then a running health-check backoff.
-   */
-  private fun wakeHold(): WakeHold? {
-    val minimum = currentOptions().minNetworkQuality
-    if (!connectivityMonitor.qualityForGate().meetsMinimum(minimum)) return WakeHold.Quality
-    val backoffUntil = healthCheck.backoffUntil()
-    if (backoffUntil > 0L) return WakeHold.Health(backoffUntil - System.currentTimeMillis())
-    return null
-  }
+  /** See [timerWakeHold]. */
+  private fun wakeHold(): WakeHold? =
+    timerWakeHold(currentOptions().minNetworkQuality, connectivityMonitor, healthCheck)
 
   private fun isQualityGateOpen(): Boolean {
     val minimum = currentOptions().minNetworkQuality
@@ -412,4 +403,21 @@ internal class SyncProviderRuntime private constructor(
       healthCheckBackoffMs = null,
     )
   }
+}
+
+/**
+ * The checks a timer wake runs before dispatching, silently and in the dispatcher's order:
+ * the quality gate, read only when [minimum] sets one, since the reading can start a new
+ * measurement when the last one is 30 s old; then the health check's hold on automatic
+ * wakes, which lasts at least [HealthCheck.MIN_WAKE_BACKOFF_MS] after a failure.
+ */
+internal fun timerWakeHold(
+  minimum: NetworkQuality?,
+  connectivity: ConnectivityMonitor,
+  healthCheck: HealthCheck,
+  now: Long = System.currentTimeMillis(),
+): WakeHold? {
+  if (!connectivity.passesGate(minimum)) return WakeHold.Quality
+  val notBefore = healthCheck.wakeNotBefore()
+  return if (notBefore > 0L) WakeHold.Health(notBefore - now) else null
 }

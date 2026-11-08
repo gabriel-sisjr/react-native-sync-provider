@@ -914,6 +914,21 @@ internal class SyncDispatcherTest {
   }
 
   @Test
+  fun `health_zeroBackoff_explicitFlushesStillProbe, while wakes wait a second`() = runTest {
+    healthServer { MockResponse().setResponseCode(503) }
+    val id = enqueue()
+    val dispatcher = newDispatcher(healthCheckUrl = healthUrl, healthCheckBackoffMs = 0.0)
+
+    repeat(3) { dispatcher.flush() }
+
+    // Each flush() sends its own HEAD: the floor holds back only automatic wakes.
+    assertThat(recorded().map { it.method }).containsExactly("HEAD", "HEAD", "HEAD")
+    assertThat(healthSkips).isEqualTo(3)
+    assertThat(healthCheck.wakeNotBefore()).isEqualTo(clock.now() + HealthCheck.MIN_WAKE_BACKOFF_MS)
+    assertThat(row(id).attempts).isEqualTo(0)
+  }
+
+  @Test
   fun `health_success_and_configure_clearBackoff, the success half`() = runTest {
     var healthy = false
     healthServer { MockResponse().setResponseCode(if (healthy) 200 else 503) }
@@ -921,14 +936,14 @@ internal class SyncDispatcherTest {
     val dispatcher = newDispatcher(healthCheckUrl = healthUrl, healthCheckBackoffMs = 30_000.0)
 
     dispatcher.flush()
-    assertThat(healthCheck.backoffUntil()).isEqualTo(clock.now() + 30_000L)
+    assertThat(healthCheck.wakeNotBefore()).isEqualTo(clock.now() + 30_000L)
 
     healthy = true
     clock.advance(30_000L)
     val outcome = dispatcher.flushWithOutcome()
 
     assertThat(outcome).isInstanceOf(FlushOutcome.Ran::class.java)
-    assertThat(healthCheck.backoffUntil()).isEqualTo(0L)
+    assertThat(healthCheck.wakeNotBefore()).isEqualTo(0L)
   }
 
   @Test

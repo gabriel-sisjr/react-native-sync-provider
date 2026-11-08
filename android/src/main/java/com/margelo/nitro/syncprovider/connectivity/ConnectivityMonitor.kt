@@ -37,9 +37,9 @@ import kotlinx.coroutines.launch
  * [NetworkQualityClassifier]). With `healthCheckUrl` set, a latency measurement
  * ([LatencyProbe]) feeds it:
  * - one is requested when the default network or its capabilities change, when the URL
- *   changes, when the monitor starts, and when the flush gate reads one older than
- *   [QUALITY_CACHE_TTL_MS] ([qualityForGate]). Requests are debounced by [probeDebounceMs],
- *   and one probe runs at a time;
+ *   changes, when the monitor starts, and when the flush gate, with a minimum configured,
+ *   reads one older than [QUALITY_CACHE_TTL_MS] ([passesGate]). Requests are debounced by
+ *   [probeDebounceMs], and one probe runs at a time;
  * - a result is reused for [QUALITY_CACHE_TTL_MS]: a request inside that window sends
  *   nothing. An older result keeps classifying until a new one replaces it;
  * - a result belongs to the network it measured, that network's validation state and the
@@ -137,12 +137,15 @@ internal class ConnectivityMonitor(
     }
 
     try {
+      // Seed silently before registering: the first onAvailable can run before registration
+      // returns, and must find the initial value already there rather than report it.
+      synchronized(stateLock) { set(extractCurrentSnapshot(), emit = false) }
       cm.registerDefaultNetworkCallback(cb)
       callback = cb
-      // Seed the StateFlow with the current snapshot.
-      synchronized(stateLock) { set(currentState(), emit = false) }
       requestMeasurement()
     } catch (t: Throwable) {
+      // With no callback nothing would refresh the seed: read the system on every call again.
+      synchronized(stateLock) { _state.value = unknownState() }
       Log.e(TAG, "registerDefaultNetworkCallback failed", t)
     }
   }
@@ -173,6 +176,15 @@ internal class ConnectivityMonitor(
     requestMeasurement()
     return quality
   }
+
+  /**
+   * Whether the flush gate lets a cycle through under [minimum]. Unset and `OFFLINE` gate
+   * nothing: nothing is read and no measurement starts, so a wake with no gate costs no probe.
+   * Otherwise [qualityForGate] decides, starting a new measurement when the one behind it is
+   * missing or older than [QUALITY_CACHE_TTL_MS].
+   */
+  fun passesGate(minimum: NetworkQuality?): Boolean =
+    minimum == null || minimum == NetworkQuality.OFFLINE || qualityForGate().meetsMinimum(minimum)
 
   /**
    * After `configureSync`. A new `healthCheckUrl` outdates the result for the old one; an

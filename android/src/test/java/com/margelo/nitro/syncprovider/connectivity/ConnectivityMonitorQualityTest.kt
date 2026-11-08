@@ -11,10 +11,12 @@ import com.margelo.nitro.syncprovider.NetworkQuality
 import com.margelo.nitro.syncprovider.SyncEvent
 import com.margelo.nitro.syncprovider.SyncEventType
 import com.margelo.nitro.syncprovider.events.SyncEventEmitter
+import com.margelo.nitro.syncprovider.http.HeadProbe
 import com.margelo.nitro.syncprovider.http.HeadResult
+import com.margelo.nitro.syncprovider.http.HealthCheck
 import com.margelo.nitro.syncprovider.retry.GateRecheck
 import com.margelo.nitro.syncprovider.retry.RetryTimer
-import com.margelo.nitro.syncprovider.retry.WakeHold
+import com.margelo.nitro.syncprovider.timerWakeHold
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.launch
@@ -466,9 +468,7 @@ internal class ConnectivityMonitorQualityTest {
         scope = backgroundScope,
         isOffline = { false },
         flush = { dispatched++ },
-        holdReason = {
-          if (monitor.qualityForGate().meetsMinimum(NetworkQuality.EXCELLENT)) null else WakeHold.Quality
-        },
+        holdReason = { timerWakeHold(NetworkQuality.EXCELLENT, monitor, idleHealthCheck) },
       )
       backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
         monitor.state.collect {
@@ -491,6 +491,41 @@ internal class ConnectivityMonitorQualityTest {
       assertThat(probed).hasSize(2)
       assertThat(dispatched).isEqualTo(1)
     }
+
+  /** Never asked to check: it holds no wake, so only the gate decides. */
+  private val idleHealthCheck = HealthCheck(HeadProbe(lazyOf(HeadProbe.newClient())))
+
+  @Test
+  fun `gate_unset_wakeCheckStartsNoMeasurement, however old the result`() = runTest {
+    val monitor = monitor()
+    callback().onAvailable(wifi())
+    settle()
+    advanceTimeBy(ConnectivityMonitor.QUALITY_CACHE_TTL_MS)
+
+    // A timer wake with no gate, unset or OFFLINE, reads nothing.
+    assertThat(timerWakeHold(null, monitor, idleHealthCheck)).isNull()
+    assertThat(timerWakeHold(NetworkQuality.OFFLINE, monitor, idleHealthCheck)).isNull()
+    settle()
+
+    assertThat(probed).hasSize(1)
+  }
+
+  @Test
+  fun `gate_set_wakeCheckMeasuresAgain once the result is older than 30 s`() = runTest {
+    val monitor = monitor()
+    callback().onAvailable(wifi())
+    settle()
+
+    assertThat(timerWakeHold(NetworkQuality.POOR, monitor, idleHealthCheck)).isNull()
+    settle()
+    assertThat(probed).hasSize(1)
+
+    advanceTimeBy(ConnectivityMonitor.QUALITY_CACHE_TTL_MS)
+    assertThat(timerWakeHold(NetworkQuality.POOR, monitor, idleHealthCheck)).isNull()
+    settle()
+
+    assertThat(probed).hasSize(2)
+  }
 
   @Test
   fun `without an engine, the gate's reading starts the first measurement`() = runTest {

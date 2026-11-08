@@ -34,6 +34,7 @@ import io.mockk.every
 import io.mockk.mockkConstructor
 import io.mockk.unmockkConstructor
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
@@ -1396,6 +1397,35 @@ internal class SyncProviderRuntimeTest {
 
     assertThat(heads.get()).isEqualTo(2)
     assertThat(row("due")).isNull()
+  }
+
+  @Test
+  fun `health_zeroBackoff_automaticWakesStayAtLeastOneSecondApart`() = runBlocking<Unit> {
+    server.dispatcher = healthDispatcher { false }
+    goOnline()
+    runtime.configure(TestData.syncOptions(healthCheckUrl = healthUrl(), healthCheckBackoffMs = 0.0))
+    // A cooldown that has elapsed: every arm finds the row due at once.
+    insert("due", attempts = 1, nextRetryAt = 1L)
+    val failedChecks = java.util.concurrent.atomic.AtomicInteger(0)
+    // Inline on the emitting thread, so a burst cannot outrun the event buffer.
+    val counting = CoroutineScope(Dispatchers.Unconfined)
+    counting.launch(start = CoroutineStart.UNDISPATCHED) {
+      runtime.emitter.events.collect {
+        if (it.type == SyncEventType.SYNC_FAILED && it.errorCode == SyncErrorCode.HEALTH_CHECK_FAILED) {
+          failedChecks.incrementAndGet()
+        }
+      }
+    }
+    try {
+      attachEngineAndRecover()
+      delay(1_500L)
+    } finally {
+      counting.cancel()
+    }
+
+    // The first wake checks once; the next automatic check waits a second, whatever the backoff.
+    assertThat(failedChecks.get()).isIn(Range.closed(1, 2))
+    assertThat(row("due")!!.attempts).isEqualTo(1)
   }
 
   @Test

@@ -21,7 +21,8 @@ import java.util.concurrent.atomic.AtomicReference
  * - the network-quality gate: [onDispatchPossible] delivers the wake once the quality
  *   reaches the minimum. Until then it is checked again after a [GateRecheck] step, 30 s
  *   and doubling for each consecutive check the gate turns back too, up to 15 min;
- * - a health-check backoff: checked again when it ends.
+ * - a health-check backoff, which holds a wake for at least a second after the failure:
+ *   checked again when it ends.
  *
  * @param isOffline live connectivity check, evaluated when the timer fires.
  * @param flush the normal, mutex-guarded flush. Failures are logged, never thrown:
