@@ -73,9 +73,10 @@ export interface DrainResult {
    * Best-effort count of items that left the pending queue during the drain,
    * summed from decreases in queue size.
    *
-   * It is not a success count. It includes items that failed permanently and
-   * items removed by `removeItem` / `clearQueue`, and it under-counts when items
-   * are enqueued during the drain. Use `getSyncHistory` for per-cycle results.
+   * It is not a success count. It includes items that failed permanently, which
+   * are now in the dead-letter queue, and items removed by `removeItem` /
+   * `clearQueue`, and it under-counts when items are enqueued during the drain.
+   * Use `getSyncHistory` for per-cycle results.
    */
   itemsDispatched: number;
   /**

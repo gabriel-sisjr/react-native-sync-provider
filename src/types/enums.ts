@@ -23,12 +23,22 @@
 export const ConnectionStatus = {
   /** Device has an active internet path (Wi-Fi, cellular, ethernet, etc.). */
   CONNECTED: 'CONNECTED',
-  /** Device is offline — no usable network path is available. */
+  /**
+   * Device is offline — no usable network path is available.
+   *
+   * On Android only the default network counts: losing a secondary network,
+   * such as cellular alongside Wi-Fi or a VPN that does not apply to the app,
+   * does not report it.
+   */
   DISCONNECTED: 'DISCONNECTED',
   /**
    * Device is online but the active link is metered (cellular data, mobile
    * hotspot, paid Wi-Fi). Background sync should be more conservative on
    * metered links.
+   *
+   * On Android 11 (API 30) and later, a metered link the network marks as
+   * temporarily unmetered, as some 5G plans do, reports `CONNECTED` instead,
+   * and `METERED` again once that exemption is withdrawn.
    */
   METERED: 'METERED',
   /**
@@ -81,7 +91,9 @@ export type ConnectionType =
 export const SyncStrategy = {
   /**
    * The engine retries on its own: a failed item is dispatched again when its
-   * cooldown ends, and pending items are dispatched on `resumeSync()`.
+   * cooldown ends, and pending items are dispatched on `resumeSync()`. Those
+   * wakes also wait for `SyncOptions.minNetworkQuality` and for a running
+   * health-check backoff.
    *
    * Enqueueing does **not** trigger a native flush. To dispatch new items, mount
    * `useAutoSync` or call `flush()`.
@@ -156,26 +168,37 @@ export type BackoffStrategy =
  * Both platforms classify with the same fixed table:
  *
  * - **Measured**, only when {@link SyncOptions.healthCheckUrl} is set: three
- *   sequential `HEAD` requests to that URL, 2 s timeout each, a failure or a
+ *   back-to-back `HEAD` requests to that URL, 2 s timeout each, a failure or a
  *   timeout counting as infinitely slow. The median picks the level: under
  *   200 ms → `EXCELLENT`, 200–499 ms → `GOOD`, 500–999 ms → `MODERATE`,
  *   1000 ms or more (including two or more failures) → `POOR`. Any HTTP status
  *   counts as a latency sample: a `5xx` is the health check's concern, not the
  *   classifier's.
  * - **Not measured**, because there is no `healthCheckUrl` or the first
- *   measurement is still pending: an unmetered link → `GOOD`, a metered one →
- *   `MODERATE`.
+ *   measurement of the current network is still pending: an unmetered link →
+ *   `GOOD`, a metered one → `MODERATE`.
  * - **No link**, or a link the OS has not reported yet → `OFFLINE`.
- * - **Caps**, applied last: an Android link without
+ * - **Caps**, applied last, the lowest one winning: an Android link without
  *   `NET_CAPABILITY_VALIDATED` → at most `POOR`; a metered (Android) or
  *   expensive (iOS) link → at most `GOOD`; iOS Low Data Mode → at most
  *   `MODERATE`.
  *
- * Without `healthCheckUrl` nothing is measured, so the classification never
- * reaches `EXCELLENT` and `minNetworkQuality: EXCELLENT` never passes. With
- * it, the measurement is taken again when the network changes and a result is
- * reused for 30 s. Nothing is sent while the device is offline, and nothing at
- * all without `healthCheckUrl`.
+ * Without `healthCheckUrl` nothing is measured and nothing is sent, so the
+ * classification never reaches `EXCELLENT` and `minNetworkQuality: EXCELLENT`
+ * never passes.
+ *
+ * With it, the engine measures when the network changes, 1 s after the change
+ * so that a burst of changes costs one measurement, and when the URL changes.
+ * A measurement belongs to the network it was taken on and is reused there for
+ * 30 s, so the same network coming back within 30 s, for example after a short
+ * offline gap, is not measured again. A measurement never expires: its level
+ * stays in place until a new measurement replaces it. When the gate
+ * ({@link SyncOptions.minNetworkQuality}) reads a measurement 30 s old or
+ * older, for a flush or for a held retry wake, it decides on that level and
+ * starts one new measurement in the background. Nothing is sent while the
+ * device is offline. The requests carry neither `defaultHeaders` nor any item
+ * header, and ask caches on the way to go to the server
+ * (`Cache-Control: no-cache`).
  *
  * @example
  * const LEVELS = Object.values(NetworkQuality);
@@ -286,6 +309,12 @@ export const SyncEventType = {
    *   `HEALTH_CHECK_FAILED` (see `SyncOptions.healthCheckUrl`).
    *
    * A skipped cycle has no `SYNC_STARTED` before it and writes no history row.
+   * Each skipped flush reports its own skip: a `flush()` call (including the
+   * ones `useAutoSync` and `drainUntilEmpty` make), a run of the Android retry
+   * kick or periodic worker, or an iOS background task. The in-process retry
+   * timer checks the gate and a running health-check backoff before it starts a
+   * flush, and holds a wake either one would block without any event; a flush it
+   * does start reports like any other.
    */
   SYNC_FAILED: 'SYNC_FAILED',
   /**
@@ -297,7 +326,15 @@ export const SyncEventType = {
    * A single item failed permanently: a non-retryable failure, or a retriable
    * one with no attempts left. `itemId`, `errorCode` and `attempt` are set, plus
    * `statusCode` when applicable. The item has already left the queue for the
-   * dead-letter queue, and `ITEM_DEAD_LETTERED` follows right after.
+   * dead-letter queue, and `ITEM_DEAD_LETTERED` follows right after, unless the
+   * item was removed (`removeItem()`) or the queue cleared (`clearQueue()`)
+   * while its request was in flight: this event then still reports that
+   * request, but nothing is dead-lettered and no `ITEM_DEAD_LETTERED` follows.
+   *
+   * An item whose attempts had already reached `RetryPolicy.maxAttempts` when a
+   * cycle took it, for example because the limit was lowered, fails without a
+   * request: `errorCode` is `MAX_ATTEMPTS_EXCEEDED`, `attempt` is the number of
+   * attempts it had made, and `statusCode` is not set.
    */
   ITEM_FAILED: 'ITEM_FAILED',
   /**
@@ -311,10 +348,19 @@ export const SyncEventType = {
    */
   QUEUE_CLEARED: 'QUEUE_CLEARED',
   /**
-   * Network connectivity or its quality changed. `connectionStatus` is set.
-   * A change of `networkQuality` alone also emits it, with an unchanged
-   * `connectionStatus`: read `getConnectionStatus()` for the new quality and
-   * the rest of the snapshot. Not emitted when nothing changed.
+   * A field of the `ConnectionState` snapshot changed: `status`, `type`,
+   * `isInternetReachable`, `isExpensive` or `networkQuality`. Never emitted for
+   * the state the engine starts with, nor when an update changes none of those
+   * fields, so read `getConnectionStatus()` once at start. iOS starts from
+   * `UNKNOWN`, so the system's first network report emits one; Android starts
+   * from the network it finds, normally without an event.
+   *
+   * `connectionStatus` is set, and stays the same when another field changed,
+   * for example `networkQuality` alone: read `getConnectionStatus()` for the
+   * new snapshot. With `SyncOptions.healthCheckUrl` set, the first measurement
+   * often changes the quality a few seconds after start, which emits one. iOS
+   * emits the event synchronously with the change, Android asynchronously, so
+   * its order relative to other events can differ between the platforms.
    */
   CONNECTION_CHANGED: 'CONNECTION_CHANGED',
   /** Sync was paused via `pauseSync()`. */
@@ -335,13 +381,22 @@ export const SyncEventType = {
    * succeeded or failed, with `metadata.ok` set to `"false"` on a failure.
    * Android emits it only after the flush returns, so a worker whose flush
    * throws emits none. `errorCode` is not set on either platform.
+   *
+   * A flush that the network-quality gate or the health check skipped did not
+   * fail in this sense: it returns normally, the skip is reported on its
+   * `SYNC_FAILED`, and on iOS this event then carries `metadata.kind` only,
+   * without `ok`.
    */
   BACKGROUND_SYNC_COMPLETED: 'BACKGROUND_SYNC_COMPLETED',
   /**
    * A permanently failed item was moved to the dead-letter queue. Emitted
-   * synchronously right after that item's `ITEM_FAILED`. `itemId` is set,
-   * `errorCode` is `DEAD_LETTERED`, and `metadata.lastErrorCode` carries the
-   * real failure code, the same one `ITEM_FAILED` reported. Read the dead
+   * right after that item's `ITEM_FAILED`, except for an item removed or
+   * cleared while its request was in flight, which is not dead-lettered and
+   * gets no `ITEM_DEAD_LETTERED`. `itemId` is set, `errorCode` is
+   * `DEAD_LETTERED`, and `metadata.lastErrorCode` carries the real failure
+   * code, the same one `ITEM_FAILED` reported; `statusCode` and `attempt` are
+   * not set. Android dispatches a batch concurrently, so another item's event
+   * can come between the two there: pair them by `itemId`. Read the dead
    * letter with `listDeadLetter()`.
    */
   ITEM_DEAD_LETTERED: 'ITEM_DEAD_LETTERED',

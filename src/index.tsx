@@ -222,8 +222,10 @@ export async function enqueueBatch(items: SyncItemInput[]): Promise<string[]> {
  * Removal does not cancel a request. An item that a running cycle has already
  * taken into its batch can still be sent and reach the server. Its outcome
  * event (`ITEM_SUCCEEDED`, `ITEM_RETRYING` or `ITEM_FAILED`) is still emitted,
- * but nothing is written back to the queue. `ITEM_REMOVED` is emitted only when
- * a row was removed.
+ * but nothing is written back: the item does not return to the queue, and a
+ * permanent failure does not make it a dead letter, so no `ITEM_DEAD_LETTERED`
+ * follows its `ITEM_FAILED`. A removed item never comes back, with or without
+ * its headers and body. `ITEM_REMOVED` is emitted only when a row was removed.
  *
  * @example
  * const removed = await removeItem(id);
@@ -246,7 +248,11 @@ export async function removeItem(id: string): Promise<boolean> {
  * history.
  *
  * Dead letters keep their request headers and body, so this is the call that
- * purges every stored request, for example on logout.
+ * purges every stored request, for example on logout. Clearing does not cancel
+ * a request already sent by a running cycle: its outcome event is still
+ * emitted, but the item returns neither to the queue nor, after a permanent
+ * failure, to the dead letters, and no `ITEM_DEAD_LETTERED` follows. A cleared
+ * item never comes back, with or without its headers and body.
  *
  * @returns resolves once the queue and the dead-letter queue are empty.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
@@ -334,12 +340,15 @@ export async function getPendingItems(): Promise<SyncItem[]> {
  * of the queue, with the original request and its failure bookkeeping.
  *
  * An item becomes a dead letter whenever it fails permanently. The move is
- * atomic and is followed by `ITEM_FAILED`, then `ITEM_DEAD_LETTERED`. Items
- * that failed permanently before the upgrade to this version are moved here
- * too. See {@link SyncDeadLetterItem}.
+ * atomic and is followed by `ITEM_FAILED`, then `ITEM_DEAD_LETTERED`. An item
+ * removed with {@link removeItem} or {@link clearQueue} while its request was
+ * in flight is the exception: it is never dead-lettered, and only its
+ * `ITEM_FAILED` is emitted. Items that failed permanently before the upgrade to
+ * this version are moved here too. See {@link SyncDeadLetterItem}.
  *
  * @returns every dead letter, oldest first: ordered by `deadLetteredAt`, then
- *   by `id`.
+ *   by `id`. There is at most one per id: a newer dead letter replaces an older
+ *   one with the same id.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
  * @throws {SyncError} {@link SyncErrorCode.INVALID_PAYLOAD} when native rejects
@@ -382,7 +391,13 @@ export async function listDeadLetter(): Promise<SyncDeadLetterItem[]> {
  * window.
  *
  * An unknown id resolves with no change, so replaying the same id twice, or an
- * id that was already discarded, is harmless.
+ * id that was already discarded, is harmless. If the queue already holds an
+ * item with that id, which normal use does not produce, nothing changes and the
+ * dead letter stays: iOS resolves, Android rejects.
+ *
+ * The replayed item counts toward `SyncOptions.maxQueueSize` the way an
+ * enqueue does on that platform: iOS counts the pending items, Android the
+ * pending and in-flight ones.
  *
  * @param id — the dead letter's id, from {@link listDeadLetter} or an
  *   `ITEM_DEAD_LETTERED` event.
@@ -459,14 +474,17 @@ export async function discardDeadLetter(id: string): Promise<void> {
  * with `SYNC_SUCCEEDED`.
  *
  * Before a cycle starts, the flush checks, in this order, the pause, the stored
- * credentials, the network-quality gate and the health check. When one of them
+ * credentials, on iOS whether a cycle is already running (see the last
+ * paragraph), the network-quality gate and the health check. When one of them
  * fails, no cycle runs: nothing is dispatched, no item changes, no
  * `SYNC_STARTED` is emitted and no history row is written.
  *
  * - Paused, or with stored `defaultHeaders` that cannot be read: no event at
  *   all.
  * - Network quality below `SyncOptions.minNetworkQuality`: `SYNC_FAILED` with
- *   `errorCode: NETWORK_QUALITY_TOO_LOW`.
+ *   `errorCode: NETWORK_QUALITY_TOO_LOW`. On iOS, when the system has not
+ *   reported the link yet, the gate first waits up to 1.5 s for it, and grades
+ *   a link still unknown after that `OFFLINE`.
  * - Health check failed, or its backoff still running (see
  *   `SyncOptions.healthCheckUrl`): `SYNC_FAILED` with
  *   `errorCode: HEALTH_CHECK_FAILED`.
@@ -474,17 +492,19 @@ export async function discardDeadLetter(id: string): Promise<void> {
  * The result counts are then 0/0 on both platforms and do not say why. Android
  * returns `0` for `startedAt` and `finishedAt`, the zeroed shape that
  * {@link getLastSyncResult} reports as `undefined`; `flush()` returns it as is.
- * iOS sets both to the time of the call, so the result looks like an empty
- * cycle's.
+ * iOS sets both to the time the check stopped the flush, so the result looks
+ * like an empty cycle's.
  *
  * Unless `SyncOptions.minNetworkQuality` is set, `flush()` does not check
- * connectivity first, so calling it offline can spend retry attempts. Any
- * `minNetworkQuality` other than `OFFLINE` blocks an offline flush instead.
- * {@link drainUntilEmpty} waits for the network, and `useAutoSync` skips its
- * interval and foreground flushes while `DISCONNECTED`.
+ * connectivity first, so calling it offline can spend retry attempts and move
+ * valid items to the dead-letter queue. Any `minNetworkQuality` other than
+ * `OFFLINE` blocks an offline flush instead. {@link drainUntilEmpty} waits for
+ * the network, and `useAutoSync` skips its interval and foreground flushes
+ * while `DISCONNECTED`.
  *
- * While a cycle is running, iOS returns the last result at once, and Android
- * waits and then runs its own cycle.
+ * While a cycle is running, iOS returns the last result at once, so the gate
+ * and the health check do not run and report nothing. Android waits, then runs
+ * its own cycle with every check.
  *
  * @example
  * const result = await flush();
@@ -634,13 +654,17 @@ export async function pauseSync(): Promise<void> {
  * Unless the strategy is `MANUAL`, the engine then schedules a flush for the
  * soonest pending item: items with no cooldown left are dispatched right away,
  * and cooling items when their cooldown ends. If the device is offline at that
- * moment, the flush waits until connectivity is restored.
+ * moment, the flush waits until connectivity is restored. With
+ * `SyncOptions.minNetworkQuality` set, it also waits, without any event, until
+ * the network quality reaches that minimum (see there for how often it checks
+ * again).
  *
  * During a credential hold, set after a 401 or 403 on a request sent with
  * headers restored from storage, that flush waits for the hold to end before
  * dispatching, on both platforms, even when items are already due. The hold
  * lives in memory, so a process restart drops it. See
- * {@link SyncOptions.defaultHeaders}.
+ * {@link SyncOptions.defaultHeaders}. It also waits for a running health-check
+ * backoff to end (see {@link SyncOptions.healthCheckBackoffMs}).
  *
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
@@ -713,7 +737,9 @@ export async function isSyncing(): Promise<boolean> {
  * the token in this process, so a 401 or 403 is terminal, as under any
  * configuration set in the process: the item fails with `UNAUTHORIZED`. Every
  * call also ends a running health-check backoff (see
- * {@link SyncOptions.healthCheckBackoffMs}).
+ * {@link SyncOptions.healthCheckBackoffMs}), and arms the retry wake again,
+ * which starts the network-quality gate's re-check schedule over (see
+ * {@link SyncOptions.minNetworkQuality}).
  *
  * Only `minNetworkQuality`, `healthCheckUrl`, `healthCheckTtlMs` and
  * `healthCheckBackoffMs` are validated in JS, in that order and only when
@@ -766,6 +792,12 @@ export async function configureSync(options: SyncOptions): Promise<void> {
  * `defaultHeaders` is `undefined` on Android and `{}` on iOS. That lasts until
  * the library reads the copy again, which it retries on each flush while not
  * paused, or until `configureSync` runs.
+ *
+ * A stored `minNetworkQuality` that cannot be read, a stored `healthCheckUrl`
+ * the engine cannot use, and a stored `healthCheckTtlMs` or
+ * `healthCheckBackoffMs` that is negative or not finite load as unset, so the
+ * result leaves them out. Only a damaged record can hold such values, since
+ * `configureSync` rejects them.
  *
  * `configureSync` replaces the whole configuration, so passing such a result
  * back, for example `configureSync({ ...cfg, batchSize: 5 })`, deletes the
@@ -877,7 +909,8 @@ export async function clearSyncHistory(): Promise<void> {
  * @remarks
  * `CONNECTION_CHANGED` carries only `connectionStatus`, and is also emitted
  * when only the network quality changed: call this again on that event, or use
- * `useConnection`, which does.
+ * `useConnection`, which does. It is not emitted for the state the engine
+ * starts with, so call this once at start too.
  *
  * @example
  * const conn = await getConnectionStatus();

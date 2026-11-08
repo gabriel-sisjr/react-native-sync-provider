@@ -93,9 +93,14 @@ export const SyncErrorCode = {
   /**
    * A retriable failure with no attempts left in `RetryPolicy.maxAttempts`. A
    * non-retryable failure keeps its real code instead, even on the last attempt.
+   * Also the code of an item whose attempts had already reached the limit when
+   * a cycle took it, for example because the limit was lowered: it fails
+   * without a request, and its dead letter's `lastErrorMessage` is
+   * `"Retry budget exhausted"`.
    *
    * Reported on `ITEM_FAILED`. Also the `lastErrorCode` of a dead letter whose
-   * item failed under an earlier version that recorded no code.
+   * stored code is empty or unknown, such as an item that failed under an
+   * earlier version without recording one.
    */
   MAX_ATTEMPTS_EXCEEDED: 'MAX_ATTEMPTS_EXCEEDED',
   /**
@@ -115,19 +120,25 @@ export const SyncErrorCode = {
   /**
    * A flush cycle was skipped because the current network quality is below
    * `SyncOptions.minNetworkQuality`. No item changes and no attempt is spent.
-   * An automatic wake the gate blocks runs once the quality reaches the
-   * minimum; a `flush()` call is not repeated.
+   * A `flush()` call is not repeated.
    *
-   * Reported on `SYNC_FAILED`.
+   * Reported on `SYNC_FAILED` by the skipped flush: a `flush()` call, a run of
+   * the Android retry kick or periodic worker, or an iOS background task. The
+   * in-process retry timer checks the gate before it flushes and holds a wake
+   * the gate blocks without reporting it, until the quality reaches the
+   * minimum.
    */
   NETWORK_QUALITY_TOO_LOW: 'NETWORK_QUALITY_TOO_LOW',
   /**
    * A flush cycle was skipped because the `HEAD` request to
-   * `SyncOptions.healthCheckUrl` did not end with a `2xx` status, or because
+   * `SyncOptions.healthCheckUrl` did not end with a final `2xx` status (any
+   * other status, a transport error and its 2 s timeout all count), or because
    * the backoff after such a failure (`SyncOptions.healthCheckBackoffMs`) was
    * still running. No item changes and no attempt is spent.
    *
-   * Reported on `SYNC_FAILED`.
+   * Reported on `SYNC_FAILED` by the skipped flush. The in-process retry timer
+   * does not flush during the backoff and reports nothing; a flush it starts
+   * afterwards reports a failed check like any other.
    */
   HEALTH_CHECK_FAILED: 'HEALTH_CHECK_FAILED',
   /**

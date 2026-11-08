@@ -58,9 +58,16 @@ export interface UseAutoSyncExtraOptions extends UseAutoSyncOptions {
  *
  * The periodic tick and the foreground trigger read the connection status first
  * and do nothing while it is `DISCONNECTED`, because a flush while offline can
- * spend retry attempts and mark valid items `FAILED`. `UNKNOWN` and `METERED`
- * still flush, and a status read that fails skips the flush. Neither trigger
- * checks queue size, so on an empty queue a flush records a 0/0 result.
+ * spend retry attempts and move valid items to the dead-letter queue. `UNKNOWN`
+ * and `METERED` still flush, and a status read that fails skips the flush.
+ * Neither trigger checks queue size, so on an empty queue a flush records a
+ * 0/0 result.
+ *
+ * Every flush the hook starts is a `flush()` call and runs its checks. With
+ * `SyncOptions.minNetworkQuality` set, each tick or trigger the gate blocks
+ * emits `SYNC_FAILED` with `NETWORK_QUALITY_TOO_LOW`, and each one during a
+ * health-check backoff `HEALTH_CHECK_FAILED`, an empty queue included, since
+ * both checks run before the queue is read.
  *
  * The reconnect trigger does not read the status: it follows the
  * `CONNECTION_CHANGED` event.
@@ -119,9 +126,9 @@ export function useAutoSync(options: UseAutoSyncExtraOptions): void {
       }
     };
 
-    // Neither dispatcher checks connectivity, so a flush while offline would
-    // spend retry attempts and can mark valid items FAILED. A status read that
-    // rejects skips the flush too.
+    // Unless `minNetworkQuality` is set, neither dispatcher checks
+    // connectivity, so a flush while offline would spend retry attempts and can
+    // dead-letter valid items. A status read that rejects skips the flush too.
     const flushUnlessOffline = async () => {
       try {
         const connection = await facadeGetConnectionStatus();
