@@ -18,6 +18,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -251,7 +253,8 @@ internal class SyncDispatcher(
   /**
    * With headers restored from disk, one item goes first. If the server rejects the
    * credential, the rest of the batch is released untouched, so an expired token
-   * costs one request per wake rather than a burst of `batchSize`.
+   * costs one request per wake rather than a burst of `batchSize`. An item purged before
+   * its turn is skipped, and the next one goes first in its place.
    */
   private suspend fun dispatchClaimed(
     claimed: List<SyncItemEntity>,
@@ -261,12 +264,19 @@ internal class SyncDispatcher(
     if (credentials != CredentialPolicy.PERSISTED) {
       return dispatchConcurrently(claimed, options, credentials)
     }
-    val first = dispatchRecordingOutcome(claimed.first(), options, credentials)
-    if (first is ItemOutcome.CredentialRejected) {
-      storage.resetInFlight()
-      return listOf(first)
+    val leading = mutableListOf<ItemOutcome>()
+    for (entity in claimed) {
+      // Dispatches are not cancellable once started: a cancelled cycle starts no more.
+      currentCoroutineContext().ensureActive()
+      val outcome = dispatchRecordingOutcome(entity, options, credentials)
+      leading += outcome
+      if (outcome is ItemOutcome.CredentialRejected) {
+        storage.resetInFlight()
+        return leading
+      }
+      if (outcome !is ItemOutcome.Gone) break
     }
-    return listOf(first) + dispatchConcurrently(claimed.drop(1), options, credentials)
+    return leading + dispatchConcurrently(claimed.drop(leading.size), options, credentials)
   }
 
   private suspend fun dispatchConcurrently(
@@ -310,6 +320,10 @@ internal class SyncDispatcher(
     val policy = options.retryPolicy
     val maxAttempts = policy.maxAttempts.toInt().coerceAtLeast(1)
 
+    // A purge since the claim, a logout say, leaves nothing to send: no request and no event
+    // of its own. Once the request is out, its outcome is reported even if a purge follows.
+    if (!storage.isQueued(entity.id)) return ItemOutcome.Gone(entity.id)
+
     // Cross-cycle attempt counter: this attempt is one past whatever prior
     // cycles persisted. Never reset to 0 — the budget must survive cycles.
     val attempt = entity.attempts + 1
@@ -320,14 +334,17 @@ internal class SyncDispatcher(
     // was lowered via configureSync between cycles.
     if (entity.attempts >= maxAttempts) {
       val message = "Retry budget exhausted"
-      deadLetter(
+      val moved = deadLetter(
         entity = entity,
         attempts = entity.attempts,
         lastAttemptAt = entity.lastAttemptAt?.takeIf { it > 0L } ?: startedAt,
         code = SyncErrorCode.MAX_ATTEMPTS_EXCEEDED,
         detail = message,
         statusCode = null,
+        requestSent = false,
       )
+      // Purged since the check above: no request went out, so there is nothing to end.
+      if (!moved) return ItemOutcome.Gone(entity.id)
       return ItemOutcome.Failed(entity.id, SyncErrorCode.MAX_ATTEMPTS_EXCEEDED, message)
     }
 
@@ -406,7 +423,15 @@ internal class SyncDispatcher(
     // A non-retryable failure keeps its real code; only a retriable one can run out
     // of budget.
     val terminalCode = if (outcome.retryable) SyncErrorCode.MAX_ATTEMPTS_EXCEEDED else outcome.code
-    deadLetter(entity, attempt, startedAt, terminalCode, outcome.detail, outcome.statusCode)
+    deadLetter(
+      entity = entity,
+      attempts = attempt,
+      lastAttemptAt = startedAt,
+      code = terminalCode,
+      detail = outcome.detail,
+      statusCode = outcome.statusCode,
+      requestSent = true,
+    )
     return ItemOutcome.Failed(entity.id, terminalCode, outcome.message)
   }
 
@@ -414,11 +439,13 @@ internal class SyncDispatcher(
    * Move [entity] to the dead letters in one transaction, then report `ITEM_FAILED` with the
    * real code and, right after it, `ITEM_DEAD_LETTERED` carrying that code in its metadata.
    *
-   * A row that `clearQueue()` or `removeItem(id)` purged after the claim, typically while
-   * its request was in flight, is not moved: nothing is written and no `ITEM_DEAD_LETTERED`
-   * follows. `ITEM_FAILED` still reports the outcome the item reached, as `ITEM_SUCCEEDED`
-   * and `ITEM_RETRYING` do for a purged row, and the cycle still counts it as failed. The
-   * same holds on iOS.
+   * A row that `clearQueue()` or `removeItem(id)` purged meanwhile is not moved: nothing is
+   * written and no `ITEM_DEAD_LETTERED` follows. When its request went out ([requestSent]),
+   * typically purged while that request was in flight, `ITEM_FAILED` still reports how it
+   * ended, as `ITEM_SUCCEEDED` and `ITEM_RETRYING` do for a purged row, and the cycle still
+   * counts it as failed. When none did, nothing is reported. The same holds on iOS.
+   *
+   * @return true when the row was moved.
    */
   @Suppress("LongParameterList")
   private suspend fun deadLetter(
@@ -428,7 +455,8 @@ internal class SyncDispatcher(
     code: SyncErrorCode,
     detail: String,
     statusCode: Int?,
-  ) {
+    requestSent: Boolean,
+  ): Boolean {
     val moved = storage.moveToDeadLetters(
       entity = entity,
       attempts = attempts,
@@ -437,6 +465,7 @@ internal class SyncDispatcher(
       lastErrorMessage = detail,
       deadLetteredAt = clock(),
     )
+    if (!moved && !requestSent) return false
     emitter.emit(
       SyncEventEmitter.event(
         type = SyncEventType.ITEM_FAILED,
@@ -446,7 +475,7 @@ internal class SyncDispatcher(
         attempt = attempts,
       ),
     )
-    if (!moved) return
+    if (!moved) return false
     emitter.emit(
       SyncEventEmitter.event(
         type = SyncEventType.ITEM_DEAD_LETTERED,
@@ -455,6 +484,7 @@ internal class SyncDispatcher(
         metadata = mapOf(METADATA_LAST_ERROR_CODE to code.name),
       ),
     )
+    return true
   }
 
   private suspend fun emitRetrying(
@@ -619,7 +649,8 @@ internal class SyncDispatcher(
 
   /**
    * Rescheduled and held items count as neither success nor failure: they are still
-   * queued, and their outcome belongs to a later cycle.
+   * queued, and their outcome belongs to a later cycle. Nor do items purged before their
+   * dispatch started: they were never sent.
    */
   private fun buildResult(startedAt: Long, outcomes: List<ItemOutcome>): SyncResult {
     val succeeded = outcomes.filterIsInstance<ItemOutcome.Succeeded>().map { it.itemId }
@@ -659,6 +690,9 @@ internal class SyncDispatcher(
 
     /** Restored credential rejected: the item waits, without spending an attempt. */
     data class CredentialRejected(override val itemId: String, val nextRetryAt: Long) : ItemOutcome
+
+    /** Purged before its dispatch started: never sent, and nothing reported for it. */
+    data class Gone(override val itemId: String) : ItemOutcome
     data class Failed(
       override val itemId: String,
       val code: SyncErrorCode,

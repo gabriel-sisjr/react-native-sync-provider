@@ -85,6 +85,12 @@ internal class SyncQueueStorage(
 
   suspend fun count(): Int = withContext(Dispatchers.IO) { itemDao.count() }
 
+  /**
+   * Whether row [id] is still queued. A claimed row stops being queued only when a purge
+   * (`clearQueue()`, `removeItem(id)`) deletes it, or when its outcome is recorded.
+   */
+  suspend fun isQueued(id: String): Boolean = withContext(Dispatchers.IO) { itemDao.exists(id) }
+
   suspend fun pendingCount(): Int = withContext(Dispatchers.IO) {
     itemDao.countByStatus(SyncItemEntity.STATUS_PENDING)
   }

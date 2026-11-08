@@ -33,6 +33,10 @@ internal interface SyncItemDao {
   @Query("SELECT COUNT(*) FROM sync_items")
   suspend fun count(): Int
 
+  /** Whether the queue still has row [id], in any status. */
+  @Query("SELECT EXISTS(SELECT 1 FROM sync_items WHERE id = :id)")
+  suspend fun exists(id: String): Boolean
+
   @Query("SELECT COUNT(*) FROM sync_items WHERE status = :status")
   suspend fun countByStatus(status: String): Int
 

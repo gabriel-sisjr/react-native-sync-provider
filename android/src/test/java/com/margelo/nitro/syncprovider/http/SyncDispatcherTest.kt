@@ -1145,12 +1145,12 @@ internal class SyncDispatcherTest {
   }
 
   @Test
-  fun `dlq_spentBudget_rowPurgedAfterTheClaim_isNotRevived`() = runTest {
+  fun `dlq_spentBudget_rowPurgedAfterTheClaim_isNeitherSentNorReported`() = runTest {
     db.syncItemDao().insert(
       TestData.entity(id = "spent", attempts = 7, url = server.url("/x").toString()),
     )
-    // Purge the queue right after the cycle claimed the row, before the budget check. The
-    // claim runs on the real storage: mockk's callOriginal() cannot return from a suspension.
+    // Purge the queue right after the cycle claimed the row. The claim runs on the real
+    // storage: mockk's callOriginal() cannot return from a suspension.
     val purgingAfterClaim = spyk(storage)
     coEvery { purgingAfterClaim.claimPending(any(), any()) } coAnswers {
       storage.claimPending(firstArg(), secondArg()).also { storage.clear() }
@@ -1161,12 +1161,76 @@ internal class SyncDispatcherTest {
 
     assertThat(server.requestCount).isEqualTo(0)
     assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
-    assertThat(storage.count()).isEqualTo(0)
-    assertThat(events.types()).doesNotContain(SyncEventType.ITEM_DEAD_LETTERED)
-    val failure = events.single { it.type == SyncEventType.ITEM_FAILED }
-    assertThat(failure.itemId).isEqualTo("spent")
-    assertThat(failure.errorCode).isEqualTo(SyncErrorCode.MAX_ATTEMPTS_EXCEEDED)
-    assertThat(result.failedIds.toList()).containsExactly("spent")
+    assertThat(events.filter { it.itemId == "spent" }).isEmpty()
+    assertThat(result.failedIds.toList()).isEmpty()
+    assertThat(result.succeededIds.toList()).isEmpty()
+  }
+
+  @Test
+  fun `dlq_spentBudget_rowPurgedBeforeItsMove_reportsNothing`() = runTest {
+    db.syncItemDao().insert(
+      TestData.entity(id = "spent", attempts = 7, url = server.url("/x").toString()),
+    )
+    // Purge right after the dispatch found the row still queued: the move finds none.
+    val purgingAfterCheck = spyk(storage)
+    coEvery { purgingAfterCheck.isQueued(any()) } coAnswers {
+      storage.isQueued(firstArg()).also { storage.clear() }
+    }
+    val events = recordEvents()
+
+    val result = newDispatcher(maxAttempts = 5, queue = purgingAfterCheck).flush()
+
+    assertThat(server.requestCount).isEqualTo(0)
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(events.filter { it.itemId == "spent" }).isEmpty()
+    assertThat(result.failedIds.toList()).isEmpty()
+  }
+
+  @Test
+  fun `an item purged before its dispatch started is never sent and reports nothing`() = runTest {
+    val release = CountDownLatch(1)
+    server.dispatcher = holdResponses(release, code = 200)
+    val first = enqueue("/first")
+    val second = enqueue("/second")
+    val third = enqueue("/third")
+    val events = recordEvents()
+    // Restored headers: one item goes first, and the rest wait for its answer.
+    val d = newDispatcher(credentials = { CredentialPolicy.PERSISTED })
+
+    val running = async(Dispatchers.IO) { d.flush() }
+    assertThat(server.takeRequest(20, TimeUnit.SECONDS)!!.path).isEqualTo("/first")
+    storage.clear()
+    release.countDown()
+    val result = running.await()
+
+    // The first request was out, so its outcome stands; the others never left.
+    assertThat(server.requestCount).isEqualTo(1)
+    assertThat(result.succeededIds.toList()).containsExactly(first)
+    assertThat(result.failedIds.toList()).isEmpty()
+    assertThat(events.filter { it.itemId == second || it.itemId == third }).isEmpty()
+  }
+
+  @Test
+  fun `with restored headers, the first item still queued goes alone first`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(401))
+    val removed = enqueue("/removed")
+    enqueue("/probe")
+    val held = enqueue("/held")
+    // The head of the batch is removed right after the claim, before its dispatch starts.
+    val removingHead = spyk(storage)
+    coEvery { removingHead.claimPending(any(), any()) } coAnswers {
+      storage.claimPending(firstArg(), secondArg()).also { storage.removeItem(removed) }
+    }
+    val events = recordEvents()
+
+    newDispatcher(credentials = { CredentialPolicy.PERSISTED }, queue = removingHead).flush()
+
+    // The next item probes the restored credential alone, and its rejection holds the rest.
+    assertThat(server.requestCount).isEqualTo(1)
+    assertThat(server.takeRequest(1, TimeUnit.SECONDS)!!.path).isEqualTo("/probe")
+    assertThat(row(held).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(row(held).attempts).isEqualTo(0)
+    assertThat(events.filter { it.itemId == removed || it.itemId == held }).isEmpty()
   }
 
   @Test
