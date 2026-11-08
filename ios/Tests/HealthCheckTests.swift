@@ -243,6 +243,40 @@ final class HealthCheckTests: XCTestCase {
         XCTAssertEqual(requestCount, 1)
     }
 
+    /// A backoff of 0 must not let a check that keeps failing drive automatic
+    /// retries back to back: each waits at least a second after the failure,
+    /// so they send at most one HEAD a second. An explicit flush still checks
+    /// at once.
+    func test_health_zeroBackoff_automaticRetriesWaitASecond() async throws {
+        let engine = await fixture.makeEngine(emitter: emitter)
+        await configureWithAnUnrefreshedCache(engine, in: fixture, backoffMs: 0)
+        _ = try await engine.storage.enqueue(input: .sample())
+        fixture.probe.script([], then: .response(statusCode: 503, latencyMs: 50))
+
+        assertSkippedByTheHealthCheck(try await engine.dispatcher.flushOutcome())
+        XCTAssertEqual(fixture.probe.callCount, 4)
+        XCTAssertEqual(fixture.timer.delayMs, 1_000, "The re-arm waits a second, not 0")
+
+        emitter.clear()
+        fixture.clock.advance(ms: 999)
+        await fixture.timer.fire()
+
+        XCTAssertEqual(fixture.probe.callCount, 4, "No HEAD within the second")
+        XCTAssertTrue(emitter.emittedEvents.isEmpty, "\(emitter.emittedEvents.map(\.type))")
+        XCTAssertEqual(fixture.timer.delayMs, 1, "Back at the end of the second")
+
+        fixture.clock.advance(ms: 1)
+        await fixture.timer.fire()
+
+        XCTAssertEqual(fixture.probe.callCount, 5, "One HEAD for the second")
+        XCTAssertEqual(emitter.events(ofType: "SYNC_FAILED").map(\.errorCode), ["HEALTH_CHECK_FAILED"])
+        XCTAssertEqual(fixture.timer.delayMs, 1_000, "And the next a second after it")
+        XCTAssertEqual(requestCount, 0)
+
+        assertSkippedByTheHealthCheck(try await engine.dispatcher.flushOutcome())
+        XCTAssertEqual(fixture.probe.callCount, 6, "An explicit flush is not held")
+    }
+
     func test_health_backgroundTask_failedCheck_completesTheTask() async throws {
         let engine = await fixture.makeColdEngine(emitter: emitter)
         await configureWithAnUnrefreshedCache(engine, in: fixture)
@@ -352,6 +386,32 @@ final class HealthCheckTests: XCTestCase {
         let next = await check.check(url: url, ttlMs: 0, backoffMs: 0)
         XCTAssertEqual(next, .healthy)
         XCTAssertEqual(probe.callCount, 4)
+    }
+
+    /// Automatic retries wait for the backoff, but never less than the floor
+    /// after a failure; a success ends the wait.
+    func test_retryBackoff_isTheBackoff_flooredAfterAFailure() async {
+        let probe = FakeHeadProbe()
+        let clock = ManualClock()
+        let check = HealthCheck(probe: probe, clock: clock)
+        let url = URL(string: healthURL)!
+        XCTAssertNil(check.retryBackoffUntilMs(floorMs: 1_000), "No failure yet")
+
+        probe.script([.response(statusCode: 500, latencyMs: 50)])
+        let failedAt = clock.nowMs()
+        _ = await check.check(url: url, ttlMs: 0, backoffMs: 0)
+        XCTAssertNil(check.backoffUntilMs, "Checks are not held")
+        XCTAssertEqual(check.retryBackoffUntilMs(floorMs: 1_000), failedAt + 1_000)
+        clock.advance(ms: 1_000)
+        XCTAssertNil(check.retryBackoffUntilMs(floorMs: 1_000))
+
+        probe.script([.response(statusCode: 500, latencyMs: 50)])
+        let longFailedAt = clock.nowMs()
+        _ = await check.check(url: url, ttlMs: 0, backoffMs: 30_000)
+        XCTAssertEqual(check.retryBackoffUntilMs(floorMs: 1_000), longFailedAt + 30_000, "A longer backoff stands")
+
+        check.clearBackoff()
+        XCTAssertNil(check.retryBackoffUntilMs(floorMs: 1_000), "configureSync ends the wait")
     }
 
     /// Ages run on the wall clock, which can move back: a cached 2xx with a

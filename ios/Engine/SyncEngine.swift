@@ -19,6 +19,10 @@ import BackgroundTasks
 let kHeldWakeRecheckInitialMs: Int64 = 30_000
 /// The longest wait between two re-checks of a held wake.
 let kHeldWakeRecheckMaxMs: Int64 = 900_000
+/// The least time automatic retries wait after a failed health check, whatever
+/// `healthCheckBackoffMs` says: with 0, a check that keeps failing would have
+/// them wake, probe and fail back to back. An explicit `flush()` is not held.
+let kMinHealthCheckRetryBackoffMs: Int64 = 1_000
 
 /// Where the retry timer learns its next deadline.
 protocol RetryWakeSource: Sendable {
@@ -356,7 +360,8 @@ final class SyncEngine: @unchecked Sendable {
     /// configuration changes, and after the health check stopped a flush.
     ///
     /// The wake comes no earlier than the latest of the row's deadline, the
-    /// credential hold and the end of a running health-check backoff.
+    /// credential hold and the end of a running health-check backoff, which
+    /// lasts at least ``kMinHealthCheckRetryBackoffMs`` here.
     ///
     /// - Parameter notBefore: when the hold on a rejected credential ends. It
     ///   outlives this call, so a later re-arm cannot wake earlier.
@@ -455,8 +460,9 @@ final class SyncEngine: @unchecked Sendable {
         }
         lock.withLock { releaseHeldWakeLocked() }
         if healthCheckBackoffEnd() != nil {
-            // A health-check backoff is running: like a gated wake, wait for it
-            // silently. The re-arm lands no earlier than its end.
+            // A health-check backoff is running, at least a second long for an
+            // automatic wake: like a gated wake, wait for it silently. The
+            // re-arm lands no earlier than its end.
             SyncLogger.debug("Retry wake during a health-check backoff; waiting for its end", category: "dispatcher")
             await rearmRetryTimer(scope: .allPending)
             return
@@ -497,10 +503,13 @@ final class SyncEngine: @unchecked Sendable {
                          category: "dispatcher")
     }
 
-    /// The end of a running health-check backoff, when a health check is set.
+    /// The end of the wait automatic wakes keep after a failed health check,
+    /// when one is set: its backoff, never shorter than
+    /// ``kMinHealthCheckRetryBackoffMs``. An explicit `flush()` keeps to the
+    /// backoff alone.
     private func healthCheckBackoffEnd() -> Int64? {
         guard lock.withLock({ options.healthCheckUrl != nil }) else { return nil }
-        return healthCheck.backoffUntilMs
+        return healthCheck.retryBackoffUntilMs(floorMs: kMinHealthCheckRetryBackoffMs)
     }
 
     /// `true` when an automatic wake may flush: online and, with a

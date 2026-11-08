@@ -32,6 +32,9 @@ enum HealthCheckVerdict: Sendable, Equatable {
 /// - A failure starts a backoff: until it ends, checks fail at once, without a
 ///   HEAD. Time, a successful check or ``clearBackoff()`` (every
 ///   `configureSync`) ends it; a 2xx quality sample does not.
+/// - Automatic retries wait for the backoff too, but for no less than a floor
+///   after the failure (``retryBackoffUntilMs(floorMs:)``). Checks themselves
+///   keep to the backoff alone.
 /// - Checks that overlap share one HEAD.
 /// - Ages run on the wall clock, which can move back. A negative age makes a
 ///   cached 2xx stale and ends a backoff, so neither outlives a clock change.
@@ -69,6 +72,21 @@ final class HealthCheck: @unchecked Sendable {
         return lock.withLock {
             guard let backoff, backoff.isRunning(atMs: nowMs) else { return nil }
             return backoff.endMs
+        }
+    }
+
+    /// The end of the wait automatic retries keep after the last failure: the
+    /// backoff, lasting at least `floorMs`, so that a backoff of 0 cannot have
+    /// them probe back to back while the check keeps failing. `nil` once that
+    /// wait is over, and with no failure since the last success or
+    /// ``clearBackoff()``.
+    func retryBackoffUntilMs(floorMs: Int64) -> Int64? {
+        let nowMs = clock.nowMs()
+        return lock.withLock {
+            guard let backoff else { return nil }
+            let floored = Backoff(startMs: backoff.startMs, durationMs: max(backoff.durationMs, floorMs))
+            guard floored.isRunning(atMs: nowMs) else { return nil }
+            return floored.endMs
         }
     }
 
