@@ -211,12 +211,13 @@ final class CoreDataStack: @unchecked Sendable {
     ///
     /// Every transaction has its own context, and the merge policy accepts a
     /// save over a row another context deleted after it was read: the stale
-    /// delete does nothing, and whatever the block inserted is written. A
+    /// change does nothing, and whatever the block inserted is written. A
     /// transaction that copies a row to the other store once it has read it
     /// would then write a copy of a row that is gone, the request's headers
-    /// and body included. Those transactions, and every transaction that
-    /// deletes queued items or dead letters, run here, so such a deletion
-    /// cannot land between that read and its save.
+    /// and body included, and the claim of an item for dispatch would report
+    /// a row that is gone as claimed. Those transactions, and every
+    /// transaction that deletes queued items or dead letters, run here, so
+    /// such a deletion cannot land between that read and its save.
     func performSerializedTask<T>(_ block: @escaping (NSManagedObjectContext) throws -> T) async throws -> T {
         let container = persistentContainer
         if let loadError = initializationError {

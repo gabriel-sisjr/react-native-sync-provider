@@ -106,7 +106,9 @@ actor SyncQueueStorage {
 
     // MARK: - Status mutations
 
-    func markInFlight(id: String) async throws {
+    /// See ``SyncItemDao/markInFlight(id:)``. `false` when the row is gone.
+    @discardableResult
+    func markInFlight(id: String) async throws -> Bool {
         try await dao.markInFlight(id: id)
     }
 

@@ -272,12 +272,21 @@ final class SyncItemDao {
 
     /// Claims an item for dispatch and counts the attempt. Counting here, before
     /// the request, means a kill mid-request spends the attempt.
-    func markInFlight(id: String) async throws {
-        try await stack.performBackgroundTask { [clock] context in
-            guard let entity = try Self.fetchEntity(id: id, in: context) else { return }
+    ///
+    /// Runs one at a time with the purges (see
+    /// ``CoreDataStack/performSerializedTask(_:)``), so its answer still holds
+    /// when it saves.
+    ///
+    /// - Returns: `false` when no queue row has `id`: it was purged since the
+    ///   batch was read, and there is nothing to send.
+    @discardableResult
+    func markInFlight(id: String) async throws -> Bool {
+        try await stack.performSerializedTask { [clock] context in
+            guard let entity = try Self.fetchEntity(id: id, in: context) else { return false }
             entity.status = SyncItemStatus.inFlight.rawValue
             entity.attempts += 1
             entity.lastAttemptAt = clock.nowMs()
+            return true
         }
     }
 

@@ -451,11 +451,11 @@ actor SyncDispatcher {
 
         dispatchLoop: for (index, item) in pending.enumerated() {
             if isPaused { break }
-            attempted += 1
 
             // A budget spent before this cycle, by a `maxAttempts` lowered
             // since the last attempt say, ends the item without a request.
             if Int(item.attempts) >= max(1, config.retryPolicy.maxAttempts) {
+                attempted += 1
                 emitProgress(index: index, total: total)
                 try await deadLetterSpentBudget(item: item)
                 failedIds.append(item.id)
@@ -466,7 +466,14 @@ actor SyncDispatcher {
             }
 
             inFlight.insert(item.id)
-            try await storage.markInFlight(id: item.id)
+            // A purge since the batch was read, a logout say, leaves this item
+            // nothing to send: no request and no event of its own.
+            guard try await storage.markInFlight(id: item.id) else {
+                inFlight.remove(item.id)
+                emitProgress(index: index, total: total)
+                continue
+            }
+            attempted += 1
 
             // `configureSync` can land while the request is out. Its answer is
             // about the credential it carried, not the one configured since.

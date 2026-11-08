@@ -348,6 +348,73 @@ final class SyncDispatcherTests: XCTestCase {
         XCTAssertEqual(result.errorMessage, "paused")
     }
 
+    // MARK: - Purged before its dispatch
+
+    // A cycle reads its batch, then claims the items one by one. These purge
+    // while the first request is out: after the batch was read, before the
+    // second item is claimed.
+
+    func test_flush_queueClearedBeforeAnItemsDispatch_sendsNothingForIt() async throws {
+        let first = try await enqueue(url: "https://api.test/v1/first", priority: "HIGH")
+        let second = try await enqueue(url: "https://api.test/v1/second", priority: "LOW")
+        let storage = self.storage!
+        URLProtocolStub.setHandler { request in
+            let cleared = DispatchSemaphore(value: 0)
+            Task {
+                try? await storage.clear()
+                cleared.signal()
+            }
+            cleared.wait()
+            return (self.httpResponse(request.url!.absoluteString, status: 200), Data("{}".utf8))
+        }
+        dispatcher = makeDispatcher()
+
+        let result = try await dispatcher.flush()
+
+        assertOnlyTheFirstWasSent(result: result, first: first, second: second)
+    }
+
+    func test_flush_itemRemovedBeforeItsDispatch_sendsNothingForIt() async throws {
+        let first = try await enqueue(url: "https://api.test/v1/first", priority: "HIGH")
+        let second = try await enqueue(url: "https://api.test/v1/second", priority: "LOW")
+        let storage = self.storage!
+        URLProtocolStub.setHandler { request in
+            let removed = DispatchSemaphore(value: 0)
+            Task {
+                _ = try? await storage.remove(id: second)
+                removed.signal()
+            }
+            removed.wait()
+            return (self.httpResponse(request.url!.absoluteString, status: 200), Data("{}".utf8))
+        }
+        dispatcher = makeDispatcher()
+
+        let result = try await dispatcher.flush()
+
+        assertOnlyTheFirstWasSent(result: result, first: first, second: second)
+        let queue = try await storage.getAll()
+        XCTAssertTrue(queue.isEmpty)
+    }
+
+    /// No request left for `second`, and no event of its own, while the cycle
+    /// still counts its progress to the end.
+    private func assertOnlyTheFirstWasSent(result: StoredSyncResult,
+                                           first: String,
+                                           second: String,
+                                           file: StaticString = #filePath,
+                                           line: UInt = #line) {
+        XCTAssertEqual(URLProtocolStub.capturedRequests.map { $0.url?.absoluteString },
+                       ["https://api.test/v1/first"], "Only the first request left the device", file: file, line: line)
+        XCTAssertEqual(emitter.events(ofType: "ITEM_SUCCEEDED").map(\.itemId), [first], file: file, line: line)
+        XCTAssertTrue(emitter.emittedEvents.filter { $0.itemId == second }.isEmpty,
+                      "\(emitter.emittedEvents.filter { $0.itemId == second }.map(\.type))", file: file, line: line)
+        XCTAssertEqual(emitter.events(ofType: "SYNC_PROGRESS").compactMap { $0.metadata?["index"] }, ["1", "2"],
+                       file: file, line: line)
+        XCTAssertEqual(result.itemsAttempted, 1, "The purged item was not attempted", file: file, line: line)
+        XCTAssertEqual(result.itemsSucceeded, 1, file: file, line: line)
+        XCTAssertEqual(result.itemsFailed, 0, file: file, line: line)
+    }
+
     // MARK: - classifyResponseSync (nonisolated)
 
     func test_classifyResponseSync_2xx_succeeds() {
