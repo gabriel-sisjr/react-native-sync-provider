@@ -219,13 +219,22 @@ export async function enqueueBatch(items: SyncItemInput[]): Promise<string[]> {
  *   the native module is not loaded.
  *
  * @remarks
- * Removal does not cancel a request. An item that a running cycle has already
- * taken into its batch can still be sent and reach the server. Its outcome
- * event (`ITEM_SUCCEEDED`, `ITEM_RETRYING` or `ITEM_FAILED`) is still emitted,
- * but nothing is written back: the item does not return to the queue, and a
- * permanent failure does not make it a dead letter, so no `ITEM_DEAD_LETTERED`
- * follows its `ITEM_FAILED`. A removed item never comes back, with or without
- * its headers and body. `ITEM_REMOVED` is emitted only when a row was removed.
+ * Removal does not cancel a request already sent. For an item that a running
+ * cycle has taken into its batch, it depends on when the removal lands:
+ *
+ * - Before the item's request is sent, including an item whose attempts had
+ *   already run out, which a cycle ends without a request: the item is never
+ *   sent and gets no outcome event (`ITEM_SUCCEEDED`, `ITEM_RETRYING`,
+ *   `ITEM_FAILED` or `ITEM_DEAD_LETTERED`).
+ * - While its request is in flight: the request can still reach the server,
+ *   and its outcome event (`ITEM_SUCCEEDED`, `ITEM_RETRYING` or `ITEM_FAILED`)
+ *   is still emitted for it, but nothing is written back. The item does not
+ *   return to the queue and is never dead-lettered, so no `ITEM_DEAD_LETTERED`
+ *   follows its `ITEM_FAILED`.
+ *
+ * A removed item never comes back, as a dead letter or as a replayed queue
+ * row, with or without its headers and body. `ITEM_REMOVED` is emitted only
+ * when a row was removed.
  *
  * @example
  * const removed = await removeItem(id);
@@ -249,10 +258,13 @@ export async function removeItem(id: string): Promise<boolean> {
  *
  * Dead letters keep their request headers and body, so this is the call that
  * purges every stored request, for example on logout. Clearing does not cancel
- * a request already sent by a running cycle: its outcome event is still
- * emitted, but the item returns neither to the queue nor, after a permanent
- * failure, to the dead letters, and no `ITEM_DEAD_LETTERED` follows. A cleared
- * item never comes back, with or without its headers and body.
+ * a request already sent by a running cycle, and every cleared item follows the
+ * same rules as with {@link removeItem}: one whose request was not sent yet is
+ * never sent and gets no outcome event; one whose request is in flight still
+ * gets its outcome event for that request, but returns neither to the queue
+ * nor, after a permanent failure, to the dead letters, and no
+ * `ITEM_DEAD_LETTERED` follows. A cleared item never comes back, as a dead
+ * letter or as a replayed queue row, with or without its headers and body.
  *
  * @returns resolves once the queue and the dead-letter queue are empty.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
@@ -341,10 +353,10 @@ export async function getPendingItems(): Promise<SyncItem[]> {
  *
  * An item becomes a dead letter whenever it fails permanently. The move is
  * atomic and is followed by `ITEM_FAILED`, then `ITEM_DEAD_LETTERED`. An item
- * removed with {@link removeItem} or {@link clearQueue} while its request was
- * in flight is the exception: it is never dead-lettered, and only its
- * `ITEM_FAILED` is emitted. Items that failed permanently before the upgrade to
- * this version are moved here too. See {@link SyncDeadLetterItem}.
+ * removed with {@link removeItem} or {@link clearQueue} is never
+ * dead-lettered: if its request was in flight, only its `ITEM_FAILED` is
+ * emitted. Items that failed permanently before the upgrade to this version
+ * are moved here too. See {@link SyncDeadLetterItem}.
  *
  * @returns every dead letter, oldest first: ordered by `deadLetteredAt`, then
  *   by `id`. There is at most one per id: a newer dead letter replaces an older
@@ -395,6 +407,11 @@ export async function listDeadLetter(): Promise<SyncDeadLetterItem[]> {
  * item with that id, which normal use does not produce, nothing changes and the
  * dead letter stays: iOS resolves, Android rejects.
  *
+ * Calls on the same id take effect one at a time. Two overlapping replays act
+ * as one replay and one no-op, so `ITEM_ENQUEUED` is emitted once, and a dead
+ * letter that an overlapping {@link clearQueue} or {@link discardDeadLetter}
+ * deletes is never put back.
+ *
  * The replayed item counts toward `SyncOptions.maxQueueSize` the way an
  * enqueue does on that platform: iOS counts the pending items, Android the
  * pending and in-flight ones.
@@ -428,7 +445,9 @@ export async function replayDeadLetter(id: string): Promise<void> {
  *
  * Emits `ITEM_REMOVED` when a row was deleted. An unknown id resolves with no
  * change, so discarding the same id twice is harmless. {@link removeItem} does
- * the same for a dead letter and also reports whether a row was deleted.
+ * the same for a dead letter and also reports whether a row was deleted. A
+ * {@link replayDeadLetter} of the same id that overlaps it never puts the
+ * discarded dead letter back.
  *
  * @param id — the dead letter's id, from {@link listDeadLetter} or an
  *   `ITEM_DEAD_LETTERED` event.

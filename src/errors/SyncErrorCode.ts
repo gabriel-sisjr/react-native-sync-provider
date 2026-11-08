@@ -137,7 +137,8 @@ export const SyncErrorCode = {
    * still running. No item changes and no attempt is spent.
    *
    * Reported on `SYNC_FAILED` by the skipped flush. The in-process retry timer
-   * does not flush during the backoff and reports nothing; a flush it starts
+   * does not flush during the backoff, which for automatic retries lasts at
+   * least 1 s after the failed check, and reports nothing; a flush it starts
    * afterwards reports a failed check like any other.
    */
   HEALTH_CHECK_FAILED: 'HEALTH_CHECK_FAILED',

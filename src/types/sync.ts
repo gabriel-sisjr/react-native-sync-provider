@@ -170,9 +170,11 @@ export interface SyncItem {
  * without a request. The move is atomic, so an item is never in the queue and
  * in the dead-letter queue at once. It is followed by `ITEM_FAILED`, then by
  * `ITEM_DEAD_LETTERED`. An item that `removeItem()` or `clearQueue()` removed
- * while its request was in flight never becomes one: its `ITEM_FAILED` still
- * reports that request, and no `ITEM_DEAD_LETTERED` follows. There is at most
- * one dead letter per id: a newer one replaces an older one with the same id.
+ * never becomes one. Removed before its request was sent, it is never sent and
+ * gets no outcome event; removed while its request was in flight, its
+ * `ITEM_FAILED` still reports that request, and no `ITEM_DEAD_LETTERED`
+ * follows. There is at most one dead letter per id: a newer one replaces an
+ * older one with the same id.
  *
  * Items that failed permanently before the upgrade to this version are moved
  * here too, when the upgraded library first opens its store. Those have no
@@ -452,6 +454,12 @@ export interface SyncOptions {
    *   The next retry wake, the timer's and the Android kick's alike, is the
    *   latest of the soonest item deadline, the credential hold and the end of
    *   the backoff.
+   * - Automatic retries (the retry timer, its re-checks of a held wake, a wake
+   *   that waited for the network, and the Android kick) never come back
+   *   sooner than 1 s after the failed check, even with
+   *   `healthCheckBackoffMs: 0`. A `flush()` call is not held to that floor:
+   *   it checks as usual, reusing a healthy result younger than
+   *   `healthCheckTtlMs`.
    * - Every `configureSync` call ends it early. A `2xx` answer to a
    *   network-quality measurement does not.
    *
@@ -480,7 +488,9 @@ export interface SyncOptions {
   /**
    * How long cycles are skipped after a failed health check, in ms, counted
    * from the end of the failed request. Defaults to `30000`. `0` means no
-   * backoff: the next cycle checks again. Every `configureSync` call ends a
+   * backoff for a `flush()` call, which checks again. Automatic retries wait at
+   * least 1 s (1000 ms) after a failed check whatever this value, so a failing
+   * endpoint cannot be probed back to back. Every `configureSync` call ends a
    * running backoff. Ignored without {@link SyncOptions.healthCheckUrl}.
    *
    * `getSyncConfig()` returns it only when it was set. `configureSync` rejects
@@ -577,7 +587,9 @@ export interface SyncResult {
  * - `QUEUE_CLEARED` — base fields only.
  * - `CONNECTION_CHANGED` — `connectionStatus` set. Emitted only when a
  *   `ConnectionState` field changes, `networkQuality` alone included, and never
- *   for the initial state: read the snapshot with `getConnectionStatus()`.
+ *   for the state the engine starts with (on iOS, the first network report
+ *   replacing `UNKNOWN` is a change and emits one): read the snapshot with
+ *   `getConnectionStatus()`.
  * - `PAUSED` / `RESUMED` — base fields only.
  * - `BACKGROUND_SYNC_STARTED` / `BACKGROUND_SYNC_COMPLETED` — base fields
  *   only on Android. On iOS, `metadata.kind` (`"refresh"` or `"processing"`) is

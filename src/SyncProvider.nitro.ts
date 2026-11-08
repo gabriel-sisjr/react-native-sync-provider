@@ -112,10 +112,11 @@ export interface SyncProvider extends HybridObject<{
    * letter with that id is removed instead. Emits `ITEM_REMOVED` only when a
    * row was removed.
    *
-   * A request already in flight is not cancelled and its outcome event is
-   * still emitted, but the removed item never comes back: not to the queue,
-   * and not as a dead letter after a permanent failure, so no
-   * `ITEM_DEAD_LETTERED` follows its `ITEM_FAILED`.
+   * An item removed before its request was sent is never sent and gets no
+   * outcome event. A request already in flight is not cancelled and its
+   * outcome event is still emitted, but the removed item never comes back: not
+   * to the queue, not as a dead letter after a permanent failure (so no
+   * `ITEM_DEAD_LETTERED` follows its `ITEM_FAILED`), and not through a replay.
    *
    * @param id — the ULID returned by `enqueue` / `enqueueBatch`.
    * @returns `true` if a queued item or a dead letter with that id was found
@@ -131,10 +132,12 @@ export interface SyncProvider extends HybridObject<{
    * Remove every item from the queue, in any status (pending or in flight),
    * and every dead letter. Emits one `QUEUE_CLEARED`.
    *
-   * Requests already in flight are not cancelled and their outcome events are
-   * still emitted, but no cleared item comes back: not to the queue, and not
-   * as a dead letter after a permanent failure, so no `ITEM_DEAD_LETTERED`
-   * follows an `ITEM_FAILED` for one.
+   * A cleared item whose request was not sent yet is never sent and gets no
+   * outcome event. Requests already in flight are not cancelled and their
+   * outcome events are still emitted, but no cleared item comes back: not to
+   * the queue, not as a dead letter after a permanent failure (so no
+   * `ITEM_DEAD_LETTERED` follows an `ITEM_FAILED` for one), and not through a
+   * replay.
    *
    * @example
    * await sync.clearQueue();
@@ -194,7 +197,9 @@ export interface SyncProvider extends HybridObject<{
    * An unknown id resolves with no change, so a repeated call is harmless. If
    * the queue already holds an item with that id, which normal use does not
    * produce, nothing changes and the dead letter stays: iOS resolves, Android
-   * rejects.
+   * rejects. Two overlapping replays of the same id act as one replay and one
+   * no-op, with one `ITEM_ENQUEUED`, and a dead letter that an overlapping
+   * `clearQueue` or `discardDeadLetter` deletes is never put back.
    *
    * @param id — the dead letter's id, from `listDeadLetter` or an
    *   `ITEM_DEAD_LETTERED` event.
@@ -211,7 +216,9 @@ export interface SyncProvider extends HybridObject<{
 
   /**
    * Delete a dead letter. Emits `ITEM_REMOVED` when a row was deleted. An
-   * unknown id resolves with no change, so a repeated call is harmless.
+   * unknown id resolves with no change, so a repeated call is harmless. A
+   * `replayDeadLetter` of the same id that overlaps it never puts the
+   * discarded dead letter back.
    *
    * @param id — the dead letter's id, from `listDeadLetter` or an
    *   `ITEM_DEAD_LETTERED` event.

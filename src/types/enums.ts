@@ -195,8 +195,9 @@ export type BackoffStrategy =
  * stays in place until a new measurement replaces it. When the gate
  * ({@link SyncOptions.minNetworkQuality}) reads a measurement 30 s old or
  * older, for a flush or for a held retry wake, it decides on that level and
- * starts one new measurement in the background. Nothing is sent while the
- * device is offline. The requests carry neither `defaultHeaders` nor any item
+ * starts one new measurement in the background. Without a gate, flushes and
+ * retry wakes never measure; network and URL changes still do. Nothing is sent
+ * while the device is offline. The requests carry neither `defaultHeaders` nor any item
  * header, and ask caches on the way to go to the server
  * (`Cache-Control: no-cache`).
  *
@@ -334,7 +335,9 @@ export const SyncEventType = {
    * An item whose attempts had already reached `RetryPolicy.maxAttempts` when a
    * cycle took it, for example because the limit was lowered, fails without a
    * request: `errorCode` is `MAX_ATTEMPTS_EXCEEDED`, `attempt` is the number of
-   * attempts it had made, and `statusCode` is not set.
+   * attempts it had made, and `statusCode` is not set. Removed or cleared
+   * before that move, it gets neither `ITEM_FAILED` nor `ITEM_DEAD_LETTERED`,
+   * like any item removed or cleared before its request was sent.
    */
   ITEM_FAILED: 'ITEM_FAILED',
   /**
@@ -353,7 +356,7 @@ export const SyncEventType = {
    * the state the engine starts with, nor when an update changes none of those
    * fields, so read `getConnectionStatus()` once at start. iOS starts from
    * `UNKNOWN`, so the system's first network report emits one; Android starts
-   * from the network it finds, normally without an event.
+   * from the network it finds, without an event.
    *
    * `connectionStatus` is set, and stays the same when another field changed,
    * for example `networkQuality` alone: read `getConnectionStatus()` for the
