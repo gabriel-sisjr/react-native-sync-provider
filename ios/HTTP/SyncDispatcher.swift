@@ -455,9 +455,11 @@ actor SyncDispatcher {
             // A budget spent before this cycle, by a `maxAttempts` lowered
             // since the last attempt say, ends the item without a request.
             if Int(item.attempts) >= max(1, config.retryPolicy.maxAttempts) {
-                attempted += 1
                 emitProgress(index: index, total: total)
-                try await deadLetterSpentBudget(item: item)
+                // Purged since the batch was read: like a claim that finds no
+                // row, it is neither attempted nor failed.
+                guard try await deadLetterSpentBudget(item: item) else { continue }
+                attempted += 1
                 failedIds.append(item.id)
                 if firstError == nil {
                     firstError = Self.spentBudgetMessage
@@ -552,22 +554,25 @@ actor SyncDispatcher {
     /// and its last attempt's time, then `ITEM_FAILED` with
     /// `MAX_ATTEMPTS_EXCEEDED` and `ITEM_DEAD_LETTERED` follow, as after a
     /// failed last attempt. `attempt` is the attempts made, none being added.
-    private func deadLetterSpentBudget(item: StoredSyncItem) async throws {
+    ///
+    /// - Returns: `false` when the row was purged since the batch was read.
+    ///   No request was sent, so there is nothing to end: nothing is emitted.
+    ///   A failed request reports `ITEM_FAILED` even then.
+    private func deadLetterSpentBudget(item: StoredSyncItem) async throws -> Bool {
         let code = "MAX_ATTEMPTS_EXCEEDED"
         let moved = try await storage.moveToDeadLetters(id: item.id,
                                                         errorCode: code,
                                                         errorMessage: Self.spentBudgetMessage)
+        guard moved else { return false }
         emitter.emit(.now(type: "ITEM_FAILED",
                           itemId: item.id,
                           errorCode: code,
                           attempt: Double(item.attempts)))
-        // A row removed meanwhile has nothing to move.
-        if moved {
-            emitter.emit(.now(type: "ITEM_DEAD_LETTERED",
-                              itemId: item.id,
-                              errorCode: "DEAD_LETTERED",
-                              metadata: ["lastErrorCode": code]))
-        }
+        emitter.emit(.now(type: "ITEM_DEAD_LETTERED",
+                          itemId: item.id,
+                          errorCode: "DEAD_LETTERED",
+                          metadata: ["lastErrorCode": code]))
+        return true
     }
 
     /// Records the outcome of a **failed** dispatch: decides retry vs. terminal

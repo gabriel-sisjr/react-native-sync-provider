@@ -75,13 +75,13 @@ final class EngineFixture {
 
 extension SyncQueueStorage.SyncItemInputData {
     /// A valid item. The URL is unique enough to tell requests apart.
-    static func sample(url: String = "https://api.test/items") -> Self {
+    static func sample(url: String = "https://api.test/items", priority: String = "NORMAL") -> Self {
         Self(method: "POST",
              url: url,
              headers: nil,
              body: "{}",
              contentType: "application/json",
-             priority: "NORMAL",
+             priority: priority,
              metadata: nil)
     }
 }

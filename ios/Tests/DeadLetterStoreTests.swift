@@ -205,6 +205,45 @@ final class DeadLetterStoreTests: XCTestCase {
         XCTAssertEqual(result.errorMessage, "Retry budget exhausted")
     }
 
+    /// A spent budget sends no request, so an item purged since the batch was
+    /// read has nothing to end: no event, no dead letter, not attempted, not
+    /// failed. The cycle's progress still runs to the end.
+    func test_dlq_budgetSpentItemPurgedBeforeItsTurn_staysSilent() async throws {
+        let engine = await engine(maxAttempts: 5)
+        let spent = try await engine.storage.enqueue(input: .sample(url: "https://api.test/spent", priority: "LOW"))
+        URLProtocolStub.setHandler(stubResponse(503))
+        _ = try await engine.dispatcher.flush()
+        await engine.configure(.sample(retryPolicy: .exact(maxAttempts: 1, baseDelayMs: 50)))
+        fixture.clock.advance(ms: 1_000)
+        let fresh = try await engine.storage.enqueue(input: .sample(url: "https://api.test/fresh", priority: "HIGH"))
+        URLProtocolStub.setHandler { request in
+            // A logout-style purge lands while the fresh item's request is
+            // out, before the spent item's turn.
+            let cleared = DispatchSemaphore(value: 0)
+            Task {
+                try? await engine.storage.clear()
+                cleared.signal()
+            }
+            cleared.wait()
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data())
+        }
+        emitter.clear()
+
+        let result = try await engine.dispatcher.flush()
+
+        XCTAssertEqual(URLProtocolStub.capturedRequests.map { $0.url?.absoluteString }, ["https://api.test/fresh"])
+        XCTAssertEqual(emitter.events(ofType: "ITEM_SUCCEEDED").map(\.itemId), [fresh])
+        XCTAssertTrue(emitter.emittedEvents.filter { $0.itemId == spent }.isEmpty,
+                      "\(emitter.emittedEvents.filter { $0.itemId == spent }.map(\.type))")
+        let letters = try await engine.storage.getDeadLetters()
+        XCTAssertTrue(letters.isEmpty)
+        XCTAssertEqual(emitter.events(ofType: "SYNC_PROGRESS").compactMap { $0.metadata?["index"] }, ["1", "2"])
+        XCTAssertEqual(result.itemsAttempted, 1, "The purged item was not attempted")
+        XCTAssertEqual(result.itemsSucceeded, 1)
+        XCTAssertEqual(result.itemsFailed, 0)
+        XCTAssertNil(result.errorMessage)
+    }
+
     /// A spent budget with no attempt time on record, the shape of a row
     /// migrated from an early store, is dated by the cycle that ends it.
     func test_dlq_budgetSpentWithoutAnAttemptTime_isDatedByTheCheck() async throws {
