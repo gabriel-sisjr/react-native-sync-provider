@@ -1,7 +1,7 @@
 ---
 sidebar_position: 1
 title: Migration Guides
-description: Upgrade guides for breaking and behavior changes between versions of @gabriel-sisjr/react-native-sync-provider, including the v0.1 to v0.2 upgrade.
+description: Upgrade guides for breaking and behavior changes between versions of @gabriel-sisjr/react-native-sync-provider, including the v0.2 to v0.3 and v0.1 to v0.2 upgrades.
 keywords:
   - migration
   - upgrade
@@ -17,6 +17,136 @@ The library is pre-1.0, so minor versions can carry breaking changes. Each upgra
 :::note
 The canonical list of breaking and behavior changes lives in [`BREAKING_CHANGES.md`](https://github.com/gabriel-sisjr/react-native-sync-provider/blob/develop/BREAKING_CHANGES.md). This page turns it into an upgrade procedure.
 :::
+
+## v0.2 → v0.3 {#v0-2-to-v0-3}
+
+No function, hook or error code was removed, and the quality gate and the health check are opt-in. Three things change for every app: permanently failed items move to a dead-letter queue, `networkQuality` is a required field, and connection events fire only on real changes. Read the whole list before you ship.
+
+:::danger Roll-forward only
+The upgrade migrates the stores in place, and there is no supported downgrade. Downgrading an Android install wipes the queue and the dead letters. See [Rolling back](#rolling-back-from-v03).
+:::
+
+### Step 1: Upgrade and rebuild
+
+1. Upgrade the package. The `react-native-nitro-modules` peer range is unchanged.
+2. On iOS, run `cd ios && bundle exec pod install`, then rebuild. The pod ships a new Core Data model version.
+3. On Android, rebuild. No new permission is needed.
+
+### Step 2: What migrates automatically
+
+- **Failed items.** Items that had failed permanently, which v0.2 kept as unlisted `FAILED` rows, move to the dead-letter queue when the upgraded library first opens its store: Room v2→v3 on Android, v1→v2→v3 included, and Core Data model v3 on iOS, with explicit mappings from v1 and v2. Read them with [`listDeadLetter`](../api-reference/functions.md#listdeadletter). A migrated item has no `lastErrorMessage` and takes its last attempt time, or else its enqueue time, as `deadLetteredAt`, and one with no usable error code reports `MAX_ATTEMPTS_EXCEEDED`.
+- **Pending items.** Untouched, with their attempts and cooldowns.
+- **Configuration.** The persisted options carry over. `minNetworkQuality` and the health-check options start unset, so flushes behave as in v0.2 until you opt in.
+
+:::note iOS migration
+The iOS migration runs before the store loads, on every launch path, BGTask launches included. If it fails, the original store is untouched, that launch runs without a store, so every call rejects with `NATIVE_MODULE_UNAVAILABLE`, and the next launch retries. Stores written from 0.1.1-rc on migrate. A store written by the 0.1.0-beta prerelease is not a recognized source: it fails to load the same way, and the file is kept.
+:::
+
+### Step 3: Compile-time fixes
+
+`ConnectionState.networkQuality` and `UseConnectionResult.networkQuality` are required. Code that only reads these types compiles as before. Hand-built values, usually test fixtures and mocks of `getConnectionStatus` or `useConnection`, need the field:
+
+```ts
+const online: ConnectionState = {
+  status: 'CONNECTED',
+  type: 'WIFI',
+  networkQuality: 'GOOD',
+};
+
+const offline: UseConnectionResult = {
+  status: 'DISCONNECTED',
+  type: 'NONE',
+  isOnline: false,
+  isMetered: false,
+  networkQuality: 'OFFLINE',
+};
+```
+
+Keep the invariant the library keeps: `OFFLINE` exactly when `status` is `DISCONNECTED` or `UNKNOWN`. With no `healthCheckUrl`, an online link usually reports `GOOD` when unmetered and `MODERATE` when metered; an Android network that is not validated reports `POOR`, and iOS Low Data Mode at most `MODERATE`.
+
+`SyncEventType` gains `ITEM_DEAD_LETTERED`, and `SyncErrorCode` gains `NETWORK_QUALITY_TOO_LOW`, `HEALTH_CHECK_FAILED` and `DEAD_LETTERED`. Add them to any exhaustive `switch` that ends in a `never` check. If you mock the library in tests with an explicit factory, add `listDeadLetter`, `replayDeadLetter` and `discardDeadLetter` to it.
+
+### Step 4: Handle dead letters
+
+An item that fails permanently now moves, in one transaction, to the dead-letter queue: `ITEM_FAILED` reports the real code, and `ITEM_DEAD_LETTERED` follows. Nothing retries a dead letter, nothing prunes the dead-letter queue, and it counts toward no capacity cap.
+
+```ts
+import {
+  discardDeadLetter,
+  flush,
+  listDeadLetter,
+  replayDeadLetter,
+  SyncErrorCode,
+} from '@gabriel-sisjr/react-native-sync-provider';
+
+// For example after a token refresh.
+for (const item of await listDeadLetter()) {
+  if (item.lastErrorCode === SyncErrorCode.UNAUTHORIZED) {
+    await replayDeadLetter(item.id); // back to the queue, attempts 0
+  } else {
+    await discardDeadLetter(item.id);
+  }
+}
+await flush(); // a replay does not flush by itself
+```
+
+- **Where to read them.** [`listDeadLetter`](../api-reference/functions.md#listdeadletter), oldest first, or [`useSyncSnapshot().deadLetter`](../api-reference/hooks/useSyncSnapshot.md) in a component.
+- **Replay.** [`replayDeadLetter`](../api-reference/functions.md#replaydeadletter) puts the item back under the same id, with `attempts: 0` and `nextRetryAt: 0`. It respects `maxQueueSize`: on a full queue it rejects with `INVALID_PAYLOAD` and keeps the dead letter.
+- **Discard.** [`discardDeadLetter`](../api-reference/functions.md#discarddeadletter), or `removeItem(id)`, which falls through to the dead letter with that id.
+- **Logout.** `clearQueue()` deletes the dead letters too. They keep their request headers and body, so keep it in the logout path. It does not need to wait for a running cycle: an item whose request has not started is not sent, and a request already in flight is not cancelled, but its item is never written back. See [What a purge stops](../api-reference/functions.md#what-a-purge-stops).
+- **Android cap.** Failed items no longer count toward `maxQueueSize`. Code that removed them on `ITEM_FAILED` only to stay under the cap can go, but the dead-letter queue is unbounded, so discard what you will not replay.
+
+See [Dead-letter flows](../guides/error-handling.md#dead-letter-flows) for more patterns.
+
+### Step 5: Review behavior your code may rely on
+
+| Area | What changed | What to do |
+| --- | --- | --- |
+| Permanent failures | Moved to the dead-letter queue. `ITEM_FAILED` is followed by `ITEM_DEAD_LETTERED`. | Handle dead letters as in Step 4. |
+| `removeItem`, `clearQueue` | Also delete dead letters. `removeItem` returns `true` when either store deleted a row. | Nothing, unless you counted on dead letters surviving a `clearQueue()`. |
+| Android `maxQueueSize` | Counts pending and in-flight items. Failed items no longer count. | Drop purges that only kept the queue under the cap. |
+| `CONNECTION_CHANGED` | Fires only when a reported field changes, never for a duplicate, and on Android never for its starting state. iOS starts at `UNKNOWN`, so its first path report emits one. iOS used to emit it on every path update. Also fires when only `networkQuality` changed, with the same `connectionStatus`. iOS delivers it synchronously, Android asynchronously. | Read the initial state with `getConnectionStatus()`. Compare `connectionStatus` with the previous value before acting on a transition, as `useAutoSync` does. |
+| Android connectivity | Follows the default network only: losing a secondary network no longer reports `DISCONNECTED`. | Expect fewer false disconnects. |
+| Android 11 (API 30) and later | A temporarily unmetered link reads as `CONNECTED` with `isExpensive: false`, not `METERED`. | Check `type === 'CELLULAR'` too if you must tell cellular apart. |
+| iOS synchronous calls | `getSyncConfig`, `getConnectionStatus`, `isBackgroundSyncEnabled`, `addListener` and `removeListener` return settled promises, which fixes a promise that could stay pending forever with `react-native-nitro-modules` 0.35.6 and 0.35.7. | Nothing. |
+
+### Step 6: Adopt the quality gate and the health check (optional)
+
+Both are off until you set them, through `configureSync` or `<SyncProvider options>`:
+
+```ts
+import {
+  configureSync,
+  NetworkQuality,
+} from '@gabriel-sisjr/react-native-sync-provider';
+
+await configureSync({
+  ...SYNC_OPTIONS,
+  defaultHeaders: session.headers,
+  minNetworkQuality: NetworkQuality.POOR, // skip cycles while offline
+  healthCheckUrl: 'https://api.example.com/health',
+  healthCheckTtlMs: 60_000, // the default
+  healthCheckBackoffMs: 30_000, // the default
+});
+```
+
+Before you turn them on:
+
+- **Pick the minimum.** `POOR` is the most permissive gate: it only stops flushes while the quality is `OFFLINE`, which also protects a manual `flush()` from spending attempts offline. Without `healthCheckUrl`, `GOOD` means unmetered links in practice, and `EXCELLENT` never passes. See [The quality gate](../guides/connectivity-detection.md#the-quality-gate).
+- **Pick the endpoint.** The `HEAD` carries no `defaultHeaders`, so `healthCheckUrl` must answer it with a `2xx` without authentication. It is also the only target of the latency measurement. Expect three `HEAD`s when the device moves to a network or the URL changes, and, with `minNetworkQuality` set, three more when the gate finds the measurement 30 s old or older. Without a gate, nothing measures a network again while the device stays on it. The health check adds one `HEAD` per cycle, except while a healthy result younger than `healthCheckTtlMs` exists, which a `2xx` sample from a kept measurement can provide, and while a backoff runs. After a failure, the next check goes out when the backoff ends. Automatic retry wakes also wait at least 1000 ms, so a backoff of `0` cannot make them spin, while a `flush()` call checks again at once. See [Health check](../guides/connectivity-detection.md#health-check).
+- **Skipped cycles are not failures.** A skipped flush emits `SYNC_FAILED` with `NETWORK_QUALITY_TOO_LOW` or `HEALTH_CHECK_FAILED`, with no `SYNC_STARTED` and no item change. If your UI reacts to `SYNC_FAILED`, check `errorCode`. `drainUntilEmpty()` counts a skipped flush as an iteration, so on a gated link it ends with `MAX_ITERATIONS` or `TIMEOUT`.
+- **Background windows.** A worker or BGTask the gate or the health check skips completes normally, and the window is spent. See [Background Sync](../guides/background-sync.md#when-the-gate-or-the-health-check-skips-a-window).
+- **Validation.** `configureSync` now rejects an invalid value for these four fields before any native call. The first invalid field, in the order `minNetworkQuality`, `healthCheckUrl`, `healthCheckTtlMs`, `healthCheckBackoffMs`, sets the code: `INVALID_URL` for `healthCheckUrl`, `INVALID_PAYLOAD` for the others.
+
+### Rolling back {#rolling-back-from-v03}
+
+:::danger Android downgrade wipes the store
+Downgrading an Android install to a v0.2 build wipes the persisted queue and the dead letters. There is no supported downgrade.
+:::
+
+A v0.2 iOS build cannot open the migrated store: the load fails as incompatible, and every call rejects with `NATIVE_MODULE_UNAVAILABLE` until the app runs v0.3 again. The store file is kept, not deleted. That iOS outcome follows from the code and has not been exercised in a test.
+
+If you must roll back, first drain the queue with `drainUntilEmpty()` and confirm `stoppedReason === 'EMPTY'`. Then read the dead letters with `listDeadLetter()` and export anything you need to keep: the older build does not read them, on either platform.
 
 ## v0.1 → v0.2 {#v0-1-to-v0-2}
 

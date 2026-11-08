@@ -1,7 +1,7 @@
 ---
 sidebar_position: 2
 title: Background Sync
-description: Configure OS-scheduled background sync with BGTaskScheduler (iOS) and WorkManager (Android) — constraints, identifiers, cold-start configuration, and platform differences.
+description: Configure OS-scheduled background sync with BGTaskScheduler (iOS) and WorkManager (Android) — constraints, identifiers, cold-start configuration, gated windows, and platform differences.
 keywords:
   - background-sync
   - bgtaskscheduler
@@ -194,7 +194,9 @@ Users that Force Stop the app must open it once before any of this runs again --
 
 ## Cold-Start Configuration
 
-**Added in v0.2.** A worker or BGTask can run in a process that never loaded JS. `configureSync` persists its options, so that process honors `maxAttempts`, `batchSize`, `requestTimeoutMs` and the rest. No new dependency is involved.
+**Added in v0.2.** A worker or BGTask can run in a process that never loaded JS. `configureSync` persists its options, so that process honors `maxAttempts`, `batchSize`, `requestTimeoutMs` and the rest, including `minNetworkQuality` and the health-check options, so a cold worker applies the [quality gate and the health check](#when-the-gate-or-the-health-check-skips-a-window) too. No new dependency is involved.
+
+A stored value that cannot be used, such as an unusable `healthCheckUrl` or a negative duration, can only come from a damaged record, because `configureSync` rejects them. It loads as unset instead of breaking the engine.
 
 | Data                                     | Android                                                                            | iOS                                                                                |
 | ---------------------------------------- | ---------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
@@ -252,6 +254,8 @@ Calling `configureSync` ends the wait in every case. While headers are unreadabl
 
 A process with no JS-facing hybrid, such as a worker, a boot broadcast or an iOS background launch where JS never reaches the library, runs no retry timer: it would dispatch outside the constraints you set. Android relies on the kick there. Events are not delivered either, since nothing is listening.
 
+With `healthCheckUrl` set, such a process can still send requests of its own: an Android retry kick that finds a stale network-quality measurement may send a measurement before its flush.
+
 ## Foreground-only mode
 
 **Added in v0.2.** Set `foregroundOnly: true` to turn OS-scheduled background dispatch **off** entirely while keeping the rest of the library working:
@@ -293,6 +297,24 @@ These events reach a listener only if a JS engine is running at the time of the 
 
 Neither event carries `errorCode`: a window whose flush fails reports the code on that cycle's `SYNC_FAILED`. On iOS, `metadata.kind` is `"refresh"` or `"processing"` on every `BACKGROUND_SYNC_COMPLETED` and on the processing task's `BACKGROUND_SYNC_STARTED`, and `metadata.ok` is `"false"` when the window's flush failed. Android sends base fields only, and emits `BACKGROUND_SYNC_COMPLETED` only after the flush returns, so a worker whose flush throws emits none.
 
+## When the gate or the health check skips a window {#when-the-gate-or-the-health-check-skips-a-window}
+
+A background window runs the same [checks as any flush](../api-reference/functions.md#checks-before-a-cycle). With [`minNetworkQuality`](./connectivity-detection.md#the-quality-gate) or [`healthCheckUrl`](./connectivity-detection.md#health-check) set, a window can therefore run no cycle. It spends no attempt and changes no item, and the skipped flush emits `SYNC_FAILED` with `NETWORK_QUALITY_TOO_LOW` or `HEALTH_CHECK_FAILED`, which a listener receives only if JS is running.
+
+| Window | Below `minNetworkQuality` | Health check failed, or its backoff running |
+| ------ | ------------------------- | ------------------------------------------- |
+| Android periodic worker | Returns `Result.success()`. The next period tries again. | Returns `Result.success()`. The next period tries again. |
+| Android retry kick | Returns `Result.success()` and re-arms itself on the held-wake backoff: 30 s, doubling up to 15 minutes. The streak survives process death. | Returns `Result.success()` and re-arms no earlier than the end of the backoff, and at least 1000 ms after the failed check. |
+| iOS BGTask | The flush returns normally, `BACKGROUND_SYNC_COMPLETED` fires with `metadata.kind` only, and the task completes successfully. The next attempt is the next window the OS grants. | The same as below the minimum. |
+
+A skipped worker never returns `Result.retry()`, so WorkManager's own backoff does not compete with the gate's. On iOS, a gated flush that finds the path not reported yet waits up to 1.5 s for the first update, then grades the link `OFFLINE`.
+
+On iOS, a skipped window is not a failed one: its `BACKGROUND_SYNC_COMPLETED` carries neither `errorCode` nor `metadata.ok: "false"`, and the next request was already scheduled at the top of the handler. Read the reason from the cycle's `SYNC_FAILED`.
+
+:::tip Keep the gate and the Android constraints consistent
+On Android, `minNetworkQuality` does not replace `requiresUnmeteredNetwork`. WorkManager checks its constraints before it starts a worker, while the gate runs inside the worker, after the window was granted, so a window the gate skips is spent. If you gate on `GOOD` without `healthCheckUrl`, which in practice means unmetered links, also set `requiresUnmeteredNetwork: true`.
+:::
+
 ## When Sync May Be Deferred
 
 | Cause                        | iOS                   | Android                               |
@@ -303,6 +325,7 @@ Neither event carries `errorCode`: a window whose flush fails reports the code o
 | User force-quit / Force Stop | Until the app is opened | Until the app is opened             |
 | App not opened recently      | iOS reduces frequency | WorkManager respects Adaptive Battery |
 | Network constraint not met   | Skips this fire       | Skips this fire                       |
+| Below `minNetworkQuality`, or health check failing | Window runs no cycle | Window runs no cycle |
 
 For predictable cadence in development, use `useAutoSync({ enabled: true, flushOnReconnect: true, flushOnAppForeground: true })` -- it triggers a JS-side flush on the events you care about, independent of OS scheduling.
 

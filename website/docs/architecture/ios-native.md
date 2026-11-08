@@ -50,12 +50,17 @@ The Swift class is intentionally named `HybridSyncProvider`, not `SyncProvider`.
 
 `CoreDataStack` is a singleton that lazily builds an `NSPersistentContainer` against the `SyncProvider.xcdatamodeld` model bundled as a `.podspec` resource.
 
-Two entities are declared with no `codeGenerationType` attribute, which Xcode shows as **Manual/None**. No class is generated, so nothing clashes with the explicit `+CoreDataClass.swift` files (`Invalid redeclaration`). `manual/none` is not a valid value for the attribute: `momc` rejects it.
+The entities are declared with no `codeGenerationType` attribute, which Xcode shows as **Manual/None**. No class is generated, so nothing clashes with the explicit `+CoreDataClass.swift` files (`Invalid redeclaration`). `manual/none` is not a valid value for the attribute: `momc` rejects it.
 
-- **`SyncItemEntity`** — `id`, `method`, `url`, `headersJSON`, `body`, `contentType`, `priority`, `createdAt`, `attempts`, `lastAttemptAt`, `nextRetryAt`, `lastErrorCode`, `metadataJSON`, plus a `status` discriminator (`PENDING`, `IN_FLIGHT`, `FAILED`). A delivered item is deleted.
+- **`SyncItemEntity`** — `id`, `method`, `url`, `headersJSON`, `body`, `contentType`, `priority`, `createdAt`, `attempts`, `lastAttemptAt`, `nextRetryAt`, `lastErrorCode`, `metadataJSON`, plus a `status` discriminator (`PENDING`, `IN_FLIGHT`). A delivered item is deleted, and an item that fails permanently moves to `SyncDeadLetterEntity`.
+- **`SyncDeadLetterEntity`** — `id` (unique), `method`, `url`, `headersJSON`, `body`, `contentType`, `priority`, `createdAt`, `metadataJSON`, `attempts`, `lastAttemptAt`, `lastErrorCode`, `lastErrorMessage`, and `deadLetteredAt`, which is indexed. No `nextRetryAt`. Backs `listDeadLetter()`. An unknown stored code reaches JS as `MAX_ATTEMPTS_EXCEEDED`.
 - **`SyncResultEntity`** — `id`, `startedAt`, `finishedAt`, `itemsAttempted`, `itemsSucceeded`, `itemsFailed`, `errorMessage`. Persists the flush history exposed by `getSyncHistory()`. It stores no per-item detail, which is why `SyncResult.succeededIds`, `failedIds` and `errors` are always empty on iOS.
 
-The model has two versions. Version 2 adds `nextRetryAt`, the store migrates lightweight, and version 1 stays in the bundle. The store is at `Library/Application Support/SyncProvider.sqlite`.
+The model has three versions: `SyncProvider`, `SyncProvider 2` and `SyncProvider 3`, the current one. Version 2 adds `nextRetryAt` and migrates lightweight. Version 3 adds `SyncDeadLetterEntity`. Earlier versions stay in the bundle. The store is at `Library/Application Support/SyncProvider.sqlite`.
+
+`CoreDataStack` migrates a v1 store (written from 0.1.1-rc on) or a v2 store (v0.2.x) to v3 before it loads the store, on every load path, BGTask launches included. The mapping is explicit and built in code, never inferred, and `NSMigrationManager` writes the result to a side file that `replacePersistentStore` swaps in, keeping the WAL and SHM files consistent. Pending and in-flight rows are copied (v1 rows get `nextRetryAt: 0`), `FAILED` rows become dead letters with the legacy fallbacks, and history rows are copied.
+
+If the migration fails, the original store is untouched, that launch runs without a store, so every call rejects with `NATIVE_MODULE_UNAVAILABLE`, and the next launch retries. A store the code does not recognize as a source, such as one written by the 0.1.0-beta prerelease or a v3 store opened by a downgraded v0.2 build, fails to load as incompatible the same way, and the file is never deleted. That last case follows from the code and has not been exercised in a test.
 
 A separate background `NSManagedObjectContext` is used for writes to keep the JSI thread free of Core Data work.
 
@@ -68,8 +73,8 @@ The model is also reconstructed programmatically in `InMemoryCoreDataStack` (tes
 `SyncQueueStorage` wraps the Core Data DAO and is the only path the rest of the iOS code uses to mutate the queue. It enforces:
 
 - **Atomic batch insert** (`enqueueBatch` either persists every item or throws — no partial success).
-- **`maxQueueSize` enforcement** with `QUEUE_FULL` thrown at the boundary. The cap counts `PENDING` rows only, cooling ones included.
-- **Status transitions** (`PENDING → IN_FLIGHT → deleted | PENDING (for retry) | FAILED`) via a single transactional `perform` block to avoid race conditions across the dispatcher and recovery paths. An attempt is counted when the row goes `IN_FLIGHT`, so a kill mid-request spends it.
+- **`maxQueueSize` enforcement** with `QUEUE_FULL` thrown at the boundary, for enqueues and dead-letter replays. The cap counts `PENDING` rows only, cooling ones included. Dead letters do not count.
+- **Status transitions** (`PENDING → IN_FLIGHT → deleted | PENDING (for retry) | moved to the dead-letter entity`) via a single transactional `perform` block to avoid race conditions across the dispatcher and recovery paths. An attempt is counted when the row goes `IN_FLIGHT`, so a kill mid-request spends it.
 - **Sort order**: priority first, `HIGH` to `LOW`, then `createdAt` ascending — the same order Android uses, kept in sync deliberately. `getSize` and `getQueued` cover `PENDING` rows only. The fetch for a cycle also requires `nextRetryAt <= now`.
 
 ## SyncDispatcher (URLSession)
@@ -108,7 +113,13 @@ Keychain items survive an uninstall. If the engine finds an item with no UserDef
 
 ## ConnectivityMonitor (NWPathMonitor)
 
-`ConnectivityMonitor` runs an `NWPathMonitor` on a dedicated queue and publishes a `ConnectionState` snapshot (`status`, `type`, `isInternetReachable`, `isExpensive`). It emits a `CONNECTION_CHANGED` event whenever the path status changes, and exposes the latest snapshot synchronously to `getConnectionStatus()`.
+`ConnectivityMonitor` runs an `NWPathMonitor` on a dedicated queue and publishes a `ConnectionState` snapshot (`status`, `type`, `networkQuality`, `isInternetReachable`, `isExpensive`). It emits a `CONNECTION_CHANGED` event, synchronously, only when a reported field changes, and exposes the latest snapshot synchronously to `getConnectionStatus()`. The snapshot starts at `UNKNOWN`, so the first path report emits one. Before v0.3 it emitted one on every path update.
+
+The quality follows the [shared threshold table](../guides/connectivity-detection.md#how-it-is-classified). An expensive path is at most `GOOD` and a constrained one (Low Data Mode) at most `MODERATE`. With `healthCheckUrl` set, the latency is measured with `HEAD` requests on an ephemeral `URLSession` of its own, timed with `URLSessionTaskMetrics`. A gated flush that finds no path update yet waits up to 1.5 s for the first one, then grades the link `OFFLINE`.
+
+`NWPath` has no network identifier, so a measurement is keyed by the interface type, the expensive and constrained flags, the gateway addresses and the URL. The gateways are a best-effort discriminator: two networks with the same gateway address can share a measurement for up to 30 s. Cache ages use the wall clock, not a Required Reason API, and a negative age counts as stale.
+
+The health check sends its `HEAD` on the same probe session. A healthy result is cached per URL, so a new URL is checked afresh, and overlapping checks share one request. A `2xx` sample from a kept quality measurement refreshes that cache but does not end a backoff. A failure starts the backoff when the failed `HEAD` finishes, and a negative cache age also ends it. Automatic retry wakes wait for the backoff, and at least 1000 ms after the failure, so a backoff of `0` cannot make them spin. An explicit `flush()` keeps to the backoff alone.
 
 `SyncEngine` starts the monitor when it is built and keeps it alive for the process lifetime — there is no per-listener registration overhead. `.unknown` does not count as online, so the retry timer waits on it.
 

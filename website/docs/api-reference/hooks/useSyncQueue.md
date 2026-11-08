@@ -14,7 +14,7 @@ keywords:
 
 # `useSyncQueue`
 
-Reactive view of the native pending queue, plus the write operations. Refreshes on the events that can change the queue.
+Reactive view of the native pending queue, plus the write operations. Refreshes on the events that can change the queue. Dead letters are not part of `items`: read them with [`listDeadLetter`](../functions.md#listdeadletter) or [`useSyncSnapshot().deadLetter`](./useSyncSnapshot.md).
 
 ```ts
 import { useSyncQueue } from '@gabriel-sisjr/react-native-sync-provider';
@@ -38,7 +38,7 @@ function useSyncQueue(): UseSyncQueueResult
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `size` | `number` | `PENDING` items, cooling ones included. Items in flight and items that failed permanently are not counted. |
+| `size` | `number` | `PENDING` items, cooling ones included. Items in flight and dead letters are not counted. |
 | `items` | [`SyncItem[]`](../types.md#syncitem) | The same items, in dispatch order. |
 | `isLoading` | `boolean` | `true` while the initial fetch / a refresh is in flight. |
 | `error` | [`SyncError`](../errors.md) `\| null` | Last failure refreshing the queue, or `null`. The methods reject instead of setting it. |
@@ -49,8 +49,8 @@ function useSyncQueue(): UseSyncQueueResult
 |--------|-----------|-------------|
 | `enqueue` | `(input: SyncItemInput) => Promise<string>` | Same as the top-level [`enqueue`](../functions.md#enqueue). Rejects on failure. |
 | `enqueueBatch` | `(inputs: SyncItemInput[]) => Promise<string[]>` | Same as the top-level [`enqueueBatch`](../functions.md#enqueuebatch). Rejects on failure. |
-| `removeItem` | `(id: string) => Promise<boolean>` | Remove a single item. Returns `false` if unknown or already delivered. |
-| `clearQueue` | `() => Promise<void>` | Drop every item, in any status. |
+| `removeItem` | `(id: string) => Promise<boolean>` | Remove a single item, or the dead letter with that id. Returns `false` if neither exists. |
+| `clearQueue` | `() => Promise<void>` | Drop every item, in any status, and every dead letter. |
 | `refresh` | `() => Promise<void>` | Force a re-fetch from native. Rarely needed -- the hook auto-refreshes on events. |
 
 ---
@@ -61,7 +61,7 @@ function useSyncQueue(): UseSyncQueueResult
 - **Auto-refresh** -- subscribes via [`addSyncEventListener`](../listeners.md#addsynceventlistener) and re-fetches on:
   - `ITEM_ENQUEUED`, `ITEM_REMOVED`, `QUEUE_CLEARED`
   - `SYNC_SUCCEEDED`, `SYNC_FAILED`
-  - `ITEM_SUCCEEDED`, `ITEM_FAILED`
+  - `ITEM_SUCCEEDED`, `ITEM_FAILED`, `ITEM_DEAD_LETTERED`
 - **Cooldown fields** -- `ITEM_RETRYING` is not on that list, so an item's `attempts` and `nextRetryAt` update when the cycle ends.
 - **Errors** -- the methods pass through to the facade and reject on failure, so catch them yourself. `error` only holds a failed refresh.
 - **Cleanup** -- unsubscribes on unmount.

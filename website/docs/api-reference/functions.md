@@ -1,7 +1,7 @@
 ---
 sidebar_position: 1
 title: Functions
-description: API reference for every public function in @gabriel-sisjr/react-native-sync-provider — queue, sync, configuration, history, connection, and background sync APIs.
+description: API reference for every public function in @gabriel-sisjr/react-native-sync-provider — queue, dead letters, sync, configuration, history, connection, and background sync APIs.
 keywords:
   - react-native
   - sync-provider
@@ -25,6 +25,10 @@ import {
   clearQueue,
   getQueueSize,
   getPendingItems,
+  // Dead letters
+  listDeadLetter,
+  replayDeadLetter,
+  discardDeadLetter,
   // Sync
   flush,
   drainUntilEmpty,
@@ -144,7 +148,7 @@ const ids = await enqueueBatch([
 
 ### `removeItem`
 
-Remove a single item by id, in any status: pending (including items waiting out a cooldown), in flight, or failed permanently. This is the way to delete one item that failed permanently: [`getPendingItems`](#getpendingitems) does not return failed items, so take its id from an `ITEM_FAILED` event.
+Remove a single item by id, in any status: pending (including items waiting out a cooldown) or in flight. When no queued item has that id, the [dead letter](#dead-letters) with that id is removed instead, so this also deletes an item that failed permanently. Take its id from [`listDeadLetter`](#listdeadletter) or from its `ITEM_FAILED` / `ITEM_DEAD_LETTERED` event.
 
 #### Signature
 
@@ -160,15 +164,20 @@ function removeItem(id: string): Promise<boolean>;
 
 #### Returns
 
-`Promise<boolean>` -- `true` if a row with that id existed and was removed, `false` if none exists: the item was already delivered, already removed or cleared, or never enqueued.
+`Promise<boolean>` -- `true` if a queued item or a dead letter with that id existed and was removed, `false` if neither exists: the item was already delivered, already removed or cleared, or never enqueued. `ITEM_REMOVED` is emitted only when a row was removed.
 
 #### Throws
 
 `NATIVE_MODULE_UNAVAILABLE`.
 
-:::warning Removal does not cancel a request
-An item that a running cycle has already taken into its batch can still be sent and reach the server. Its outcome event (`ITEM_SUCCEEDED`, `ITEM_RETRYING` or `ITEM_FAILED`) is still emitted, but nothing is written back to the queue. `ITEM_REMOVED` is emitted only when a row was removed.
-:::
+#### What a purge stops {#what-a-purge-stops}
+
+These rules hold for `removeItem` and for [`clearQueue`](#clearqueue), on both platforms. A purge does not wait for a running cycle: each item is checked again just before its own request starts.
+
+- **Before its request starts.** An item removed or cleared before its own request starts is never sent, even when its cycle already picked it. No `ITEM_SUCCEEDED`, `ITEM_RETRYING`, `ITEM_FAILED` or `ITEM_DEAD_LETTERED` is emitted for it, and it counts in neither `successCount` nor `failureCount`.
+- **While its request is in flight.** The purge does not cancel the request. It can still reach the server, and its outcome event is emitted, but nothing is written back: the item is not queued again, even after an `ITEM_RETRYING`, and it is never dead-lettered, so no `ITEM_DEAD_LETTERED` follows its `ITEM_FAILED`.
+- **Spent retry budget.** An item whose `attempts` already reached `maxAttempts`, for example after `configureSync` lowered it, is dead-lettered without a request. Purged before that move, it gets no event.
+- **No way back.** A purged item never returns, as a dead letter or as a queue row from a replay. Moves to the dead-letter queue, replays, discards, removals and clears run one at a time.
 
 #### Example
 
@@ -181,7 +190,9 @@ if (!ok) console.warn('already delivered or unknown id');
 
 ### `clearQueue`
 
-Remove every item, in any status: pending, in flight, or failed permanently. Does not touch sync history. A request already in flight is not cancelled.
+Remove every item, in any status (pending or in flight), and every [dead letter](#dead-letters). Emits one `QUEUE_CLEARED`. Does not touch sync history. A request already in flight is not cancelled.
+
+Dead letters keep their request headers and body, so this is the call that purges every stored request, for example on logout. It does not wait for a running cycle, and it does not need to: an item whose request has not started is not sent, and one whose request is in flight is never written back, as a queue row or as a dead letter. See [What a purge stops](#what-a-purge-stops).
 
 #### Signature
 
@@ -207,9 +218,9 @@ await clearQueue();
 
 ### `getQueueSize`
 
-Read the number of items waiting to be dispatched: `PENDING` items, including those waiting out a retry cooldown. Items in flight and items that failed permanently are not counted, on either platform.
+Read the number of items waiting to be dispatched: `PENDING` items, including those waiting out a retry cooldown. Items in flight and dead letters are not counted, on either platform.
 
-The `maxQueueSize` cap is checked separately and differs: Android counts every row, including `FAILED` and in-flight ones. iOS counts `PENDING` rows only.
+The `maxQueueSize` cap is checked separately and differs: Android counts pending and in-flight items, iOS `PENDING` items only. Dead letters count on neither.
 
 #### Signature
 
@@ -236,7 +247,7 @@ console.log(`${n} items pending`);
 
 ### `getPendingItems`
 
-Snapshot the `PENDING` items in dispatch order on both platforms: `HIGH` first, then oldest first. Cooling items are included. Items in flight and items that failed permanently are not returned.
+Snapshot the `PENDING` items in dispatch order on both platforms: `HIGH` first, then oldest first. Cooling items are included. Items in flight and dead letters are not returned: read dead letters with [`listDeadLetter`](#listdeadletter).
 
 Each item carries its [`attempts` and `nextRetryAt`](./types.md#syncitem).
 
@@ -263,6 +274,138 @@ items.forEach((item) => console.log(item.id, item.url));
 
 ---
 
+## Dead letters
+
+An item that fails permanently is not dropped. In one transaction it leaves the queue and enters the dead-letter queue, then `ITEM_FAILED` reports the real code and `ITEM_DEAD_LETTERED` follows, unless the item was [removed or cleared while its request was in flight](#what-a-purge-stops). That covers attempts exhausted, a response that is not retried, and a 401 or 403 under a configuration set in the current process. Items that had failed permanently before the upgrade to v0.3 are moved there too. See [`SyncDeadLetterItem`](./types.md#syncdeadletteritem) for the fields.
+
+:::warning Nothing prunes the dead-letter queue
+It is unbounded and counts toward no capacity cap. Each dead letter keeps its request's headers and body until it is replayed, discarded, removed with [`removeItem`](#removeitem) or cleared with [`clearQueue`](#clearqueue). Discard what you do not replay.
+:::
+
+### `listDeadLetter`
+
+Read every dead letter, with the original request and its failure bookkeeping.
+
+#### Signature
+
+```ts
+function listDeadLetter(): Promise<SyncDeadLetterItem[]>;
+```
+
+#### Returns
+
+`Promise<`[`SyncDeadLetterItem`](./types.md#syncdeadletteritem)`[]>` -- every dead letter, oldest first: ordered by `deadLetteredAt`, then by `id`.
+
+#### Throws
+
+- `INVALID_PAYLOAD` -- native rejected the call. See [Native rejections](./errors.md#native-rejections).
+- `NATIVE_MODULE_UNAVAILABLE`.
+
+#### Example
+
+```ts
+const deadLetters = await listDeadLetter();
+for (const item of deadLetters) {
+  console.warn(
+    `${item.method} ${item.url} failed with ${item.lastErrorCode}`,
+    item.lastErrorMessage ?? ''
+  );
+}
+```
+
+For a component, [`useSyncSnapshot().deadLetter`](./hooks/useSyncSnapshot.md) keeps this list up to date.
+
+---
+
+### `replayDeadLetter`
+
+Put a dead letter back into the queue for another try. In one transaction the item is re-inserted under the same id, with its original `createdAt`, as a `PENDING` item with `attempts: 0`, `nextRetryAt: 0` and no last error code, and the dead letter is deleted. Emits `ITEM_ENQUEUED`.
+
+Like [`enqueue`](#enqueue), it does not dispatch the item: a flush does, from [`flush`](#flush), [`useAutoSync`](./hooks/useAutoSync.md), or an OS background window.
+
+#### Signature
+
+```ts
+function replayDeadLetter(id: string): Promise<void>;
+```
+
+#### Parameters
+
+| Name | Type     | Required | Description                                                                   |
+| ---- | -------- | -------- | ----------------------------------------------------------------------------- |
+| `id` | `string` | Yes      | The dead letter's id, from `listDeadLetter()` or an `ITEM_DEAD_LETTERED` event. |
+
+#### Returns
+
+`Promise<void>`. An unknown id resolves with no change, so replaying the same id twice, or an id that was already discarded, is harmless.
+
+#### Throws
+
+- `INVALID_PAYLOAD` with no `validationErrors` -- native rejected the call, most often because the queue is at `maxQueueSize`. The dead letter stays in place. See [Native rejections](./errors.md#native-rejections).
+- `NATIVE_MODULE_UNAVAILABLE`.
+
+The replay counts toward `maxQueueSize` the way an enqueue does on that platform: Android counts pending and in-flight items, iOS pending items only.
+
+Replays, discards and purges of dead letters run one at a time. Two overlapping replays of the same id act as one replay and one no-op, with a single `ITEM_ENQUEUED`. A replay that races `discardDeadLetter` or `removeItem` for the same id either runs first or finds nothing, and one that races `clearQueue()` never leaves a queue row behind. On iOS, a replay over an id that is already in the queue resolves with nothing changed: the dead letter stays and no event is emitted.
+
+#### Example
+
+```ts
+// After a token refresh, retry what the old token got rejected.
+await configureSync({
+  ...SYNC_OPTIONS,
+  defaultHeaders: { Authorization: `Bearer ${freshToken}` },
+});
+
+const rejected = (await listDeadLetter()).filter(
+  (item) => item.lastErrorCode === SyncErrorCode.UNAUTHORIZED
+);
+for (const item of rejected) {
+  await replayDeadLetter(item.id);
+}
+await flush();
+```
+
+---
+
+### `discardDeadLetter`
+
+Delete a dead letter for good, with its stored request. Emits `ITEM_REMOVED` when a row was deleted.
+
+#### Signature
+
+```ts
+function discardDeadLetter(id: string): Promise<void>;
+```
+
+#### Parameters
+
+| Name | Type     | Required | Description                                                                   |
+| ---- | -------- | -------- | ----------------------------------------------------------------------------- |
+| `id` | `string` | Yes      | The dead letter's id, from `listDeadLetter()` or an `ITEM_DEAD_LETTERED` event. |
+
+#### Returns
+
+`Promise<void>`. An unknown id resolves with no change, so discarding the same id twice is harmless. [`removeItem`](#removeitem) does the same for a dead letter and also reports whether a row was deleted.
+
+#### Throws
+
+- `INVALID_PAYLOAD` -- native rejected the call. See [Native rejections](./errors.md#native-rejections).
+- `NATIVE_MODULE_UNAVAILABLE`.
+
+#### Example
+
+```ts
+// Drop requests the server will never accept.
+for (const item of await listDeadLetter()) {
+  if (item.lastErrorCode === SyncErrorCode.SERVER_ERROR) {
+    await discardDeadLetter(item.id);
+  }
+}
+```
+
+---
+
 ## Sync
 
 ### `flush`
@@ -281,25 +424,38 @@ function flush(): Promise<SyncResult>;
 
 `Promise<SyncResult>` -- `startedAt`, `finishedAt`, `successCount`, `failureCount`, plus `succeededIds`, `failedIds` and `errors` on Android. Those three are always empty on iOS.
 
-An item that went back to wait for a retry counts as neither a success nor a failure.
+An item that went back to wait for a retry counts as neither a success nor a failure. An item that failed permanently is counted in `failureCount` and is now in the [dead-letter queue](#dead-letters).
 
 #### Throws
 
 - `NATIVE_MODULE_UNAVAILABLE`.
 - `NETWORK_ERROR` -- the cycle itself died, for example because the store failed. It need not be a network problem: every native rejection from `flush` maps to this code.
 
-Per-item failures never throw.
+Per-item failures never throw, and neither does a cycle the quality gate or the health check skips.
 
 :::warning `flush()` resolves successfully even with failures
 A successful `Promise` resolution does **not** mean every item synced. Inspect `result.failureCount`, and listen to `ITEM_FAILED` for the per-item detail. See the [Error handling guide](../guides/error-handling.md).
 :::
 
+#### Checks before a cycle
+
+Before a cycle starts, `flush()` runs these checks in order:
+
+1. **Pause.**
+2. **Stored credentials.** `defaultHeaders` that were configured but cannot be read.
+3. **A running cycle, iOS only.** The call returns the last result at once, without the checks below.
+4. **Quality gate.** The network quality is below [`SyncOptions.minNetworkQuality`](./types.md#syncoptions). Not checked when the option is unset.
+5. **Health check.** The `HEAD` to [`SyncOptions.healthCheckUrl`](./types.md#syncoptions) fails, or the backoff after a failed one is running. Not checked when the option is unset.
+
+When the pause, the credentials, the gate or the health check stops the flush, no cycle runs: nothing is dispatched, no item changes, no `SYNC_STARTED` is emitted and no history row is written. The pause and the credentials emit no event at all. The gate emits `SYNC_FAILED` with `errorCode: 'NETWORK_QUALITY_TOO_LOW'`, and the health check `SYNC_FAILED` with `errorCode: 'HEALTH_CHECK_FAILED'`.
+
+The result of a skipped flush is 0/0 on both platforms and does not say why. Android returns `0` for `startedAt` and `finishedAt`, the zeroed shape that [`getLastSyncResult`](#getlastsyncresult) reports as `undefined`; `flush()` returns it as is. iOS sets both to the time of the call, so the result looks like an empty cycle's: only the missing `SYNC_STARTED` event and history row tell them apart.
+
 #### Behavior worth knowing
 
 - **Nothing eligible.** With an empty queue, or every item cooling, the cycle resolves with a 0/0 result, emits `SYNC_SUCCEEDED`, and adds a row to the sync history.
-- **Connectivity is not checked.** Calling `flush()` offline can spend retry attempts and mark valid items `FAILED`. On iOS the foreground session waits for connectivity, so the call may stay pending until the network returns instead. Check [`getConnectionStatus`](#getconnectionstatus) first, or use [`drainUntilEmpty`](#drainuntilempty), which does not flush while `DISCONNECTED`.
+- **Connectivity is checked only through the gate.** Without `minNetworkQuality`, calling `flush()` offline can spend retry attempts and send valid items to the dead-letter queue. On iOS the foreground session waits for connectivity, so the call may stay pending until the network returns instead. Any `minNetworkQuality` other than `OFFLINE` blocks an offline flush. Otherwise check [`getConnectionStatus`](#getconnectionstatus) first, or use [`drainUntilEmpty`](#drainuntilempty), which does not flush while `DISCONNECTED`.
 - **While a cycle is running.** iOS returns the last result at once. Android waits, then runs its own cycle.
-- **Paused, or stored headers unreadable.** No cycle runs: nothing is dispatched, no event is emitted and no history row is written. The counts are 0/0 on both platforms and do not say why. Android returns `0` for `startedAt` and `finishedAt`, the zeroed shape that [`getLastSyncResult`](#getlastsyncresult) reports as `undefined`; `flush()` returns it as is. iOS sets both to the time of the call, so the result looks like an empty cycle's: only the missing `SYNC_STARTED` event and history row tell them apart.
 
 #### Example
 
@@ -348,6 +504,8 @@ None of these waits uses up an iteration, because `maxIterations` counts real fl
 - **Items are cooling.** After a cycle with no progress, it sleeps until the soonest `nextRetryAt`. If that moment is at or past the deadline, it stops at once with `TIMEOUT`.
 - **The device is offline.** It does not flush while `getConnectionStatus()` is `DISCONNECTED`. It waits for the network and ends in `TIMEOUT` with items intact. `UNKNOWN` and `METERED` still flush.
 - **Nothing can progress.** With nothing cooling, for example while paused, it sleeps at least 250 ms so it cannot spin.
+
+A `flush()` that the [quality gate or the health check](#checks-before-a-cycle) skips does use up an iteration, and makes no progress. On a link below `minNetworkQuality`, or while a health-check backoff runs, the loop therefore ends with `MAX_ITERATIONS` or `TIMEOUT`.
 
 :::warning `timeoutMs` and `cancelDrain()` are hard stops
 Every wait ends at the deadline or on cancel, including a `flush()` still in flight. A native cycle that is already running is not aborted: it keeps going after the drain returns, and its items may still be dispatched.
@@ -460,7 +618,9 @@ Apply a full [`SyncOptions`](./types.md#syncoptions) configuration and persist i
 - **When it applies.** Android uses the new options from the next flush cycle. iOS uses them from the next item, even inside a running cycle. A request already in flight keeps the previous config.
 - **Persisted.** A worker or BGTask in a fresh process honors the options, including `maxAttempts`, `batchSize` and `requestTimeoutMs`. See [Cold-start configuration](../guides/background-sync.md#cold-start-configuration).
 - **`defaultHeaders`.** Encrypted at rest. Calling `configureSync` without them deletes the stored copy, which makes it the logout path. Pass them on every other call, and call `configureSync` whenever the token changes.
-- **Retry timer.** It is re-armed from the current queue, so a strategy change takes effect at once.
+- **Retry timer.** It is re-armed from the current queue, so a strategy change takes effect at once. A wake the quality gate was holding restarts its re-check backoff.
+- **Holds and backoffs.** Every call clears a [credential hold](../guides/background-sync.md#when-a-stored-token-expires) and ends a running [health-check backoff](../guides/connectivity-detection.md#health-check), whether or not anything changed.
+- **Network quality and health check.** `minNetworkQuality` turns on the [quality gate](../guides/connectivity-detection.md#the-quality-gate), and `healthCheckUrl` the [health check](../guides/connectivity-detection.md#health-check) and the latency measurement. Both are opt-in.
 
 #### Signature
 
@@ -472,12 +632,16 @@ function configureSync(options: SyncOptions): Promise<void>;
 
 | Name      | Type                                    | Required | Description                                                                                |
 | --------- | --------------------------------------- | -------- | ------------------------------------------------------------------------------------------ |
-| `options` | [`SyncOptions`](./types.md#syncoptions) | Yes      | Strategy, retry policy, batch size, timeout, queue cap, persistence flag, default headers. |
+| `options` | [`SyncOptions`](./types.md#syncoptions) | Yes      | Strategy, retry policy, batch size, timeout, queue cap, persistence flag, default headers, quality gate, health check. |
 
 #### Throws
 
-- `INVALID_PAYLOAD` -- native rejected the call. The options are not validated, and out-of-range numbers are clamped: Android treats a `maxAttempts` below `1` as `1`.
+- `INVALID_URL` -- `healthCheckUrl` is not an absolute `http(s)` URL, with `validationErrors` set. Checked before any native call.
+- `INVALID_PAYLOAD` -- `minNetworkQuality` is not a [`NetworkQuality`](./enums.md#networkquality) value, `healthCheckTtlMs` or `healthCheckBackoffMs` is not a finite number of at least `0`, or `options` is not an object, with `validationErrors` set. Checked before any native call.
+- `INVALID_PAYLOAD` with no `validationErrors` -- native rejected the call.
 - `NATIVE_MODULE_UNAVAILABLE`.
+
+Only those four fields are validated in JS, only when present, in the order `minNetworkQuality`, `healthCheckUrl`, `healthCheckTtlMs`, `healthCheckBackoffMs`. When several are invalid, the first one sets the code, and `validationErrors` lists them all. The other fields go to native as they are, and out-of-range numbers are clamped: Android treats a `maxAttempts` below `1` as `1`.
 
 #### Example
 
@@ -494,6 +658,9 @@ await configureSync({
   },
   batchSize: 10,
   defaultHeaders: { Authorization: `Bearer ${token}` },
+  // Opt-in: skip cycles below MODERATE, and probe the backend first.
+  minNetworkQuality: NetworkQuality.MODERATE,
+  healthCheckUrl: 'https://api.example.com/health',
 });
 ```
 
@@ -512,6 +679,8 @@ function getSyncConfig(): Promise<SyncOptions>;
 #### Returns
 
 `Promise<SyncOptions>` -- the active config: the defaults until `configureSync` first runs, then the last options applied, restored from disk in a new process. After a `configureSync` that omitted optional fields, iOS returns them filled with their defaults, including `defaultHeaders: {}`. Android returns them as `undefined`.
+
+`minNetworkQuality`, `healthCheckUrl`, `healthCheckTtlMs` and `healthCheckBackoffMs` are the exception: both platforms return them only when they were set, without filling in a default.
 
 #### Throws
 
@@ -625,7 +794,11 @@ function getConnectionStatus(): Promise<ConnectionState>;
 
 #### Returns
 
-`Promise<`[`ConnectionState`](./types.md#connectionstate)`>` -- `status`, `type`, optional `isInternetReachable`, `isExpensive`.
+`Promise<`[`ConnectionState`](./types.md#connectionstate)`>` -- `status`, `type`, `networkQuality`, optional `isInternetReachable`, `isExpensive`.
+
+`networkQuality` is always present, and `OFFLINE` exactly when `status` is `DISCONNECTED` or `UNKNOWN`. Without `healthCheckUrl` it comes from link signals only and never reaches `EXCELLENT`. See [Network quality](../guides/connectivity-detection.md#network-quality) for how it is classified.
+
+`CONNECTION_CHANGED` carries only `connectionStatus`, and is also emitted when only the network quality changed: call this again on that event, or use [`useConnection`](./hooks/useConnection.md), which does.
 
 #### Example
 
@@ -633,6 +806,10 @@ function getConnectionStatus(): Promise<ConnectionState>;
 const conn = await getConnectionStatus();
 if (conn.status === ConnectionStatus.CONNECTED) {
   await flush();
+}
+
+if (conn.networkQuality === NetworkQuality.POOR) {
+  showSlowNetworkBanner();
 }
 ```
 

@@ -27,7 +27,7 @@ All Android native code lives under `android/src/main/java/com/margelo/nitro/syn
 | `http/`            | `SyncDispatcher` (OkHttp 4.12.0 + Coroutines) and `CredentialPolicy`.                                   |
 | `retry/`           | `RetryPolicyEvaluator` (the backoff math), `RetryTimer` (in-process timer), `RetryWake` (arms the timer and the kick). |
 | `config/`          | `SyncConfigStore`, `SecretStore`, `KeystoreSecretStore`.                                                |
-| `connectivity/`    | `ConnectivityMonitor` over `ConnectivityManager.NetworkCallback`.                                       |
+| `connectivity/`    | `ConnectivityMonitor` over the default-network callback, `NetworkQualityClassifier`, `LatencyProbe`.     |
 | `work/`            | `SyncWorker` (`CoroutineWorker`), `BackgroundSyncManager`, `BootCompletedReceiver`, `RecoveryWorker`.   |
 | `events/`          | `SyncEventEmitter` — id-based listeners on the single `'sync-event'` channel.                            |
 | `error/`           | `SyncException` — typed errors mapped to `SyncErrorCode`.                                                |
@@ -37,21 +37,24 @@ The HybridObject implementation lives in `SyncProvider.kt` (`class SyncProvider 
 
 ## Room Database
 
-`SyncDatabase` is a single Room database (version 2, migrated from version 1) with two entities. It is named `syncprovider.db`. KSP is the annotation processor — Kotlin 2.0.x is incompatible with Room 2.6.1's KSP processor (`unexpected jvm signature V` on suspend `Unit` DAOs), so the project pins Room **2.7.0**.
+`SyncDatabase` is a single Room database (version 3, migrated from versions 1 and 2) with three entities. It is named `syncprovider.db`. KSP is the annotation processor — Kotlin 2.0.x is incompatible with Room 2.6.1's KSP processor (`unexpected jvm signature V` on suspend `Unit` DAOs), so the project pins Room **2.7.0**.
 
 | Entity              | Key columns                                                                                                  |
 | ------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `SyncItemEntity`    | `id`, `method`, `url`, `headers` (JSON String), `body`, `contentType`, `priority`, `priorityWeight`, `createdAt`, `status`, `attempts`, `lastAttemptAt`, `lastErrorCode`, `metadata`, `nextRetryAt`. |
+| `SyncDeadLetterEntity` | Table `sync_dead_letters`: the item's request columns plus `attempts`, `lastAttemptAt`, `lastErrorCode`, `lastErrorMessage` and `deadLetteredAt` (indexed). No `nextRetryAt`. Backs `listDeadLetter()`. |
 | `SyncResultEntity`  | `id`, `startedAt`, `finishedAt`, `successCount`, `failureCount`, `succeededIds`, `failedIds`, `errors`. Backs `getSyncHistory()`. |
 
-DAOs expose `suspend` reads and `Flow<List<SyncItemEntity>>` for reactive subscribers. Writes go through transactional methods (`claimPending`, `markSucceeded`, `markRetry`, `markFailed`, `resetInFlight`) so concurrent dispatcher + recovery passes never collide.
+DAOs expose `suspend` reads and `Flow<List<SyncItemEntity>>` for reactive subscribers. Writes go through transactional methods (`claimPending`, `markSucceeded`, `markRetry`, `resetInFlight`, and the dead-letter move and replay) so concurrent dispatcher + recovery passes never collide. A terminal failure deletes the queue row and inserts the dead letter in one transaction.
+
+`MIGRATION_2_3` creates the dead-letter table and its index, copies every `FAILED` row into it and deletes them from `sync_items`, in one transaction. A v1 store runs `MIGRATION_1_2` first. The exported schemas live under `android/schemas/`. A downgrade still falls back to a destructive migration.
 
 ## SyncQueueStorage
 
 `SyncQueueStorage` wraps the DAOs and is the only path the rest of the Android code uses to mutate the queue. It enforces:
 
 - **Atomic batch insert** (`enqueueBatch` either persists every item or throws — no partial success).
-- **`maxQueueSize` enforcement** with `QUEUE_FULL` thrown at the boundary. The cap counts every row, including `FAILED` and `IN_FLIGHT` ones. `getQueueSize()` and `getPendingItems()` cover `PENDING` rows only.
+- **`maxQueueSize` enforcement** with `QUEUE_FULL` thrown at the boundary, for enqueues and dead-letter replays. The cap counts every queue row, `PENDING` and `IN_FLIGHT`. Dead letters live in their own table and do not count. `getQueueSize()` and `getPendingItems()` cover `PENDING` rows only.
 - **`URL` validation** at insert time (throws `INVALID_URL` for non-http(s) inputs).
 - **Sort order**: `priorityWeight` ascending (`HIGH` is `0`), `createdAt` ascending — the same order iOS uses, kept in sync deliberately. A claim also requires `nextRetryAt <= now`.
 
@@ -81,6 +84,8 @@ When paused, or with default headers that cannot be read, `flush()` returns an a
 
 `RetryWake` also keeps the credential hold, in memory, as iOS does. After a rejected stored credential, every arm path waits for it, so neither the timer nor a replacement kick fires before the hold ends. `configureSync` clears it, and a new process starts without it. See [When a stored token expires](../guides/background-sync.md#when-a-stored-token-expires).
 
+After a failed health check, the timer and the kick wait for the end of its backoff, and at least 1000 ms after the failure, so a `healthCheckBackoffMs` of `0` cannot make them spin. See [Health check](../guides/connectivity-detection.md#health-check).
+
 See [Who wakes the queue](../guides/retry-policy.md#who-wakes-the-queue-and-when).
 
 ## Persisted Configuration
@@ -93,9 +98,9 @@ The background options live in `syncprovider.bgsync.prefs`, managed by `Backgrou
 
 ## ConnectivityMonitor
 
-`ConnectivityMonitor` registers a single `NetworkCallback` against the `ApplicationContext` (not an `Activity` — registering against an `Activity` loses callbacks during configuration changes). It exposes the latest `ConnectionState` as a `StateFlow<ConnectionState>` and emits `CONNECTION_CHANGED` whenever the snapshot changes.
+`ConnectivityMonitor` registers a default-network callback (`registerDefaultNetworkCallback`) against the `ApplicationContext` (not an `Activity` — registering against an `Activity` loses callbacks during configuration changes), so it follows only the network the app's traffic uses. It exposes the latest `ConnectionState` as a `StateFlow<ConnectionState>` and emits `CONNECTION_CHANGED`, asynchronously, only when a reported field changes, `networkQuality` included. It seeds its state before it registers the callback, so the state it starts in is never emitted.
 
-`NetworkCapabilities` are inspected on every change to drive the `METERED` discriminator (`!hasCapability(NET_CAPABILITY_NOT_METERED)`). The monitor starts when the first JS engine attaches.
+`NetworkCapabilities` are inspected on every change. The link is `METERED` unless it has `NET_CAPABILITY_NOT_METERED`, or, on Android 11 (API 30) and later, `NET_CAPABILITY_TEMPORARILY_NOT_METERED`. `NetworkQualityClassifier` grades the link with the [shared threshold table](../guides/connectivity-detection.md#how-it-is-classified), capping a network without `NET_CAPABILITY_VALIDATED` at `POOR`. With `healthCheckUrl` set, `LatencyProbe` measures it over the `HeadProbe` client, which the health check (`http/HealthCheck.kt`) shares; a measurement is keyed by the network handle, its validation and the URL. The monitor starts when the first JS engine attaches.
 
 ## SyncWorker (WorkManager)
 

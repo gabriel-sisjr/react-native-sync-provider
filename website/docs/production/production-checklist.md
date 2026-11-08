@@ -43,7 +43,10 @@ See [iOS Background Modes](./ios-background-modes.md), [Android Permissions](./a
 - [ ] Endpoints are idempotent, with a stable `Idempotency-Key` in `headers`. Delivery is at least once.
 - [ ] Failures are observed through `ITEM_FAILED` events, which work on both platforms. `SyncResult.errors` is always empty on iOS.
 - [ ] Failure cases handled with appropriate UI feedback (`UNAUTHORIZED` → re-auth flow, `MAX_ATTEMPTS_EXCEEDED` → notify user).
-- [ ] Items that failed permanently are removed with `removeItem`. On Android they count toward `maxQueueSize`.
+- [ ] Dead letters are handled: replayed with `replayDeadLetter` once the cause is fixed, or discarded with `discardDeadLetter`. The dead-letter queue is unbounded and keeps each request's headers and body.
+- [ ] `clearQueue()` runs on logout, before `configureSync` drops the credentials, so the dead letters are purged along with the queue. It does not need to wait for a running cycle.
+- [ ] If `minNetworkQuality` is set, the chosen level can be reached on your users' links: without `healthCheckUrl`, `EXCELLENT` never passes and `GOOD` excludes metered links.
+- [ ] If `healthCheckUrl` is set, it answers `HEAD` with a `2xx` without authentication, and UI that reacts to `SYNC_FAILED` checks `errorCode` for `NETWORK_QUALITY_TOO_LOW` and `HEALTH_CHECK_FAILED`.
 
 ## User Experience
 

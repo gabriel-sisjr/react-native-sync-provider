@@ -81,7 +81,9 @@ Nothing is dispatched yet. A flush does that.
 flowchart TD
     A["flush()"] --> B{paused, or headers unreadable?}
     B -- yes --> Z[return a 0/0 result: no cycle, no event, no history row]
-    B -- no --> C[emit SYNC_STARTED]
+    B -- no --> Q{below minNetworkQuality, or health check failing?}
+    Q -- yes --> Y[emit SYNC_FAILED with the skip code, return a 0/0 result: no cycle, no history row]
+    Q -- no --> C[emit SYNC_STARTED]
     C --> D[take one batch: up to batchSize eligible items]
     D --> E{items?}
     E -- no --> F[persist 0/0 SyncResult, emit SYNC_SUCCEEDED]
@@ -89,11 +91,11 @@ flowchart TD
     G --> H{response?}
     H -- 2xx --> I[delete row, emit ITEM_SUCCEEDED]
     H -- retriable, attempts left --> J[keep PENDING, write nextRetryAt, emit ITEM_RETRYING]
-    H -- permanent --> K[mark FAILED, emit ITEM_FAILED]
+    H -- permanent --> K[move to the dead-letter queue, emit ITEM_FAILED, then ITEM_DEAD_LETTERED]
     I --> L[persist SyncResult]
     J --> L
     K --> L
-    L --> M{any item FAILED?}
+    L --> M{any permanent failure?}
     M -- no --> N[emit SYNC_SUCCEEDED]
     M -- yes --> O[emit SYNC_FAILED]
     F --> P[arm the next retry wake, return SyncResult]
@@ -106,7 +108,8 @@ Notes:
 - A cycle takes **one batch** and makes **at most one attempt per item**. It does not loop: items left over wait for the next flush. Use [`drainUntilEmpty`](../api-reference/functions.md#drainuntilempty) to loop.
 - "Eligible" means `PENDING` with `nextRetryAt <= now`, so cooling items are skipped. Priority orders the batch.
 - Android sends a batch concurrently. iOS sends it one item at a time, and emits `SYNC_PROGRESS` after each one.
-- The dispatcher does not check connectivity.
+- The dispatcher checks connectivity only through the opt-in quality gate (`minNetworkQuality`), and the backend only through the opt-in health check (`healthCheckUrl`). Both are skipped when unset. See [Checks before a cycle](../api-reference/functions.md#checks-before-a-cycle).
+- A permanent failure moves the item, in one transaction, from the queue to the dead-letter queue.
 - Cycles do not overlap. On Android, a concurrent `flush()` waits for the running cycle and then runs its own. On iOS, it returns the last result at once.
 - HTTP requests run on the native dispatcher's executor (`URLSession` on iOS, OkHttp + `Dispatchers.IO` on Android). The JS thread is never blocked.
 - The `SyncResult` is persisted to history before the promise resolves.
@@ -133,7 +136,8 @@ sequenceDiagram
 Per-platform specifics:
 
 - **iOS**. `BGTaskScheduler` wakes a handler that was registered at process start. The handler re-submits the next request first, so the chain continues if the process is killed, then waits for launch recovery and flushes. It works with no JS loaded. A task that fires under `foregroundOnly` or after `disableBackgroundSync` completes inert. While paused, it completes without dispatching.
-- **Android**. WorkManager runs `SyncWorker`, at most every 15 minutes for the periodic job, and also for the opt-in retry kick. WorkManager enforces the constraints. The worker stays inert under `foregroundOnly` or a persisted pause. Otherwise, with no JS engine attached, it first resets rows a dead process left `IN_FLIGHT`. It then flushes and returns `Result.success()` on any completed flush, including one with failed items, so that WorkManager's backoff cannot race the persisted cooldowns. `Result.retry()` is reserved for a worker that fails as a whole.
+- **Android**. WorkManager runs `SyncWorker`, at most every 15 minutes for the periodic job, and also for the opt-in retry kick. WorkManager enforces the constraints. The worker stays inert under `foregroundOnly` or a persisted pause. Otherwise, with no JS engine attached, it first resets rows a dead process left `IN_FLIGHT`. It then flushes and returns `Result.success()` on any completed flush, including one with failed items or one the quality gate or the health check skipped, so that WorkManager's backoff cannot race the persisted cooldowns. `Result.retry()` is reserved for a worker that fails as a whole.
+- **Both**. The flush runs the same checks as a foreground one, from the persisted configuration. See [When the gate or the health check skips a window](../guides/background-sync.md#when-the-gate-or-the-health-check-skips-a-window).
 
 ## Connectivity Change Flow
 
@@ -147,7 +151,7 @@ flowchart LR
     D --> G[React re-render]
 ```
 
-The native monitor is a singleton per process. It emits an event only when the snapshot changes.
+The native monitor is a singleton per process. It emits an event only when a reported field of the snapshot changes, including `networkQuality` alone. Android never emits one for the state it starts in; iOS starts at `UNKNOWN`, so its first path report emits one. `useAutoSync` reads the starting status when it is enabled and compares each event's status with the last one it knows, so only a real change to `CONNECTED`, or to `METERED` with `flushOnMetered`, triggers its reconnect flush. A quality-only change never does.
 
 The event does not start a native flush. `useAutoSync` does that from JS. Natively, a reconnect only delivers a wake the [retry timer](../guides/retry-policy.md#who-wakes-the-queue-and-when) owes from firing offline.
 

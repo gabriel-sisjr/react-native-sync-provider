@@ -21,6 +21,7 @@ All TypeScript types exported by the library, grouped by purpose.
 import type {
   SyncItemInput,
   SyncItem,
+  SyncDeadLetterItem,
   RetryPolicy,
   SyncOptions,
   SyncResult,
@@ -119,6 +120,63 @@ The two fields do not move together. Rows carried over from v0.1 can show `attem
 
 ---
 
+### `SyncDeadLetterItem`
+
+A request that failed permanently and was moved out of the queue into the dead-letter queue, instead of being dropped. Returned by [`listDeadLetter`](./functions.md#listdeadletter) and by [`useSyncSnapshot().deadLetter`](./hooks/useSyncSnapshot.md). It mirrors `SyncItem` without the retry schedule (`nextRetryAt`), and adds the failure bookkeeping you need to inspect, replay or discard the request.
+
+```ts
+interface SyncDeadLetterItem {
+  id: string;
+  method: HttpMethod;
+  url: string;
+  headers?: Record<string, string>;
+  body?: string;
+  contentType?: string;
+  priority?: SyncPriority;
+  createdAt: number;
+  metadata?: Record<string, string>;
+  attempts: number;
+  lastAttemptAt: number;
+  lastErrorCode: SyncErrorCode;
+  lastErrorMessage?: string;
+  deadLetteredAt: number;
+}
+```
+
+| Property           | Type                                         | Required | Description |
+| ------------------ | -------------------------------------------- | -------- | ----------- |
+| `id`               | `string`                                     | Yes      | ULID assigned at enqueue time. [`replayDeadLetter`](./functions.md#replaydeadletter) puts the item back under the same id. |
+| `method`           | [`HttpMethod`](./enums.md#httpmethod)        | Yes      | HTTP verb. |
+| `url`              | `string`                                     | Yes      | Absolute URL. |
+| `headers`          | `Record<string, string>`                     | No       | Per-item headers, as enqueued. Stored in plain text, like the queue. |
+| `body`             | `string`                                     | No       | Request body, as enqueued. Stored in plain text. |
+| `contentType`      | `string`                                     | No       | `Content-Type` shortcut, as enqueued. |
+| `priority`         | [`SyncPriority`](./enums.md#syncpriority)    | No       | Dispatch lane. `NORMAL` if not supplied on enqueue. |
+| `createdAt`        | `number`                                     | Yes      | Unix ms of the original enqueue. A replay keeps it. |
+| `metadata`         | `Record<string, string>`                     | No       | Opaque tags, as enqueued. |
+| `attempts`         | `number`                                     | Yes      | Dispatch attempts recorded before the item was dead-lettered. The platforms record attempts at different moments: see [`SyncItem.attempts`](#syncitem). A replay starts again from `0`. |
+| `lastAttemptAt`    | `number`                                     | Yes      | Unix ms of the final, failing attempt. When none was recorded: for an item moved by the upgrade, the same value as `deadLetteredAt`, its enqueue time; for an item dead-lettered without a request, the time of the move. |
+| `lastErrorCode`    | [`SyncErrorCode`](./errors.md#syncerrorcode) | Yes      | Code of the final failure, the one its `ITEM_FAILED` reported. Never `DEAD_LETTERED`. An item moved by the upgrade with no usable code reports `MAX_ATTEMPTS_EXCEEDED`. |
+| `lastErrorMessage` | `string`                                     | No       | Detail of the final failure: for an HTTP failure, the status line; otherwise the error message, such as `Retry budget exhausted`. At most 1024 characters. Never contains request or response headers or bodies. Absent for items moved by the upgrade, and when the platform reported no detail. |
+| `deadLetteredAt`   | `number`                                     | Yes      | Unix ms when the item was moved. [`listDeadLetter`](./functions.md#listdeadletter) sorts by it, oldest first. For an item moved by the upgrade: its last attempt time, or its enqueue time when none was recorded. |
+
+:::note The status line differs by platform
+iOS builds it with the system's reason phrase, as in `HTTP 404 Not Found`. Android uses the server's status line, whose reason phrase is empty under HTTP/2, as in `HTTP 404`. Branch on `lastErrorCode`, not on this text.
+:::
+
+How an item becomes a dead letter:
+
+- **Every permanent failure.** Attempts exhausted (`MAX_ATTEMPTS_EXCEEDED`), a response that is not retried (`SERVER_ERROR`), and a 401 or 403 under a configuration set in the current process (`UNAUTHORIZED`). An item whose attempts already reached `maxAttempts`, for example after `configureSync` lowered it, is dead-lettered with `MAX_ATTEMPTS_EXCEEDED` without sending a request. A [credential hold](../guides/background-sync.md#when-a-stored-token-expires) is not a failure: the held item stays queued.
+- **One transaction.** The item leaves the queue and enters the dead-letter queue atomically, so it is never in both. `ITEM_FAILED` follows with the real code, then, synchronously, `ITEM_DEAD_LETTERED` with `errorCode: 'DEAD_LETTERED'` and `metadata.lastErrorCode` set to the real code.
+- **On upgrade.** Items that had failed permanently under an earlier version are moved here when the upgraded library first opens its store.
+- **Same id.** A newer dead letter with the same id replaces the older one.
+
+:::warning The dead-letter queue is unbounded
+Nothing prunes it, and it counts toward no capacity cap, on either platform. Each dead letter keeps its request's headers and body until [`replayDeadLetter`](./functions.md#replaydeadletter), [`discardDeadLetter`](./functions.md#discarddeadletter), [`removeItem`](./functions.md#removeitem) or [`clearQueue`](./functions.md#clearqueue) deletes it. Discard what you do not replay.
+:::
+
+---
+
 ## Configuration Types
 
 ### `RetryPolicy`
@@ -138,7 +196,7 @@ interface RetryPolicy {
 
 | Property             | Type                                            | Required | Default                               | Description                                                                                             |
 | -------------------- | ----------------------------------------------- | -------- | ------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `maxAttempts`        | `number`                                        | Yes      | `5`                                   | Total attempts before the item is moved to a terminal failed state.                                     |
+| `maxAttempts`        | `number`                                        | Yes      | `5`                                   | Total attempts before the item is moved to the [dead-letter queue](#syncdeadletteritem).                |
 | `backoff`            | [`BackoffStrategy`](./enums.md#backoffstrategy) | Yes      | `EXPONENTIAL`                         | Curve used to compute the next delay.                                                                   |
 | `baseDelayMs`        | `number`                                        | Yes      | `1000`                                | Base delay -- input to the curve.                                                                       |
 | `maxDelayMs`         | `number`                                        | Yes      | `60000`                               | Upper cap on the computed delay.                                                                        |
@@ -162,6 +220,10 @@ interface SyncOptions {
   maxQueueSize?: number;
   persistQueue?: boolean;
   defaultHeaders?: Record<string, string>;
+  minNetworkQuality?: NetworkQuality;
+  healthCheckUrl?: string;
+  healthCheckTtlMs?: number;
+  healthCheckBackoffMs?: number;
 }
 ```
 
@@ -171,9 +233,15 @@ interface SyncOptions {
 | `retryPolicy`      | [`RetryPolicy`](#retrypolicy)             | Yes      | Backoff policy.                                                                                                                                                                                                   |
 | `batchSize`        | `number`                                  | No       | Most items one cycle dispatches. Default `25`. Android sends them concurrently, iOS one at a time.                                                                                                                |
 | `requestTimeoutMs` | `number`                                  | No       | Per-request timeout. Default `30000`. Android enforces a floor of 1 second.                                                                                                                                       |
-| `maxQueueSize`     | `number`                                  | No       | Most items the queue may hold. Default `10000`. A value below `1` is treated as `1`, so the cap cannot be removed. Android counts `FAILED` and in-flight rows toward it, iOS counts `PENDING` rows only. See [Native rejections](./errors.md#native-rejections) for how a full queue surfaces. |
+| `maxQueueSize`     | `number`                                  | No       | Most items the queue may hold. Default `10000`. A value below `1` is treated as `1`, so the cap cannot be removed. Android counts pending and in-flight items toward it, iOS counts `PENDING` items only. Dead letters count on neither. `enqueue`, `enqueueBatch` and `replayDeadLetter` are rejected once it is reached: see [Native rejections](./errors.md#native-rejections) for how that surfaces. |
 | `persistQueue`     | `boolean`                                 | No       | Stored but not used yet. The queue is always persisted.                                                                                                                                                           |
 | `defaultHeaders`   | `Record<string, string>`                  | No       | Headers merged into every dispatched item. Per-item `headers` win on conflict. Encrypted at rest. Calling `configureSync` without them deletes the stored copy. See [Cold-start configuration](../guides/background-sync.md#cold-start-configuration). |
+| `minNetworkQuality` | [`NetworkQuality`](./enums.md#networkquality) | No | Lowest network quality at which a flush may run. Unset, the default, means no quality gate. `POOR` blocks only `OFFLINE`, and `OFFLINE` gates nothing, like leaving it unset. Below the minimum no cycle runs and `flush()` reports `NETWORK_QUALITY_TOO_LOW` on `SYNC_FAILED`. Without `healthCheckUrl` the quality never reaches `EXCELLENT`, so `EXCELLENT` then blocks every flush. See [The quality gate](../guides/connectivity-detection.md#the-quality-gate). |
+| `healthCheckUrl`   | `string`                                  | No       | Absolute `http(s)` URL the engine sends a `HEAD` to before a cycle claims its first item. A final `2xx` is healthy; anything else skips the cycle with `HEALTH_CHECK_FAILED`. Also the only target of the network-quality measurement. The probes carry no `defaultHeaders`, so point it at an endpoint that answers without authentication. Unset, the default, means no health check and no measurement. See [Health check](../guides/connectivity-detection.md#health-check). |
+| `healthCheckTtlMs` | `number`                                  | No       | How long a healthy result is reused, in ms. Default `60000`. `0` checks before every cycle. Ignored without `healthCheckUrl`. |
+| `healthCheckBackoffMs` | `number`                              | No       | How long cycles are skipped after a failed health check, in ms. Default `30000`. `0` means no backoff, but automatic retry wakes still wait 1000 ms after a failure. Ignored without `healthCheckUrl`. |
+
+`configureSync` validates the last four fields in JS, in table order and only when present: `minNetworkQuality` must be a [`NetworkQuality`](./enums.md#networkquality) value, `healthCheckUrl` an absolute `http(s)` URL, and both durations finite numbers of at least `0`. The first invalid field sets the code, `INVALID_URL` for `healthCheckUrl` and `INVALID_PAYLOAD` for the others, and `validationErrors` lists them all. [`getSyncConfig`](./functions.md#getsyncconfig) returns them only when they were set, on both platforms: their defaults are not filled in. All four are persisted for background workers, and a stored value that cannot be used, which only a damaged record can hold, loads as unset.
 
 ---
 
@@ -281,12 +349,18 @@ interface SyncResult {
 | `startedAt`    | `number`                 | Yes      | Unix ms when the run started. `0` on Android when `flush()` ran no cycle.                                                                                                                |
 | `finishedAt`   | `number`                 | Yes      | Unix ms when the run finished. `0` on Android when `flush()` ran no cycle.                                                                                                               |
 | `successCount` | `number`                 | Yes      | Items dispatched successfully.                                                                                                                                                           |
-| `failureCount` | `number`                 | Yes      | Items that failed permanently in this cycle. An item waiting for a retry counts as neither a success nor a failure.                                                                      |
+| `failureCount` | `number`                 | Yes      | Items that failed permanently in this cycle, each one now in the [dead-letter queue](#syncdeadletteritem). An item waiting for a retry counts as neither a success nor a failure.         |
 | `succeededIds` | `string[]`               | Yes      | ULIDs of successful items. Always empty on iOS.                                                                                                                                          |
 | `failedIds`    | `string[]`               | Yes      | ULIDs of failed items. Always empty on iOS.                                                                                                                                              |
 | `errors`       | `Record<string, string>` | Yes      | Failed-item id to `"<SyncErrorCode>: <detail>"`, so split on the first `:` to get the code. Always empty on iOS: use `ITEM_FAILED` events there.                                        |
 
-A `flush()` that runs no cycle, because the engine is paused or stored `defaultHeaders` cannot be read, still resolves with a `SyncResult`. Nothing is dispatched, no event is emitted and no history row is written. Both counts are `0`, and the result does not say why. Android sets `startedAt` and `finishedAt` to `0`. iOS sets both to the time of the call, so there the result alone cannot be told apart from an empty cycle: only the missing `SYNC_STARTED` event and history row show that no cycle ran.
+A `flush()` that runs no cycle still resolves with a `SyncResult`. Nothing is dispatched, no item changes, no `SYNC_STARTED` is emitted and no history row is written. That happens when:
+
+- the engine is paused, or stored `defaultHeaders` cannot be read: no event is emitted at all;
+- the network quality is below [`minNetworkQuality`](#syncoptions): `SYNC_FAILED` with `errorCode: 'NETWORK_QUALITY_TOO_LOW'`;
+- the health check fails, or its backoff is running: `SYNC_FAILED` with `errorCode: 'HEALTH_CHECK_FAILED'`.
+
+Both counts are `0`, and the result does not say why. Android sets `startedAt` and `finishedAt` to `0`. iOS sets both to the time of the call, so there the result alone cannot be told apart from an empty cycle: only the missing `SYNC_STARTED` event and history row show that no cycle ran.
 
 ---
 
@@ -316,11 +390,11 @@ interface SyncEvent {
 | `timestamp`        | `number`                                          | Yes      | Unix ms when the event was emitted.                                    |
 | `itemId`           | `string`                                          | No       | Present on item-scoped events (`ITEM_*`).                              |
 | `progress`         | `number`                                          | No       | `[0, 1]`, present on `SYNC_PROGRESS`, which only iOS emits.            |
-| `errorCode`        | [`SyncErrorCode`](./errors.md#syncerrorcode)      | No       | Present on `ITEM_FAILED` and `ITEM_RETRYING`, and on `SYNC_FAILED` only when the cycle itself died. Never set on `BACKGROUND_SYNC_*` events. |
+| `errorCode`        | [`SyncErrorCode`](./errors.md#syncerrorcode)      | No       | Present on `ITEM_FAILED` and `ITEM_RETRYING`, and `DEAD_LETTERED` on `ITEM_DEAD_LETTERED`. On `SYNC_FAILED` only when the cycle itself died, or when the quality gate (`NETWORK_QUALITY_TOO_LOW`) or the health check (`HEALTH_CHECK_FAILED`) skipped it. Never set on `BACKGROUND_SYNC_*` events. |
 | `statusCode`       | `number`                                          | No       | HTTP status code, present on dispatch-related events when available.   |
 | `attempt`          | `number`                                          | No       | 1-indexed attempt number, present on `ITEM_SUCCEEDED`, `ITEM_FAILED` and `ITEM_RETRYING`. |
-| `connectionStatus` | [`ConnectionStatus`](./enums.md#connectionstatus) | No       | Present on `CONNECTION_CHANGED`.                                       |
-| `metadata`         | `Record<string, string>`                          | No       | Engine diagnostics, on iOS only, for cycle-level events, such as attempted and succeeded counts, and for the `BACKGROUND_SYNC_*` events (`kind`, and `ok: "false"` on a failed window). This is **not** [`SyncItem.metadata`](#syncitem), which is never echoed on events. |
+| `connectionStatus` | [`ConnectionStatus`](./enums.md#connectionstatus) | No       | Present on `CONNECTION_CHANGED`. Unchanged when only the network quality changed: read [`getConnectionStatus`](./functions.md#getconnectionstatus) for the new value. |
+| `metadata`         | `Record<string, string>`                          | No       | Engine diagnostics. On both platforms, `ITEM_DEAD_LETTERED` sets `lastErrorCode`, the code the item failed with. iOS also sets diagnostics on cycle-level events, such as attempted and succeeded counts, and on the `BACKGROUND_SYNC_*` events (`kind`, and `ok: "false"` on a failed window). This is **not** [`SyncItem.metadata`](#syncitem), which is never echoed on events. |
 
 ---
 
@@ -334,6 +408,7 @@ Returned by [`getConnectionStatus`](./functions.md#getconnectionstatus) and expo
 interface ConnectionState {
   status: ConnectionStatus;
   type: ConnectionType;
+  networkQuality: NetworkQuality;
   isInternetReachable?: boolean;
   isExpensive?: boolean;
 }
@@ -343,8 +418,13 @@ interface ConnectionState {
 | --------------------- | ------------------------------------------------- | -------- | -------------------------------------------------------------- |
 | `status`              | [`ConnectionStatus`](./enums.md#connectionstatus) | Yes      | High-level status.                                             |
 | `type`                | [`ConnectionType`](./enums.md#connectiontype)     | Yes      | Network family.                                                |
+| `networkQuality`      | [`NetworkQuality`](./enums.md#networkquality)     | Yes      | The engine's quality classification, always present. `OFFLINE` exactly when `status` is `DISCONNECTED` or `UNKNOWN`. Without `healthCheckUrl` it comes from link signals only and never reaches `EXCELLENT`. |
 | `isInternetReachable` | `boolean`                                         | No       | Optional reachability probe (iOS only on some setups).         |
 | `isExpensive`         | `boolean`                                         | No       | Mirrors `NWPath.isExpensive` (iOS) / metered status (Android). |
+
+:::warning `networkQuality` is required
+Code that only reads `ConnectionState` is unaffected, but a hand-built value, such as a test fixture or a mock of `getConnectionStatus`, must now set it. See the [v0.2 → v0.3 migration](../migration/index.md#v0-2-to-v0-3).
+:::
 
 ---
 
@@ -360,8 +440,11 @@ interface UseConnectionResult {
   type: ConnectionType;
   isOnline: boolean;
   isMetered: boolean;
+  networkQuality: NetworkQuality;
 }
 ```
+
+`networkQuality` is required, like on `ConnectionState`. It is `OFFLINE` whenever `isOnline` is `false`, including before the first snapshot arrives.
 
 See [`useConnection`](./hooks/useConnection.md).
 
@@ -444,63 +527,14 @@ interface UseSyncSnapshotResult {
   lastResult: SyncResult | null;
   isWaitingForConnection: boolean;
   error: SyncError | null;
-  // Forward fields for v0.3 -- ALWAYS undefined in v0.2:
   networkQuality?: NetworkQuality;
   deadLetter?: readonly SyncDeadLetterItem[];
 }
 ```
 
-Read-only dashboard aggregator with no action methods. `networkQuality` and `deadLetter` are forward-looking fields that are **ALWAYS `undefined` in v0.2** -- see [Forward Types](#forward-types-v03) below.
+Read-only dashboard aggregator with no action methods. `networkQuality` mirrors [`ConnectionState.networkQuality`](#connectionstate) and `deadLetter` the [`listDeadLetter`](./functions.md#listdeadletter) result. Both stay `undefined` until their first read succeeds, and are always `undefined` on web.
 
 See [`useSyncSnapshot`](./hooks/useSyncSnapshot.md).
-
----
-
-## Forward Types (v0.3) {#forward-types-v03}
-
-These types are part of the frozen public surface so consumer code can depend on their final shape, but in v0.2 they are surfaced **only** as the optional [`UseSyncSnapshotResult.networkQuality`](#usesyncsnapshotresult) and [`UseSyncSnapshotResult.deadLetter`](#usesyncsnapshotresult) fields, both **ALWAYS `undefined`** until the v0.3 features ship.
-
-### `SyncDeadLetterItem`
-
-An item that exhausted its retry budget and was moved to the dead-letter queue. The dead-letter queue is slated for v0.3; in v0.2 this type is never produced, and an item that fails permanently stays in the queue store as a `FAILED` row.
-
-```ts
-interface SyncDeadLetterItem {
-  id: string;
-  method: HttpMethod;
-  url: string;
-  headers?: Record<string, string>;
-  body?: string;
-  contentType?: string;
-  priority?: SyncPriority;
-  createdAt: number;
-  metadata?: Record<string, string>;
-  attempts: number;
-  lastAttemptAt: number;
-  lastErrorCode: SyncErrorCode;
-  lastErrorMessage?: string;
-  deadLetteredAt: number;
-}
-```
-
-| Property           | Type                                         | Required | Description                                                             |
-| ------------------ | -------------------------------------------- | -------- | ----------------------------------------------------------------------- |
-| `id`               | `string`                                     | Yes      | ULID assigned by the native layer at enqueue time.                      |
-| `method`           | [`HttpMethod`](./enums.md#httpmethod)        | Yes      | HTTP verb used to dispatch the request.                                 |
-| `url`              | `string`                                     | Yes      | Absolute URL of the request.                                            |
-| `headers`          | `Record<string, string>`                     | No       | Request headers, mirroring what was enqueued.                           |
-| `body`             | `string`                                     | No       | Pre-serialized request body.                                            |
-| `contentType`      | `string`                                     | No       | `Content-Type` shortcut, mirroring what was enqueued.                   |
-| `priority`         | [`SyncPriority`](./enums.md#syncpriority)    | No       | Dispatch lane (`NORMAL` if not supplied on enqueue).                    |
-| `createdAt`        | `number`                                     | Yes      | Unix ms captured by the native layer at enqueue time.                   |
-| `metadata`         | `Record<string, string>`                     | No       | Opaque tags, mirroring what was enqueued.                               |
-| `attempts`         | `number`                                     | Yes      | Total dispatch attempts made before dead-lettering.                     |
-| `lastAttemptAt`    | `number`                                     | Yes      | Unix ms of the final (failing) dispatch attempt.                        |
-| `lastErrorCode`    | [`SyncErrorCode`](./errors.md#syncerrorcode) | Yes      | Failure code from the final attempt -- the reason it was dead-lettered. |
-| `lastErrorMessage` | `string`                                     | No       | Human-readable detail accompanying `lastErrorCode`.                     |
-| `deadLetteredAt`   | `number`                                     | Yes      | Unix ms at which the item was moved to dead-letter.                     |
-
-See also [`NetworkQuality`](./enums.md#networkquality) -- the companion forward enum.
 
 ---
 
