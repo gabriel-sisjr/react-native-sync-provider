@@ -404,7 +404,7 @@ final class DeadLetterStoreTests: XCTestCase {
         let move = Task {
             try await engine.storage.moveToDeadLetters(id: id, errorCode: "SERVER_ERROR", errorMessage: "HTTP 404 Not Found")
         }
-        await fulfillment(of: [hold.reached], timeout: 5)
+        await fulfillment(of: [hold.reached], timeout: livenessTimeout)
         let purge = Task { try await engine.storage.clear() }
         try await letPurgeLand()
         hold.release()
@@ -426,7 +426,7 @@ final class DeadLetterStoreTests: XCTestCase {
         let move = Task {
             try await engine.storage.moveToDeadLetters(id: id, errorCode: "SERVER_ERROR", errorMessage: "HTTP 404 Not Found")
         }
-        await fulfillment(of: [hold.reached], timeout: 5)
+        await fulfillment(of: [hold.reached], timeout: livenessTimeout)
         let remove = Task { try await engine.storage.remove(id: id) }
         try await letPurgeLand()
         hold.release()
@@ -447,7 +447,7 @@ final class DeadLetterStoreTests: XCTestCase {
         defer { hold.release() }
 
         let replay = Task { try await engine.storage.replayDeadLetter(id: id) }
-        await fulfillment(of: [hold.reached], timeout: 5)
+        await fulfillment(of: [hold.reached], timeout: livenessTimeout)
         let purge = Task { try await engine.storage.clear() }
         try await letPurgeLand()
         hold.release()
@@ -467,7 +467,7 @@ final class DeadLetterStoreTests: XCTestCase {
         defer { hold.release() }
 
         let replay = Task { try await engine.storage.replayDeadLetter(id: id) }
-        await fulfillment(of: [hold.reached], timeout: 5)
+        await fulfillment(of: [hold.reached], timeout: livenessTimeout)
         let discard = Task { try await engine.storage.discardDeadLetter(id: id) }
         try await letPurgeLand()
         hold.release()
@@ -489,7 +489,7 @@ final class DeadLetterStoreTests: XCTestCase {
         defer { hold.release() }
 
         let first = Task { try await engine.storage.replayDeadLetter(id: id) }
-        await fulfillment(of: [hold.reached], timeout: 5)
+        await fulfillment(of: [hold.reached], timeout: livenessTimeout)
         let second = Task { try await engine.storage.replayDeadLetter(id: id) }
         try await letPurgeLand()
         hold.release()

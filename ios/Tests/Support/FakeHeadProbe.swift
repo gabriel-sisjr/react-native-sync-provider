@@ -67,8 +67,9 @@ final class FakeHeadProbe: HeadProbing, @unchecked Sendable {
         waiting.forEach { $0.resume() }
     }
 
-    /// Returns once `count` calls are held, failing after `timeout`.
-    func waitUntilHeld(_ count: Int = 1, timeout: TimeInterval = 2) async -> Bool {
+    /// Returns once `count` calls are held, failing after `timeout`
+    /// (``livenessTimeout`` by default).
+    func waitUntilHeld(_ count: Int = 1, timeout: TimeInterval = livenessTimeout) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while heldCalls < count {
             guard Date() < deadline else { return false }

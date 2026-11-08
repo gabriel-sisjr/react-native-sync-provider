@@ -41,8 +41,9 @@ extension XCTestCase {
     }
 
     /// Attaches listeners the same way, then waits for one of them, failing
-    /// the test instead of hanging when none is called within `timeout`.
-    func settle<T>(_ promise: Promise<T>, timeout: TimeInterval = 2) async -> Result<T, Error>? {
+    /// the test instead of hanging when none is called within `timeout`
+    /// (``livenessTimeout`` by default).
+    func settle<T>(_ promise: Promise<T>, timeout: TimeInterval = livenessTimeout) async -> Result<T, Error>? {
         let settled = expectation(description: "the promise settles")
         let outcome = PromiseOutcome<T>()
         promise

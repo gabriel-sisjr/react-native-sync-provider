@@ -626,7 +626,7 @@ final class SyncEngineConfigTests: XCTestCase {
         let hold = RecoveryWriteHold(stack: fixture.stack)
         defer { hold.release() }
         let cold = fixture.buildEngine(emitter: emitter)
-        await fulfillment(of: [hold.reached], timeout: 30)
+        await fulfillment(of: [hold.reached], timeout: livenessTimeout)
 
         let task = FakeBackgroundTask()
         fire(cold.background, task)
