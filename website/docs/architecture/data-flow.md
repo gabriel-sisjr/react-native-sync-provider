@@ -80,7 +80,7 @@ Nothing is dispatched yet. A flush does that.
 ```mermaid
 flowchart TD
     A["flush()"] --> B{paused, or headers unreadable?}
-    B -- yes --> Z[return an empty result: no cycle runs]
+    B -- yes --> Z[return a 0/0 result: no cycle, no event, no history row]
     B -- no --> C[emit SYNC_STARTED]
     C --> D[take one batch: up to batchSize eligible items]
     D --> E{items?}

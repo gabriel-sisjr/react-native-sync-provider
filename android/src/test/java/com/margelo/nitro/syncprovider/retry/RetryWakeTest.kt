@@ -8,6 +8,9 @@ import com.margelo.nitro.syncprovider.database.SyncItemEntity
 import com.margelo.nitro.syncprovider.storage.SyncQueueStorage
 import com.margelo.nitro.syncprovider.testutil.MovingClock
 import com.margelo.nitro.syncprovider.testutil.TestData
+import io.mockk.Runs
+import io.mockk.every
+import io.mockk.just
 import io.mockk.mockk
 import io.mockk.verify
 import kotlinx.coroutines.test.runTest
@@ -25,13 +28,17 @@ internal class RetryWakeTest {
   private lateinit var db: SyncDatabase
   private lateinit var storage: SyncQueueStorage
   private val timer = mockk<RetryTimer>(relaxed = true)
+
+  /** The delay of every timer arm, in order. */
+  private val armed = mutableListOf<Long>()
   private val kicks = mutableListOf<Long>()
   private val clock = MovingClock()
   private var halted = false
   private var live = true
 
-  private val wake: RetryWake
-    get() = RetryWake(
+  /** One per test, like the runtime's: the credential hold must carry between calls. */
+  private val wake: RetryWake by lazy {
+    RetryWake(
       storage = storage,
       timer = timer,
       scheduleKick = { kicks += it },
@@ -39,6 +46,7 @@ internal class RetryWakeTest {
       isEngineLive = { live },
       clock = clock::now,
     )
+  }
 
   @Before
   fun setUp() {
@@ -47,6 +55,7 @@ internal class RetryWakeTest {
       SyncDatabase::class.java,
     ).allowMainThreadQueries().build()
     storage = SyncQueueStorage.from(db)
+    every { timer.arm(capture(armed)) } just Runs
   }
 
   @After
@@ -189,5 +198,106 @@ internal class RetryWakeTest {
 
     verify(exactly = 0) { timer.arm(any()) }
     assertThat(kicks).isEmpty()
+  }
+
+  /* ------------------------------ the credential hold ----------------------------- */
+
+  @Test
+  fun `a credential hold outlives the cycle that set it`() = runTest {
+    insert("due", clock.now() - 1L)
+
+    wake.arm(notBefore = clock.now() + HOLD_MS)
+    wake.arm() // A later cycle that was not rejected again.
+
+    assertThat(armed).containsExactly(HOLD_MS, HOLD_MS).inOrder()
+    assertThat(kicks).containsExactly(HOLD_MS, HOLD_MS).inOrder()
+  }
+
+  @Test
+  fun `resume waits for the credential hold, even for a row with no cooldown`() = runTest {
+    insert("due", clock.now() - 1L)
+    wake.arm(notBefore = clock.now() + HOLD_MS)
+    insert("fresh", 0L)
+
+    wake.armForResume()
+
+    assertThat(armed).containsExactly(HOLD_MS, HOLD_MS).inOrder()
+    assertThat(kicks).containsExactly(HOLD_MS, HOLD_MS).inOrder()
+  }
+
+  @Test
+  fun `a hold reported while halted still holds back the wake that follows`() = runTest {
+    insert("due", clock.now() - 1L)
+    halted = true
+    wake.arm(notBefore = clock.now() + HOLD_MS)
+    assertThat(armed).isEmpty()
+
+    halted = false
+    wake.armForResume()
+
+    assertThat(armed).containsExactly(HOLD_MS)
+    assertThat(kicks).containsExactly(HOLD_MS)
+  }
+
+  @Test
+  fun `with no JS engine the hold holds back the kick alone`() = runTest {
+    insert("due", clock.now() - 1L)
+    live = false
+
+    wake.arm(notBefore = clock.now() + HOLD_MS)
+    wake.arm()
+
+    assertThat(armed).isEmpty()
+    assertThat(kicks).containsExactly(HOLD_MS, HOLD_MS).inOrder()
+  }
+
+  @Test
+  fun `a hold never wakes the queue by itself`() = runTest {
+    wake.arm(notBefore = clock.now() + HOLD_MS)
+
+    verify { timer.cancel() }
+    assertThat(armed).isEmpty()
+    assertThat(kicks).isEmpty()
+  }
+
+  @Test
+  fun `a later rejection extends the hold, and an earlier one cannot shorten it`() = runTest {
+    insert("due", clock.now() - 1L)
+
+    wake.arm(notBefore = clock.now() + HOLD_MS)
+    wake.arm(notBefore = clock.now() + HOLD_MS / 2)
+    wake.arm(notBefore = clock.now() + HOLD_MS * 2)
+
+    assertThat(armed).containsExactly(HOLD_MS, HOLD_MS, HOLD_MS * 2).inOrder()
+    assertThat(kicks).containsExactly(HOLD_MS, HOLD_MS, HOLD_MS * 2).inOrder()
+  }
+
+  @Test
+  fun `clearing the hold lets the next wake fire earlier`() = runTest {
+    insert("due", clock.now() - 1L)
+    wake.arm(notBefore = clock.now() + HOLD_MS)
+
+    wake.clearCredentialHold()
+    wake.arm()
+
+    assertThat(armed).containsExactly(HOLD_MS, 0L).inOrder()
+    assertThat(kicks).containsExactly(HOLD_MS, 0L).inOrder()
+  }
+
+  @Test
+  fun `once the hold has passed, wakes are back to normal`() = runTest {
+    insert("due", clock.now() - 1L)
+    wake.arm(notBefore = clock.now() + HOLD_MS)
+
+    clock.advance(HOLD_MS + 1L)
+    wake.arm()
+    wake.armForResume()
+
+    assertThat(armed).containsExactly(HOLD_MS, 0L, 0L).inOrder()
+    assertThat(kicks).containsExactly(HOLD_MS, 0L, 0L).inOrder()
+  }
+
+  private companion object {
+    const val HOLD_MS = 60_000L
   }
 }

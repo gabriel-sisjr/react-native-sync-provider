@@ -93,34 +93,55 @@ export interface SyncItem {
    */
   createdAt: number;
   /**
-   * Number of dispatch attempts made for this item so far.
+   * Number of dispatch attempts recorded for this item, counted against
+   * {@link RetryPolicy.maxAttempts}.
    *
-   * `attempts === 0` means the item has **never been tried** — it is still
-   * awaiting its first dispatch. Any value `> 0` is the count of attempts
-   * already spent against {@link RetryPolicy.maxAttempts}.
+   * `attempts === 0` means no attempt has been recorded. It does not mean the
+   * item was never tried: its request may already have reached the server.
    *
    * @remarks
-   * iOS counts an attempt when dispatch starts and Android when its outcome is
-   * recorded, so an attempt cut short by a process kill counts only on iOS.
+   * When an attempt is recorded depends on the platform:
+   *
+   * - Android records it with the attempt's outcome. A process kill
+   *   mid-request leaves the count unchanged, so an item whose first request
+   *   reached the server can still show `0`.
+   * - iOS counts it when the dispatch starts, so a kill mid-request spends it.
+   * - On both, a 401 or 403 sent with `defaultHeaders` restored from storage,
+   *   in a process where `configureSync` has not run, holds the item without
+   *   spending an attempt: the count ends at its value from before the
+   *   dispatch. A held item can therefore show `attempts: 0` with
+   *   `nextRetryAt > 0`.
    *
    * Surfaced **verbatim** by the facade. This is deliberately asymmetric with
    * `getLastSyncResult`, which translates a native sentinel
    * (`startedAt === 0 && finishedAt === 0`) into `undefined` via the facade's
    * `isLastSyncSentinel` helper. `SyncItem.attempts` is **never** translated:
-   * the `0` here is a real value (`never tried`), not an "absent" marker.
+   * the `0` here is a real value (`no attempt recorded`), not an "absent"
+   * marker.
    */
   attempts: number;
   /**
    * Epoch-millisecond timestamp at which this item becomes eligible for its
-   * next dispatch attempt — its retry-cooldown deadline. An item is eligible
-   * once `nextRetryAt <= now`.
+   * next dispatch. An item is eligible once `nextRetryAt <= now`.
    *
-   * - `0` means the item was **never attempted** and is eligible now.
-   * - A positive value means a retry is pending. The native dispatcher skips the
-   *   item until the device clock reaches it, and the value stays in place
-   *   afterwards, so a timestamp in the past means the cooldown has elapsed.
+   * - `0` means the item is eligible now. It does not mean the item was never
+   *   attempted: see the remarks.
+   * - A positive value means a retry cooldown or a credential hold is pending.
+   *   The native dispatcher skips the item until the device clock reaches it,
+   *   and the value stays in place afterwards, so a timestamp in the past means
+   *   the wait has elapsed.
    *
    * @remarks
+   * `nextRetryAt` and {@link SyncItem.attempts} do not move together. Rows
+   * carried over from v0.1 can show `attempts >= 1` with `nextRetryAt: 0`, and
+   * so does an iOS row whose first attempt was cut short by a process kill. An
+   * item held after a credential rejection can show `attempts: 0` with
+   * `nextRetryAt > 0`.
+   *
+   * A cooldown and a credential hold look the same here, because `SyncItem`
+   * carries neither the last error code nor the last attempt time. An
+   * `ITEM_RETRYING` event with `errorCode: 'UNAUTHORIZED'` marks a hold.
+   *
    * Surfaced **verbatim** by the facade. Unlike `getLastSyncResult`'s sentinel
    * translation (`isLastSyncSentinel` → `undefined`), `SyncItem.nextRetryAt`'s
    * `0` is a real value (`eligible now`) and is **never** translated to
@@ -192,8 +213,9 @@ export interface SyncDeadLetterItem {
  *
  * @remarks
  * The policy is intentionally declarative, so it also works with no JS running.
- * A per-attempt `shouldRetry(error)` callback is planned for v0.4: it requires a
- * JS-alive bridge round-trip on every retry decision.
+ * A JS-side per-attempt retry override is planned for a later release. It would
+ * run only while JS is alive, because every retry decision would need a bridge
+ * round-trip.
  */
 export interface RetryPolicy {
   /** Maximum number of dispatch attempts (initial attempt counts as one). */
@@ -264,9 +286,19 @@ export interface SyncOptions {
    * on logout.
    *
    * If the stored copy cannot be read, the worker leaves items pending instead
-   * of dispatching without the headers. If a worker running on stored headers
-   * gets a 401 or 403, the item stays pending and no attempt is spent, because a
-   * stored token can expire and only the app can renew it.
+   * of dispatching without the headers. In a process that has not called
+   * `configureSync`, a 401 or 403 does not fail the item, because a stored
+   * token can expire and only the app can renew it: the item stays pending, no
+   * attempt is spent, and a credential hold keeps every retry wake in the
+   * process back for at least 60 seconds.
+   *
+   * The hold lives in memory, so a process restart (an OS kill, a reboot or an
+   * app update) drops it. The rejected item keeps its own `nextRetryAt`, but
+   * another due item can wake the queue in the new process and spend one
+   * request with the rejected token, whose rejection sets a new hold. The
+   * periodic worker and the iOS BGTasks are not retry wakes and do not wait for
+   * the hold, so a background window that opens during one can also spend one
+   * request.
    */
   defaultHeaders?: Record<string, string>;
 }
@@ -278,11 +310,26 @@ export interface SyncOptions {
 /**
  * Outcome of a single flush cycle. Returned by `flush()` and persisted to the
  * sync history (see `getSyncHistory`).
+ *
+ * @remarks
+ * A `flush()` that runs no cycle, because the engine is paused or stored
+ * `defaultHeaders` cannot be read, still resolves with a `SyncResult`, but
+ * nothing is dispatched, no event is emitted and no history row is written.
+ * Both counts are `0`, and the result does not say why. Android sets
+ * `startedAt` and `finishedAt` to `0`. iOS sets both to the time of the call,
+ * so there the result alone cannot be told apart from an empty cycle: only the
+ * missing `SYNC_STARTED` event and history row show that no cycle ran.
  */
 export interface SyncResult {
-  /** Epoch ms — when the flush cycle started. */
+  /**
+   * Epoch ms — when the flush cycle started. `0` on Android when `flush()` ran
+   * no cycle.
+   */
   startedAt: number;
-  /** Epoch ms — when the flush cycle finished. */
+  /**
+   * Epoch ms — when the flush cycle finished. `0` on Android when `flush()` ran
+   * no cycle.
+   */
   finishedAt: number;
   /** Number of items that succeeded in this cycle. */
   successCount: number;
@@ -322,7 +369,14 @@ export interface SyncResult {
  * - `QUEUE_CLEARED` — base fields only.
  * - `CONNECTION_CHANGED` — `connectionStatus` set.
  * - `PAUSED` / `RESUMED` — base fields only.
- * - `BACKGROUND_SYNC_STARTED` / `BACKGROUND_SYNC_COMPLETED` — base fields only.
+ * - `BACKGROUND_SYNC_STARTED` / `BACKGROUND_SYNC_COMPLETED` — base fields
+ *   only on Android. On iOS, `metadata.kind` (`"refresh"` or `"processing"`) is
+ *   set on every `BACKGROUND_SYNC_COMPLETED` and on the processing task's
+ *   `BACKGROUND_SYNC_STARTED`, and `metadata.ok` is `"false"` on a
+ *   `BACKGROUND_SYNC_COMPLETED` whose flush failed. `errorCode` is not set on
+ *   either platform: a window whose flush fails reports the code on that
+ *   cycle's `SYNC_FAILED` event. See {@link SyncEventType} for when each
+ *   platform emits these events.
  */
 export interface SyncEvent {
   /** Discriminator — see {@link SyncEventType} for per-type field semantics. */
@@ -348,8 +402,9 @@ export interface SyncEvent {
   /** Connection status snapshot. Only set for `CONNECTION_CHANGED`. */
   connectionStatus?: ConnectionStatus;
   /**
-   * Engine diagnostics, on iOS only, for cycle-level events. This is not
-   * {@link SyncItemInput.metadata}: item metadata is not echoed on events.
+   * Engine diagnostics, on iOS only, for cycle-level events and the
+   * `BACKGROUND_SYNC_*` events. This is not {@link SyncItemInput.metadata}:
+   * item metadata is not echoed on events.
    */
   metadata?: Record<string, string>;
 }

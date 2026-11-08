@@ -65,6 +65,14 @@ export interface UseAutoSyncExtraOptions extends UseAutoSyncOptions {
  * The reconnect trigger does not read the status: it follows the
  * `CONNECTION_CHANGED` event.
  *
+ * The hook never reads `SyncOptions.strategy`, so under `MANUAL` it keeps
+ * flushing on its interval, reconnect and foreground triggers. `MANUAL` only
+ * stops the native engine from scheduling flushes on its own: the in-process
+ * retry timer and, on Android, the WorkManager retry kick. Background windows
+ * enabled through `enableBackgroundSync` (the Android periodic worker and the
+ * iOS BGTasks) still run. To stop the hook's flushes, pass `enabled: false` or
+ * unmount it.
+ *
  * @param options — see {@link UseAutoSyncExtraOptions}.
  *
  * @example

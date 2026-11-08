@@ -1,9 +1,10 @@
 /**
  * A single, machine-readable validation violation.
  *
- * Produced by {@link collectSyncItemIssues} and attached to a
- * {@link SyncError} via its `validationErrors` field, so consumers can react
- * to *every* problem with a payload instead of parsing one opaque `message`.
+ * `enqueue` and `enqueueBatch` validate their input in JS, before any native
+ * call, and attach every issue they find to the thrown {@link SyncError} via
+ * its `validationErrors` field, so consumers can react to *every* problem with
+ * a payload instead of parsing one opaque `message`.
  *
  * For batch operations ({@link enqueueBatch}), `itemIndex` identifies which
  * input item the issue belongs to (the position in the `items` array). For

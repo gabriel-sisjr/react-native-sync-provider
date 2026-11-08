@@ -92,6 +92,10 @@ export const SyncStrategy = {
    * retry kick. Items are dispatched by an explicit `flush()`, plus any OS
    * windows enabled through `enableBackgroundSync`. Useful for batch upload
    * screens.
+   *
+   * `useAutoSync` does not read the strategy: while it is mounted with
+   * `enabled: true`, it keeps flushing under `MANUAL` too. Pass
+   * `enabled: false` for a manual flow.
    */
   MANUAL: 'MANUAL',
   /**
@@ -253,9 +257,18 @@ export const SyncEventType = {
    * recovery put interrupted items back in the queue.
    */
   RESUMED: 'RESUMED',
-  /** OS-scheduled background sync window started. */
+  /**
+   * OS-scheduled background sync window started: a BGTask on iOS, the periodic
+   * worker on Android. Android's one-time retry kick emits neither background
+   * event.
+   */
   BACKGROUND_SYNC_STARTED: 'BACKGROUND_SYNC_STARTED',
-  /** OS-scheduled background sync window finished (success or otherwise). */
+  /**
+   * The same window finished. iOS emits it whether the window's flush
+   * succeeded or failed, with `metadata.ok` set to `"false"` on a failure.
+   * Android emits it only after the flush returns, so a worker whose flush
+   * throws emits none. `errorCode` is not set on either platform.
+   */
   BACKGROUND_SYNC_COMPLETED: 'BACKGROUND_SYNC_COMPLETED',
 } as const;
 /** See {@link SyncEventType} value set. */

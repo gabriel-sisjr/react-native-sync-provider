@@ -103,7 +103,7 @@ final class CoreDataMigrationV1ToV2Tests: XCTestCase {
         XCTAssertFalse(attribute.isOptional, "`nextRetryAt` must be non-optional.")
         XCTAssertEqual(
             (attribute.defaultValue as? NSNumber)?.int64Value, 0,
-            "`nextRetryAt` must default to 0 (never attempted, so eligible now)."
+            "`nextRetryAt` must default to 0 (no deadline pending, so eligible now)."
         )
     }
 

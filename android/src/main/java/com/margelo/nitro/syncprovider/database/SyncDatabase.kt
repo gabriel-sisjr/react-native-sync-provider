@@ -35,9 +35,11 @@ internal abstract class SyncDatabase : RoomDatabase() {
      * index's left prefix).
      *
      * The column is added `NOT NULL DEFAULT 0` so pre-existing rows survive as
-     * "never attempted", with no data loss, and the migrated schema matches a
-     * fresh install. Index names MUST match Room's generated names
-     * byte-for-byte for [androidx.room.testing.MigrationTestHelper] validation.
+     * eligible now, with no data loss, and the migrated schema matches a fresh
+     * install. They keep their `attempts`, so a migrated row can show
+     * `attempts >= 1` with `nextRetryAt = 0`. Index names MUST match Room's
+     * generated names byte-for-byte for
+     * [androidx.room.testing.MigrationTestHelper] validation.
      */
     val MIGRATION_1_2: Migration = object : Migration(1, 2) {
       override fun migrate(db: SupportSQLiteDatabase) {

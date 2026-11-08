@@ -249,7 +249,7 @@ const result = await flush();
 | ----------------- | ----------------------------------------------- | ------------------------------------------------------- |
 | `enqueue`         | `(item: SyncItemInput) => Promise<string>`      | Persist a single HTTP request; returns its native ULID. |
 | `enqueueBatch`    | `(items: SyncItemInput[]) => Promise<string[]>` | Atomic batch enqueue; returns ULIDs in input order.     |
-| `removeItem`      | `(id: string) => Promise<boolean>`              | Remove a queued item by ULID. `false` if not found.     |
+| `removeItem`      | `(id: string) => Promise<boolean>`              | Remove an item by ULID, in any status. `false` if no row has that id. Does not cancel a request in flight. |
 | `clearQueue`      | `() => Promise<void>`                           | Drop every item, including failed ones.                 |
 | `getQueueSize`    | `() => Promise<number>`                         | `PENDING` items, cooling ones included.                 |
 | `getPendingItems` | `() => Promise<SyncItem[]>`                     | `PENDING` items, cooling included, in dispatch order.   |
@@ -345,7 +345,7 @@ interface SyncItem {
 }
 ```
 
-> `attempts` and `nextRetryAt` are the per-item retry bookkeeping (added in v0.2). `attempts === 0` means never attempted. `nextRetryAt === 0` means never attempted and eligible now; a positive value means a retry is pending, and the item is eligible once `nextRetryAt <= now`. Both are returned verbatim, never translated to `undefined`.
+> `attempts` and `nextRetryAt` are the per-item retry bookkeeping (added in v0.2). `attempts` counts the attempts recorded for the item, so `attempts === 0` means none was recorded, not that the item was never tried. `nextRetryAt === 0` means the item is eligible now; a positive value means a retry cooldown or a credential hold is pending, and the item is eligible once `nextRetryAt <= now`. Both are returned verbatim, never translated to `undefined`.
 
 ### RetryPolicy
 
@@ -360,7 +360,7 @@ interface RetryPolicy {
 }
 ```
 
-> Network errors and timeouts are always retried regardless of `retryOnStatusCodes`. Non-listed 4xx/5xx responses are permanent failures, and 401/403 stay permanent even when listed. The optional per-attempt `shouldRetry(error)` callback is deferred to v0.4 — it requires a JS-alive bridge round-trip on every retry decision.
+> Network errors and timeouts are always retried regardless of `retryOnStatusCodes`. Non-listed 4xx/5xx responses are permanent failures, and 401/403 stay permanent even when listed. A JS-side per-attempt retry override is planned for a later release. It would run only while JS is alive, because every retry decision would need a bridge round-trip.
 
 ### SyncOptions
 
@@ -487,7 +487,7 @@ type ValidationIssue = {
 | Value           | Description                                                                                                                                                       |
 | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `AUTOMATIC`     | The engine retries on its own: a failed item is dispatched again when its cooldown ends, and pending items on `resumeSync()`. Enqueueing does not trigger a flush. |
-| `MANUAL`        | The engine schedules nothing on its own: no retry timer and no Android retry kick. Items go on `flush()`, plus any OS windows enabled by `enableBackgroundSync`.   |
+| `MANUAL`        | The engine schedules nothing on its own: no retry timer and no Android retry kick. Items go on `flush()`, plus any OS windows enabled by `enableBackgroundSync`. `useAutoSync` does not read the strategy, so it keeps flushing while enabled. |
 | `OPPORTUNISTIC` | Reserved. Currently behaves like `AUTOMATIC`.                                                                                                                     |
 
 ### SyncPriority
@@ -555,8 +555,8 @@ type ValidationIssue = {
 | `CONNECTION_CHANGED`        | Network connectivity changed.                                          |
 | `PAUSED`                    | Sync was paused via `pauseSync()`.                                     |
 | `RESUMED`                   | Sync was resumed via `resumeSync()`, or iOS recovered items at launch. |
-| `BACKGROUND_SYNC_STARTED`   | OS-scheduled background sync window started.                           |
-| `BACKGROUND_SYNC_COMPLETED` | OS-scheduled background sync window finished.                          |
+| `BACKGROUND_SYNC_STARTED`   | A background window started: a BGTask on iOS, the periodic worker on Android. |
+| `BACKGROUND_SYNC_COMPLETED` | The same window finished. No `errorCode`: a failed flush reports it on `SYNC_FAILED`. |
 
 ### SyncErrorCode
 

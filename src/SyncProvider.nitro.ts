@@ -160,6 +160,11 @@ export interface SyncProvider extends HybridObject<{
    * `SyncOptions.batchSize`, applying the retry policy. Items still cooling down
    * are skipped. The strategy plays no part.
    *
+   * While the engine is paused, or while stored `defaultHeaders` cannot be read,
+   * no cycle runs: the result is 0/0, and no event or history row is written.
+   * Android then returns `0` for `startedAt` and `finishedAt`, and iOS the time
+   * of the call for both.
+   *
    * @returns the outcome of the cycle. Per-item failures never reject: they are
    *   counted here and reported through item events.
    * @throws when the cycle itself dies, for example because the store fails.
@@ -187,7 +192,9 @@ export interface SyncProvider extends HybridObject<{
    * `MANUAL`, a flush is scheduled for the soonest pending item: items with no
    * cooldown left are dispatched right away, and cooling items when their
    * cooldown ends. If the device is offline at that moment, the flush waits
-   * until connectivity is restored.
+   * until connectivity is restored. During a credential hold, the flush waits
+   * for the hold to end, on both platforms. The hold lives in memory, so a
+   * process restart drops it.
    *
    * @example
    * await sync.resumeSync();

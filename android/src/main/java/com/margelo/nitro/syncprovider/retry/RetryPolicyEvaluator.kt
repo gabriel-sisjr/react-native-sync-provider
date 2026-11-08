@@ -40,7 +40,7 @@ internal object RetryPolicyEvaluator {
     }
 
     val jittered = if (policy.jitter && raw > 0) {
-      // Equal jitter [0.75, 1.25]: spread the back-off ±25% around `raw`,
+      // Equal jitter [0.75, 1.25): spread the back-off ±25% around `raw`,
       // matching JS (src/utils/retryBackoff.ts) and iOS
       // (ios/Retry/RetryPolicyEvaluator.swift). Cap is applied AFTER jitter so
       // the clamped value never exceeds maxDelayMs, exactly like both peers.

@@ -28,11 +28,24 @@ struct StoredSyncItem: Sendable, Equatable {
     let contentType: String?
     let priority: String
     let createdAt: Int64
+    /// Recorded attempts. ``SyncItemDao/markInFlight(id:)`` counts one when the
+    /// dispatch starts, so a kill mid-request still spends it. After a
+    /// credential rejection under a persisted credential,
+    /// ``SyncItemDao/markCredentialRejected(id:errorCode:retryDelayMs:attempts:)``
+    /// restores the count from before the dispatch, so `0` does not prove the
+    /// request never left the device. `lastAttemptAt` is the field that records
+    /// whether a dispatch ever started.
     let attempts: Int32
     let lastAttemptAt: Int64?
     /// Epoch-ms timestamp before which the item is **not** eligible for
-    /// dispatch (retry cooldown). `0` means "never attempted", which is
-    /// eligible now; any other value was written by a failed attempt.
+    /// dispatch. `0` means "eligible now": no cooldown or credential hold is
+    /// pending. A positive value is a deadline written by
+    /// ``SyncItemDao/markPendingForRetry(id:errorCode:retryDelayMs:)`` (retry
+    /// cooldown) or by
+    /// ``SyncItemDao/markCredentialRejected(id:errorCode:retryDelayMs:attempts:)``
+    /// (credential hold). `0` does not mean "never attempted": a row recovered
+    /// after a kill mid-dispatch, or migrated from the v1 store, can have
+    /// `attempts >= 1` with `nextRetryAt == 0`.
     let nextRetryAt: Int64
     let lastErrorCode: String?
     let status: String
@@ -127,9 +140,10 @@ final class SyncItemDao {
     /// applied via the SQL store directly to keep the in-memory work minimal.
     ///
     /// Eligibility gate: a `PENDING` item is only dispatchable once its
-    /// retry cooldown has elapsed, i.e. `nextRetryAt <= now`. A never-attempted
-    /// row (`0`) trivially satisfies the comparison, so freshly enqueued items
-    /// are always returned. This is the only place that filters by cooldown:
+    /// retry cooldown has elapsed, i.e. `nextRetryAt <= now`. A row with no
+    /// deadline pending (`0`, which every enqueue writes) trivially satisfies
+    /// the comparison, so freshly enqueued items are always returned. This is
+    /// the only place that filters by cooldown:
     /// `countPending` (capacity) deliberately does not.
     func fetchPending(limit: Int = 0) async throws -> [StoredSyncItem] {
         try await stack.performBackgroundTask { [clock] context in
@@ -175,10 +189,11 @@ final class SyncItemDao {
         }
     }
 
-    /// `MIN(nextRetryAt)` over the `PENDING` rows that have been attempted, or
-    /// `nil` when none qualifies. This is when the retry timer must wake.
+    /// `MIN(nextRetryAt)` over the `PENDING` rows that carry a deadline
+    /// (`nextRetryAt > 0`: a retry cooldown or a credential hold), or `nil`
+    /// when none qualifies. This is when the retry timer must wake.
     ///
-    /// Never-attempted rows (`nextRetryAt = 0`) stay out on purpose: a batch
+    /// Rows with no deadline (`nextRetryAt = 0`) stay out on purpose: a batch
     /// that left fresh rows behind does not start a new cycle by itself. The
     /// minimum may already be in the past; the caller clamps the delay to 0,
     /// so an elapsed cooldown is never stranded.
@@ -194,7 +209,8 @@ final class SyncItemDao {
     }
 
     /// `MIN(nextRetryAt)` over **all** `PENDING` rows, or `nil` for an empty
-    /// queue. A never-attempted row makes this 0, which means "dispatch now".
+    /// queue. A row with no deadline (`nextRetryAt = 0`) makes this 0, which
+    /// means "dispatch now".
     /// Used when the engine resumes.
     func earliestPendingAt() async throws -> Int64? {
         try await stack.performBackgroundTask { context in
@@ -242,13 +258,17 @@ final class SyncItemDao {
     /// `now` is read here, after the attempt finished. ``fetchPending(limit:)``
     /// honors it, so a degraded server cannot drive a hot-retry loop.
     ///
-    /// The value is a positive timestamp even when the delay is 0, so
-    /// `nextRetryAt > 0` always means "attempted, retry pending" and `0` always
-    /// means "never attempted". The retry timer relies on that distinction.
+    /// The value is a positive timestamp even when the delay is 0, so the row
+    /// keeps `nextRetryAt > 0` ("a cooldown or credential hold is pending")
+    /// rather than `0` ("eligible now", no deadline). The retry timer's usual
+    /// wake source, ``earliestRetryAt()``, only considers rows with
+    /// `nextRetryAt > 0`, so it relies on that distinction. `0` is not a
+    /// "never attempted" marker.
     ///
-    /// - Note: `attempts` is intentionally **not** modified here. It is
-    ///   incremented once per dispatch by ``markInFlight(id:)`` and must keep
-    ///   counting across retries so the backoff curve advances.
+    /// - Note: `attempts` is intentionally **not** modified here. It counts
+    ///   recorded attempts: ``markInFlight(id:)`` increments it once when each
+    ///   dispatch starts, and it must keep counting across retries so the
+    ///   backoff curve advances.
     /// - Parameters:
     ///   - errorCode: the last failure's code, surfaced to JS via `lastErrorCode`.
     ///   - retryDelayMs: backoff delay (ms) from ``RetryPolicyEvaluator``.
@@ -409,10 +429,11 @@ final class SyncItemDao {
             // sentinel meaning "never attempted"; map back to `Int64?` so the
             // public-facing `StoredSyncItem` keeps nullable semantics.
             lastAttemptAt: entity.lastAttemptAt == 0 ? nil : entity.lastAttemptAt,
-            // `nextRetryAt` is a scalar `Int64`; `0` means "never attempted"
-            // (eligible now). A positive value is a retry-cooldown deadline
-            // (epoch ms) written by `markPendingForRetry`; `fetchPending`
-            // excludes the item until that deadline elapses.
+            // `nextRetryAt` is a scalar `Int64`; `0` means "eligible now" (no
+            // cooldown or credential hold pending). A positive value is a
+            // deadline (epoch ms) written by `markPendingForRetry` (retry
+            // cooldown) or `markCredentialRejected` (credential hold);
+            // `fetchPending` excludes the item until that deadline elapses.
             nextRetryAt: entity.nextRetryAt,
             lastErrorCode: entity.lastErrorCode,
             status: entity.status ?? SyncItemStatus.pending.rawValue,

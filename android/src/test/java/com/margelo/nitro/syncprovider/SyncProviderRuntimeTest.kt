@@ -15,10 +15,12 @@ import androidx.work.testing.TestListenableWorkerBuilder
 import androidx.work.testing.WorkManagerTestInitHelper
 import com.google.common.collect.Range
 import com.google.common.truth.Truth.assertThat
+import com.google.common.truth.Truth.assertWithMessage
 import com.margelo.nitro.syncprovider.config.ConfigSource
 import com.margelo.nitro.syncprovider.config.SecretStore
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
 import com.margelo.nitro.syncprovider.http.SyncDispatcher
+import com.margelo.nitro.syncprovider.retry.RetryTimer
 import com.margelo.nitro.syncprovider.testutil.InMemorySecretStore
 import com.margelo.nitro.syncprovider.testutil.RuntimeTestSupport
 import com.margelo.nitro.syncprovider.testutil.TestData
@@ -45,6 +47,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.shadows.ShadowNetworkCapabilities
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -64,6 +67,9 @@ internal class SyncProviderRuntimeTest {
   private lateinit var runtime: SyncProviderRuntime
   private val secrets = InMemorySecretStore()
 
+  /** Set by [recordWakes], whose constructor mocks [tearDown] undoes. */
+  private var recordingWakes = false
+
   @Before
   fun setUp() {
     context = ApplicationProvider.getApplicationContext()
@@ -81,6 +87,7 @@ internal class SyncProviderRuntimeTest {
     RuntimeTestSupport.awaitRecovery(context)
     RuntimeTestSupport.reset()
     server.shutdown()
+    if (recordingWakes) unmockkConstructor(RetryTimer::class, BackgroundSyncManager::class)
   }
 
   private fun restartProcess() {
@@ -898,6 +905,195 @@ internal class SyncProviderRuntimeTest {
     assertThat(row("auth")).isNull()
   }
 
+  /* ------------------------------ the credential hold ------------------------------ */
+
+  /** The wakes armed since the last [clear], each as the instant it fires. */
+  private class WakeLog {
+    val timer = CopyOnWriteArrayList<Long>()
+    val kick = CopyOnWriteArrayList<Long>()
+
+    fun clear() {
+      timer.clear()
+      kick.clear()
+    }
+  }
+
+  /**
+   * Records every wake armed by a runtime built after this call. Both mechanisms take a
+   * delay counted from the call, so the call's time anchors it.
+   */
+  private fun recordWakes(): WakeLog {
+    val log = WakeLog()
+    mockkConstructor(RetryTimer::class, BackgroundSyncManager::class)
+    recordingWakes = true
+    every { anyConstructed<RetryTimer>().arm(any()) } answers {
+      log.timer += System.currentTimeMillis() + firstArg<Long>()
+      callOriginal()
+    }
+    every { anyConstructed<BackgroundSyncManager>().scheduleOneTimeFlush(any()) } answers {
+      log.kick += System.currentTimeMillis() + firstArg<Long>()
+      callOriginal()
+    }
+    return log
+  }
+
+  /** When the armed kick fires: WorkManager counts its delay from when it was enqueued. */
+  private fun kickFiresAt(): Long {
+    val spec = WorkManagerImpl.getInstance(context).workDatabase.workSpecDao()
+      .getWorkSpec(oneTimeWork().single().id.toString())!!
+    return spec.lastEnqueueTime + spec.initialDelay
+  }
+
+  private suspend fun runRecovery(): ListenableWorker.Result =
+    TestListenableWorkerBuilder<RecoveryWorker>(context).build().doWork()
+
+  /**
+   * A token restored from disk that the server rejects. Leaves one row held by it,
+   * background sync enabled, and a row already due that would otherwise wake the queue
+   * at once.
+   *
+   * @return when the hold ends: the deadline the rejected cycle wrote on its row.
+   */
+  private suspend fun holdRejectedCredential(): Long {
+    runtime.configure(TestData.syncOptions(defaultHeaders = mapOf("Authorization" to "Bearer expired")))
+    runtime.backgroundSyncManager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+    restartProcess() // The headers are now restored from disk.
+    server.dispatcher = rejectingWithoutToken()
+    insert("held", createdAt = 1L)
+
+    runtime.dispatcher.flush()
+
+    val holdUntil = row("held")!!.nextRetryAt
+    assertThat(holdUntil).isGreaterThan(System.currentTimeMillis())
+    insert("due", attempts = 1, nextRetryAt = 1L, createdAt = 2L)
+    return holdUntil
+  }
+
+  /**
+   * No wake armed since [wakes] was last cleared fires before [holdUntil], and neither
+   * does the kick WorkManager holds now: no REPLACE brought it forward.
+   */
+  private fun assertHeldUntil(holdUntil: Long, wakes: WakeLog, timerArmed: Boolean = true) {
+    assertWithMessage("timer armed").that(wakes.timer.isNotEmpty()).isEqualTo(timerArmed)
+    assertWithMessage("early timer").that(wakes.timer.filter { it < holdUntil }).isEmpty()
+    assertWithMessage("kick armed").that(wakes.kick).isNotEmpty()
+    assertWithMessage("early kick").that(wakes.kick.filter { it < holdUntil }).isEmpty()
+    assertWithMessage("kick in WorkManager").that(kickFiresAt()).isAtLeast(holdUntil)
+  }
+
+  @Test
+  fun `resumeSync during a credential hold waits for it, though rows are due`() = runBlocking<Unit> {
+    goOnline()
+    val wakes = recordWakes()
+    val holdUntil = holdRejectedCredential()
+    insert("fresh", createdAt = 3L) // No cooldown, so resumeSync alone would wake for it.
+    attachEngineAndRecover()
+    runtime.pause()
+    wakes.clear()
+
+    runtime.resume()
+
+    assertHeldUntil(holdUntil, wakes)
+    delay(QUIET_MS)
+    assertThat(server.requestCount).isEqualTo(1) // Only the request that was rejected.
+  }
+
+  @Test
+  fun `a JS engine attaching or reloading during a credential hold waits for it`() = runBlocking<Unit> {
+    goOnline()
+    val wakes = recordWakes()
+    val holdUntil = holdRejectedCredential()
+    wakes.clear()
+
+    attachEngineAndRecover() // The app starts in the process that met the rejection.
+    assertHeldUntil(holdUntil, wakes)
+    wakes.clear()
+    attachEngineAndRecover() // A reload: the new engine attaches before the old one detaches.
+    assertHeldUntil(holdUntil, wakes)
+
+    delay(QUIET_MS)
+    assertThat(server.requestCount).isEqualTo(1)
+  }
+
+  @Test
+  fun `a recovery in the same process during a credential hold waits for it`() = runBlocking<Unit> {
+    goOnline()
+    val wakes = recordWakes()
+    val holdUntil = holdRejectedCredential()
+    wakes.clear()
+
+    runRecovery() // No JS engine in this process: the kick alone.
+    assertHeldUntil(holdUntil, wakes, timerArmed = false)
+
+    attachEngineAndRecover()
+    wakes.clear()
+    runRecovery() // Beside a JS engine: the timer too.
+    assertHeldUntil(holdUntil, wakes)
+
+    delay(QUIET_MS)
+    assertThat(server.requestCount).isEqualTo(1)
+  }
+
+  @Test
+  fun `every configureSync lifts the credential hold, even with unchanged headers`() = runBlocking<Unit> {
+    goOffline() // The wake that follows is armed, but not delivered.
+    val wakes = recordWakes()
+    val holdUntil = holdRejectedCredential()
+    attachEngineAndRecover()
+    assertHeldUntil(holdUntil, wakes)
+    wakes.clear()
+
+    runtime.configure(TestData.syncOptions(defaultHeaders = mapOf("Authorization" to "Bearer expired")))
+
+    assertThat(wakes.timer.minOrNull()).isLessThan(holdUntil)
+    assertThat(wakes.kick.minOrNull()).isLessThan(holdUntil)
+    assertThat(kickFiresAt()).isLessThan(holdUntil)
+  }
+
+  @Test
+  fun `during a credential hold no wake path REPLACEs the kick with an earlier one`() = runBlocking<Unit> {
+    // Offline, an early timer cannot dispatch, and the hold that a new rejection would set
+    // cannot hide an early kick.
+    goOffline()
+    val holdUntil = holdRejectedCredential()
+    assertWithMessage("rejected cycle").that(kickFiresAt()).isAtLeast(holdUntil)
+
+    suspend fun kickHeldAfter(path: String, arm: suspend () -> Unit) {
+      arm()
+      assertWithMessage(path).that(kickFiresAt()).isAtLeast(holdUntil)
+    }
+    kickHeldAfter("recovery") { runRecovery() }
+    kickHeldAfter("engine attach") { attachEngineAndRecover() }
+    kickHeldAfter("reload") { attachEngineAndRecover() }
+    kickHeldAfter("resumeSync") {
+      runtime.pause()
+      runtime.resume()
+    }
+    kickHeldAfter("re-arm") { runtime.armRetryWake() }
+  }
+
+  @Test
+  fun `a new process starts without the hold and spends one request to set it again`() = runBlocking<Unit> {
+    val holdUntil = holdRejectedCredential()
+    insert("also-due", attempts = 1, nextRetryAt = 1L, createdAt = 3L)
+
+    restartProcess()
+    runRecovery()
+
+    // The hold is kept in memory only: the new process wakes for the due rows at once,
+    // while the held row still waits for its own deadline.
+    assertThat(kickFiresAt()).isLessThan(holdUntil)
+    assertThat(row("held")!!.nextRetryAt).isEqualTo(holdUntil)
+
+    runWorker()
+
+    // Restored headers send one request first, and its rejection holds the rest again.
+    assertThat(server.requestCount).isEqualTo(2)
+    assertThat(row("also-due")!!.attempts).isEqualTo(1)
+    assertThat(row("also-due")!!.lastErrorCode).isNull()
+    assertThat(kickFiresAt()).isAtLeast(row("due")!!.nextRetryAt)
+  }
+
   /* ----------------------------------- queue ---------------------------------- */
 
   @Test
@@ -914,5 +1110,8 @@ internal class SyncProviderRuntimeTest {
     const val TOKEN = "Bearer live"
     const val AWAIT_TIMEOUT_MS = 20_000L
     const val FAR_MS = 3_600_000L
+
+    /** Long enough for a wake armed at once to have sent its request. */
+    const val QUIET_MS = 250L
   }
 }

@@ -139,10 +139,12 @@ Until the v0.3 dead-letter queue, Android counts `FAILED` rows toward `maxQueueS
 
 [`SyncItem.nextRetryAt`](../api-reference/types.md#syncitem) tells you where an item stands:
 
-- `0` means it was never attempted, and is eligible now.
-- A positive value means it was attempted and a retry is pending. It is eligible once `nextRetryAt <= now`. The value stays in place afterwards, so a timestamp in the past means the cooldown has elapsed.
+- `0` means it is eligible now. It does not mean the item was never attempted: rows carried over from v0.1, and an iOS row whose first attempt was cut short by a process kill, can show `attempts >= 1` with `nextRetryAt: 0`.
+- A positive value means a retry cooldown or a [credential hold](./background-sync.md#when-a-stored-token-expires) is pending. It is eligible once `nextRetryAt <= now`. The value stays in place afterwards, so a timestamp in the past means the wait has elapsed.
 
-Each cycle makes at most one attempt per item, and `attempts` counts across cycles, so the retry budget survives a restart.
+Each cycle makes at most one attempt per item, and `attempts` counts the attempts recorded across cycles, so the retry budget survives a restart. `0` means no attempt has been recorded, not that the item was never tried. Android records an attempt with its outcome, so a process kill mid-request leaves the count unchanged, while iOS counts it when the dispatch starts. A credential hold spends no attempt, so a held item can show `attempts: 0` with `nextRetryAt > 0`.
+
+A cooldown and a hold look the same on a `SyncItem`, which carries neither the last error code nor the last attempt time. An `ITEM_RETRYING` event with `errorCode: 'UNAUTHORIZED'` marks a hold.
 
 :::note Capacity vs. eligibility
 A cooling item still counts toward `getQueueSize()` and the `maxQueueSize` cap — it is _in_ the queue, just not _dispatchable right now_. Cooldowns also survive launch recovery: resetting in-flight items back to pending does **not** clear their `nextRetryAt`.
@@ -164,14 +166,14 @@ What the timer does and does not do:
 
 - **It never flushes offline.** Neither dispatcher checks connectivity, so a flush offline would spend every attempt and mark valid items `FAILED`. When the timer fires offline, it remembers the wake and flushes when connectivity returns. A manual `flush()` while offline keeps its behavior.
 - **It only exists in a process with JS.** A worker, a boot broadcast, or an iOS background launch where JS never reaches the library arms no timer. Android relies on the kick there.
-- **It looks at attempted items.** Items never attempted do not arm it, so it does not replace a flush for new items, though the cycle it starts takes them too. `resumeSync` is the exception: it considers every pending item, so never-attempted items are dispatched at once.
+- **It looks at items with a deadline.** Only items with `nextRetryAt > 0`, a cooldown or a credential hold, arm it. Items with `nextRetryAt: 0` do not, so it does not replace a flush for new items, though the cycle it starts takes them too. `resumeSync` is the exception: it considers every pending item, so items with no deadline are dispatched at once.
 - **On iOS it cannot fire while the app is suspended.** It fires on resume.
 
 That owed wake is the only native flush tied to connectivity. There is no native flush on enqueue, and none on reconnect by itself: [`useAutoSync`](../api-reference/hooks/useAutoSync.md) is the mechanism.
 
 `SyncWorker` reports `Result.success()` on any completed flush, so WorkManager's own backoff is reserved for a worker that fails as a whole and cannot race the cooldown.
 
-After a [rejected stored credential](./background-sync.md#when-a-stored-token-expires), the next wake waits for the hold to end, even if other items are already due.
+After a [rejected stored credential](./background-sync.md#when-a-stored-token-expires), the retry timer and the Android retry kick wait for the hold to end, even if other items are already due. The periodic worker and BGTasks do not wait for it, and a process restart drops it.
 
 ### `foregroundOnly` interaction
 
@@ -203,25 +205,13 @@ await configureSync({
 });
 ```
 
-## JS-Side Override (planned for v0.4)
+## JS-Side Override (planned)
 
-A per-attempt `shouldRetry(ctx)` callback is planned for v0.4:
+A JS-side, per-attempt retry override is planned for a later release. Its shape is not settled yet.
 
-```ts
-type ShouldRetryFn = (ctx: {
-  attempt: number;
-  error?: SyncErrorCode;
-  statusCode?: number;
-  itemId: string;
-}) => boolean;
-```
+It would run only while JS is alive, because every retry decision would need a bridge round-trip. Background dispatch with no JS running cannot consult it, so the declarative `RetryPolicy` would keep deciding there.
 
-It is not available yet because:
-
-- The callback would need to be evaluated on every retry decision, requiring a JS-alive bridge round-trip.
-- Background dispatch (when the app is killed) cannot consult the JS thread, so the override would behave inconsistently between foreground and background fires.
-
-Until v0.4 ships, configure the declarative `RetryPolicy` carefully -- it covers the vast majority of cases.
+Until it ships, configure the declarative `RetryPolicy` carefully -- it covers the vast majority of cases.
 
 ## Next Steps
 

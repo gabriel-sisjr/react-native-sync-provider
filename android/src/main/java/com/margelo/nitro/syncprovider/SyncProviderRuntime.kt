@@ -135,7 +135,10 @@ internal class SyncProviderRuntime private constructor(
   /** Items waiting to be dispatched, cooling ones included. */
   suspend fun queueSize(): Int = storage.pendingCount()
 
-  /** Apply a `configureSync` from JS: it takes effect now, and in every later process. */
+  /**
+   * Apply a `configureSync` from JS: it takes effect now, and in every later process.
+   * Every call also lifts the credential hold, whether or not the headers changed.
+   */
   suspend fun configure(options: SyncOptions) {
     configureMutex.withLock {
       configRef.set(
@@ -145,6 +148,7 @@ internal class SyncProviderRuntime private constructor(
           hasDefaultHeaders = !options.defaultHeaders.isNullOrEmpty(),
         ),
       )
+      retryWake.clearCredentialHold()
       applyQueueCap(options)
       withContext(Dispatchers.IO) {
         runCatching { configStore.save(options) }
@@ -168,7 +172,7 @@ internal class SyncProviderRuntime private constructor(
     retryWake.armForResume()
   }
 
-  /** Arm the next retry wake from the current queue. */
+  /** Arm the next retry wake from the current queue, no earlier than a credential hold. */
   suspend fun armRetryWake() {
     retryWake.arm()
   }

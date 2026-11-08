@@ -180,7 +180,7 @@ Enqueueing never dispatches an item, under any strategy. A flush does, and somet
 The [strategy](../api-reference/enums.md#syncstrategy) only decides what the engine schedules on its own:
 
 - **`SyncStrategy.AUTOMATIC`** (default): the engine retries by itself. A failed item is dispatched again when its cooldown ends, and pending items are dispatched on `resumeSync()`.
-- **`SyncStrategy.MANUAL`**: the engine schedules nothing by itself. Useful for explicit upload screens. Background windows still run if you called `enableBackgroundSync`.
+- **`SyncStrategy.MANUAL`**: the engine schedules nothing by itself. Useful for explicit upload screens. Background windows still run if you called `enableBackgroundSync`, and `useAutoSync` keeps flushing while `enabled` is `true`, because it does not read the strategy.
 - **`SyncStrategy.OPPORTUNISTIC`**: reserved. It currently behaves like `AUTOMATIC`.
 
 See the [`useSyncStatus` hook](../api-reference/hooks/useSyncStatus.md) for live progress reporting.

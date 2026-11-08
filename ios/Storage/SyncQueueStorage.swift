@@ -87,14 +87,16 @@ actor SyncQueueStorage {
         try await dao.fetchAll()
     }
 
-    /// When the retry timer must wake for rows already attempted, or `nil`
+    /// When the retry timer must wake for rows that carry a deadline
+    /// (`nextRetryAt > 0`: a retry cooldown or a credential hold), or `nil`
     /// when none is waiting.
     func earliestRetryAt() async throws -> Int64? {
         try await dao.earliestRetryAt()
     }
 
     /// The earliest due time across every `PENDING` row, or `nil` for an empty
-    /// queue. `0` means a never-attempted row is waiting.
+    /// queue. `0` means a row with no deadline pending (eligible now) is
+    /// waiting.
     func earliestPendingAt() async throws -> Int64? {
         try await dao.earliestPendingAt()
     }
@@ -181,9 +183,10 @@ actor SyncQueueStorage {
             createdAt: nowMs,
             attempts: 0,
             lastAttemptAt: nil,
-            // `0` means "never attempted", which is eligible now.
-            // `markPendingForRetry` writes a positive deadline on retriable
-            // failure (the persisted retry cooldown).
+            // `0` means "eligible now": no cooldown or credential hold is
+            // pending. `markPendingForRetry` writes a positive deadline on a
+            // retriable failure (the persisted retry cooldown), and
+            // `markCredentialRejected` writes one for a credential hold.
             nextRetryAt: 0,
             lastErrorCode: nil,
             status: SyncItemStatus.pending.rawValue,

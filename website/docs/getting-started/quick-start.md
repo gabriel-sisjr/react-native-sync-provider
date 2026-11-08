@@ -192,7 +192,7 @@ Each `configureSync` replaces the whole configuration, and omitting `defaultHead
 | Strategy | When to use |
 |---|---|
 | `AUTOMATIC` | Most apps. The engine retries failed items on its own when their cooldown ends. |
-| `MANUAL` | Bulk-upload screens. The engine schedules nothing on its own, but background windows still run if you enabled them. |
+| `MANUAL` | Bulk-upload screens. The engine schedules nothing on its own, but background windows still run if you enabled them, and `useAutoSync` keeps flushing while it is enabled. |
 | `OPPORTUNISTIC` | Reserved. It currently behaves like `AUTOMATIC`. |
 
 No strategy flushes on enqueue. That takes `useAutoSync`, `flush()`, or a background window.

@@ -567,7 +567,12 @@ internal class SyncDispatcher(
     /** Floor for the wait after a restored credential is rejected. */
     const val MIN_CREDENTIAL_HOLD_MS: Long = 60_000L
 
-    /** The zeroed result that means "no cycle ran". The facade maps it to `undefined`. */
+    /**
+     * The zeroed result that means "no cycle ran". `flush()` returns it to JS unchanged
+     * while paused or while default headers cannot be recovered. `getLastSyncResult()`
+     * returns it when no result is stored, and only there does the facade map it to
+     * `undefined`.
+     */
     fun emptyResult(): SyncResult = SyncResult(
       startedAt = 0.0,
       finishedAt = 0.0,

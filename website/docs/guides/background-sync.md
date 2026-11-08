@@ -80,6 +80,8 @@ The options persist across relaunches, on both platforms.
 
 `MANUAL` does not stop background windows, because calling `enableBackgroundSync` is an explicit request. To stop them, use `foregroundOnly` or do not enable them. The [retry timer and kick](./retry-policy.md#who-wakes-the-queue-and-when) are covered in the retry guide.
 
+None of these controls turns off [`useAutoSync`](../api-reference/hooks/useAutoSync.md). It never reads the strategy, so it keeps flushing under `MANUAL`, and while the engine is paused its flushes run no cycle. Pass `enabled: false` to stop it.
+
 A pause lasts until `resumeSync()` or the next launch that reaches the library, including a JS reload. A launch clears it without emitting `RESUMED`. On iOS, React Native can start during a background launch, and if JS reaches the library there, that counts as a launch.
 
 ## iOS: `BGTaskScheduler`
@@ -229,7 +231,12 @@ A token read back from storage can be stale, and only the app can renew it. So i
 
 In a process that has called `configureSync`, the app owns the token, and a 401 stays terminal.
 
-`resumeSync()` during such a hold differs by platform: iOS waits for the hold to end, Android does not.
+Every retry wake in the process waits for that hold to end, on both platforms, even when other items are already due: the end of a cycle, `resumeSync()`, a JS attach or reload and the recovery re-arm, for both the retry timer and the Android retry kick. Every `configureSync` call clears the hold.
+
+Two cases can still send a request with the rejected token:
+
+- **A process restart.** The hold lives in memory, so an OS kill, a reboot or an app update drops it. The rejected item keeps its own `nextRetryAt`, but another due item can wake the queue in the new process. That costs at most one request, whose rejection sets a new hold.
+- **A background window.** The periodic worker and the BGTasks are not retry wakes and do not wait for the hold, so a window that opens during one can cost one request.
 
 ### When stored headers cannot be read
 
@@ -239,7 +246,7 @@ If headers were configured but cannot be read, nothing is dispatched: sending wi
 - The device has not been unlocked since boot (iOS).
 - A backup was restored onto another device. With `allowBackup` on Android, the ciphertext comes back but the key does not.
 
-Calling `configureSync` ends the wait in every case. While headers are unreadable, `getSyncConfig()` returns none, so `setConfig({ ...config })` deletes them. See [Troubleshooting](../troubleshooting.md#symptom-items-stay-pending-and-flush-returns-00).
+Calling `configureSync` ends the wait in every case. While headers are unreadable, `getSyncConfig()` returns none, so `setConfig({ ...config })` deletes them: pass `defaultHeaders` from your app's session instead. See [Troubleshooting](../troubleshooting.md#symptom-items-stay-pending-and-flush-returns-00).
 
 ### What needs a running app
 
@@ -283,6 +290,8 @@ useSyncEvents({
 ```
 
 These events reach a listener only if a JS engine is running at the time of the OS callback. If the OS delivers a fire with no JS loaded, the queue still flushes, but you will not see the event. On Android, the periodic worker emits them and the retry kick does not.
+
+Neither event carries `errorCode`: a window whose flush fails reports the code on that cycle's `SYNC_FAILED`. On iOS, `metadata.kind` is `"refresh"` or `"processing"` on every `BACKGROUND_SYNC_COMPLETED` and on the processing task's `BACKGROUND_SYNC_STARTED`, and `metadata.ok` is `"false"` when the window's flush failed. Android sends base fields only, and emits `BACKGROUND_SYNC_COMPLETED` only after the flush returns, so a worker whose flush throws emits none.
 
 ## When Sync May Be Deferred
 

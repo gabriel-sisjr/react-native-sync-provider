@@ -116,8 +116,9 @@ final class SyncDispatcherCooldownTests: XCTestCase {
         XCTAssertEqual(second.nextRetryAt, start + 100 + 200)
     }
 
-    /// `nextRetryAt > 0` means "attempted, retry pending". A policy with no
-    /// delay must not write the never-attempted value.
+    /// `nextRetryAt > 0` means "a cooldown is pending", which the retry timer
+    /// watches. A policy with no delay must still write a positive deadline,
+    /// not `0` ("eligible now"), which `earliestRetryAt` skips.
     func test_retriableFailure_withZeroDelay_stillWritesAPositiveTimestamp() async throws {
         let id = try await storage.enqueue(input: .sample())
         URLProtocolStub.setHandler(stubResponse(503))

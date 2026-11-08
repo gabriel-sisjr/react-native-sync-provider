@@ -112,15 +112,15 @@ internal class SyncQueueStorage(
   }
 
   /**
-   * Earliest retry deadline among attempted `PENDING` rows, or `null` when none
-   * exist. A deadline in the past means a retry is due now.
+   * Earliest deadline among `PENDING` rows with a retry cooldown or a credential hold,
+   * or `null` when none exist. A deadline in the past means a retry is due now.
    */
   suspend fun nextRetryDeadline(): Long? =
     withContext(Dispatchers.IO) { itemDao.nextRetryDeadline() }
 
   /**
    * Earliest deadline across every `PENDING` row, or `null` when the queue has
-   * none. `0` means at least one row was never attempted.
+   * none. `0` means at least one row is eligible now, with no deadline.
    */
   suspend fun nextPendingDeadline(): Long? =
     withContext(Dispatchers.IO) { itemDao.nextPendingDeadline() }
@@ -230,7 +230,7 @@ internal class SyncQueueStorage(
       lastErrorCode = null,
       status = SyncItemEntity.STATUS_PENDING,
       metadata = JsonMap.encode(input.metadata),
-      // 0 = never attempted, and therefore eligible now.
+      // 0 = eligible now: no cooldown or credential hold.
       nextRetryAt = 0L,
     )
   }

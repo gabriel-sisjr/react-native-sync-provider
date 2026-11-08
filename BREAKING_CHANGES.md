@@ -166,7 +166,7 @@ const value: SyncProviderContextValue = { config, hasProvider: true };
 
 #### Migration steps
 
-1. Add `attempts` and `nextRetryAt` to hand-built `SyncItem` values. `0` means "never attempted".
+1. Add `attempts` and `nextRetryAt` to hand-built `SyncItem` values. `attempts: 0` means no attempt has been recorded, and `nextRetryAt: 0` means the item is eligible now. Neither one means the item was never tried.
 2. Add `hasProvider` to hand-built context values.
 
 #### Affected symbols
@@ -252,7 +252,7 @@ If you branch on `ITEM_FAILED.errorCode`, make sure `UNAUTHORIZED` and `SERVER_E
 Three consequences to check:
 
 - **Omitting `defaultHeaders` is a logout.** Each `configureSync` replaces the whole configuration, and omitting `defaultHeaders` deletes the stored copy. Pass them on every call, including through `<SyncProvider options>`.
-- **A stored token can expire.** On a 401 or 403 in a process that has not called `configureSync`, the item stays `PENDING`, no attempt is spent, the next try waits at least 60 seconds and the cycle stops. You see `ITEM_RETRYING` with `UNAUTHORIZED` rather than `ITEM_FAILED`. In a process that has called `configureSync`, a 401 stays terminal.
+- **A stored token can expire.** On a 401 or 403 in a process that has not called `configureSync`, the item stays `PENDING`, no attempt is spent, the next try waits at least 60 seconds and the cycle stops. Its `attempts` keeps the value it had before the request, so a held item can show `attempts: 0` with `nextRetryAt > 0`. You see `ITEM_RETRYING` with `UNAUTHORIZED` rather than `ITEM_FAILED`. In a process that has called `configureSync`, a 401 stays terminal.
 - **The library does not refresh tokens.** Call `configureSync` when the token changes. A process with no JS cannot renew one.
 
 If stored headers cannot be read, nothing is dispatched and items wait. See [Background sync](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/guides/background-sync#cold-start-configuration).
