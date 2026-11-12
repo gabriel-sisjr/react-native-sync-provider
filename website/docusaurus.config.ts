@@ -6,6 +6,7 @@ const config: Config = {
   title: 'React Native Sync Provider',
   tagline:
     'Offline-first HTTP request queue for React Native, with native persistence and OS-scheduled background sync.',
+  favicon: 'img/favicon.svg',
 
   url: 'https://gabriel-sisjr.github.io',
   baseUrl: '/react-native-sync-provider/',
@@ -17,6 +18,7 @@ const config: Config = {
   onBrokenLinks: 'throw',
 
   markdown: {
+    mermaid: true,
     hooks: {
       onBrokenMarkdownLinks: 'warn',
     },
@@ -77,6 +79,7 @@ const config: Config = {
         explicitSearchResultPath: true,
       },
     ],
+    '@docusaurus/theme-mermaid',
   ],
 
   themeConfig: {
@@ -155,7 +158,17 @@ const config: Config = {
     prism: {
       theme: prismThemes.github,
       darkTheme: prismThemes.dracula,
-      additionalLanguages: ['kotlin', 'swift', 'bash', 'json', 'markup'],
+      additionalLanguages: [
+        'kotlin',
+        'swift',
+        'bash',
+        'json',
+        'markup',
+        'typescript',
+        'tsx',
+        'gradle',
+        'ruby',
+      ],
     },
     colorMode: {
       defaultMode: 'dark',
