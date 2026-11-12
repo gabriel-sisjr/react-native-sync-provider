@@ -102,7 +102,7 @@ function PendingBadge() {
 }
 ```
 
-The hook re-fetches `items` and `size` whenever an `ITEM_ENQUEUED`, `ITEM_REMOVED`, `ITEM_SUCCEEDED`, `ITEM_FAILED`, `QUEUE_CLEARED`, `SYNC_SUCCEEDED` or `SYNC_FAILED` event fires.
+The hook re-fetches `items` and `size` whenever an `ITEM_ENQUEUED`, `ITEM_REMOVED`, `ITEM_SUCCEEDED`, `ITEM_FAILED`, `ITEM_DEAD_LETTERED`, `QUEUE_CLEARED`, `SYNC_SUCCEEDED` or `SYNC_FAILED` event fires.
 
 ### Direct facade calls
 
@@ -115,7 +115,7 @@ const count = await getQueueSize();
 const items = await getPendingItems();
 ```
 
-`getQueueSize()` and `getPendingItems()` cover `PENDING` items only, on both platforms. Items waiting out a retry cooldown are included. Items in flight and items that failed permanently are not, so `0` does not mean the engine is idle: check `isSyncing()` too.
+`getQueueSize()` and `getPendingItems()` cover `PENDING` items only, on both platforms. Items waiting out a retry cooldown are included. Items in flight and dead letters are not, so `0` does not mean the engine is idle: check `isSyncing()` too. Read dead letters with [`listDeadLetter`](../api-reference/functions.md#listdeadletter).
 
 `getPendingItems()` returns items in dispatch order (priority desc, `createdAt` asc).
 
@@ -144,13 +144,13 @@ The default cap is `10000`. Any value below `1` is treated as `1`, so the cap ca
 
 When the cap is reached, subsequent `enqueue()` calls reject. The native layer raises `QUEUE_FULL`, but it [reaches JS as `INVALID_PAYLOAD` with no `validationErrors`](../api-reference/errors.md#native-rejections) for now. Catch that and decide: drop the new item, flush, or surface a retry-later UX.
 
-:::warning Failed items count toward the Android cap
-Android counts every row toward the cap, including items that failed permanently, which `getQueueSize()` does not show. iOS counts `PENDING` rows only. Remove failed items as described in [Permanent Failures](./retry-policy.md#permanent-failures).
+:::note What the cap counts
+Android counts pending and in-flight items toward the cap, and in-flight items are not in `getQueueSize()`. iOS counts `PENDING` items only. Dead letters count on neither platform: the dead-letter queue is unbounded, so discard what you will not replay. See [Permanent Failures](./retry-policy.md#permanent-failures).
 :::
 
 ## Manual Removal
 
-Remove a single item by id (returns `false` if it has already drained):
+Remove a single item by id, or the dead letter with that id (returns `false` if neither exists, for example because it has already drained):
 
 ```ts
 import { removeItem } from '@gabriel-sisjr/react-native-sync-provider';
@@ -167,7 +167,7 @@ import { clearQueue } from '@gabriel-sisjr/react-native-sync-provider';
 await clearQueue();
 ```
 
-`clearQueue()` removes every item, including items that failed permanently. It does not touch the persisted flush history -- use [`clearSyncHistory()`](../api-reference/functions.md#clearsynchistory) for that.
+`clearQueue()` removes every item and every dead letter, with one `QUEUE_CLEARED`. It does not touch the persisted flush history -- use [`clearSyncHistory()`](../api-reference/functions.md#clearsynchistory) for that.
 
 ## When Items Are Dispatched
 

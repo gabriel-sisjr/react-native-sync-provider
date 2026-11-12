@@ -31,6 +31,7 @@ import type { SyncErrorCode } from './errors';
 import type {
   BackgroundSyncOptions,
   ConnectionState,
+  SyncDeadLetterItem,
   SyncEvent,
   SyncItem,
   SyncItemInput,
@@ -107,11 +108,19 @@ export interface SyncProvider extends HybridObject<{
   enqueueBatch(items: SyncItemInput[]): Promise<string[]>;
 
   /**
-   * Remove a single item from the queue by ULID.
+   * Remove a single item by ULID. When no queued item has that id, the dead
+   * letter with that id is removed instead. Emits `ITEM_REMOVED` only when a
+   * row was removed.
+   *
+   * An item removed before its request was sent is never sent and gets no
+   * outcome event. A request already in flight is not cancelled and its
+   * outcome event is still emitted, but the removed item never comes back: not
+   * to the queue, not as a dead letter after a permanent failure (so no
+   * `ITEM_DEAD_LETTERED` follows its `ITEM_FAILED`), and not through a replay.
    *
    * @param id — the ULID returned by `enqueue` / `enqueueBatch`.
-   * @returns `true` if the item was found and removed, `false` if no item
-   *   with that id exists in the queue.
+   * @returns `true` if a queued item or a dead letter with that id was found
+   *   and removed, `false` if neither exists.
    *
    * @example
    * const removed = await sync.removeItem(id);
@@ -120,8 +129,15 @@ export interface SyncProvider extends HybridObject<{
   removeItem(id: string): Promise<boolean>;
 
   /**
-   * Remove every item from the queue, in any status: pending, in flight, or
-   * failed permanently.
+   * Remove every item from the queue, in any status (pending or in flight),
+   * and every dead letter. Emits one `QUEUE_CLEARED`.
+   *
+   * A cleared item whose request was not sent yet is never sent and gets no
+   * outcome event. Requests already in flight are not cancelled and their
+   * outcome events are still emitted, but no cleared item comes back: not to
+   * the queue, not as a dead letter after a permanent failure (so no
+   * `ITEM_DEAD_LETTERED` follows an `ITEM_FAILED` for one), and not through a
+   * replay.
    *
    * @example
    * await sync.clearQueue();
@@ -133,7 +149,7 @@ export interface SyncProvider extends HybridObject<{
    *
    * @returns the number of items currently waiting to be dispatched: `PENDING`
    *   items, including those waiting out a retry cooldown. Items in flight and
-   *   items that failed permanently are not counted.
+   *   dead letters are not counted.
    *
    * @example
    * if ((await sync.getQueueSize()) > 0) await sync.flush();
@@ -145,13 +161,72 @@ export interface SyncProvider extends HybridObject<{
    *
    * @returns the `PENDING` items in dispatch order, including those waiting
    *   out a retry cooldown, with `id` and `createdAt` populated. Items in
-   *   flight and items that failed permanently are not returned.
+   *   flight and dead letters are not returned: read dead letters with
+   *   `listDeadLetter`.
    *
    * @example
    * const pending = await sync.getPendingItems();
    * console.log(`${pending.length} item(s) pending`);
    */
   getPendingItems(): Promise<SyncItem[]>;
+
+  /* ---------------------------- Dead letters ---------------------------- */
+
+  /**
+   * Read every dead letter: the items that failed permanently and were moved
+   * out of the queue, with the request and its failure bookkeeping.
+   *
+   * @returns every dead letter, ordered by `deadLetteredAt` ascending, then by
+   *   `id` ascending, at most one per id: a newer dead letter replaces an older
+   *   one with the same id. The list is unbounded: nothing prunes it, and dead
+   *   letters count toward no capacity cap.
+   *
+   * @example
+   * const dead = await sync.listDeadLetter();
+   * for (const item of dead) console.warn(item.id, item.lastErrorCode);
+   */
+  listDeadLetter(): Promise<SyncDeadLetterItem[]>;
+
+  /**
+   * Put a dead letter back into the queue. In one transaction, the item is
+   * re-inserted under the same id, with its original `createdAt`, as `PENDING`
+   * with `attempts: 0`, `nextRetryAt: 0` and no last error code, and the dead
+   * letter is deleted. Emits `ITEM_ENQUEUED`. Like `enqueue`, it does not
+   * start a flush.
+   *
+   * An unknown id resolves with no change, so a repeated call is harmless. If
+   * the queue already holds an item with that id, which normal use does not
+   * produce, nothing changes and the dead letter stays: iOS resolves, Android
+   * rejects. Two overlapping replays of the same id act as one replay and one
+   * no-op, with one `ITEM_ENQUEUED`, and a dead letter that an overlapping
+   * `clearQueue` or `discardDeadLetter` deletes is never put back.
+   *
+   * @param id — the dead letter's id, from `listDeadLetter` or an
+   *   `ITEM_DEAD_LETTERED` event.
+   * @throws SyncError with code `QUEUE_FULL` when the queue is at
+   *   `SyncOptions.maxQueueSize`, counted as for an enqueue on that platform
+   *   (iOS: pending items; Android: pending and in-flight items). The dead
+   *   letter stays in place.
+   *
+   * @example
+   * await sync.replayDeadLetter(deadLetter.id);
+   * await sync.flush();
+   */
+  replayDeadLetter(id: string): Promise<void>;
+
+  /**
+   * Delete a dead letter. Emits `ITEM_REMOVED` when a row was deleted. An
+   * unknown id resolves with no change, so a repeated call is harmless. A
+   * `replayDeadLetter` of the same id that overlaps it never puts the
+   * discarded dead letter back.
+   *
+   * @param id — the dead letter's id, from `listDeadLetter` or an
+   *   `ITEM_DEAD_LETTERED` event.
+   *
+   * @example
+   * await sync.discardDeadLetter(deadLetter.id);
+   */
+  discardDeadLetter(id: string): Promise<void>;
 
   /* ------------------------------ Sync ops ------------------------------ */
 
@@ -160,10 +235,18 @@ export interface SyncProvider extends HybridObject<{
    * `SyncOptions.batchSize`, applying the retry policy. Items still cooling down
    * are skipped. The strategy plays no part.
    *
-   * While the engine is paused, or while stored `defaultHeaders` cannot be read,
-   * no cycle runs: the result is 0/0, and no event or history row is written.
+   * The checks at the start of a flush run in this order: pause, stored
+   * credentials, on iOS a cycle already running, network-quality gate
+   * (`SyncOptions.minNetworkQuality`), health check
+   * (`SyncOptions.healthCheckUrl`). On iOS, a flush that finds a cycle running
+   * returns the last result at once, without the gate or the health check;
+   * Android waits for the running cycle, then runs every check. When a check
+   * fails, no cycle runs: the result is 0/0, no item changes, no `SYNC_STARTED`
+   * is emitted and no history row is written. Paused or with unreadable
+   * `defaultHeaders`, no event is emitted at all. The gate and the health check
+   * emit `SYNC_FAILED` with `NETWORK_QUALITY_TOO_LOW` or `HEALTH_CHECK_FAILED`.
    * Android then returns `0` for `startedAt` and `finishedAt`, and iOS the time
-   * of the call for both.
+   * the check stopped the flush for both.
    *
    * @returns the outcome of the cycle. Per-item failures never reject: they are
    *   counted here and reported through item events.
@@ -192,9 +275,10 @@ export interface SyncProvider extends HybridObject<{
    * `MANUAL`, a flush is scheduled for the soonest pending item: items with no
    * cooldown left are dispatched right away, and cooling items when their
    * cooldown ends. If the device is offline at that moment, the flush waits
-   * until connectivity is restored. During a credential hold, the flush waits
-   * for the hold to end, on both platforms. The hold lives in memory, so a
-   * process restart drops it.
+   * until connectivity is restored, and with `SyncOptions.minNetworkQuality`
+   * set, until the quality reaches it, without any event. During a credential
+   * hold or a health-check backoff, the flush waits for it to end, on both
+   * platforms. The hold lives in memory, so a process restart drops it.
    *
    * @example
    * await sync.resumeSync();
@@ -219,9 +303,16 @@ export interface SyncProvider extends HybridObject<{
    * a running cycle. A request already in flight keeps the previous config.
    *
    * The options are persisted for background workers. `defaultHeaders` are
-   * encrypted at rest, and omitting them deletes the stored copy.
+   * encrypted at rest, and omitting them deletes the stored copy. Every call
+   * also ends a running health-check backoff, and arms the retry wake again,
+   * which starts the network-quality gate's re-check schedule over.
    *
    * @param options — new library-wide configuration.
+   * @throws SyncError with code `INVALID_URL` when `healthCheckUrl` is not a
+   *   valid absolute http(s) URL.
+   * @throws SyncError with code `INVALID_PAYLOAD` when `healthCheckTtlMs` or
+   *   `healthCheckBackoffMs` is not a finite number of at least `0`, or
+   *   `minNetworkQuality` is not a `NetworkQuality` value.
    *
    * @example
    * await sync.configureSync({
@@ -241,7 +332,11 @@ export interface SyncProvider extends HybridObject<{
   /**
    * Read the active sync configuration.
    *
-   * @returns the currently active {@link SyncOptions}.
+   * @returns the currently active {@link SyncOptions}. `minNetworkQuality`,
+   *   `healthCheckUrl`, `healthCheckTtlMs` and `healthCheckBackoffMs` are
+   *   present only when they were set: their defaults are not filled in. A
+   *   stored value of theirs that the engine cannot use, which only a damaged
+   *   record can hold, loads as unset and is left out too.
    *
    * @example
    * const cfg = await sync.getSyncConfig();
@@ -300,7 +395,9 @@ export interface SyncProvider extends HybridObject<{
   /**
    * Read the current connectivity snapshot.
    *
-   * @returns the live {@link ConnectionState} as reported by the OS.
+   * @returns the live {@link ConnectionState} as reported by the OS, with the
+   *   engine's `networkQuality` classification, always present: `OFFLINE`
+   *   exactly when `status` is `DISCONNECTED` or `UNKNOWN`.
    *
    * @example
    * const conn = await sync.getConnectionStatus();

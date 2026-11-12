@@ -24,7 +24,9 @@
         "!$TURBO_ROOT$/android/.cxx/**",
         "$TURBO_ROOT$/src/*.ts",
         "$TURBO_ROOT$/src/*.tsx",
-        "$TURBO_ROOT$/src/**/*.nitro.ts"
+        "$TURBO_ROOT$/src/**/*.nitro.ts",
+        "$TURBO_ROOT$/src/types/**",
+        "$TURBO_ROOT$/src/errors/**"
       ],
       "outputs": []
     },
@@ -50,7 +52,9 @@
         "$TURBO_ROOT$/ios/**",
         "$TURBO_ROOT$/src/*.ts",
         "$TURBO_ROOT$/src/*.tsx",
-        "$TURBO_ROOT$/src/**/*.nitro.ts"
+        "$TURBO_ROOT$/src/**/*.nitro.ts",
+        "$TURBO_ROOT$/src/types/**",
+        "$TURBO_ROOT$/src/errors/**"
       ],
       "outputs": []
     }

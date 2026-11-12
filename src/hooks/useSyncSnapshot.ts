@@ -5,10 +5,16 @@ import { SyncErrorCode } from '../errors/SyncErrorCode';
 import {
   ConnectionStatus,
   ConnectionType,
+  NetworkQuality,
   SyncEventType,
 } from '../types/enums';
 import type { UseSyncSnapshotResult } from '../types/hooks';
-import type { SyncEvent, SyncItem, SyncResult } from '../types/sync';
+import type {
+  SyncDeadLetterItem,
+  SyncEvent,
+  SyncItem,
+  SyncResult,
+} from '../types/sync';
 import { isNativeModuleAvailable } from '../utils/isNativeModuleAvailable';
 
 import {
@@ -18,6 +24,7 @@ import {
   getPendingItems,
   getQueueSize,
   isSyncing as facadeIsSyncing,
+  listDeadLetter,
   removeSyncEventListener,
 } from '../index';
 
@@ -29,11 +36,47 @@ const QUEUE_REFRESH_EVENTS: ReadonlySet<string> = new Set<string>([
   SyncEventType.SYNC_FAILED,
   SyncEventType.ITEM_SUCCEEDED,
   SyncEventType.ITEM_FAILED,
+  // Dead-lettered items leave the pending queue.
+  SyncEventType.ITEM_DEAD_LETTERED,
+]);
+
+/** Events after which the dead-letter queue may have changed. */
+const DEAD_LETTER_REFRESH_EVENTS: ReadonlySet<string> = new Set<string>([
+  // A failed item moved in.
+  SyncEventType.ITEM_DEAD_LETTERED,
+  // `discardDeadLetter()`, or `removeItem()` reaching a dead letter.
+  SyncEventType.ITEM_REMOVED,
+  // `replayDeadLetter()` moved one back to the queue.
+  SyncEventType.ITEM_ENQUEUED,
+  // `clearQueue()` deletes dead letters too.
+  SyncEventType.QUEUE_CLEARED,
 ]);
 
 /**
- * Read-only dashboard aggregator that combines connection, queue, and
- * sync-engine state into a single reactive snapshot.
+ * Whether a dead-letter read found the rows already shown. A dead letter is
+ * never updated in place, so its id, the time it was moved and its attempt
+ * bookkeeping identify it.
+ */
+function sameDeadLetters(
+  shown: readonly SyncDeadLetterItem[] | undefined,
+  read: readonly SyncDeadLetterItem[]
+): boolean {
+  if (shown === undefined || shown.length !== read.length) return false;
+  return shown.every((item, index) => {
+    const other = read[index];
+    return (
+      other !== undefined &&
+      item.id === other.id &&
+      item.deadLetteredAt === other.deadLetteredAt &&
+      item.attempts === other.attempts &&
+      item.lastAttemptAt === other.lastAttemptAt
+    );
+  });
+}
+
+/**
+ * Read-only dashboard aggregator that combines connection, queue, dead-letter
+ * and sync-engine state into a single reactive snapshot.
  *
  * Unlike {@link useOfflineQueue}, this hook exposes NO action methods — it is a
  * pure observer intended for status dashboards, badges, and "what is the sync
@@ -51,9 +94,14 @@ const QUEUE_REFRESH_EVENTS: ReadonlySet<string> = new Set<string>([
  * full snapshot object. Consumers that need fine-grained re-render control can
  * memoize derived values themselves.
  *
- * **Forward fields.** `networkQuality` and `deadLetter` are typed-optional and
- * ALWAYS `undefined` in v0.2; real values arrive with the v0.3 classifier /
- * dead-letter store.
+ * **Network quality and dead letters.** `networkQuality` comes from the same
+ * `getConnectionStatus()` read as `connection`, made on mount and on every
+ * `CONNECTION_CHANGED`. `deadLetter` is read with `listDeadLetter()` on mount
+ * and on `ITEM_DEAD_LETTERED`, `ITEM_REMOVED`, `ITEM_ENQUEUED` and
+ * `QUEUE_CLEARED`. Both are `undefined` until their first read succeeds, and a
+ * failed read keeps the last value. A dead-letter read that finds the list
+ * already shown does not re-render, so an `ITEM_ENQUEUED` that leaves the
+ * dead-letter queue as it was costs no extra render.
  *
  * Safe to call before the native module loads — it returns inert state and
  * never throws on render.
@@ -61,10 +109,13 @@ const QUEUE_REFRESH_EVENTS: ReadonlySet<string> = new Set<string>([
  * @returns {UseSyncSnapshotResult} the aggregated, read-only sync snapshot.
  *
  * @example
- * const { size, isSyncing, connection, isWaitingForConnection } =
+ * const { size, isSyncing, connection, isWaitingForConnection, deadLetter } =
  *   useSyncSnapshot();
  * if (isWaitingForConnection) {
  *   return <Badge>{size} item(s) waiting for connection…</Badge>;
+ * }
+ * if (deadLetter !== undefined && deadLetter.length > 0) {
+ *   return <Badge>{deadLetter.length} request(s) need attention</Badge>;
  * }
  *
  * @public
@@ -82,8 +133,20 @@ export function useSyncSnapshot(): UseSyncSnapshotResult {
   const [connectionType, setConnectionType] = useState<ConnectionType>(
     ConnectionType.UNKNOWN
   );
+  const [networkQuality, setNetworkQuality] = useState<
+    NetworkQuality | undefined
+  >(undefined);
+  const [deadLetter, setDeadLetter] = useState<
+    readonly SyncDeadLetterItem[] | undefined
+  >(undefined);
   const [error, setError] = useState<SyncError | null>(null);
   const cancelledRef = useRef(false);
+  /** The dead-letter list last rendered, compared before every update. */
+  const deadLetterRef = useRef<readonly SyncDeadLetterItem[] | undefined>(
+    undefined
+  );
+  /** Only the latest dead-letter read may update the list. */
+  const deadLetterReadRef = useRef(0);
 
   const refreshQueue = useCallback(async () => {
     if (!isNativeModuleAvailable()) return;
@@ -116,6 +179,7 @@ export function useSyncSnapshot(): UseSyncSnapshotResult {
       if (cancelledRef.current) return;
       setConnectionStatus(snap.status);
       setConnectionType(snap.type);
+      setNetworkQuality(snap.networkQuality);
     } catch {
       // Best-effort: connection is secondary state — swallow and keep
       // last-known value (queue refresh is the primary path that surfaces
@@ -136,6 +200,24 @@ export function useSyncSnapshot(): UseSyncSnapshotResult {
     }
   }, []);
 
+  const refreshDeadLetter = useCallback(async () => {
+    if (!isNativeModuleAvailable()) return;
+    deadLetterReadRef.current += 1;
+    const read = deadLetterReadRef.current;
+    try {
+      const next = await listDeadLetter();
+      // A later read may have started meanwhile: let it decide.
+      if (cancelledRef.current || read !== deadLetterReadRef.current) return;
+      if (sameDeadLetters(deadLetterRef.current, next)) return;
+      deadLetterRef.current = next;
+      setDeadLetter(next);
+    } catch {
+      // Best-effort: the dead-letter list is secondary state — swallow and
+      // keep the last-known list (queue refresh is the primary path that
+      // surfaces errors into `error`).
+    }
+  }, []);
+
   useEffect(() => {
     cancelledRef.current = false;
     if (!isNativeModuleAvailable()) return undefined;
@@ -145,6 +227,7 @@ export function useSyncSnapshot(): UseSyncSnapshotResult {
     void refreshQueue();
     void refreshConnection();
     void refreshLastResult();
+    void refreshDeadLetter();
     facadeIsSyncing()
       .then((b) => {
         if (!cancelledRef.current) setIsSyncing(b);
@@ -155,6 +238,9 @@ export function useSyncSnapshot(): UseSyncSnapshotResult {
       try {
         subscriptionId = await addSyncEventListener((event: SyncEvent) => {
           if (QUEUE_REFRESH_EVENTS.has(event.type)) void refreshQueue();
+          if (DEAD_LETTER_REFRESH_EVENTS.has(event.type)) {
+            void refreshDeadLetter();
+          }
           switch (event.type) {
             case SyncEventType.SYNC_STARTED:
               setIsSyncing(true);
@@ -198,7 +284,7 @@ export function useSyncSnapshot(): UseSyncSnapshotResult {
         void removeSyncEventListener(subscriptionId).catch(() => undefined);
       }
     };
-  }, [refreshQueue, refreshConnection, refreshLastResult]);
+  }, [refreshQueue, refreshConnection, refreshLastResult, refreshDeadLetter]);
 
   const isOnline =
     connectionStatus === ConnectionStatus.CONNECTED ||
@@ -210,6 +296,7 @@ export function useSyncSnapshot(): UseSyncSnapshotResult {
     type: connectionType,
     isOnline,
     isMetered,
+    networkQuality: networkQuality ?? NetworkQuality.OFFLINE,
   };
 
   const isWaitingForConnection = size > 0 && !isOnline;
@@ -224,5 +311,7 @@ export function useSyncSnapshot(): UseSyncSnapshotResult {
     lastResult,
     isWaitingForConnection,
     error,
+    networkQuality,
+    deadLetter,
   };
 }

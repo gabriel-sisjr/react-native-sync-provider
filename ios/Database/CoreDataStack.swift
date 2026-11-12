@@ -16,6 +16,9 @@ import os.log
 enum CoreDataStackError: LocalizedError {
     case modelNotFound
     case persistentStoreLoadFailed(underlying: Error)
+    /// A store from an earlier model could not be brought up to the current
+    /// one. It is left as it was; the next load tries again.
+    case storeMigrationFailed(underlying: Error)
 
     var errorDescription: String? {
         switch self {
@@ -24,6 +27,8 @@ enum CoreDataStackError: LocalizedError {
                    "Make sure the Core Data model is bundled with the SyncProvider podspec."
         case .persistentStoreLoadFailed(let underlying):
             return "Failed to load the SyncProvider Core Data store: \(underlying.localizedDescription)"
+        case .storeMigrationFailed(let underlying):
+            return "Failed to migrate the SyncProvider Core Data store: \(underlying.localizedDescription)"
         }
     }
 }
@@ -35,9 +40,10 @@ enum CoreDataStackError: LocalizedError {
 /// launch recovery and a BGTask launch all race here, and two containers
 /// opening the same file would run the lightweight migration twice.
 ///
-/// Lightweight migration is enabled: the model bundle carries every version,
-/// and Core Data infers each step between them. Once the library reaches 1.0,
-/// explicit migration mappings will replace this default.
+/// A store written by an earlier model version is migrated explicitly before it
+/// is loaded (see ``CoreDataMigration``): moving failed items to the
+/// dead-letter store is not a step inference can be trusted with. Inference
+/// stays on only for a store no bundled version recognizes.
 final class CoreDataStack: @unchecked Sendable {
     /// Shared singleton.
     static let shared = CoreDataStack()
@@ -54,6 +60,9 @@ final class CoreDataStack: @unchecked Sendable {
 
     /// Builds the container and reports any load failure. Runs at most once.
     private let makeContainer: (CoreDataStack) -> (NSPersistentContainer, Error?)
+
+    /// Runs the transactions of ``performSerializedTask(_:)``, one at a time.
+    private let serializedQueue = DispatchQueue(label: "com.syncprovider.coredata.serialized", qos: .utility)
 
     /// The loaded container. The first caller loads the store while holding
     /// the lock, so concurrent callers wait for it instead of opening their
@@ -85,6 +94,12 @@ final class CoreDataStack: @unchecked Sendable {
         self.makeContainer = { $0.loadBundledContainer() }
     }
 
+    /// Test-only initializer. Runs the production load, migration included,
+    /// against a store and a compiled model of the caller's choosing.
+    internal init(storeURL: URL, modelURL: URL) {
+        self.makeContainer = { $0.loadBundledContainer(modelURL: modelURL, storeURL: storeURL) }
+    }
+
     /// Test-only initializer. Accepts a pre-loaded `NSPersistentContainer`
     /// so XCTest cases can run without touching disk or the bundled `.momd`
     /// resource.
@@ -101,10 +116,18 @@ final class CoreDataStack: @unchecked Sendable {
         self.makeContainer = { _ in load() }
     }
 
-    /// Loads the bundled model and store. Called once, under `loadLock`.
-    private func loadBundledContainer() -> (NSPersistentContainer, Error?) {
-        let bundle = Self.resolveBundle()
-        guard let modelURL = bundle.url(forResource: Self.modelName, withExtension: "momd"),
+    /// The options the store is opened with, and migrated with.
+    private static let storeOptions: [AnyHashable: Any] = [NSPersistentHistoryTrackingKey: true as NSNumber]
+
+    /// Loads the bundled model and store, migrating the store first when an
+    /// earlier model wrote it. Called once, under `loadLock`.
+    ///
+    /// - Parameters:
+    ///   - modelURL: test seam; `nil` finds the bundled `.momd`.
+    ///   - storeURL: test seam; `nil` is the container's default location.
+    private func loadBundledContainer(modelURL: URL? = nil, storeURL: URL? = nil) -> (NSPersistentContainer, Error?) {
+        let resolvedModelURL = modelURL ?? Self.resolveBundle().url(forResource: Self.modelName, withExtension: "momd")
+        guard let modelURL = resolvedModelURL,
               let model = NSManagedObjectModel(contentsOf: modelURL) else {
             os_log("Failed to find %@.momd in any candidate bundle", log: logger, type: .error, Self.modelName)
             // Returning an empty container would crash on first use; instead we
@@ -116,10 +139,30 @@ final class CoreDataStack: @unchecked Sendable {
         let container = NSPersistentContainer(name: Self.modelName, managedObjectModel: model)
 
         if let description = container.persistentStoreDescriptions.first {
+            if let storeURL {
+                description.url = storeURL
+            }
             description.shouldMigrateStoreAutomatically = true
             description.shouldInferMappingModelAutomatically = true
             description.setOption(true as NSNumber, forKey: NSPersistentHistoryTrackingKey)
             description.setOption(true as NSNumber, forKey: NSPersistentStoreRemoteChangeNotificationPostOptionKey)
+
+            if let url = description.url {
+                do {
+                    if let version = try CoreDataMigration.migrateStoreIfNeeded(at: url,
+                                                                                momd: modelURL,
+                                                                                currentModel: model,
+                                                                                storeOptions: Self.storeOptions) {
+                        os_log("Migrated the store from %{public}@", log: logger, type: .info, version)
+                    }
+                } catch {
+                    // Never fall through to the load: its inference would accept
+                    // the store and leave the failed items behind in the queue.
+                    os_log("Failed to migrate the store: %{public}@", log: logger, type: .error,
+                           error.localizedDescription)
+                    return (Self.makeFallbackContainer(), CoreDataStackError.storeMigrationFailed(underlying: error))
+                }
+            }
         }
 
         var failure: Error?
@@ -156,17 +199,50 @@ final class CoreDataStack: @unchecked Sendable {
         }
         return try await withCheckedThrowingContinuation { continuation in
             container.performBackgroundTask { context in
-                context.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
-                do {
-                    let value = try block(context)
-                    if context.hasChanges {
-                        try context.save()
-                    }
-                    continuation.resume(returning: value)
-                } catch {
-                    continuation.resume(throwing: error)
+                continuation.resume(with: Self.run(block, in: context))
+            }
+        }
+    }
+
+    /// ``performBackgroundTask(_:)``, one transaction at a time: a block starts
+    /// only once every block submitted here before it has saved, in the order
+    /// they were submitted. Transactions submitted to
+    /// ``performBackgroundTask(_:)`` still run alongside.
+    ///
+    /// Every transaction has its own context, and the merge policy accepts a
+    /// save over a row another context deleted after it was read: the stale
+    /// change does nothing, and whatever the block inserted is written. A
+    /// transaction that copies a row to the other store once it has read it
+    /// would then write a copy of a row that is gone, the request's headers
+    /// and body included, and the claim of an item for dispatch would report
+    /// a row that is gone as claimed. Those transactions, and every
+    /// transaction that deletes queued items or dead letters, run here, so
+    /// such a deletion cannot land between that read and its save.
+    func performSerializedTask<T>(_ block: @escaping (NSManagedObjectContext) throws -> T) async throws -> T {
+        let container = persistentContainer
+        if let loadError = initializationError {
+            throw loadError
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            serializedQueue.async {
+                let context = container.newBackgroundContext()
+                context.performAndWait {
+                    continuation.resume(with: Self.run(block, in: context))
                 }
             }
+        }
+    }
+
+    /// Runs `block` on `context` and saves what it changed, if it did not throw.
+    private static func run<T>(_ block: (NSManagedObjectContext) throws -> T,
+                               in context: NSManagedObjectContext) -> Result<T, Error> {
+        context.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
+        return Result {
+            let value = try block(context)
+            if context.hasChanges {
+                try context.save()
+            }
+            return value
         }
     }
 

@@ -80,18 +80,11 @@ class SyncProvider : HybridSyncProviderSpec() {
   }
 
   override fun removeItem(id: String): Promise<Boolean> = promise {
-    val removed = runtime.storage.removeItem(id)
-    if (removed) {
-      runtime.emitter.emit(
-        SyncEventEmitter.event(SyncEventType.ITEM_REMOVED, itemId = id),
-      )
-    }
-    removed
+    runtime.removeItem(id)
   }
 
   override fun clearQueue(): Promise<Unit> = promise {
-    runtime.storage.clear()
-    runtime.emitter.emit(SyncEventEmitter.event(SyncEventType.QUEUE_CLEARED))
+    runtime.clearQueue()
   }
 
   override fun getQueueSize(): Promise<Double> = promise {
@@ -100,6 +93,20 @@ class SyncProvider : HybridSyncProviderSpec() {
 
   override fun getPendingItems(): Promise<Array<SyncItem>> = promise {
     runtime.storage.getPending().toTypedArray()
+  }
+
+  /* ---------------------------- Dead letters ---------------------------- */
+
+  override fun listDeadLetter(): Promise<Array<SyncDeadLetterItem>> = promise {
+    runtime.listDeadLetter().toTypedArray()
+  }
+
+  override fun replayDeadLetter(id: String): Promise<Unit> = promise {
+    runtime.replayDeadLetter(id)
+  }
+
+  override fun discardDeadLetter(id: String): Promise<Unit> = promise {
+    runtime.discardDeadLetter(id)
   }
 
   /* ------------------------------ Sync ops ------------------------------ */

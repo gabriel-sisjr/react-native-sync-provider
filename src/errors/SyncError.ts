@@ -35,9 +35,9 @@ export class SyncError extends Error {
    * Structured, machine-readable list of validation violations.
    *
    * Populated only for validation failures (`INVALID_URL` / `INVALID_PAYLOAD`
-   * raised by {@link enqueue} / {@link enqueueBatch}). Carries *every* issue
-   * detected — not just the first — so consumers can surface all problems at
-   * once. `undefined` for non-validation errors.
+   * raised by {@link enqueue} / {@link enqueueBatch} / {@link configureSync}).
+   * Carries *every* issue detected — not just the first — so consumers can
+   * surface all problems at once. `undefined` for non-validation errors.
    */
   readonly validationErrors?: ValidationIssue[];
 

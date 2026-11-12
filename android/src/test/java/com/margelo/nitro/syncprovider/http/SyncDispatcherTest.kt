@@ -3,12 +3,15 @@ package com.margelo.nitro.syncprovider.http
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.google.common.truth.Truth.assertThat
+import com.google.common.truth.Truth.assertWithMessage
 import com.margelo.nitro.syncprovider.HttpMethod
+import com.margelo.nitro.syncprovider.NetworkQuality
 import com.margelo.nitro.syncprovider.SyncErrorCode
 import com.margelo.nitro.syncprovider.SyncEvent
 import com.margelo.nitro.syncprovider.SyncEventType
 import com.margelo.nitro.syncprovider.SyncResult
 import com.margelo.nitro.syncprovider.database.SyncDatabase
+import com.margelo.nitro.syncprovider.database.SyncDeadLetterEntity
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
 import com.margelo.nitro.syncprovider.error.SyncException
 import com.margelo.nitro.syncprovider.events.SyncEventEmitter
@@ -17,6 +20,7 @@ import com.margelo.nitro.syncprovider.testutil.MovingClock
 import com.margelo.nitro.syncprovider.testutil.TestData
 import io.mockk.coEvery
 import io.mockk.mockk
+import io.mockk.spyk
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -31,6 +35,7 @@ import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
+import okhttp3.mockwebserver.SocketPolicy
 import org.junit.After
 import org.junit.Assert.assertThrows
 import org.junit.Before
@@ -83,6 +88,13 @@ internal class SyncDispatcherTest {
     credentials: () -> CredentialPolicy = { CredentialPolicy.TRUSTED },
     onCycleFinished: suspend (Long?) -> Unit = { finishedCycles += it },
     queue: SyncQueueStorage = storage,
+    minNetworkQuality: NetworkQuality? = null,
+    quality: () -> NetworkQuality = { NetworkQuality.GOOD },
+    healthCheckUrl: String? = null,
+    healthCheckTtlMs: Double? = null,
+    healthCheckBackoffMs: Double? = null,
+    healthCheck: HealthCheck = this.healthCheck,
+    defaultHeaders: Map<String, String>? = null,
   ): SyncDispatcher {
     val options = TestData.syncOptions(
       retryPolicy = TestData.retryPolicy(
@@ -93,6 +105,11 @@ internal class SyncDispatcherTest {
       ),
       requestTimeoutMs = requestTimeoutMs,
       batchSize = batchSize,
+      minNetworkQuality = minNetworkQuality,
+      healthCheckUrl = healthCheckUrl,
+      healthCheckTtlMs = healthCheckTtlMs,
+      healthCheckBackoffMs = healthCheckBackoffMs,
+      defaultHeaders = defaultHeaders,
     )
     return SyncDispatcher(
       storage = queue,
@@ -101,9 +118,23 @@ internal class SyncDispatcherTest {
       clock = clock::now,
       isPaused = isPaused,
       credentialPolicy = credentials,
+      networkQuality = quality,
+      healthCheck = healthCheck,
+      onHealthCheckSkipped = { healthSkips++ },
       onCycleFinished = onCycleFinished,
     )
   }
+
+  /** On the test clock, so the reuse window and the backoff move with it. */
+  private val healthCheck: HealthCheck by lazy { healthCheck() }
+  private var healthSkips = 0
+
+  private fun healthCheck(timeoutMs: Long = HealthCheck.TIMEOUT_MS): HealthCheck = HealthCheck(
+    probe = HeadProbe(lazyOf(HeadProbe.newClient())),
+    wallClock = clock::now,
+    monotonicClock = clock::now,
+    timeoutMs = timeoutMs,
+  )
 
   /** Answers [code] after moving the clock by [attemptMs], as a real request would. */
   private fun respondAfter(attemptMs: Long, code: Int): Dispatcher = object : Dispatcher() {
@@ -127,6 +158,12 @@ internal class SyncDispatcherTest {
     storage.enqueue(TestData.input(url = server.url(path).toString()))
 
   private suspend fun row(id: String): SyncItemEntity = db.syncItemDao().findById(id)!!
+
+  /** The dead letter [id] became; it is no longer queued. */
+  private suspend fun deadLetter(id: String): SyncDeadLetterEntity {
+    assertThat(db.syncItemDao().findById(id)).isNull()
+    return checkNotNull(db.syncDeadLetterDao().findById(id))
+  }
 
   /* ---------------------------- plain dispatch ---------------------------- */
 
@@ -241,8 +278,7 @@ internal class SyncDispatcherTest {
     val result = d.flush()
     assertThat(result.failureCount.toInt()).isEqualTo(1)
     assertThat(result.failedIds.toList()).containsExactly(id)
-    val failed = row(id)
-    assertThat(failed.status).isEqualTo(SyncItemEntity.STATUS_FAILED)
+    val failed = deadLetter(id)
     assertThat(failed.attempts).isEqualTo(2)
     assertThat(result.errors[id] ?: "").contains(SyncErrorCode.MAX_ATTEMPTS_EXCEEDED.name)
     assertThat(server.requestCount).isEqualTo(2)
@@ -260,9 +296,8 @@ internal class SyncDispatcherTest {
     }
 
     assertThat(server.requestCount).isEqualTo(3)
-    assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_FAILED)
-    assertThat(row(id).attempts).isEqualTo(3)
-    assertThat(row(id).lastErrorCode).isEqualTo(SyncErrorCode.MAX_ATTEMPTS_EXCEEDED.name)
+    assertThat(deadLetter(id).attempts).isEqualTo(3)
+    assertThat(deadLetter(id).lastErrorCode).isEqualTo(SyncErrorCode.MAX_ATTEMPTS_EXCEEDED.name)
   }
 
   @Test
@@ -273,8 +308,7 @@ internal class SyncDispatcherTest {
     val result = newDispatcher(maxAttempts = 5).flush()
 
     assertThat(server.requestCount).isEqualTo(0)
-    assertThat(row("spent").status).isEqualTo(SyncItemEntity.STATUS_FAILED)
-    assertThat(row("spent").attempts).isEqualTo(7)
+    assertThat(deadLetter("spent").attempts).isEqualTo(7)
     assertThat(result.failedIds.toList()).containsExactly("spent")
     val failure = events.single { it.type == SyncEventType.ITEM_FAILED }
     assertThat(failure.errorCode).isEqualTo(SyncErrorCode.MAX_ATTEMPTS_EXCEEDED)
@@ -313,7 +347,7 @@ internal class SyncDispatcherTest {
 
     newDispatcher(maxAttempts = 1).flush()
 
-    assertThat(row(id).lastErrorCode).isEqualTo(SyncErrorCode.UNAUTHORIZED.name)
+    assertThat(deadLetter(id).lastErrorCode).isEqualTo(SyncErrorCode.UNAUTHORIZED.name)
   }
 
   /* --------------------------- cycle semantics ---------------------------- */
@@ -638,8 +672,8 @@ internal class SyncDispatcherTest {
 
     newDispatcher(credentials = { CredentialPolicy.TRUSTED }).flush()
 
-    assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_FAILED)
-    assertThat(row(id).attempts).isEqualTo(1)
+    assertThat(deadLetter(id).attempts).isEqualTo(1)
+    assertThat(deadLetter(id).lastErrorCode).isEqualTo(SyncErrorCode.UNAUTHORIZED.name)
   }
 
   @Test
@@ -655,5 +689,605 @@ internal class SyncDispatcherTest {
     assertThat(row(id).attempts).isEqualTo(0)
     assertThat(events).isEmpty()
     assertThat(finishedCycles).isEmpty()
+  }
+
+  /* -------------------------- network-quality gate -------------------------- */
+
+  @Test
+  fun `gate_unset_neverGates, so a manual flush on an offline link still dispatches`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(200))
+    enqueue()
+    var reads = 0
+    val dispatcher = newDispatcher(quality = { reads++; NetworkQuality.OFFLINE })
+
+    val outcome = dispatcher.flushWithOutcome()
+
+    assertThat(outcome).isInstanceOf(FlushOutcome.Ran::class.java)
+    assertThat(outcome.result.successCount).isEqualTo(1.0)
+    assertThat(server.requestCount).isEqualTo(1)
+    assertThat(reads).isEqualTo(0)
+  }
+
+  @Test
+  fun `gate_offlineMinimum_neverGates`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(200))
+    enqueue()
+    var reads = 0
+    val dispatcher = newDispatcher(
+      minNetworkQuality = NetworkQuality.OFFLINE,
+      quality = { reads++; NetworkQuality.OFFLINE },
+    )
+
+    val outcome = dispatcher.flushWithOutcome()
+
+    assertThat(outcome.result.successCount).isEqualTo(1.0)
+    assertThat(reads).isEqualTo(0)
+  }
+
+  @Test
+  fun `gate_belowMinimum_skipsCycle`() = runTest {
+    val id = enqueue()
+    val events = recordEvents()
+    val dispatcher = newDispatcher(
+      minNetworkQuality = NetworkQuality.GOOD,
+      quality = { NetworkQuality.MODERATE },
+    )
+
+    val outcome = dispatcher.flushWithOutcome()
+
+    assertThat(outcome).isEqualTo(FlushOutcome.Skipped(FlushSkip.NETWORK_QUALITY_TOO_LOW))
+    assertThat(outcome.isHeldByQualityGate).isTrue()
+    // The no-cycle result, the shape a paused flush resolves with.
+    assertThat(outcome.result).isEqualTo(SyncDispatcher.emptyResult())
+    assertThat(events.types()).containsExactly(SyncEventType.SYNC_FAILED)
+    assertThat(events.single().errorCode).isEqualTo(SyncErrorCode.NETWORK_QUALITY_TOO_LOW)
+    assertThat(server.requestCount).isEqualTo(0)
+    assertThat(storage.getLastResult()).isNull()
+    val untouched = row(id)
+    assertThat(untouched.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(untouched.attempts).isEqualTo(0)
+    assertThat(untouched.nextRetryAt).isEqualTo(0L)
+    assertThat(untouched.lastErrorCode).isNull()
+    assertThat(finishedCycles).isEmpty()
+    assertThat(dispatcher.flush()).isEqualTo(SyncDispatcher.emptyResult())
+  }
+
+  @Test
+  fun `the gate lets a link at or above the minimum through`() = runTest {
+    repeat(2) { server.enqueue(MockResponse().setResponseCode(200)) }
+    enqueue()
+    var quality = NetworkQuality.GOOD
+    val dispatcher = newDispatcher(minNetworkQuality = NetworkQuality.GOOD, quality = { quality })
+
+    assertThat(dispatcher.flushWithOutcome()).isInstanceOf(FlushOutcome.Ran::class.java)
+
+    enqueue()
+    quality = NetworkQuality.EXCELLENT
+    assertThat(dispatcher.flushWithOutcome()).isInstanceOf(FlushOutcome.Ran::class.java)
+    assertThat(server.requestCount).isEqualTo(2)
+  }
+
+  @Test
+  fun `POOR, the most permissive minimum, blocks only OFFLINE`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(200))
+    enqueue()
+    var quality = NetworkQuality.OFFLINE
+    val dispatcher = newDispatcher(minNetworkQuality = NetworkQuality.POOR, quality = { quality })
+
+    assertThat(dispatcher.flushWithOutcome().isHeldByQualityGate).isTrue()
+
+    quality = NetworkQuality.POOR
+    assertThat(dispatcher.flushWithOutcome()).isInstanceOf(FlushOutcome.Ran::class.java)
+    assertThat(server.requestCount).isEqualTo(1)
+  }
+
+  @Test
+  fun `the gate runs after the paused and the credential checks`() = runTest {
+    enqueue()
+    val events = recordEvents()
+    var reads = 0
+    val gated = { reads++; NetworkQuality.POOR }
+
+    val paused = newDispatcher(
+      isPaused = { true },
+      minNetworkQuality = NetworkQuality.GOOD,
+      quality = gated,
+    ).flushWithOutcome()
+    val noCredentials = newDispatcher(
+      credentials = { CredentialPolicy.UNAVAILABLE },
+      minNetworkQuality = NetworkQuality.GOOD,
+      quality = gated,
+    ).flushWithOutcome()
+
+    assertThat(paused).isEqualTo(FlushOutcome.Skipped(FlushSkip.PAUSED))
+    assertThat(noCredentials).isEqualTo(FlushOutcome.Skipped(FlushSkip.CREDENTIALS_UNAVAILABLE))
+    assertThat(reads).isEqualTo(0)
+    assertThat(events).isEmpty()
+    assertThat(server.requestCount).isEqualTo(0)
+  }
+
+  /* ------------------------------- health check ------------------------------- */
+
+  /** `/health` answers [health]; every other path, an item, answers 200. */
+  private fun healthServer(health: () -> MockResponse) {
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest): MockResponse =
+        if (request.path == "/health") health() else MockResponse().setResponseCode(200)
+    }
+  }
+
+  private var taken = 0
+
+  /** The requests the server received since the last call. */
+  private fun recorded(): List<RecordedRequest> {
+    val received = server.requestCount
+    return List(received - taken) { checkNotNull(server.takeRequest(1, TimeUnit.SECONDS)) }
+      .also { taken = received }
+  }
+
+  private val healthUrl: String get() = server.url("/health").toString()
+
+  @Test
+  fun `health_unset_neverProbes`() = runTest {
+    healthServer { MockResponse().setResponseCode(200) }
+    enqueue()
+
+    newDispatcher().flush()
+
+    assertThat(recorded().map { it.method }).containsExactly("POST")
+  }
+
+  @Test
+  fun `health_2xx_proceeds_andIsCachedForTtl`() = runTest {
+    healthServer { MockResponse().setResponseCode(204) }
+    val dispatcher = newDispatcher(healthCheckUrl = healthUrl, healthCheckTtlMs = 60_000.0)
+
+    enqueue()
+    assertThat(dispatcher.flushWithOutcome()).isInstanceOf(FlushOutcome.Ran::class.java)
+    enqueue()
+    clock.advance(59_999L)
+    dispatcher.flush()
+    assertThat(recorded().map { it.method }).containsExactly("HEAD", "POST", "POST").inOrder()
+
+    enqueue()
+    clock.advance(1L)
+    dispatcher.flush()
+    assertThat(recorded().map { it.method }).containsExactly("HEAD", "POST").inOrder()
+  }
+
+  @Test
+  fun `a healthCheckTtlMs of 0 checks before every cycle`() = runTest {
+    healthServer { MockResponse().setResponseCode(200) }
+    val dispatcher = newDispatcher(healthCheckUrl = healthUrl, healthCheckTtlMs = 0.0)
+
+    repeat(2) {
+      enqueue()
+      dispatcher.flush()
+    }
+
+    assertThat(recorded().map { it.method }).containsExactly("HEAD", "POST", "HEAD", "POST").inOrder()
+  }
+
+  @Test
+  fun `health_failure_skipsCycle_andStartsBackoff, for 404, 500 and a timeout`() = runTest {
+    val failures = listOf(
+      "404" to { MockResponse().setResponseCode(404) },
+      "500" to { MockResponse().setResponseCode(500) },
+      "timeout" to { MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE) },
+    )
+    for ((name, failure) in failures) {
+      healthServer(failure)
+      val id = enqueue()
+      val events = recordEvents()
+      healthSkips = 0
+      val dispatcher = newDispatcher(
+        healthCheckUrl = healthUrl,
+        healthCheckBackoffMs = 30_000.0,
+        healthCheck = healthCheck(timeoutMs = 300L),
+      )
+
+      val failed = dispatcher.flushWithOutcome()
+      clock.advance(29_999L)
+      val backingOff = dispatcher.flushWithOutcome()
+
+      assertWithMessage(name).that(failed).isEqualTo(FlushOutcome.Skipped(FlushSkip.HEALTH_CHECK_FAILED))
+      assertWithMessage(name).that(backingOff)
+        .isEqualTo(FlushOutcome.Skipped(FlushSkip.HEALTH_CHECK_BACKOFF))
+      assertWithMessage(name).that(failed.result).isEqualTo(SyncDispatcher.emptyResult())
+      // One HEAD: none is sent during the backoff.
+      assertWithMessage(name).that(recorded().map { it.method }).containsExactly("HEAD")
+      assertWithMessage(name).that(events.types())
+        .containsExactly(SyncEventType.SYNC_FAILED, SyncEventType.SYNC_FAILED)
+      assertWithMessage(name).that(events.map { it.errorCode }.distinct())
+        .containsExactly(SyncErrorCode.HEALTH_CHECK_FAILED)
+      assertWithMessage(name).that(healthSkips).isEqualTo(2)
+      assertWithMessage(name).that(storage.getLastResult()).isNull()
+      assertWithMessage(name).that(row(id).attempts).isEqualTo(0)
+      assertWithMessage(name).that(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+
+      // The backoff over, the next flush checks again.
+      clock.advance(1L)
+      dispatcher.flushWithOutcome()
+      assertWithMessage(name).that(recorded().map { it.method }).containsExactly("HEAD")
+      storage.clear()
+    }
+  }
+
+  @Test
+  fun `health_zeroBackoff_explicitFlushesStillProbe, while wakes wait a second`() = runTest {
+    healthServer { MockResponse().setResponseCode(503) }
+    val id = enqueue()
+    val dispatcher = newDispatcher(healthCheckUrl = healthUrl, healthCheckBackoffMs = 0.0)
+
+    repeat(3) { dispatcher.flush() }
+
+    // Each flush() sends its own HEAD: the floor holds back only automatic wakes.
+    assertThat(recorded().map { it.method }).containsExactly("HEAD", "HEAD", "HEAD")
+    assertThat(healthSkips).isEqualTo(3)
+    assertThat(healthCheck.wakeNotBefore()).isEqualTo(clock.now() + HealthCheck.MIN_WAKE_BACKOFF_MS)
+    assertThat(row(id).attempts).isEqualTo(0)
+  }
+
+  @Test
+  fun `health_success_and_configure_clearBackoff, the success half`() = runTest {
+    var healthy = false
+    healthServer { MockResponse().setResponseCode(if (healthy) 200 else 503) }
+    enqueue()
+    val dispatcher = newDispatcher(healthCheckUrl = healthUrl, healthCheckBackoffMs = 30_000.0)
+
+    dispatcher.flush()
+    assertThat(healthCheck.wakeNotBefore()).isEqualTo(clock.now() + 30_000L)
+
+    healthy = true
+    clock.advance(30_000L)
+    val outcome = dispatcher.flushWithOutcome()
+
+    assertThat(outcome).isInstanceOf(FlushOutcome.Ran::class.java)
+    assertThat(healthCheck.wakeNotBefore()).isEqualTo(0L)
+  }
+
+  @Test
+  fun `a redirect to a 2xx is healthy`() = runTest {
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+        "/health" -> MockResponse().setResponseCode(302).setHeader("Location", "/ok")
+        else -> MockResponse().setResponseCode(200)
+      }
+    }
+    enqueue()
+
+    val outcome = newDispatcher(healthCheckUrl = healthUrl).flushWithOutcome()
+
+    assertThat(outcome).isInstanceOf(FlushOutcome.Ran::class.java)
+  }
+
+  @Test
+  fun `health_qualitySample2xx_refreshesLastHealthy, so no extra HEAD is sent`() = runTest {
+    healthServer { MockResponse().setResponseCode(200) }
+    enqueue()
+    // What the network-quality probe reports after a 2xx sample.
+    healthCheck.recordHealthy(healthUrl)
+
+    newDispatcher(healthCheckUrl = healthUrl).flush()
+
+    assertThat(recorded().map { it.method }).containsExactly("POST")
+  }
+
+  @Test
+  fun `health_noAuthHeaders_and_noCache`() = runTest {
+    healthServer { MockResponse().setResponseCode(200) }
+    enqueue()
+
+    newDispatcher(
+      healthCheckUrl = healthUrl,
+      defaultHeaders = mapOf("Authorization" to "Bearer live"),
+    ).flush()
+
+    val (head, post) = recorded()
+    assertThat(head.method).isEqualTo("HEAD")
+    assertThat(head.getHeader("Authorization")).isNull()
+    assertThat(head.getHeader("Cache-Control")).isEqualTo("no-cache")
+    assertThat(head.getHeader("X-Test")).isNull()
+    assertThat(post.getHeader("Authorization")).isEqualTo("Bearer live")
+  }
+
+  @Test
+  fun `the quality gate runs before the health check`() = runTest {
+    healthServer { MockResponse().setResponseCode(200) }
+    enqueue()
+
+    val outcome = newDispatcher(
+      minNetworkQuality = NetworkQuality.GOOD,
+      quality = { NetworkQuality.POOR },
+      healthCheckUrl = healthUrl,
+    ).flushWithOutcome()
+
+    assertThat(outcome).isEqualTo(FlushOutcome.Skipped(FlushSkip.NETWORK_QUALITY_TOO_LOW))
+    assertThat(server.requestCount).isEqualTo(0)
+    assertThat(healthSkips).isEqualTo(0)
+  }
+
+  /* ------------------------------- dead letters ------------------------------- */
+
+  @Test
+  fun `dlq_terminalFailure_movesRow_andEmitsFailedThenDeadLettered`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(400))
+    val id = storage.enqueue(
+      TestData.input(url = server.url("/x").toString(), metadata = mapOf("origin" to "test")),
+    )
+    val queued = row(id)
+    val events = recordEvents()
+    val startedAt = clock.now()
+
+    val result = newDispatcher().flush()
+
+    val dead = deadLetter(id)
+    assertThat(dead.method).isEqualTo(queued.method)
+    assertThat(dead.url).isEqualTo(queued.url)
+    assertThat(dead.headers).isEqualTo(queued.headers)
+    assertThat(dead.body).isEqualTo(queued.body)
+    assertThat(dead.contentType).isEqualTo(queued.contentType)
+    assertThat(dead.priority).isEqualTo(queued.priority)
+    assertThat(dead.priorityWeight).isEqualTo(queued.priorityWeight)
+    assertThat(dead.createdAt).isEqualTo(queued.createdAt)
+    assertThat(dead.metadata).isEqualTo(queued.metadata)
+    assertThat(dead.attempts).isEqualTo(1)
+    assertThat(dead.lastAttemptAt).isEqualTo(startedAt)
+    assertThat(dead.lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
+    assertThat(dead.lastErrorMessage).startsWith("HTTP 400")
+    assertThat(dead.deadLetteredAt).isAtLeast(dead.lastAttemptAt)
+    assertThat(result.failedIds.toList()).containsExactly(id)
+
+    val itemEvents = events.filter { it.itemId == id }
+    assertThat(itemEvents.map { it.type })
+      .containsExactly(SyncEventType.ITEM_FAILED, SyncEventType.ITEM_DEAD_LETTERED).inOrder()
+    assertThat(itemEvents[0].errorCode).isEqualTo(SyncErrorCode.SERVER_ERROR)
+    assertThat(itemEvents[1].errorCode).isEqualTo(SyncErrorCode.DEAD_LETTERED)
+    assertThat(itemEvents[1].metadata).containsExactly("lastErrorCode", SyncErrorCode.SERVER_ERROR.name)
+  }
+
+  /** Holds every response until [release] opens, so a purge can land while requests are out. */
+  private fun holdResponses(release: CountDownLatch, code: Int): Dispatcher = object : Dispatcher() {
+    override fun dispatch(request: RecordedRequest): MockResponse {
+      release.await(20, TimeUnit.SECONDS)
+      return MockResponse().setResponseCode(code)
+    }
+  }
+
+  @Test
+  fun `dlq_clearQueue_whileInFlight_leavesNoDeadLetter`() = runTest {
+    // A logout: the queue is purged while a request still carries the old token, and the
+    // server then rejects that token under the live configuration.
+    val release = CountDownLatch(1)
+    server.dispatcher = holdResponses(release, code = 401)
+    val id = storage.enqueue(
+      TestData.input(
+        url = server.url("/secure").toString(),
+        headers = mapOf("Authorization" to "Bearer old-session"),
+        body = "private-body",
+      ),
+    )
+    val events = recordEvents()
+    val d = newDispatcher(credentials = { CredentialPolicy.TRUSTED })
+
+    val running = async(Dispatchers.IO) { d.flush() }
+    assertThat(server.takeRequest(20, TimeUnit.SECONDS)).isNotNull()
+    storage.clear()
+    release.countDown()
+    val result = running.await()
+
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(storage.count()).isEqualTo(0)
+    assertThat(events.types()).doesNotContain(SyncEventType.ITEM_DEAD_LETTERED)
+    // The request did go out and fail: that outcome is still reported and counted.
+    val failure = events.single { it.type == SyncEventType.ITEM_FAILED }
+    assertThat(failure.itemId).isEqualTo(id)
+    assertThat(failure.errorCode).isEqualTo(SyncErrorCode.UNAUTHORIZED)
+    assertThat(result.failedIds.toList()).containsExactly(id)
+  }
+
+  @Test
+  fun `dlq_removeItem_whileInFlight_leavesNoDeadLetter`() = runTest {
+    val release = CountDownLatch(1)
+    server.dispatcher = holdResponses(release, code = 404)
+    val id = enqueue("/missing")
+    val events = recordEvents()
+    val d = newDispatcher()
+
+    val running = async(Dispatchers.IO) { d.flush() }
+    assertThat(server.takeRequest(20, TimeUnit.SECONDS)).isNotNull()
+    assertThat(storage.removeItem(id)).isTrue()
+    release.countDown()
+    val result = running.await()
+
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(storage.count()).isEqualTo(0)
+    assertThat(events.types()).doesNotContain(SyncEventType.ITEM_DEAD_LETTERED)
+    val failure = events.single { it.type == SyncEventType.ITEM_FAILED }
+    assertThat(failure.itemId).isEqualTo(id)
+    assertThat(failure.errorCode).isEqualTo(SyncErrorCode.SERVER_ERROR)
+    assertThat(result.failedIds.toList()).containsExactly(id)
+  }
+
+  @Test
+  fun `dlq_removeItem_whileInFlight_sparesOnlyThatRow`() = runTest {
+    val release = CountDownLatch(1)
+    server.dispatcher = holdResponses(release, code = 422)
+    val removed = enqueue("/removed")
+    val kept = storage.enqueue(
+      TestData.input(
+        url = server.url("/kept").toString(),
+        headers = mapOf("X-Trace" to "kept"),
+        body = "kept-body",
+      ),
+    )
+    val keptRow = row(kept)
+    val events = recordEvents()
+    val d = newDispatcher()
+
+    val running = async(Dispatchers.IO) { d.flush() }
+    // Both requests are out at once: the batch dispatches concurrently.
+    repeat(2) { assertThat(server.takeRequest(20, TimeUnit.SECONDS)).isNotNull() }
+    assertThat(storage.removeItem(removed)).isTrue()
+    release.countDown()
+    val result = running.await()
+
+    assertThat(db.syncDeadLetterDao().findById(removed)).isNull()
+    val dead = deadLetter(kept)
+    assertThat(dead.headers).isEqualTo(keptRow.headers)
+    assertThat(dead.body).isEqualTo("kept-body")
+    assertThat(dead.lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
+    assertThat(events.filter { it.type == SyncEventType.ITEM_DEAD_LETTERED }.map { it.itemId })
+      .containsExactly(kept)
+    assertThat(events.filter { it.type == SyncEventType.ITEM_FAILED }.map { it.itemId })
+      .containsExactly(removed, kept)
+    assertThat(result.failedIds.toList()).containsExactly(removed, kept)
+  }
+
+  @Test
+  fun `dlq_spentBudget_rowPurgedAfterTheClaim_isNeitherSentNorReported`() = runTest {
+    db.syncItemDao().insert(
+      TestData.entity(id = "spent", attempts = 7, url = server.url("/x").toString()),
+    )
+    // Purge the queue right after the cycle claimed the row. The claim runs on the real
+    // storage: mockk's callOriginal() cannot return from a suspension.
+    val purgingAfterClaim = spyk(storage)
+    coEvery { purgingAfterClaim.claimPending(any(), any()) } coAnswers {
+      storage.claimPending(firstArg(), secondArg()).also { storage.clear() }
+    }
+    val events = recordEvents()
+
+    val result = newDispatcher(maxAttempts = 5, queue = purgingAfterClaim).flush()
+
+    assertThat(server.requestCount).isEqualTo(0)
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(events.filter { it.itemId == "spent" }).isEmpty()
+    assertThat(result.failedIds.toList()).isEmpty()
+    assertThat(result.succeededIds.toList()).isEmpty()
+  }
+
+  @Test
+  fun `dlq_spentBudget_rowPurgedBeforeItsMove_reportsNothing`() = runTest {
+    db.syncItemDao().insert(
+      TestData.entity(id = "spent", attempts = 7, url = server.url("/x").toString()),
+    )
+    // Purge right after the dispatch found the row still queued: the move finds none.
+    val purgingAfterCheck = spyk(storage)
+    coEvery { purgingAfterCheck.isQueued(any()) } coAnswers {
+      storage.isQueued(firstArg()).also { storage.clear() }
+    }
+    val events = recordEvents()
+
+    val result = newDispatcher(maxAttempts = 5, queue = purgingAfterCheck).flush()
+
+    assertThat(server.requestCount).isEqualTo(0)
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(events.filter { it.itemId == "spent" }).isEmpty()
+    assertThat(result.failedIds.toList()).isEmpty()
+  }
+
+  @Test
+  fun `an item purged before its dispatch started is never sent and reports nothing`() = runTest {
+    val release = CountDownLatch(1)
+    server.dispatcher = holdResponses(release, code = 200)
+    val first = enqueue("/first")
+    val second = enqueue("/second")
+    val third = enqueue("/third")
+    val events = recordEvents()
+    // Restored headers: one item goes first, and the rest wait for its answer.
+    val d = newDispatcher(credentials = { CredentialPolicy.PERSISTED })
+
+    val running = async(Dispatchers.IO) { d.flush() }
+    assertThat(server.takeRequest(20, TimeUnit.SECONDS)!!.path).isEqualTo("/first")
+    storage.clear()
+    release.countDown()
+    val result = running.await()
+
+    // The first request was out, so its outcome stands; the others never left.
+    assertThat(server.requestCount).isEqualTo(1)
+    assertThat(result.succeededIds.toList()).containsExactly(first)
+    assertThat(result.failedIds.toList()).isEmpty()
+    assertThat(events.filter { it.itemId == second || it.itemId == third }).isEmpty()
+  }
+
+  @Test
+  fun `with restored headers, the first item still queued goes alone first`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(401))
+    val removed = enqueue("/removed")
+    enqueue("/probe")
+    val held = enqueue("/held")
+    // The head of the batch is removed right after the claim, before its dispatch starts.
+    val removingHead = spyk(storage)
+    coEvery { removingHead.claimPending(any(), any()) } coAnswers {
+      storage.claimPending(firstArg(), secondArg()).also { storage.removeItem(removed) }
+    }
+    val events = recordEvents()
+
+    newDispatcher(credentials = { CredentialPolicy.PERSISTED }, queue = removingHead).flush()
+
+    // The next item probes the restored credential alone, and its rejection holds the rest.
+    assertThat(server.requestCount).isEqualTo(1)
+    assertThat(server.takeRequest(1, TimeUnit.SECONDS)!!.path).isEqualTo("/probe")
+    assertThat(row(held).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(row(held).attempts).isEqualTo(0)
+    assertThat(events.filter { it.itemId == removed || it.itemId == held }).isEmpty()
+  }
+
+  @Test
+  fun `every terminal failure moves its row, with the code it failed with`() = runTest {
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+        "/spent" -> MockResponse().setResponseCode(503)
+        "/unauthorized" -> MockResponse().setResponseCode(401)
+        else -> MockResponse().setResponseCode(422)
+      }
+    }
+    val spent = enqueue("/spent")
+    val unauthorized = enqueue("/unauthorized")
+    val rejected = enqueue("/rejected")
+
+    newDispatcher(maxAttempts = 1, credentials = { CredentialPolicy.TRUSTED }).flush()
+
+    assertThat(deadLetter(spent).lastErrorCode).isEqualTo(SyncErrorCode.MAX_ATTEMPTS_EXCEEDED.name)
+    assertThat(deadLetter(unauthorized).lastErrorCode).isEqualTo(SyncErrorCode.UNAUTHORIZED.name)
+    assertThat(deadLetter(rejected).lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
+    assertThat(storage.count()).isEqualTo(0)
+  }
+
+  @Test
+  fun `dlq_lastErrorMessage_capturedBoundedAndRedacted`() = runTest {
+    server.enqueue(
+      MockResponse()
+        .setStatus("HTTP/1.1 400 " + "x".repeat(2_000))
+        .setHeader("X-Secret", "header-secret")
+        .setBody("body-secret"),
+    )
+    val id = storage.enqueue(
+      TestData.input(
+        url = server.url("/x").toString(),
+        headers = mapOf("Authorization" to "Bearer request-secret"),
+        body = "request-body-secret",
+      ),
+    )
+
+    newDispatcher().flush()
+
+    val message = checkNotNull(deadLetter(id).lastErrorMessage)
+    assertThat(message).startsWith("HTTP 400 x")
+    assertThat(message.length).isEqualTo(SyncDeadLetterEntity.MAX_ERROR_MESSAGE_LENGTH)
+    listOf("header-secret", "body-secret", "request-secret", "request-body-secret").forEach {
+      assertThat(message).doesNotContain(it)
+    }
+  }
+
+  @Test
+  fun `a transport failure records its exception message`() = runTest {
+    server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST))
+    val id = enqueue()
+
+    newDispatcher(maxAttempts = 1).flush()
+
+    assertThat(deadLetter(id).lastErrorCode).isEqualTo(SyncErrorCode.MAX_ATTEMPTS_EXCEEDED.name)
+    assertThat(deadLetter(id).lastErrorMessage).isNotEmpty()
   }
 }

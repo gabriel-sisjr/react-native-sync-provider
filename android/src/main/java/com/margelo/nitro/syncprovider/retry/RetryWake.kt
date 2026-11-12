@@ -29,7 +29,14 @@ import java.util.concurrent.atomic.AtomicLong
  * @param isEngineLive true while a JS engine is attached to this process. A process
  *   started only for a worker or a boot broadcast relies on the kick: a timer there
  *   would dispatch outside the constraints the consumer asked WorkManager to honor.
+ * @param isQualityGateOpen whether the current network quality passes `minNetworkQuality`.
+ * @param scheduleGatedKick arms the kick for the check after [armAfterGate], carrying the
+ *   number of consecutive kicks the gate turned back.
+ * @param healthBackoffUntil when wakes may run again after a failed health check, or `0`: the
+ *   end of its backoff, and at least a second after the failure, so a backoff of `0` cannot
+ *   re-arm a wake at once. Like the credential hold, no wake on any path fires before it.
  */
+@Suppress("LongParameterList")
 internal class RetryWake(
   private val storage: SyncQueueStorage,
   private val timer: RetryTimer,
@@ -37,6 +44,11 @@ internal class RetryWake(
   private val isHalted: () -> Boolean,
   private val isEngineLive: () -> Boolean,
   private val clock: () -> Long = { System.currentTimeMillis() },
+  private val isQualityGateOpen: () -> Boolean = { true },
+  private val scheduleGatedKick: (delayMs: Long, gateStreak: Int) -> Unit = { delayMs, _ ->
+    scheduleKick(delayMs)
+  },
+  private val healthBackoffUntil: () -> Long = { 0L },
 ) {
 
   /**
@@ -64,18 +76,32 @@ internal class RetryWake(
       if (notBefore != null) {
         credentialHoldUntil.accumulateAndGet(notBefore) { held, reported -> maxOf(held, reported) }
       }
+      armLocked()
+    }
+  }
+
+  /**
+   * Re-arm the kick after the network-quality gate turned it back, [gateStreak] kicks in a
+   * row: no earlier than the next [GateRecheck] step, nor before a credential hold ends. The
+   * next kick carries `gateStreak + 1`, so the delay doubles up to its cap; any other arm
+   * schedules a kick without it, which starts the backoff over.
+   *
+   * The in-process timer is left alone: it checks the gate itself and holds its own wakes.
+   * A gate that opened meanwhile, through a `configureSync`, makes this a plain [arm].
+   */
+  suspend fun armAfterGate(gateStreak: Int) {
+    armMutex.withLock {
       if (isHalted()) {
         timer.cancel()
         return@withLock
       }
-      val deadline = storage.nextRetryDeadline()
-      if (deadline == null) {
-        timer.cancel()
+      if (isQualityGateOpen()) {
+        armLocked()
         return@withLock
       }
-      val delayMs = delayUntil(maxOf(deadline, credentialHoldUntil.get()))
-      if (isEngineLive()) timer.arm(delayMs)
-      scheduleKick(delayMs)
+      val deadline = storage.nextRetryDeadline() ?: return@withLock
+      val notBefore = maxOf(clock() + GateRecheck.delayMs(gateStreak), notBeforeAny())
+      scheduleGatedKick(delayUntil(maxOf(deadline, notBefore)), gateStreak + 1)
     }
   }
 
@@ -94,7 +120,7 @@ internal class RetryWake(
         timer.cancel()
         return@withLock
       }
-      val holdUntil = credentialHoldUntil.get()
+      val holdUntil = notBeforeAny()
       timer.arm(delayUntil(maxOf(pendingDeadline, holdUntil)))
       storage.nextRetryDeadline()?.let { scheduleKick(delayUntil(maxOf(it, holdUntil))) }
     }
@@ -108,6 +134,25 @@ internal class RetryWake(
   fun clearCredentialHold() {
     credentialHoldUntil.set(0L)
   }
+
+  /** Caller holds [armMutex]. */
+  private suspend fun armLocked() {
+    if (isHalted()) {
+      timer.cancel()
+      return
+    }
+    val deadline = storage.nextRetryDeadline()
+    if (deadline == null) {
+      timer.cancel()
+      return
+    }
+    val delayMs = delayUntil(maxOf(deadline, notBeforeAny()))
+    if (isEngineLive()) timer.arm(delayMs)
+    scheduleKick(delayMs)
+  }
+
+  /** No wake before the credential hold or the health-check backoff ends. */
+  private fun notBeforeAny(): Long = maxOf(credentialHoldUntil.get(), healthBackoffUntil())
 
   private fun delayUntil(deadline: Long): Long = (deadline - clock()).coerceAtLeast(0L)
 }

@@ -26,11 +26,13 @@ keywords:
 - **Native persistent queue** -- Requests survive app force-quit, process kill, and device reboot (Core Data on iOS, Room on Android).
 - **Background dispatch** -- Flushes via `BGTaskScheduler` (iOS) and `WorkManager` (Android) with no JS runtime required. The OS decides when, and a force-quit stops it until the user opens the app again.
 - **Connectivity awareness** -- `NWPathMonitor` (iOS) and `ConnectivityManager` (Android) report the network state. `useAutoSync` flushes on reconnect, and the retry timer and `drainUntilEmpty` wait for the network.
+- **Network quality and health checks** -- Every connection snapshot carries a `networkQuality` level. Opt in to `minNetworkQuality` to skip flushes on a poor link without spending attempts, and to `healthCheckUrl` to probe your backend before a batch. See [Connectivity Detection](../guides/connectivity-detection.md).
+- **Dead-letter queue** -- A request that fails permanently is kept with its last error until you replay or discard it.
 - **Declarative retry policy** -- Linear, exponential, or Fibonacci backoff with jitter, configurable retry-on-status codes, and a per-item attempt budget. Cooldowns persist across restarts, and a timer brings items back while the app runs.
 - **Persisted configuration** -- A worker or BGTask with no JS honors your options, and `defaultHeaders` are encrypted at rest (Android Keystore, iOS Keychain).
 - **Per-item priority lanes** -- `HIGH` / `NORMAL` / `LOW` dispatch order, deterministic within a flush cycle.
 - **At-least-once delivery** -- A request can be sent twice after a crash, so endpoints must be idempotent. See the [Idempotency guide](../guides/idempotency.md).
-- **First-class TypeScript** -- 21 facade functions, 2 listener helpers, 9 React hooks, and a complete type / enum / error surface, all strict-mode clean.
+- **First-class TypeScript** -- 24 facade functions, 2 listener helpers, 9 React hooks, and a complete type / enum / error surface, all strict-mode clean.
 - **Optional Provider** -- An optional `<SyncProvider>` Context wraps `configureSync` + `enableBackgroundSync` lifecycle for app-level setup.
 - **Unified hooks library** -- `useConnection`, `useSyncQueue`, `useSyncStatus`, `useOfflineQueue`, `useSyncEvents`, `useSyncConfig`, `useAutoSync`, `useSyncSnapshot`, `useSyncContext`.
 

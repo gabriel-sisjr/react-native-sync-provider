@@ -12,6 +12,9 @@ interface SyncMock {
   clearQueue: jest.Mock;
   getQueueSize: jest.Mock;
   getPendingItems: jest.Mock;
+  listDeadLetter: jest.Mock;
+  replayDeadLetter: jest.Mock;
+  discardDeadLetter: jest.Mock;
   __emit: (event: unknown) => void;
 }
 
@@ -63,6 +66,60 @@ describe('useSyncQueue', () => {
 
     await waitFor(() => expect(result.current.size).toBe(1));
     expect(result.current.items).toHaveLength(1);
+  });
+
+  it('refreshes when ITEM_DEAD_LETTERED fires, since the item left the queue', async () => {
+    const mock = getMock();
+    mock.getQueueSize.mockResolvedValueOnce(1);
+    mock.getPendingItems.mockResolvedValueOnce([makeItem('a')]);
+
+    const { result } = renderHook(() => useSyncQueue());
+    await waitFor(() => expect(result.current.size).toBe(1));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    mock.getQueueSize.mockResolvedValueOnce(0);
+    mock.getPendingItems.mockResolvedValueOnce([]);
+
+    await act(async () => {
+      mock.__emit({
+        type: SyncEventType.ITEM_DEAD_LETTERED,
+        timestamp: Date.now(),
+        itemId: 'a',
+        errorCode: 'DEAD_LETTERED',
+        metadata: { lastErrorCode: 'SERVER_ERROR' },
+      });
+    });
+
+    await waitFor(() => expect(result.current.size).toBe(0));
+    expect(result.current.items).toEqual([]);
+    expect(mock.getQueueSize).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps dead letters out of items and never reads or changes them', async () => {
+    const mock = getMock();
+
+    const { result } = renderHook(() => useSyncQueue());
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      mock.__emit({
+        type: SyncEventType.ITEM_DEAD_LETTERED,
+        timestamp: Date.now(),
+        itemId: 'a',
+      });
+    });
+    await waitFor(() => expect(mock.getQueueSize).toHaveBeenCalledTimes(2));
+
+    expect(mock.listDeadLetter).not.toHaveBeenCalled();
+    expect(mock.replayDeadLetter).not.toHaveBeenCalled();
+    expect(mock.discardDeadLetter).not.toHaveBeenCalled();
   });
 
   it('forwards enqueue/clearQueue to the native layer', async () => {

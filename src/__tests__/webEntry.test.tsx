@@ -49,10 +49,28 @@ const FACADE_FUNCTIONS = Object.keys(webEntry).filter(
 describe('web facade', () => {
   it('covers the whole facade', () => {
     expect(FACADE_FUNCTIONS).toEqual(
-      expect.arrayContaining(['enqueue', 'flush', 'drainUntilEmpty'])
+      expect.arrayContaining([
+        'enqueue',
+        'flush',
+        'drainUntilEmpty',
+        'listDeadLetter',
+        'replayDeadLetter',
+        'discardDeadLetter',
+      ])
     );
-    expect(FACADE_FUNCTIONS).toHaveLength(20);
+    expect(FACADE_FUNCTIONS).toHaveLength(23);
   });
+
+  it.each(['replayDeadLetter', 'discardDeadLetter'])(
+    '%s rejects as unavailable with an id too',
+    async (name) => {
+      await expect(
+        (web[name] as (id: string) => Promise<void>)('01HZX0DEADLETTER')
+      ).rejects.toMatchObject({
+        code: webEntry.SyncErrorCode.NATIVE_MODULE_UNAVAILABLE,
+      });
+    }
+  );
 
   it.each(FACADE_FUNCTIONS)('%s rejects as unavailable', async (name) => {
     await expect((web[name] as AnyFunction)()).rejects.toMatchObject({
@@ -123,7 +141,30 @@ describe('web hooks', () => {
       isWaitingForConnection: false,
       error: null,
     });
+    expect(result.current.networkQuality).toBeUndefined();
+    expect(result.current.deadLetter).toBeUndefined();
+    expect(result.current.connection.networkQuality).toBe(
+      webEntry.NetworkQuality.OFFLINE
+    );
   });
+
+  it.each(['useConnection', 'useOfflineQueue'])(
+    '%s reports an offline link quality',
+    (name) => {
+      const { result } = renderHook(() =>
+        (web[name] as () => Record<string, unknown>)()
+      );
+      const connection =
+        name === 'useConnection'
+          ? result.current
+          : (result.current.connection as Record<string, unknown>);
+
+      expect(connection).toMatchObject({
+        isOnline: false,
+        networkQuality: webEntry.NetworkQuality.OFFLINE,
+      });
+    }
+  );
 
   it('useSyncEvents and useAutoSync render without doing anything', () => {
     expect(() =>

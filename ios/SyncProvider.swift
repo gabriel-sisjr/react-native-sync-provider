@@ -23,6 +23,14 @@ import NitroModules
 /// Although Nitro instantiates this class via the generated factory glue
 /// (so internal access would be enough for that path), we keep the class
 /// `public` so the host AppDelegate can call ``handleBackgroundURLSessionEvents(identifier:completionHandler:)``.
+///
+/// A call that answers from memory returns a promise it has already settled.
+/// The generated glue attaches its listeners to the returned promise only
+/// after the method returns, and Nitro's Swift `Promise` before 0.35.8 is not
+/// synchronized: from `Promise.async`, a body this short can settle on another
+/// thread while the glue is still attaching, and that listener is then never
+/// called, so the JS promise never settles. A call that does real work stays
+/// on `Promise.async`, off the JS thread.
 public final class HybridSyncProvider: HybridSyncProviderSpec {
     // MARK: - Components
 
@@ -147,6 +155,55 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
         }
     }
 
+    // MARK: - Dead letters
+
+    /// Every dead letter, `deadLetteredAt` ascending, then `id` ascending.
+    public func listDeadLetter() throws -> Promise<[SyncDeadLetterItem]> {
+        return Promise.async { [weak self] in
+            guard let self = self else { return [] }
+            do {
+                let letters = try await self.engine.storage.getDeadLetters()
+                return letters.map(Self.translate(deadLetter:))
+            } catch {
+                throw wrapAsSyncProviderError(error)
+            }
+        }
+    }
+
+    /// Puts a dead letter back in the queue under its id, as a fresh item,
+    /// and emits `ITEM_ENQUEUED`. Like an enqueue, it does not flush. Rejects
+    /// with `QUEUE_FULL` at the cap, keeping the dead letter. An unknown id
+    /// resolves with nothing changed.
+    public func replayDeadLetter(id: String) throws -> Promise<Void> {
+        return Promise.async { [weak self] in
+            guard let self = self else {
+                throw SyncProviderError(code: .nativeModuleUnavailable, message: "SyncProvider deallocated")
+            }
+            do {
+                if try await self.engine.storage.replayDeadLetter(id: id) {
+                    self.engine.emitter.emit(.now(type: "ITEM_ENQUEUED", itemId: id))
+                }
+            } catch {
+                throw wrapAsSyncProviderError(error)
+            }
+        }
+    }
+
+    /// Deletes a dead letter for good and emits `ITEM_REMOVED`. An unknown id
+    /// resolves with nothing changed.
+    public func discardDeadLetter(id: String) throws -> Promise<Void> {
+        return Promise.async { [weak self] in
+            guard let self = self else { return }
+            do {
+                if try await self.engine.storage.discardDeadLetter(id: id) {
+                    self.engine.emitter.emit(.now(type: "ITEM_REMOVED", itemId: id))
+                }
+            } catch {
+                throw wrapAsSyncProviderError(error)
+            }
+        }
+    }
+
     // MARK: - Sync ops
 
     public func flush() throws -> Promise<SyncResult> {
@@ -188,20 +245,24 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
 
     // MARK: - Config ops
 
+    /// Checked before anything is applied or persisted: a rejected
+    /// configuration leaves the active one in place.
     public func configureSync(options: SyncOptions) throws -> Promise<Void> {
         return Promise.async { [weak self] in
             guard let self = self else { return }
-            await self.engine.configure(Self.translate(options: options))
+            do {
+                let snapshot = Self.translate(options: options)
+                try snapshot.validateNetworkHealth()
+                await self.engine.configure(snapshot)
+            } catch {
+                throw wrapAsSyncProviderError(error)
+            }
         }
     }
 
+    /// Answers from memory: settled on return.
     public func getSyncConfig() throws -> Promise<SyncOptions> {
-        return Promise.async { [weak self] in
-            guard let self = self else {
-                return Self.translate(snapshot: .default)
-            }
-            return Self.translate(snapshot: self.engine.currentOptions())
-        }
+        return Promise.resolved(withResult: Self.translate(snapshot: engine.currentOptions()))
     }
 
     // MARK: - History ops
@@ -247,17 +308,16 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
 
     // MARK: - Connection
 
+    /// Answers from memory: settled on return.
     public func getConnectionStatus() throws -> Promise<ConnectionState> {
-        return Promise.async { [weak self] in
-            guard let self = self else {
-                return Self.translate(snapshot: .unknown)
-            }
-            return Self.translate(snapshot: self.engine.connectivity.current)
-        }
+        return Promise.resolved(withResult: Self.translate(network: engine.currentNetwork()))
     }
 
     // MARK: - Background sync
 
+    /// Stays asynchronous, unlike the other calls with no `await`:
+    /// `BGTaskScheduler` submit and cancel are blocking IPC calls that must
+    /// not run on the JS thread.
     public func enableBackgroundSync(options: BackgroundSyncOptions) throws -> Promise<Void> {
         return Promise.async { [weak self] in
             guard let self = self else { return }
@@ -270,48 +330,43 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
         }
     }
 
+    /// Stays asynchronous: see ``enableBackgroundSync(options:)``.
     public func disableBackgroundSync() throws -> Promise<Void> {
         return Promise.async { [weak self] in
             self?.engine.background.disable()
         }
     }
 
+    /// Answers from memory: settled on return.
     public func isBackgroundSyncEnabled() throws -> Promise<Bool> {
-        return Promise.async { [weak self] in
-            return self?.engine.background.isEnabled ?? false
-        }
+        return Promise.resolved(withResult: engine.background.isEnabled)
     }
 
     // MARK: - Events
 
+    /// Answers from memory: settled on return, rejected for an unknown channel.
     public func addListener(event: String,
                             callback: @escaping (_ event: SyncEvent) -> Void) throws -> Promise<String> {
-        return Promise.async { [weak self] in
-            guard let self = self else {
-                throw SyncProviderError(code: .nativeModuleUnavailable, message: "SyncProvider deallocated")
+        do {
+            let id = try engine.emitter.addListener(channel: event) { payload in
+                callback(Self.translate(payload: payload))
             }
-            do {
-                let id = try self.engine.emitter.addListener(channel: event) { payload in
-                    callback(Self.translate(payload: payload))
-                }
-                self.listenerLock.withLock {
-                    _ = self.listenerIds[event, default: []].insert(id)
-                }
-                return id
-            } catch {
-                throw wrapAsSyncProviderError(error)
+            listenerLock.withLock {
+                _ = listenerIds[event, default: []].insert(id)
             }
+            return Promise.resolved(withResult: id)
+        } catch {
+            return Promise.rejected(withError: wrapAsSyncProviderError(error))
         }
     }
 
+    /// Answers from memory: settled on return.
     public func removeListener(event: String, subscriptionId: String) throws -> Promise<Void> {
-        return Promise.async { [weak self] in
-            guard let self = self else { return }
-            self.listenerLock.withLock {
-                _ = self.listenerIds[event]?.remove(subscriptionId)
-            }
-            self.engine.emitter.removeListener(channel: event, id: subscriptionId)
+        listenerLock.withLock {
+            _ = listenerIds[event]?.remove(subscriptionId)
         }
+        engine.emitter.removeListener(channel: event, id: subscriptionId)
+        return Promise.resolved()
     }
 
     // MARK: - Public helper for AppDelegate
@@ -388,6 +443,25 @@ extension HybridSyncProvider {
                         metadata: stored.metadata)
     }
 
+    static func translate(deadLetter stored: StoredDeadLetter) -> SyncDeadLetterItem {
+        SyncDeadLetterItem(id: stored.id,
+                           method: HttpMethod(fromString: stored.method) ?? .post,
+                           url: stored.url,
+                           headers: stored.headers,
+                           body: stored.body,
+                           contentType: stored.contentType,
+                           priority: SyncPriority(fromString: stored.priority),
+                           createdAt: Double(stored.createdAt),
+                           metadata: stored.metadata,
+                           attempts: Double(stored.attempts),
+                           lastAttemptAt: Double(stored.lastAttemptAt),
+                           // A code this build does not know, from a newer one
+                           // say, reads as the code of a dead letter with none.
+                           lastErrorCode: SyncErrorCode(fromString: stored.lastErrorCode) ?? .maxAttemptsExceeded,
+                           lastErrorMessage: stored.lastErrorMessage,
+                           deadLetteredAt: Double(stored.deadLetteredAt))
+    }
+
     static func translate(result: StoredSyncResult) -> SyncResult {
         SyncResult(startedAt: Double(result.startedAt),
                    finishedAt: Double(result.finishedAt),
@@ -425,7 +499,13 @@ extension HybridSyncProvider {
             requestTimeoutMs: options.requestTimeoutMs ?? 30_000,
             maxQueueSize: options.maxQueueSize ?? Double(kDefaultQueueCapacity),
             persistQueue: options.persistQueue ?? true,
-            defaultHeaders: options.defaultHeaders ?? [:]
+            defaultHeaders: options.defaultHeaders ?? [:],
+            // Unset stays `nil`: the defaults are filled in at use, so
+            // `getSyncConfig()` can echo only what was set.
+            minNetworkQuality: options.minNetworkQuality.map(Self.translate(quality:)),
+            healthCheckUrl: options.healthCheckUrl,
+            healthCheckTtlMs: options.healthCheckTtlMs,
+            healthCheckBackoffMs: options.healthCheckBackoffMs
         )
     }
 
@@ -446,16 +526,44 @@ extension HybridSyncProvider {
                            requestTimeoutMs: snapshot.requestTimeoutMs,
                            maxQueueSize: snapshot.maxQueueSize,
                            persistQueue: snapshot.persistQueue,
-                           defaultHeaders: snapshot.defaultHeaders)
+                           defaultHeaders: snapshot.defaultHeaders,
+                           minNetworkQuality: snapshot.minNetworkQuality.map(Self.translate(level:)),
+                           healthCheckUrl: snapshot.healthCheckUrl,
+                           healthCheckTtlMs: snapshot.healthCheckTtlMs,
+                           healthCheckBackoffMs: snapshot.healthCheckBackoffMs)
     }
 
-    static func translate(snapshot: ConnectionSnapshot) -> ConnectionState {
-        let status = ConnectionStatus(fromString: snapshot.status.rawValue) ?? .unknown
-        let type = ConnectionType(fromString: snapshot.type.rawValue) ?? .unknown
+    /// `networkQuality` is the engine's grade, which is `OFFLINE` exactly when
+    /// the status is `DISCONNECTED` or `UNKNOWN`.
+    static func translate(network: NetworkState) -> ConnectionState {
+        let link = network.link
+        let status = ConnectionStatus(fromString: link.status.rawValue) ?? .unknown
+        let type = ConnectionType(fromString: link.type.rawValue) ?? .unknown
         return ConnectionState(status: status,
                                type: type,
-                               isInternetReachable: snapshot.isInternetReachable,
-                               isExpensive: snapshot.isExpensive)
+                               networkQuality: translate(level: network.quality),
+                               isInternetReachable: link.isInternetReachable,
+                               isExpensive: link.isExpensive)
+    }
+
+    static func translate(quality: NetworkQuality) -> NetworkQualityLevel {
+        switch quality {
+        case .offline: return .offline
+        case .poor: return .poor
+        case .moderate: return .moderate
+        case .good: return .good
+        case .excellent: return .excellent
+        }
+    }
+
+    static func translate(level: NetworkQualityLevel) -> NetworkQuality {
+        switch level {
+        case .offline: return .offline
+        case .poor: return .poor
+        case .moderate: return .moderate
+        case .good: return .good
+        case .excellent: return .excellent
+        }
     }
 
     static func translate(options: BackgroundSyncOptions) -> BackgroundSyncOptionsValue {

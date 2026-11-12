@@ -4,10 +4,12 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
 import com.margelo.nitro.syncprovider.BackoffStrategy
+import com.margelo.nitro.syncprovider.NetworkQuality
 import com.margelo.nitro.syncprovider.RetryPolicy
 import com.margelo.nitro.syncprovider.SyncOptions
 import com.margelo.nitro.syncprovider.SyncStrategy
 import com.margelo.nitro.syncprovider.util.JsonMap
+import com.margelo.nitro.syncprovider.util.UrlValidator
 
 /** Where the active configuration came from. */
 internal enum class ConfigSource {
@@ -113,6 +115,10 @@ internal class SyncConfigStore(
       } else {
         remove(KEY_PERSIST_QUEUE)
       }
+      putOptionalString(KEY_MIN_NETWORK_QUALITY, options.minNetworkQuality?.name)
+      putOptionalString(KEY_HEALTH_CHECK_URL, options.healthCheckUrl)
+      putOptionalDouble(KEY_HEALTH_CHECK_TTL_MS, options.healthCheckTtlMs)
+      putOptionalDouble(KEY_HEALTH_CHECK_BACKOFF_MS, options.healthCheckBackoffMs)
       putBoolean(KEY_HAS_DEFAULT_HEADERS, hasDefaultHeaders)
     }.commit()
   }
@@ -135,6 +141,10 @@ internal class SyncConfigStore(
         maxQueueSize = readOptionalDouble(KEY_MAX_QUEUE_SIZE),
         persistQueue = if (prefs.contains(KEY_PERSIST_QUEUE)) prefs.getBoolean(KEY_PERSIST_QUEUE, false) else null,
         defaultHeaders = null,
+        minNetworkQuality = readNetworkQuality(),
+        healthCheckUrl = readHealthCheckUrl(),
+        healthCheckTtlMs = readOptionalMs(KEY_HEALTH_CHECK_TTL_MS),
+        healthCheckBackoffMs = readOptionalMs(KEY_HEALTH_CHECK_BACKOFF_MS),
       )
     }.onFailure {
       Log.w(TAG, "Persisted configuration is unreadable; using defaults: ${it.javaClass.simpleName}")
@@ -149,6 +159,36 @@ internal class SyncConfigStore(
       .map { it.toDouble() }
       .toDoubleArray()
 
+  /**
+   * Unlike the required enums, an unreadable name only drops this field: it reads as
+   * unset, which means no gate, instead of discarding the whole configuration.
+   */
+  private fun readNetworkQuality(): NetworkQuality? {
+    val name = prefs.getString(KEY_MIN_NETWORK_QUALITY, null) ?: return null
+    val quality = NetworkQuality.entries.firstOrNull { it.name == name }
+    if (quality == null) Log.w(TAG, "Persisted minNetworkQuality is unreadable; leaving it unset.")
+    return quality
+  }
+
+  /**
+   * `configureSync` rejects a URL the probe cannot use, so only a damaged record holds one: it
+   * loads as unset, which means no health check, instead of a check that always fails.
+   */
+  private fun readHealthCheckUrl(): String? {
+    val url = prefs.getString(KEY_HEALTH_CHECK_URL, null) ?: return null
+    if (UrlValidator.isValid(url)) return url
+    Log.w(TAG, "Persisted healthCheckUrl is unusable; leaving it unset.")
+    return null
+  }
+
+  /** As for the URL: a negative or non-finite duration only a damaged record holds loads as unset. */
+  private fun readOptionalMs(key: String): Double? {
+    val value = readOptionalDouble(key) ?: return null
+    if (value.isFinite() && value >= 0.0) return value
+    Log.w(TAG, "Persisted $key is unusable; leaving it unset.")
+    return null
+  }
+
   private fun readDouble(key: String): Double =
     readOptionalDouble(key) ?: throw IllegalStateException("Missing $key")
 
@@ -161,6 +201,10 @@ internal class SyncConfigStore(
 
   private fun SharedPreferences.Editor.putOptionalDouble(key: String, value: Double?) {
     if (value != null) putDouble(key, value) else remove(key)
+  }
+
+  private fun SharedPreferences.Editor.putOptionalString(key: String, value: String?) {
+    if (value != null) putString(key, value) else remove(key)
   }
 
   private companion object {
@@ -179,6 +223,10 @@ internal class SyncConfigStore(
     const val KEY_REQUEST_TIMEOUT_MS = "requestTimeoutMs"
     const val KEY_MAX_QUEUE_SIZE = "maxQueueSize"
     const val KEY_PERSIST_QUEUE = "persistQueue"
+    const val KEY_MIN_NETWORK_QUALITY = "minNetworkQuality"
+    const val KEY_HEALTH_CHECK_URL = "healthCheckUrl"
+    const val KEY_HEALTH_CHECK_TTL_MS = "healthCheckTtlMs"
+    const val KEY_HEALTH_CHECK_BACKOFF_MS = "healthCheckBackoffMs"
     const val KEY_HAS_DEFAULT_HEADERS = "hasDefaultHeaders"
     const val KEY_PAUSED = "paused"
   }

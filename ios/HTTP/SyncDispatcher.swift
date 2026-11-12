@@ -23,6 +23,11 @@ let kBackgroundURLSessionIdentifier = "com.gabriel-sisjr.syncprovider.background
 /// does not advance on one, so backoff alone would stay at its first value.
 let kMinCredentialHoldMs = 60_000
 
+/// How long a flush behind a network-quality gate waits for the process's
+/// first path update. A BGTask launch flushes before it has one, and judging
+/// that unknown path would gate it as offline.
+let kFirstPathUpdateWaitMs = 1_500
+
 /// Knobs the dispatcher reads on each cycle. Updated by the bridge whenever
 /// `configureSync` is called.
 struct DispatcherConfig: Sendable {
@@ -38,6 +43,16 @@ struct DispatcherConfig: Sendable {
     /// `true` when default headers are declared but unreadable. Dispatch is
     /// suspended: sending without them would fail every item for no reason.
     var credentialsUnavailable: Bool = false
+    /// The lowest network quality a cycle may start at. `nil`, or `offline`,
+    /// means no gate.
+    var minNetworkQuality: NetworkQualityLevel? = nil
+    /// Checked with a HEAD before a cycle claims its first item. `nil`: no
+    /// health check.
+    var healthCheckUrl: URL? = nil
+    /// How long a 2xx spares the next health-check HEAD.
+    var healthCheckTtlMs: Int64 = SyncOptionsSnapshot.defaultHealthCheckTtlMs
+    /// How long cycles are skipped, without a HEAD, after a failed check.
+    var healthCheckBackoffMs: Int64 = SyncOptionsSnapshot.defaultHealthCheckBackoffMs
 
     static let `default` = DispatcherConfig(
         retryPolicy: .default,
@@ -71,6 +86,29 @@ enum FailureDisposition: Sendable {
     case credentialRejected(heldUntil: Int64)
 }
 
+/// Why a flush started no cycle.
+enum FlushSkipReason: Sendable, Equatable {
+    case paused
+    case credentialsUnavailable
+    case networkQualityTooLow
+    case healthCheckFailed
+}
+
+/// What one ``SyncDispatcher/flushOutcome()`` call did.
+enum FlushOutcome: Sendable {
+    /// A cycle ran, or the call joined the one already running.
+    case ran(StoredSyncResult)
+    /// No cycle ran. The result is the zero-count one a skipped flush returns.
+    case skipped(StoredSyncResult, FlushSkipReason)
+
+    var result: StoredSyncResult {
+        switch self {
+        case let .ran(result), let .skipped(result, _):
+            return result
+        }
+    }
+}
+
 /// Collaborators of ``SyncDispatcher`` that are set and read from outside the
 /// actor, synchronously. `BackgroundSyncManager` publishes `foregroundOnly`
 /// from a lock-protected, non-async path, so this cannot be actor state.
@@ -80,6 +118,10 @@ final class DispatcherHooks: @unchecked Sendable {
     private var pausedValue = false
     private var cycleFinished: (@Sendable (Int64?) async -> Void)?
     private var credentialRecovery: (@Sendable () -> [String: String]?)?
+    private var qualitySource: (@Sendable () -> NetworkQualityLevel)?
+    private var qualityRefresh: (@Sendable () -> Void)?
+    private var healthChecker: HealthCheck?
+    private var healthFailure: (@Sendable () async -> Void)?
 
     /// When `true`, uploads never go through the background `URLSession`.
     var foregroundOnly: Bool {
@@ -107,6 +149,34 @@ final class DispatcherHooks: @unchecked Sendable {
     var recoverCredentials: (@Sendable () -> [String: String]?)? {
         get { lock.withLock { credentialRecovery } }
         set { lock.withLock { credentialRecovery = newValue } }
+    }
+
+    /// The engine's current network-quality grade. Without it the gate grades
+    /// the link alone, as if no measurement had been taken.
+    var networkQuality: (@Sendable () -> NetworkQualityLevel)? {
+        get { lock.withLock { qualitySource } }
+        set { lock.withLock { qualitySource = newValue } }
+    }
+
+    /// Called on every gate evaluation, so a stale measurement is taken again
+    /// in the background. The evaluation itself uses the grade as it is.
+    var refreshStaleNetworkQuality: (@Sendable () -> Void)? {
+        get { lock.withLock { qualityRefresh } }
+        set { lock.withLock { qualityRefresh = newValue } }
+    }
+
+    /// The engine's health check. Without it no health check runs, whatever
+    /// the configuration says.
+    var healthCheck: HealthCheck? {
+        get { lock.withLock { healthChecker } }
+        set { lock.withLock { healthChecker = newValue } }
+    }
+
+    /// Awaited after a flush the health check stopped, so the next retry wake
+    /// can be armed no earlier than the end of the backoff.
+    var onHealthCheckFailed: (@Sendable () async -> Void)? {
+        get { lock.withLock { healthFailure } }
+        set { lock.withLock { healthFailure = newValue } }
     }
 }
 
@@ -238,20 +308,44 @@ actor SyncDispatcher {
     /// cycle is running returns the last result instead of starting another.
     @discardableResult
     func flush() async throws -> StoredSyncResult {
-        if isPaused {
-            SyncLogger.debug("flush() called while paused; returning empty result", category: "dispatcher")
-            return Self.skippedResult(reason: "paused")
+        try await flushOutcome().result
+    }
+
+    /// ``flush()``, reporting why no cycle ran when none did.
+    ///
+    /// The checks before a cycle run in this order: paused, stored credentials,
+    /// a cycle already running, the network-quality gate, the health check.
+    /// Only the last two emit anything when they stop the flush: `SYNC_FAILED`
+    /// with `NETWORK_QUALITY_TOO_LOW` or `HEALTH_CHECK_FAILED`, with no
+    /// `SYNC_STARTED` before it, no history row and no item touched. A cycle
+    /// already running is joined rather than gated, so its listeners never see
+    /// a `SYNC_FAILED` in the middle of it.
+    func flushOutcome() async throws -> FlushOutcome {
+        if let early = exitBeforeCycle() {
+            return early
         }
-        guard restoreCredentialsIfNeeded() else {
-            // Items stay PENDING and the caller sees a normal, empty result: a
-            // worker reports success instead of driving OS-level retries.
-            SyncLogger.error("Default headers could not be read; skipping dispatch until they can",
-                             category: "dispatcher")
-            return Self.skippedResult(reason: "credentials-unavailable")
+        // Only suspends while the path is still unknown, and during that wait
+        // a pause, a configuration or another flush can land.
+        let blockingQuality = await networkQualityBlock()
+        if let early = exitBeforeCycle() {
+            return early
         }
-        if isCycleRunning {
-            SyncLogger.debug("flush() called while cycle in progress; piggybacking", category: "dispatcher")
-            return lastResult ?? Self.emptyResult()
+        if let blockingQuality {
+            SyncLogger.info("Flush skipped: network quality \(blockingQuality.rawValue) is below the minimum \(config.minNetworkQuality?.rawValue ?? "-")",
+                            category: "dispatcher")
+            emitter.emit(.now(type: "SYNC_FAILED", errorCode: "NETWORK_QUALITY_TOO_LOW"))
+            return .skipped(Self.skippedResult(reason: "network-quality-too-low"), .networkQualityTooLow)
+        }
+        // Suspends for the HEAD, if one is sent.
+        let unhealthy = await healthCheckFails()
+        if let early = exitBeforeCycle() {
+            return early
+        }
+        if unhealthy {
+            SyncLogger.info("Flush skipped: the health check failed", category: "dispatcher")
+            emitter.emit(.now(type: "SYNC_FAILED", errorCode: "HEALTH_CHECK_FAILED"))
+            await hooks.onHealthCheckFailed?()
+            return .skipped(Self.skippedResult(reason: "health-check-failed"), .healthCheckFailed)
         }
 
         isCycleRunning = true
@@ -261,7 +355,7 @@ actor SyncDispatcher {
         do {
             let result = try await runCycle(startedAt: startedAt)
             await finishCycle()
-            return result
+            return .ran(result)
         } catch {
             // Listeners track a cycle from SYNC_STARTED to its terminal event,
             // so a cycle that dies must still end with one.
@@ -277,6 +371,57 @@ actor SyncDispatcher {
         let notBefore = credentialHeldUntil
         credentialHeldUntil = nil
         await hooks.onCycleFinished?(notBefore)
+    }
+
+    /// The outcome of a flush that must not start a cycle, or `nil` when one
+    /// may start: paused, credentials still unreadable, or a cycle already
+    /// running.
+    private func exitBeforeCycle() -> FlushOutcome? {
+        if isPaused {
+            SyncLogger.debug("flush() called while paused; returning empty result", category: "dispatcher")
+            return .skipped(Self.skippedResult(reason: "paused"), .paused)
+        }
+        guard restoreCredentialsIfNeeded() else {
+            // Items stay PENDING and the caller sees a normal, empty result: a
+            // worker reports success instead of driving OS-level retries.
+            SyncLogger.error("Default headers could not be read; skipping dispatch until they can",
+                             category: "dispatcher")
+            return .skipped(Self.skippedResult(reason: "credentials-unavailable"), .credentialsUnavailable)
+        }
+        if isCycleRunning {
+            SyncLogger.debug("flush() called while cycle in progress; piggybacking", category: "dispatcher")
+            return .ran(lastResult ?? Self.emptyResult())
+        }
+        return nil
+    }
+
+    /// `true` when the health check keeps this flush from starting a cycle:
+    /// the HEAD to `healthCheckUrl` failed, or an earlier failure's backoff is
+    /// running. `false` without a URL, and whenever a 2xx is cached.
+    private func healthCheckFails() async -> Bool {
+        guard let url = config.healthCheckUrl, let healthCheck = hooks.healthCheck else { return false }
+        let verdict = await healthCheck.check(url: url,
+                                              ttlMs: config.healthCheckTtlMs,
+                                              backoffMs: config.healthCheckBackoffMs)
+        return verdict != .healthy
+    }
+
+    /// The grade that keeps this flush from starting a cycle, or `nil` when it
+    /// may start one: no gate is set, or the network meets it.
+    ///
+    /// On a path that is still unknown, as in a process the OS just launched
+    /// for a BGTask, waits up to ``kFirstPathUpdateWaitMs`` for the first path
+    /// update. A path still unknown after that grades `offline`.
+    private func networkQualityBlock() async -> NetworkQualityLevel? {
+        guard let minimum = config.minNetworkQuality, minimum > .offline else { return nil }
+        if connectivity.current.status == .unknown {
+            await connectivity.waitUntilKnown(timeoutMs: kFirstPathUpdateWaitMs)
+        }
+        hooks.refreshStaleNetworkQuality?()
+        let quality = hooks.networkQuality?()
+            ?? NetworkQualityClassifier.classify(link: connectivity.current, samples: nil)
+        // Read again: a configuration can land during the wait.
+        return quality.satisfies(minimum: config.minNetworkQuality) ? nil : quality
     }
 
     private func runCycle(startedAt: Int64) async throws -> StoredSyncResult {
@@ -306,9 +451,31 @@ actor SyncDispatcher {
 
         dispatchLoop: for (index, item) in pending.enumerated() {
             if isPaused { break }
-            attempted += 1
+
+            // A budget spent before this cycle, by a `maxAttempts` lowered
+            // since the last attempt say, ends the item without a request.
+            if Int(item.attempts) >= max(1, config.retryPolicy.maxAttempts) {
+                emitProgress(index: index, total: total)
+                // Purged since the batch was read: like a claim that finds no
+                // row, it is neither attempted nor failed.
+                guard try await deadLetterSpentBudget(item: item) else { continue }
+                attempted += 1
+                failedIds.append(item.id)
+                if firstError == nil {
+                    firstError = Self.spentBudgetMessage
+                }
+                continue
+            }
+
             inFlight.insert(item.id)
-            try await storage.markInFlight(id: item.id)
+            // A purge since the batch was read, a logout say, leaves this item
+            // nothing to send: no request and no event of its own.
+            guard try await storage.markInFlight(id: item.id) else {
+                inFlight.remove(item.id)
+                emitProgress(index: index, total: total)
+                continue
+            }
+            attempted += 1
 
             // `configureSync` can land while the request is out. Its answer is
             // about the credential it carried, not the one configured since.
@@ -316,12 +483,7 @@ actor SyncDispatcher {
             let outcome = await dispatchOne(item: item)
             inFlight.remove(item.id)
 
-            // Progress event.
-            let progress = Double(index + 1) / Double(total)
-            emitter.emit(.now(type: "SYNC_PROGRESS",
-                              progress: progress,
-                              metadata: ["index": String(index + 1),
-                                         "total": String(total)]))
+            emitProgress(index: index, total: total)
 
             if outcome.succeeded {
                 succeededIds.append(item.id)
@@ -374,12 +536,55 @@ actor SyncDispatcher {
         return result
     }
 
+    private func emitProgress(index: Int, total: Int) {
+        emitter.emit(.now(type: "SYNC_PROGRESS",
+                          progress: Double(index + 1) / Double(total),
+                          metadata: ["index": String(index + 1),
+                                     "total": String(total)]))
+    }
+
     // MARK: - Failure handling
+
+    /// What the dead letter of an item whose budget was spent before its
+    /// request says.
+    static let spentBudgetMessage = "Retry budget exhausted"
+
+    /// Ends an item whose attempts already reached `maxAttempts`, with no
+    /// request: it moves to the dead-letter store with the attempts it made
+    /// and its last attempt's time, then `ITEM_FAILED` with
+    /// `MAX_ATTEMPTS_EXCEEDED` and `ITEM_DEAD_LETTERED` follow, as after a
+    /// failed last attempt. `attempt` is the attempts made, none being added.
+    ///
+    /// - Returns: `false` when the row was purged since the batch was read.
+    ///   No request was sent, so there is nothing to end: nothing is emitted.
+    ///   A failed request reports `ITEM_FAILED` even then.
+    private func deadLetterSpentBudget(item: StoredSyncItem) async throws -> Bool {
+        let code = "MAX_ATTEMPTS_EXCEEDED"
+        let moved = try await storage.moveToDeadLetters(id: item.id,
+                                                        errorCode: code,
+                                                        errorMessage: Self.spentBudgetMessage)
+        guard moved else { return false }
+        emitter.emit(.now(type: "ITEM_FAILED",
+                          itemId: item.id,
+                          errorCode: code,
+                          attempt: Double(item.attempts)))
+        emitter.emit(.now(type: "ITEM_DEAD_LETTERED",
+                          itemId: item.id,
+                          errorCode: "DEAD_LETTERED",
+                          metadata: ["lastErrorCode": code]))
+        return true
+    }
 
     /// Records the outcome of a **failed** dispatch: decides retry vs. terminal
     /// failure, persists the retry cooldown (`nextRetryAt`) via
-    /// ``RetryPolicyEvaluator`` when retrying, marks the item terminally FAILED
-    /// otherwise, and emits the matching event.
+    /// ``RetryPolicyEvaluator`` when retrying, and otherwise moves the item to
+    /// the dead-letter store, then emits the matching events.
+    ///
+    /// A terminal failure emits `ITEM_FAILED` with the real code, then, right
+    /// after, `ITEM_DEAD_LETTERED` with `DEAD_LETTERED` and that code in
+    /// `metadata.lastErrorCode`. The dead letter keeps the failure's message
+    /// (a status line or an error's description, never a header or a body),
+    /// cut to ``kDeadLetterMessageMaxLength`` characters.
     ///
     /// This is the single source of truth for failure handling. The background
     /// `URLSession` delegate does not use it yet: a completion delivered after
@@ -428,14 +633,24 @@ actor SyncDispatcher {
             let finalErrorCode = isRetryable
                 ? "MAX_ATTEMPTS_EXCEEDED"
                 : (outcome.errorCode ?? "NETWORK_ERROR")
-            try await storage.markFailed(id: item.id, errorCode: finalErrorCode)
+            let message = outcome.errorMessage ?? finalErrorCode
+            let moved = try await storage.moveToDeadLetters(id: item.id,
+                                                            errorCode: finalErrorCode,
+                                                            errorMessage: Self.deadLetterMessage(for: outcome,
+                                                                                                 fallback: message))
             emitter.emit(.now(type: "ITEM_FAILED",
                               itemId: item.id,
                               errorCode: finalErrorCode,
                               statusCode: outcome.statusCode.map(Double.init),
                               attempt: Double(attemptsAfter)))
-            return .failed(errorCode: finalErrorCode,
-                           message: outcome.errorMessage ?? finalErrorCode)
+            // A row removed while its request was out has nothing to move.
+            if moved {
+                emitter.emit(.now(type: "ITEM_DEAD_LETTERED",
+                                  itemId: item.id,
+                                  errorCode: "DEAD_LETTERED",
+                                  metadata: ["lastErrorCode": finalErrorCode]))
+            }
+            return .failed(errorCode: finalErrorCode, message: message)
         }
 
         // Retryable and attempts remain: park the item behind a backoff
@@ -451,6 +666,19 @@ actor SyncDispatcher {
                           statusCode: outcome.statusCode.map(Double.init),
                           attempt: Double(attemptsAfter)))
         return .retrying(attempt: attemptsAfter)
+    }
+
+    /// What a dead letter says about the failure that ended it: for an HTTP
+    /// failure, the status line with its reason phrase (`HTTP 404 Not Found`,
+    /// the phrase as Foundation localizes it), otherwise the error's message.
+    /// Built from the outcome alone, never from a header or a body. The result
+    /// and history keep the shorter `HTTP 404`.
+    static func deadLetterMessage(for outcome: ItemDispatchOutcome, fallback: String) -> String {
+        guard let status = outcome.statusCode,
+              outcome.errorCode == "SERVER_ERROR" || outcome.errorCode == "UNAUTHORIZED" else {
+            return fallback
+        }
+        return "HTTP \(status) \(HTTPURLResponse.localizedString(forStatusCode: status).capitalized)"
     }
 
     /// `true` for a 401/403 sent with default headers read back from storage.

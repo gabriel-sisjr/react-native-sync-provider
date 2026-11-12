@@ -18,7 +18,10 @@ import com.google.common.truth.Truth.assertThat
 import com.google.common.truth.Truth.assertWithMessage
 import com.margelo.nitro.syncprovider.config.ConfigSource
 import com.margelo.nitro.syncprovider.config.SecretStore
+import com.margelo.nitro.syncprovider.connectivity.ConnectivityMonitor
+import com.margelo.nitro.syncprovider.database.SyncDeadLetterEntity
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
+import com.margelo.nitro.syncprovider.error.SyncException
 import com.margelo.nitro.syncprovider.http.SyncDispatcher
 import com.margelo.nitro.syncprovider.retry.RetryTimer
 import com.margelo.nitro.syncprovider.testutil.InMemorySecretStore
@@ -30,15 +33,21 @@ import com.margelo.nitro.syncprovider.work.SyncWorker
 import io.mockk.every
 import io.mockk.mockkConstructor
 import io.mockk.unmockkConstructor
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.onSubscription
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
+import okhttp3.mockwebserver.SocketPolicy
 import org.junit.After
 import org.junit.Before
 import org.junit.Test
@@ -46,6 +55,7 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import org.robolectric.shadows.ShadowNetwork
 import org.robolectric.shadows.ShadowNetworkCapabilities
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
@@ -147,6 +157,9 @@ internal class SyncProviderRuntimeTest {
   }
 
   private suspend fun row(id: String): SyncItemEntity? = runtime.database.syncItemDao().findById(id)
+
+  private suspend fun deadLetter(id: String): SyncDeadLetterEntity? =
+    runtime.database.syncDeadLetterDao().findById(id)
 
   private suspend fun awaitGone(id: String) {
     val gone = withTimeoutOrNull(AWAIT_TIMEOUT_MS) {
@@ -789,7 +802,8 @@ internal class SyncProviderRuntimeTest {
 
     runtime.dispatcher.flush()
 
-    assertThat(row("auth")!!.status).isEqualTo(SyncItemEntity.STATUS_FAILED)
+    assertThat(row("auth")).isNull()
+    assertThat(deadLetter("auth")?.lastErrorCode).isEqualTo(SyncErrorCode.UNAUTHORIZED.name)
   }
 
   @Test
@@ -801,7 +815,8 @@ internal class SyncProviderRuntimeTest {
     restartProcess()
     runWorker()
 
-    assertThat(row("auth")!!.status).isEqualTo(SyncItemEntity.STATUS_FAILED)
+    assertThat(row("auth")).isNull()
+    assertThat(deadLetter("auth")?.lastErrorCode).isEqualTo(SyncErrorCode.UNAUTHORIZED.name)
   }
 
   @Test
@@ -1104,6 +1119,551 @@ internal class SyncProviderRuntimeTest {
     insert("failed", status = SyncItemEntity.STATUS_FAILED)
 
     assertThat(runtime.queueSize()).isEqualTo(2)
+  }
+
+  /* ------------------- network-quality and health-check options ------------------- */
+
+  private fun gateAndHealthCheck(): SyncOptions = TestData.syncOptions(
+    minNetworkQuality = NetworkQuality.MODERATE,
+    healthCheckUrl = "https://api.example.com/health",
+    healthCheckTtlMs = 0.0,
+    healthCheckBackoffMs = 15_000.0,
+  )
+
+  @Test
+  fun `the gate and health-check options are echoed and reach a cold start`() = runBlocking<Unit> {
+    val options = gateAndHealthCheck()
+
+    runtime.configure(options)
+    assertThat(runtime.currentOptions()).isEqualTo(options)
+
+    restartProcess()
+
+    assertThat(runtime.configSource).isEqualTo(ConfigSource.PERSISTED)
+    assertThat(runtime.currentOptions()).isEqualTo(options)
+  }
+
+  @Test
+  fun `options left unset are not echoed, before or after a restart`() = runBlocking<Unit> {
+    val defaults = runtime.currentOptions()
+    runtime.configure(gateAndHealthCheck())
+    // A later configureSync without them clears them, as for every optional field.
+    runtime.configure(TestData.syncOptions())
+    val live = runtime.currentOptions()
+    restartProcess()
+    val persisted = runtime.currentOptions()
+
+    listOf(defaults, live, persisted).forEach { options ->
+      assertThat(options.minNetworkQuality).isNull()
+      assertThat(options.healthCheckUrl).isNull()
+      assertThat(options.healthCheckTtlMs).isNull()
+      assertThat(options.healthCheckBackoffMs).isNull()
+    }
+  }
+
+  @Test
+  fun `invalid health-check options are rejected before anything changes`() = runBlocking<Unit> {
+    val applied = gateAndHealthCheck()
+    runtime.configure(applied)
+
+    val rejections = listOf(
+      TestData.syncOptions(healthCheckUrl = "not a url"),
+      TestData.syncOptions(healthCheckTtlMs = Double.NaN),
+      TestData.syncOptions(healthCheckBackoffMs = -1.0),
+    ).map { invalid -> runCatching { runtime.configure(invalid) }.exceptionOrNull() as? SyncException }
+
+    assertThat(rejections.map { it?.code }).containsExactly(
+      SyncErrorCode.INVALID_URL,
+      SyncErrorCode.INVALID_PAYLOAD,
+      SyncErrorCode.INVALID_PAYLOAD,
+    ).inOrder()
+    assertThat(runtime.currentOptions()).isEqualTo(applied)
+    restartProcess()
+    assertThat(runtime.currentOptions()).isEqualTo(applied)
+  }
+
+  /* --------------------------- network-quality gate --------------------------- */
+
+  private fun capabilities(vararg capabilities: Int): NetworkCapabilities =
+    ShadowNetworkCapabilities.newInstance().also { caps ->
+      shadowOf(caps).addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+      capabilities.forEach { shadowOf(caps).addCapability(it) }
+    }
+
+  /** Every event the current runtime emits from now on, until [block] returns. */
+  private suspend fun <T> withEvents(block: suspend (List<SyncEvent>) -> T): T {
+    val events: MutableList<SyncEvent> = CopyOnWriteArrayList()
+    val collecting = CoroutineScope(Dispatchers.Default)
+    val subscribed = CountDownLatch(1)
+    collecting.launch {
+      runtime.emitter.events.onSubscription { subscribed.countDown() }.collect { events += it }
+    }
+    subscribed.await(5, TimeUnit.SECONDS)
+    return try {
+      block(events)
+    } finally {
+      collecting.cancel()
+    }
+  }
+
+  private suspend fun awaitUntil(condition: suspend () -> Boolean) {
+    val met = withTimeoutOrNull(AWAIT_TIMEOUT_MS) {
+      while (!condition()) delay(10L)
+      true
+    }
+    assertThat(met).isTrue()
+  }
+
+  @Test
+  fun `a kick the quality gate holds dispatches nothing and comes back 30 s later`() = runBlocking<Unit> {
+    // INTERNET only: metered and not validated, so the link signals classify it POOR.
+    goOnline()
+    runtime.backgroundSyncManager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+    runtime.configure(TestData.syncOptions(minNetworkQuality = NetworkQuality.MODERATE))
+    insert("due", attempts = 1, nextRetryAt = 1L)
+    restartProcess()
+    val startedAt = System.currentTimeMillis()
+
+    val (result, events) = withEvents { events ->
+      val result = runWorker()
+      // Delivered in order: anything emitted before SYNC_FAILED is visible once it is.
+      awaitUntil { events.any { it.type == SyncEventType.SYNC_FAILED } }
+      result to events.toList()
+    }
+
+    assertThat(result).isEqualTo(ListenableWorker.Result.success())
+    assertThat(server.requestCount).isEqualTo(0)
+    assertThat(row("due")!!.attempts).isEqualTo(1)
+    assertThat(events.map { it.type }).containsExactly(SyncEventType.SYNC_FAILED)
+    assertThat(events.single().errorCode).isEqualTo(SyncErrorCode.NETWORK_QUALITY_TOO_LOW)
+    assertThat(kickFiresAt()).isAtLeast(startedAt + ConnectivityMonitor.QUALITY_CACHE_TTL_MS)
+  }
+
+  @Test
+  fun `a kick the gate turned back again waits twice as long and carries the streak on`() =
+    runBlocking<Unit> {
+      goOnline()
+      runtime.backgroundSyncManager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+      runtime.configure(TestData.syncOptions(minNetworkQuality = NetworkQuality.MODERATE))
+      insert("due", attempts = 1, nextRetryAt = 1L)
+      restartProcess()
+      val startedAt = System.currentTimeMillis()
+
+      TestListenableWorkerBuilder<SyncWorker>(context)
+        .setInputData(Data.Builder().putInt(SyncWorker.KEY_GATE_STREAK, 1).build())
+        .build()
+        .doWork()
+
+      val spec = WorkManagerImpl.getInstance(context).workDatabase.workSpecDao()
+        .getWorkSpec(oneTimeWork().single().id.toString())!!
+      assertThat(spec.lastEnqueueTime + spec.initialDelay).isAtLeast(startedAt + 60_000L)
+      assertThat(spec.input.getInt(SyncWorker.KEY_GATE_STREAK, 0)).isEqualTo(2)
+    }
+
+  @Test
+  fun `a periodic run the quality gate holds leaves the kick as it was`() = runBlocking<Unit> {
+    goOnline()
+    runtime.backgroundSyncManager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+    runtime.configure(TestData.syncOptions(minNetworkQuality = NetworkQuality.MODERATE))
+    insert("due", attempts = 1, nextRetryAt = 1L)
+    runtime.armRetryWake()
+    val kick = oneTimeWork().single().id
+    restartProcess()
+
+    val result = runPeriodicWorker()
+
+    assertThat(result).isEqualTo(ListenableWorker.Result.success())
+    assertThat(server.requestCount).isEqualTo(0)
+    assertThat(oneTimeWork().single().id).isEqualTo(kick)
+  }
+
+  @Test
+  fun `gate_automaticWake_rerunsWhenQualityReachesMinimum`() = runBlocking<Unit> {
+    var healthy = false
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest): MockResponse = when {
+        request.path == "/health" && !healthy ->
+          MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST)
+        else -> MockResponse().setResponseCode(200)
+      }
+    }
+    val wifi = manager().activeNetwork!!
+    val linkCaps = intArrayOf(
+      NetworkCapabilities.NET_CAPABILITY_INTERNET,
+      NetworkCapabilities.NET_CAPABILITY_VALIDATED,
+      NetworkCapabilities.NET_CAPABILITY_NOT_METERED,
+    )
+    shadowOf(manager()).setNetworkCapabilities(wifi, capabilities(*linkCaps))
+    // An IP literal: with one route, a failed HEAD cannot steer the next one to another
+    // address the server does not listen on.
+    val healthCheckUrl = server.url("/health").newBuilder().host("127.0.0.1").build().toString()
+    // EXCELLENT: the link signals alone reach GOOD at most, so only a measurement passes.
+    runtime.configure(
+      TestData.syncOptions(
+        minNetworkQuality = NetworkQuality.EXCELLENT,
+        healthCheckUrl = healthCheckUrl,
+      ),
+    )
+    attachEngineAndRecover()
+    shadowOf(manager()).networkCallbacks.forEach { it.onAvailable(wifi) }
+    // Every HEAD fails, so the measurement classifies the link POOR.
+    awaitUntil { runtime.connectivityMonitor.currentState().networkQuality == NetworkQuality.POOR }
+
+    // The timer checks the gate before dispatching: the wake is held, and nothing is emitted.
+    val emitted = withEvents { events ->
+      insert("due", attempts = 1, nextRetryAt = 1L)
+      runtime.armRetryWake()
+      delay(QUIET_MS)
+      events.toList()
+    }
+    assertThat(emitted.filter { it.type == SyncEventType.SYNC_FAILED }).isEmpty()
+    assertThat(runtime.isRetryTimerArmed).isTrue()
+    assertThat(row("due")!!.attempts).isEqualTo(1)
+
+    // A better network becomes the default and is measured at once: the held wake runs.
+    healthy = true
+    val better = ShadowNetwork.newInstance(202)
+    shadowOf(manager()).setNetworkCapabilities(better, capabilities(*linkCaps))
+    shadowOf(manager()).networkCallbacks.forEach { it.onAvailable(better) }
+
+    awaitGone("due")
+    assertThat(runtime.connectivityMonitor.currentState().networkQuality).isEqualTo(NetworkQuality.EXCELLENT)
+  }
+
+  /* ------------------------------- health check ------------------------------- */
+
+  /** `/health` answers 200 while [healthy] holds, else 503; items always answer 200. */
+  private fun healthDispatcher(healthy: () -> Boolean): Dispatcher = object : Dispatcher() {
+    override fun dispatch(request: RecordedRequest): MockResponse = when {
+      request.path == "/health" -> MockResponse().setResponseCode(if (healthy()) 200 else 503)
+      else -> MockResponse().setResponseCode(200)
+    }
+  }
+
+  /** An IP literal, so a failed request has no other address to fall back to. */
+  private fun healthUrl(): String = server.url("/health").newBuilder().host("127.0.0.1").build().toString()
+
+  private val heads = java.util.concurrent.atomic.AtomicInteger(0)
+
+  private fun countingHeads(inner: Dispatcher): Dispatcher = object : Dispatcher() {
+    override fun dispatch(request: RecordedRequest): MockResponse {
+      if (request.method == "HEAD") heads.incrementAndGet()
+      return inner.dispatch(request)
+    }
+  }
+
+  @Test
+  fun `a kick the health check skips succeeds and comes back after the backoff`() = runBlocking<Unit> {
+    server.dispatcher = countingHeads(healthDispatcher { false })
+    goOnline()
+    runtime.backgroundSyncManager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+    runtime.configure(TestData.syncOptions(healthCheckUrl = healthUrl(), healthCheckBackoffMs = 120_000.0))
+    insert("due", attempts = 1, nextRetryAt = 1L)
+    restartProcess()
+    val startedAt = System.currentTimeMillis()
+
+    val (result, events) = withEvents { events ->
+      val result = runWorker()
+      awaitUntil { events.any { it.type == SyncEventType.SYNC_FAILED } }
+      result to events.toList()
+    }
+
+    assertThat(result).isEqualTo(ListenableWorker.Result.success())
+    assertThat(heads.get()).isEqualTo(1)
+    assertThat(row("due")!!.attempts).isEqualTo(1)
+    assertThat(events.map { it.type }).containsExactly(SyncEventType.SYNC_FAILED)
+    assertThat(events.single().errorCode).isEqualTo(SyncErrorCode.HEALTH_CHECK_FAILED)
+    assertThat(kickFiresAt()).isAtLeast(startedAt + 120_000L)
+  }
+
+  @Test
+  fun `health_success_and_configure_clearBackoff, the configureSync half`() = runBlocking<Unit> {
+    var healthy = false
+    server.dispatcher = countingHeads(healthDispatcher { healthy })
+    // Offline as far as the system knows: no quality measurement shares the endpoint, and a
+    // manual flush sends anyway.
+    goOffline()
+    val options = TestData.syncOptions(healthCheckUrl = healthUrl(), healthCheckBackoffMs = 120_000.0)
+    runtime.configure(options)
+    insert("due")
+
+    runtime.dispatcher.flush()
+    runtime.dispatcher.flush()
+    assertThat(heads.get()).isEqualTo(1)
+
+    healthy = true
+    runtime.configure(options)
+    runtime.dispatcher.flush()
+
+    assertThat(heads.get()).isEqualTo(2)
+    assertThat(row("due")).isNull()
+  }
+
+  @Test
+  fun `health_zeroBackoff_automaticWakesStayAtLeastOneSecondApart`() = runBlocking<Unit> {
+    server.dispatcher = healthDispatcher { false }
+    goOnline()
+    runtime.configure(TestData.syncOptions(healthCheckUrl = healthUrl(), healthCheckBackoffMs = 0.0))
+    // A cooldown that has elapsed: every arm finds the row due at once.
+    insert("due", attempts = 1, nextRetryAt = 1L)
+    val failedChecks = java.util.concurrent.atomic.AtomicInteger(0)
+    // Inline on the emitting thread, so a burst cannot outrun the event buffer.
+    val counting = CoroutineScope(Dispatchers.Unconfined)
+    counting.launch(start = CoroutineStart.UNDISPATCHED) {
+      runtime.emitter.events.collect {
+        if (it.type == SyncEventType.SYNC_FAILED && it.errorCode == SyncErrorCode.HEALTH_CHECK_FAILED) {
+          failedChecks.incrementAndGet()
+        }
+      }
+    }
+    try {
+      attachEngineAndRecover()
+      delay(1_500L)
+    } finally {
+      counting.cancel()
+    }
+
+    // The first wake checks once; the next automatic check waits a second, whatever the backoff.
+    assertThat(failedChecks.get()).isIn(Range.closed(1, 2))
+    assertThat(row("due")!!.attempts).isEqualTo(1)
+  }
+
+  @Test
+  fun `nothing is emitted or probed while a health-check backoff runs`() = runBlocking<Unit> {
+    server.dispatcher = countingHeads(healthDispatcher { false })
+    goOnline()
+    attachEngineAndRecover()
+    runtime.configure(TestData.syncOptions(healthCheckUrl = healthUrl(), healthCheckBackoffMs = 120_000.0))
+
+    val events = withEvents { events ->
+      insert("due", attempts = 1, nextRetryAt = 1L)
+      runtime.dispatcher.flush()
+      // Due rows and every arm path from here on: none may wake before the backoff ends.
+      runtime.armRetryWake()
+      runtime.resume()
+      delay(QUIET_MS * 2)
+      events.toList()
+    }
+
+    assertThat(events.filter { it.type == SyncEventType.SYNC_FAILED }).hasSize(1)
+    assertThat(row("due")!!.attempts).isEqualTo(1)
+  }
+
+  @Test
+  fun `health_qualitySample2xx_refreshesLastHealthy through the shared probe`() = runBlocking<Unit> {
+    server.dispatcher = countingHeads(healthDispatcher { true })
+    val wifi = manager().activeNetwork!!
+    shadowOf(manager()).setNetworkCapabilities(
+      wifi,
+      capabilities(
+        NetworkCapabilities.NET_CAPABILITY_INTERNET,
+        NetworkCapabilities.NET_CAPABILITY_VALIDATED,
+        NetworkCapabilities.NET_CAPABILITY_NOT_METERED,
+      ),
+    )
+    runtime.configure(TestData.syncOptions(healthCheckUrl = healthUrl()))
+    attachEngineAndRecover()
+    shadowOf(manager()).networkCallbacks.forEach { it.onAvailable(wifi) }
+    awaitUntil { runtime.connectivityMonitor.currentState().networkQuality == NetworkQuality.EXCELLENT }
+    val measured = heads.get()
+
+    insert("due")
+    runtime.dispatcher.flush()
+
+    assertThat(heads.get()).isEqualTo(measured)
+    assertThat(row("due")).isNull()
+  }
+
+  /* ------------------------------- dead letters ------------------------------- */
+
+  private suspend fun deadLetterRow(id: String, deadLetteredAt: Long, code: String = "SERVER_ERROR") =
+    runtime.database.syncDeadLetterDao().insert(
+      SyncDeadLetterEntity(
+        id = id,
+        method = "PUT",
+        url = server.url("/$id").toString(),
+        headers = """{"X-Test":"1"}""",
+        body = """{"a":1}""",
+        contentType = "application/json",
+        priority = "HIGH",
+        priorityWeight = 0,
+        createdAt = 1_000L,
+        metadata = """{"k":"v"}""",
+        attempts = 3,
+        lastAttemptAt = 2_000L,
+        lastErrorCode = code,
+        lastErrorMessage = "HTTP 500 Internal Server Error",
+        deadLetteredAt = deadLetteredAt,
+      ),
+    )
+
+  private suspend fun deadLetterCount(): Int = runtime.database.syncDeadLetterDao().count()
+
+  @Test
+  fun `dlq_list_orderedByDeadLetteredAtThenId, every field mapped`() = runBlocking<Unit> {
+    deadLetterRow("b", deadLetteredAt = 20L)
+    deadLetterRow("c", deadLetteredAt = 10L)
+    deadLetterRow("a", deadLetteredAt = 20L)
+
+    val listed = runtime.listDeadLetter()
+
+    assertThat(listed.map { it.id }).containsExactly("c", "a", "b").inOrder()
+    with(listed.first()) {
+      assertThat(method).isEqualTo(HttpMethod.PUT)
+      assertThat(url).isEqualTo(server.url("/c").toString())
+      assertThat(headers).containsExactly("X-Test", "1")
+      assertThat(body).isEqualTo("""{"a":1}""")
+      assertThat(contentType).isEqualTo("application/json")
+      assertThat(priority).isEqualTo(SyncPriority.HIGH)
+      assertThat(createdAt).isEqualTo(1_000.0)
+      assertThat(metadata).containsExactly("k", "v")
+      assertThat(attempts).isEqualTo(3.0)
+      assertThat(lastAttemptAt).isEqualTo(2_000.0)
+      assertThat(lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR)
+      assertThat(lastErrorMessage).isEqualTo("HTTP 500 Internal Server Error")
+      assertThat(deadLetteredAt).isEqualTo(10.0)
+    }
+  }
+
+  @Test
+  fun `a stored code this version does not know lists as MAX_ATTEMPTS_EXCEEDED`() = runBlocking<Unit> {
+    deadLetterRow("future", deadLetteredAt = 1L, code = "SOME_FUTURE_CODE")
+
+    assertThat(runtime.listDeadLetter().single().lastErrorCode).isEqualTo(SyncErrorCode.MAX_ATTEMPTS_EXCEEDED)
+  }
+
+  @Test
+  fun `dlq_replay_requeuesFresh, sent by the next flush`() = runBlocking<Unit> {
+    server.enqueue(MockResponse().setResponseCode(200))
+    deadLetterRow("dead", deadLetteredAt = 50L)
+
+    val events = withEvents { events ->
+      runtime.replayDeadLetter("dead")
+      awaitUntil { events.any { it.type == SyncEventType.ITEM_ENQUEUED } }
+      delay(QUIET_MS)
+      events.toList()
+    }
+
+    val queued = checkNotNull(row("dead"))
+    assertThat(queued.createdAt).isEqualTo(1_000L)
+    assertThat(queued.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(queued.attempts).isEqualTo(0)
+    assertThat(queued.nextRetryAt).isEqualTo(0L)
+    assertThat(queued.lastErrorCode).isNull()
+    assertThat(queued.lastAttemptAt).isNull()
+    assertThat(queued.headers).isEqualTo("""{"X-Test":"1"}""")
+    assertThat(deadLetter("dead")).isNull()
+    assertThat(events.map { it.type }).containsExactly(SyncEventType.ITEM_ENQUEUED)
+    assertThat(events.single().itemId).isEqualTo("dead")
+    // Like an enqueue, a replay does not flush by itself.
+    assertThat(server.requestCount).isEqualTo(0)
+
+    runtime.dispatcher.flush()
+
+    assertThat(server.takeRequest(1, TimeUnit.SECONDS)?.path).isEqualTo("/dead")
+    assertThat(row("dead")).isNull()
+  }
+
+  @Test
+  fun `dlq_replay_queueFull_rejectsAndKeepsRow`() = runBlocking<Unit> {
+    runtime.configure(TestData.syncOptions(maxQueueSize = 1))
+    insert("queued")
+    deadLetterRow("dead", deadLetteredAt = 1L)
+
+    val rejected = runCatching { runtime.replayDeadLetter("dead") }.exceptionOrNull()
+
+    assertThat((rejected as SyncException).code).isEqualTo(SyncErrorCode.QUEUE_FULL)
+    assertThat(deadLetter("dead")).isNotNull()
+    assertThat(row("dead")).isNull()
+    assertThat(runtime.storage.count()).isEqualTo(1)
+  }
+
+  @Test
+  fun `dlq_replay_and_discard_unknownId_resolve`() = runBlocking<Unit> {
+    deadLetterRow("dead", deadLetteredAt = 1L)
+
+    val events = withEvents { events ->
+      runtime.replayDeadLetter("unknown")
+      runtime.discardDeadLetter("unknown")
+      delay(QUIET_MS)
+      events.toList()
+    }
+
+    assertThat(events).isEmpty()
+    assertThat(deadLetterCount()).isEqualTo(1)
+    assertThat(runtime.storage.count()).isEqualTo(0)
+  }
+
+  @Test
+  fun `dlq_discard_emitsItemRemoved`() = runBlocking<Unit> {
+    deadLetterRow("dead", deadLetteredAt = 1L)
+
+    val events = withEvents { events ->
+      runtime.discardDeadLetter("dead")
+      awaitUntil { events.isNotEmpty() }
+      events.toList()
+    }
+
+    assertThat(events.map { it.type }).containsExactly(SyncEventType.ITEM_REMOVED)
+    assertThat(events.single().itemId).isEqualTo("dead")
+    assertThat(deadLetterCount()).isEqualTo(0)
+  }
+
+  @Test
+  fun `dlq_clearQueue_clearsDeadLetters, with one QUEUE_CLEARED`() = runBlocking<Unit> {
+    deadLetterRow("dead", deadLetteredAt = 1L)
+    insert("queued")
+
+    val events = withEvents { events ->
+      runtime.clearQueue()
+      awaitUntil { events.isNotEmpty() }
+      delay(QUIET_MS)
+      events.toList()
+    }
+
+    assertThat(events.map { it.type }).containsExactly(SyncEventType.QUEUE_CLEARED)
+    assertThat(deadLetterCount()).isEqualTo(0)
+    assertThat(runtime.storage.count()).isEqualTo(0)
+  }
+
+  @Test
+  fun `dlq_removeItem_fallsThroughToDeadLetters, reporting the removal`() = runBlocking<Unit> {
+    deadLetterRow("dead", deadLetteredAt = 1L)
+
+    val (removed, events) = withEvents { events ->
+      val removed = runtime.removeItem("dead")
+      awaitUntil { events.isNotEmpty() }
+      removed to events.toList()
+    }
+
+    assertThat(removed).isTrue()
+    assertThat(events.map { it.type }).containsExactly(SyncEventType.ITEM_REMOVED)
+    assertThat(deadLetterCount()).isEqualTo(0)
+    assertThat(runtime.removeItem("dead")).isFalse()
+  }
+
+  @Test
+  fun `a terminal failure, listed then replayed, is sent again`() = runBlocking<Unit> {
+    var accept = false
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest): MockResponse =
+        MockResponse().setResponseCode(if (accept) 200 else 400)
+    }
+    insert("item")
+
+    runtime.dispatcher.flush()
+    val listed = runtime.listDeadLetter().single()
+    assertThat(listed.id).isEqualTo("item")
+    assertThat(listed.lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR)
+    assertThat(row("item")).isNull()
+
+    accept = true
+    runtime.replayDeadLetter("item")
+    runtime.dispatcher.flush()
+
+    assertThat(server.requestCount).isEqualTo(2)
+    assertThat(row("item")).isNull()
+    assertThat(runtime.listDeadLetter()).isEmpty()
   }
 
   private companion object {

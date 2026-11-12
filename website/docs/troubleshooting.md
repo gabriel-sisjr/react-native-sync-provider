@@ -71,7 +71,7 @@ ksp 'androidx.room:room-compiler:2.7.0'
 
 **Cause:** Xcode is auto-generating Core Data classes for entities in `SyncProvider.xcdatamodeld` AND the explicit `+CoreDataClass.swift` files are also being compiled — both produce the same symbol.
 
-**Fix:** Confirm neither entity has a `codeGenerationType` attribute, in both model versions under `SyncProvider.xcdatamodeld`. With no attribute, Xcode shows **Manual/None** and generates nothing, while `class` or `category` generates the clashing classes. Delete the attribute, or set **Codegen** to Manual/None in the Data Model inspector. Do not write `manual/none` as the value: `momc` fails with `unexpected code generation type 'manual/none'`. The explicit Swift files are the only source of truth.
+**Fix:** Confirm no entity (`SyncItemEntity`, `SyncResultEntity`, and from v0.3 `SyncDeadLetterEntity`) has a `codeGenerationType` attribute, in any model version under `SyncProvider.xcdatamodeld` (`SyncProvider`, `SyncProvider 2` and `SyncProvider 3`). With no attribute, Xcode shows **Manual/None** and generates nothing, while `class` or `category` generates the clashing classes. Delete the attribute, or set **Codegen** to Manual/None in the Data Model inspector. Do not write `manual/none` as the value: `momc` fails with `unexpected code generation type 'manual/none'`. The explicit Swift files are the only source of truth.
 
 ### Symptom: App crashes at launch after upgrading to v0.2
 
@@ -126,6 +126,12 @@ if (isNativeModuleAvailable()) {
 
 The 9 hooks already short-circuit safely when the module is missing — they return inert state instead of throwing.
 
+### Symptom: `Property 'networkQuality' is missing` after upgrading to v0.3
+
+**Cause:** `ConnectionState.networkQuality` and `UseConnectionResult.networkQuality` are required. A hand-built value, usually a test fixture or a mock of `getConnectionStatus`, stops compiling. An exhaustive `switch` over `SyncEventType` or `SyncErrorCode` with a `never` check fails for the same reason: `ITEM_DEAD_LETTERED` and three error codes were added.
+
+**Fix:** Add `networkQuality` to the fixtures, for example `networkQuality: 'GOOD'` for a connected unmetered link and `'OFFLINE'` for a disconnected one, and add the new cases. See the [v0.2 → v0.3 migration](./migration/index.md#v0-2-to-v0-3).
+
 ### Symptom: Type errors in unrelated files after upgrading the library
 
 **Cause:** The Nitro spec was regenerated, the `lib/typescript/` declarations refreshed, and your app's `tsconfig` is caching the old shapes. Or you forgot to run `yarn nitrogen` after pulling.
@@ -153,14 +159,29 @@ If errors persist, delete `node_modules/@gabriel-sisjr/react-native-sync-provide
 - **Cooling.** Every item is waiting out a retry cooldown. See the next symptom.
 - **Paused.** `pauseSync()` is in force. `flush()` dispatches nothing until `resumeSync()`.
 - **Stored headers cannot be read.** `defaultHeaders` were configured, but they cannot be recovered in this process, so nothing is dispatched: sending without them would fail every item. This happens when the Keystore key was invalidated, when the iOS device has not been unlocked since boot, or after a backup restore onto another device. With Android `allowBackup`, the ciphertext comes back but the key does not.
+- **Quality gate.** The network quality is below `minNetworkQuality`. The flush emits `SYNC_FAILED` with `NETWORK_QUALITY_TOO_LOW`. See the next symptom.
+- **Health check.** The `HEAD` to `healthCheckUrl` failed, or its backoff is running. The flush emits `SYNC_FAILED` with `HEALTH_CHECK_FAILED`. See the next symptom.
 
-A cycle that found nothing eligible emits `SYNC_STARTED` and `SYNC_SUCCEEDED` and adds a 0/0 row to the sync history. A `flush()` blocked by a pause or by unreadable headers runs no cycle, so it emits no event and writes no history row. On Android it also returns `0` for `startedAt` and `finishedAt`. On iOS both are the time of the call, so only the missing event and history row tell the two apart.
+A cycle that found nothing eligible emits `SYNC_STARTED` and `SYNC_SUCCEEDED` and adds a 0/0 row to the sync history. A `flush()` blocked by a pause, unreadable headers, the gate or the health check runs no cycle: it emits no `SYNC_STARTED` and writes no history row. On Android it also returns `0` for `startedAt` and `finishedAt`. On iOS both are the time of the call, so only the missing event and history row tell the two apart.
 
 **Fix:** For unreadable headers, call `configureSync` with the headers again, which ends the wait. The library also retries the read on each flush, so an iOS device resumes after the first unlock.
 
 :::warning Do not re-apply `getSyncConfig()` in this state
 While headers are unreadable, `getSyncConfig()` returns none (`undefined` on Android, `{}` on iOS), so `setConfig({ ...config })` or `configureSync(await getSyncConfig())` deletes them, which acts as a logout. Pass `defaultHeaders` from your app's session.
 :::
+
+### Symptom: Nothing syncs with `minNetworkQuality` or `healthCheckUrl` set {#symptom-nothing-syncs-with-minnetworkquality-or-healthcheckurl-set}
+
+**Cause:** Every cycle is skipped at the start. Listen to `SYNC_FAILED` and read its `errorCode`:
+
+| `errorCode` | Likely cause |
+| ----------- | ------------ |
+| `NETWORK_QUALITY_TOO_LOW` | The link never reaches the minimum. `EXCELLENT` without `healthCheckUrl` never passes, `GOOD` without it never passes on a metered link, and on Android a network without `NET_CAPABILITY_VALIDATED` is at most `POOR`. |
+| `HEALTH_CHECK_FAILED` | The endpoint does not answer the `HEAD` with a `2xx`. The probe carries no `defaultHeaders`, so an endpoint that requires authentication answers `401`. Some servers answer `405` to `HEAD`. |
+
+Read `networkQuality` from `getConnectionStatus()` to see the current level. While the gate holds the in-process retry timer, nothing is emitted at all: the wake runs once the quality reaches the minimum, and re-checks on a backoff that grows to 15 minutes.
+
+**Fix:** Lower `minNetworkQuality`, or set `healthCheckUrl` if you need `EXCELLENT`. Point `healthCheckUrl` at an unauthenticated endpoint that answers `HEAD` with a `2xx`. A `configureSync` call ends a running health-check backoff and restarts the gate's re-check backoff, so after fixing the endpoint, apply the options again. To turn either feature off, call `configureSync` without the field. See [Connectivity Detection](./guides/connectivity-detection.md#the-quality-gate).
 
 ### Symptom: Items stay pending and the server logs one 401 per wake
 
@@ -181,7 +202,7 @@ While headers are unreadable, `getSyncConfig()` returns none (`undefined` on And
 | `stoppedReason`  | What happened                                                                                                                                  |
 | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
 | `TIMEOUT`        | `timeoutMs` passed, or the soonest cooldown ends at or after that deadline, so waiting was pointless. Also how an offline drain ends, with items intact. |
-| `MAX_ITERATIONS` | `maxIterations` flushes started and items remain. It counts real flushes only.                                                                  |
+| `MAX_ITERATIONS` | `maxIterations` flushes started and items remain. It counts real flushes only, including flushes the quality gate or the health check skipped.   |
 | `CANCELLED`      | `cancelDrain()` was called.                                                                                                                    |
 
 **Fix:** For a long backoff, raise `timeoutMs`. For a large queue, raise `maxIterations` or `batchSize`. A native cycle already running is not aborted, so `queueRemaining` can be stale right after a stop: re-read `getQueueSize()`.
@@ -194,11 +215,11 @@ While headers are unreadable, `getSyncConfig()` returns none (`undefined` on And
 
 ### Symptom: `enqueue` rejects with `INVALID_PAYLOAD` and no `validationErrors`
 
-**Cause:** Native rejected the call, most often because the queue reached `maxQueueSize`. The native `QUEUE_FULL` code [does not reach JS yet](./api-reference/errors.md#native-rejections).
+**Cause:** Native rejected the call, most often because the queue reached `maxQueueSize`. The native `QUEUE_FULL` code [does not reach JS yet](./api-reference/errors.md#native-rejections). `replayDeadLetter` rejects the same way on a full queue, and keeps the dead letter.
 
-On Android this can happen while `getQueueSize()` reads below the cap, because the cap also counts `FAILED` and in-flight rows, which that function does not show.
+On Android this can happen while `getQueueSize()` reads below the cap, because the cap also counts items in flight, which that function does not show. Dead letters count toward the cap on neither platform.
 
-**Fix:** Flush, or raise `maxQueueSize`. On Android, remove failed items as described in [Permanent Failures](./guides/retry-policy.md#permanent-failures).
+**Fix:** Flush, or raise `maxQueueSize`.
 
 ### Symptom: Items wait after the device reconnects, with `useAutoSync` mounted
 
@@ -206,11 +227,29 @@ On Android this can happen while `getQueueSize()` reads below the cap, because t
 
 **Fix:** Leave `enabled` on. The hook skips its interval and foreground flushes while the status is `DISCONNECTED`. See [Skip flushes while offline](./api-reference/hooks/useAutoSync.md#skip-the-interval-while-offline).
 
-### Symptom: Items reach `FAILED` while the device is offline
+### Symptom: Items end up in the dead-letter queue while the device is offline
 
-**Cause:** A flush ran during the outage. Neither native dispatcher checks connectivity, so each failed request spends a retry attempt. `useAutoSync` skips only while the status is `DISCONNECTED`, so `UNKNOWN` still flushes, and a direct `flush()` has no check at all.
+**Cause:** A flush ran during the outage. Without `minNetworkQuality`, neither native dispatcher checks connectivity, so each failed request spends a retry attempt, and an item with no attempts left is dead-lettered. `useAutoSync` skips only while the status is `DISCONNECTED`, so `UNKNOWN` still flushes, and a direct `flush()` has no check of its own.
 
-**Fix:** Read `getConnectionStatus()` before a direct `flush()`, or use [`drainUntilEmpty`](./api-reference/functions.md#drainuntilempty), which does not flush while `DISCONNECTED`.
+**Fix:** Set `minNetworkQuality: NetworkQuality.POOR`, the most permissive gate, which blocks every flush while the quality is `OFFLINE`, including an `UNKNOWN` link. Without the gate, read `getConnectionStatus()` before a direct `flush()`, or use [`drainUntilEmpty`](./api-reference/functions.md#drainuntilempty), which does not flush while `DISCONNECTED`. Then [`replayDeadLetter`](./api-reference/functions.md#replaydeadletter) the items the outage cost you.
+
+### Symptom: A failed item is no longer in `getPendingItems()`
+
+**Cause:** It failed permanently and moved to the dead-letter queue, where `getQueueSize()`, `getPendingItems()` and the queue hooks do not look. Its `ITEM_FAILED` carried the code, and `ITEM_DEAD_LETTERED` followed. Items that had failed permanently before the upgrade to v0.3 were moved there too.
+
+**Fix:** Read it with [`listDeadLetter`](./api-reference/functions.md#listdeadletter) or `useSyncSnapshot().deadLetter`. `lastErrorCode` and `lastErrorMessage` say why it failed. Then replay it with `replayDeadLetter` once the cause is fixed, or delete it with `discardDeadLetter` or `removeItem`. Nothing prunes the dead-letter queue, so discard what you do not replay.
+
+### Symptom: `networkQuality` never reaches `EXCELLENT`
+
+**Cause:** `EXCELLENT` requires a measured median under 200 ms, and only `healthCheckUrl` turns the measurement on. Even with it, a metered link is at most `GOOD`, iOS Low Data Mode at most `MODERATE`, and an Android network without `NET_CAPABILITY_VALIDATED` at most `POOR`.
+
+**Fix:** Set `healthCheckUrl` to a fast, unauthenticated endpoint of yours, close to your users. See [Network quality](./guides/connectivity-detection.md#network-quality).
+
+### Symptom: Fewer `CONNECTION_CHANGED` events after upgrading to v0.3
+
+**Cause:** The event now fires only when a reported field changes. iOS used to emit it on every path update, including duplicates. It is also emitted when only `networkQuality` changed, with an unchanged `connectionStatus`.
+
+**Fix:** None needed if you read the status from the event. If you counted events, compare the new `connectionStatus` with the previous one, or call `getConnectionStatus()` on each event.
 
 ### Symptom: `progress` stays at `0` on Android
 
@@ -231,7 +270,7 @@ useSyncEvents({
 });
 ```
 
-`result.failedIds` and `result.errors` hold the same detail on Android, and are always empty on iOS.
+`result.failedIds` and `result.errors` hold the same detail on Android, and are always empty on iOS. The failed items themselves are in the dead-letter queue: read them with [`listDeadLetter`](./api-reference/functions.md#listdeadletter).
 
 ### Symptom: A failed item doesn't retry immediately after `flush()`
 

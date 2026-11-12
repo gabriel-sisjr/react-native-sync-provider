@@ -9,9 +9,15 @@ final class EngineFixture {
     let stack = InMemoryCoreDataStack.make()
     let secrets = InMemorySecretStore()
     let connectivity = FakeConnectivity()
+    /// Every measurement and health check goes through it, with no debounce.
+    let probe = FakeHeadProbe()
+    /// Set before building an engine to use another probe, a real one say.
+    var probeOverride: HeadProbing?
     let scheduler = FakeBackgroundTaskScheduler()
     let clock = ManualClock()
     let timer = ManualWakeTimer()
+    /// Re-checks a wake held below the network-quality minimum.
+    let recheckTimer = ManualWakeTimer()
     /// Set before building an engine to intercept its deadline queries.
     var wrapWakeSource: ((RetryWakeSource) -> RetryWakeSource)?
     let foregroundSession = URLSession.stubbed()
@@ -48,8 +54,11 @@ final class EngineFixture {
                                 emitter: emitter,
                                 scheduler: scheduler,
                                 sessions: (foregroundSession, backgroundSession),
+                                probe: probeOverride ?? probe,
+                                qualityProbeDebounceMs: 0,
                                 clock: clock,
                                 retryTimer: timer,
+                                heldWakeTimer: recheckTimer,
                                 wrapWakeSource: wrapWakeSource)
         engines.append(engine)
         return engine
@@ -66,13 +75,13 @@ final class EngineFixture {
 
 extension SyncQueueStorage.SyncItemInputData {
     /// A valid item. The URL is unique enough to tell requests apart.
-    static func sample(url: String = "https://api.test/items") -> Self {
+    static func sample(url: String = "https://api.test/items", priority: String = "NORMAL") -> Self {
         Self(method: "POST",
              url: url,
              headers: nil,
              body: "{}",
              contentType: "application/json",
-             priority: "NORMAL",
+             priority: priority,
              metadata: nil)
     }
 }

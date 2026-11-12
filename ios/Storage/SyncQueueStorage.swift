@@ -58,11 +58,14 @@ actor SyncQueueStorage {
         return stored.map(\.id)
     }
 
+    /// Removes the queued item with `id`, or else the dead letter with it.
+    /// `true` when either store deleted a row.
     @discardableResult
     func remove(id: String) async throws -> Bool {
         try await dao.delete(id: id)
     }
 
+    /// Removes every item, queued or dead-lettered.
     func clear() async throws {
         try await dao.clear()
     }
@@ -103,12 +106,44 @@ actor SyncQueueStorage {
 
     // MARK: - Status mutations
 
-    func markInFlight(id: String) async throws {
+    /// See ``SyncItemDao/markInFlight(id:)``. `false` when the row is gone.
+    @discardableResult
+    func markInFlight(id: String) async throws -> Bool {
         try await dao.markInFlight(id: id)
     }
 
-    func markFailed(id: String, errorCode: String) async throws {
-        try await dao.markFailed(id: id, errorCode: errorCode)
+    /// See ``SyncItemDao/moveToDeadLetters(id:errorCode:errorMessage:)``.
+    @discardableResult
+    func moveToDeadLetters(id: String, errorCode: String, errorMessage: String?) async throws -> Bool {
+        try await dao.moveToDeadLetters(id: id, errorCode: errorCode, errorMessage: errorMessage)
+    }
+
+    /// Every dead letter, `deadLetteredAt` ascending, then `id` ascending.
+    func getDeadLetters() async throws -> [StoredDeadLetter] {
+        try await dao.fetchDeadLetters()
+    }
+
+    /// Puts the dead letter `id` back in the queue as a fresh item. `false`
+    /// when nothing changed: no dead letter has that id, or a queue row
+    /// already has it.
+    /// - Throws: `SyncProviderError(.queueFull)` when the queue is at its cap;
+    ///   the dead letter stays.
+    @discardableResult
+    func replayDeadLetter(id: String) async throws -> Bool {
+        switch try await dao.replayDeadLetter(id: id, capacity: capacity) {
+        case .replayed:
+            return true
+        case .unknown, .alreadyQueued:
+            return false
+        case .queueFull:
+            throw SyncProviderError.queueFull(limit: capacity)
+        }
+    }
+
+    /// Deletes the dead letter `id`. `false` when there is none.
+    @discardableResult
+    func discardDeadLetter(id: String) async throws -> Bool {
+        try await dao.deleteDeadLetter(id: id)
     }
 
     /// Reset an item to PENDING for retry and persist its backoff cooldown.

@@ -13,6 +13,17 @@ import Foundation
 import BackgroundTasks
 #endif
 
+/// The wait before the first silent re-check of a wake held below the
+/// network-quality minimum. Each re-check that finds it still gated doubles
+/// the wait.
+let kHeldWakeRecheckInitialMs: Int64 = 30_000
+/// The longest wait between two re-checks of a held wake.
+let kHeldWakeRecheckMaxMs: Int64 = 900_000
+/// The least time automatic retries wait after a failed health check, whatever
+/// `healthCheckBackoffMs` says: with 0, a check that keeps failing would have
+/// them wake, probe and fail back to back. An explicit `flush()` is not held.
+let kMinHealthCheckRetryBackoffMs: Int64 = 1_000
+
 /// Where the retry timer learns its next deadline.
 protocol RetryWakeSource: Sendable {
     func earliestRetryAt() async throws -> Int64?
@@ -43,19 +54,37 @@ final class SyncEngine: @unchecked Sendable {
     let connectivity: ConnectivityProviding
     let dispatcher: SyncDispatcher
     let background: BackgroundSyncManager
+    /// Grades the network. Internal so tests can await its measurements.
+    let qualityMonitor: NetworkQualityMonitor
+    /// The HEAD before a cycle, and its cache and backoff.
+    let healthCheck: HealthCheck
+    /// The one HEAD probe of the process: measurements and the health check
+    /// share it, and with it one connection to the host.
+    let probe: HeadProbing
 
     private let configStore: SyncConfigStore
     private let recovery: RecoveryManager
     private let clock: SyncClock
     private let retryTimer: RetryWakeScheduling
+    /// Re-checks a wake held below the network-quality minimum. Nothing else
+    /// would: on a stable path no update comes to re-run it.
+    private let heldWakeTimer: RetryWakeScheduling
     private let wakeSource: RetryWakeSource
 
     private let lock = NSLock()
     private var options: SyncOptionsSnapshot
     private var source: ConfigSource
-    /// A timer fired while offline. Flushing then would spend attempts on items
-    /// that are fine, so the wake waits here for connectivity.
+    /// A timer fired while the network could not take a flush: offline, or
+    /// below `minNetworkQuality`. Flushing offline would spend attempts on
+    /// items that are fine, and below the minimum the gate would refuse it.
+    /// The wake waits here and runs once the network is online and, with a
+    /// minimum set, graded at or above it.
     private var wakeAwaitingConnectivity = false
+    /// The wait before the next re-check of a wake held below the minimum.
+    private var heldWakeRecheckMs = kHeldWakeRecheckInitialMs
+    /// The link of the last reported change, to tell a new path from a new
+    /// grade on the same one.
+    private var lastLink: ConnectionSnapshot?
     /// Bumped by every re-arm; only the newest may touch the timer. Re-arming
     /// reads the store with no lock held, so a slow read must not overwrite
     /// the decision of a newer one. A read taken while the row was IN_FLIGHT
@@ -84,7 +113,6 @@ final class SyncEngine: @unchecked Sendable {
     ///   not consult it (a rejection during one still sets it), and neither
     ///   does a JS `flush()`.
     private var credentialHoldUntil: Int64 = 0
-    private var connectivityToken: UUID?
     private var startup: Task<Void, Never>?
     private var attachWake: Task<Void, Never>?
     private var reconnectWake: Task<Void, Never>?
@@ -92,8 +120,11 @@ final class SyncEngine: @unchecked Sendable {
 
     /// - Parameters:
     ///   - sessions: test seam. `nil` builds the production sessions.
+    ///   - probe: the one HEAD probe of the process, for every measurement.
+    ///   - qualityProbeDebounceMs: test seam; see ``kQualityProbeDebounceMs``.
     ///   - clock: drives cooldowns; tests move it explicitly.
     ///   - retryTimer: tests fire it explicitly.
+    ///   - heldWakeTimer: re-checks a held wake; tests fire it explicitly.
     ///   - wrapWakeSource: test seam around the deadline queries.
     init(stack: CoreDataStack = .shared,
          configStore: SyncConfigStore = SyncConfigStore(),
@@ -102,8 +133,11 @@ final class SyncEngine: @unchecked Sendable {
          emitter: SyncEventEmitter = SyncEventEmitter(),
          scheduler: BackgroundTaskScheduling = BGTaskScheduler.shared,
          sessions: (foreground: URLSession, background: URLSession)? = nil,
+         probe: HeadProbing = HeadProbe(),
+         qualityProbeDebounceMs: Int = kQualityProbeDebounceMs,
          clock: SyncClock = SystemClock(),
          retryTimer: RetryWakeScheduling = RetryWakeTimer(),
+         heldWakeTimer: RetryWakeScheduling = RetryWakeTimer(),
          wrapWakeSource: ((RetryWakeSource) -> RetryWakeSource)? = nil) {
         let loaded = configStore.load()
         let storage = SyncQueueStorage(dao: SyncItemDao(stack: stack, clock: clock),
@@ -129,6 +163,7 @@ final class SyncEngine: @unchecked Sendable {
 
         self.clock = clock
         self.retryTimer = retryTimer
+        self.heldWakeTimer = heldWakeTimer
         self.wakeSource = wrapWakeSource?(storage) ?? storage
         self.configStore = configStore
         self.options = loaded.options
@@ -142,6 +177,14 @@ final class SyncEngine: @unchecked Sendable {
                                                 scheduler: scheduler,
                                                 store: backgroundStore)
         self.recovery = RecoveryManager(storage: storage, emitter: emitter)
+        let qualityMonitor = NetworkQualityMonitor(connectivity: connectivity,
+                                                   probe: probe,
+                                                   clock: clock,
+                                                   debounceMs: qualityProbeDebounceMs)
+        let healthCheck = HealthCheck(probe: probe, clock: clock)
+        self.qualityMonitor = qualityMonitor
+        self.healthCheck = healthCheck
+        self.probe = probe
 
         dispatcher.hooks.onCycleFinished = { [weak self] notBefore in
             await self?.rearmRetryTimer(notBefore: notBefore)
@@ -149,16 +192,33 @@ final class SyncEngine: @unchecked Sendable {
         dispatcher.hooks.recoverCredentials = { [weak self] in
             self?.recoverDefaultHeaders()
         }
+        dispatcher.hooks.networkQuality = {
+            qualityMonitor.current.quality
+        }
+        dispatcher.hooks.refreshStaleNetworkQuality = {
+            qualityMonitor.refreshIfStale()
+        }
+        dispatcher.hooks.healthCheck = healthCheck
+        dispatcher.hooks.onHealthCheckFailed = { [weak self] in
+            await self?.rearmRetryTimer(scope: .allPending)
+        }
+        qualityMonitor.onHealthySample = { url in
+            healthCheck.recordHealthy(url: url)
+        }
         background.setPrepare { [weak self] in
             await self?.waitUntilStarted()
         }
 
         // Eagerly start the monitor so the first read returns a real snapshot
         // rather than the `.unknown` default.
-        connectivity.start()
-        connectivityToken = connectivity.subscribe { [weak self] snapshot in
-            self?.connectivityChanged(snapshot)
+        qualityMonitor.setProbeURL(Self.probeURL(loaded.options))
+        qualityMonitor.onChange = { [weak self] state in
+            self?.networkChanged(state)
         }
+        connectivity.start()
+        qualityMonitor.start()
+        let startLink = qualityMonitor.current.link
+        lock.withLock { lastLink = startLink }
 
         // Detached from the caller: this must not block the bridge or a
         // launch handler. Handlers await it before flushing.
@@ -213,15 +273,22 @@ final class SyncEngine: @unchecked Sendable {
     /// flight will not re-arm. The shared engine lives as long as the process;
     /// this exists for short-lived instances.
     func shutdown() {
-        let token = lock.withLock { () -> UUID? in
-            isShutDown = true
-            defer { connectivityToken = nil }
-            return connectivityToken
-        }
+        lock.withLock { isShutDown = true }
         retryTimer.cancel()
-        if let token {
-            connectivity.unsubscribe(token)
-        }
+        heldWakeTimer.cancel()
+        qualityMonitor.stop()
+    }
+
+    // MARK: - Network
+
+    /// The link and its network-quality grade now.
+    func currentNetwork() -> NetworkState {
+        qualityMonitor.current
+    }
+
+    /// `healthCheckUrl`, the target of every measurement.
+    private static func probeURL(_ options: SyncOptionsSnapshot) -> URL? {
+        options.healthCheckUrl.flatMap { URL(string: $0) }
     }
 
     // MARK: - Configuration
@@ -242,8 +309,14 @@ final class SyncEngine: @unchecked Sendable {
             options = snapshot
             source = .live
             credentialHoldUntil = 0
+            // A held wake is re-evaluated by the re-arm below, against the new
+            // options, with its re-check backoff starting over.
+            heldWakeTimer.cancel()
+            heldWakeRecheckMs = kHeldWakeRecheckInitialMs
         }
         configStore.save(snapshot)
+        healthCheck.clearBackoff()
+        qualityMonitor.setProbeURL(Self.probeURL(snapshot))
         await storage.updateCapacity(Int(snapshot.maxQueueSize))
         await dispatcher.updateConfig(snapshot.toDispatcherConfig(source: .live))
         await rearmRetryTimer()
@@ -276,14 +349,19 @@ final class SyncEngine: @unchecked Sendable {
         retryTimer.isArmed
     }
 
-    /// `true` when a wake fired offline and is waiting for connectivity.
+    /// `true` when a wake fired while the network could not take a flush and
+    /// is waiting for one that can: offline, or below `minNetworkQuality`.
     var hasWakeAwaitingConnectivity: Bool {
         lock.withLock { wakeAwaitingConnectivity }
     }
 
     /// Arms the single retry timer for the next due row, replacing any pending
-    /// wake. Called when a cycle ends, when a hybrid attaches, and on
-    /// configuration changes.
+    /// wake. Called when a cycle ends, when a hybrid attaches, on
+    /// configuration changes, and after the health check stopped a flush.
+    ///
+    /// The wake comes no earlier than the latest of the row's deadline, the
+    /// credential hold and the end of a running health-check backoff, which
+    /// lasts at least ``kMinHealthCheckRetryBackoffMs`` here.
     ///
     /// - Parameter notBefore: when the hold on a rejected credential ends. It
     ///   outlives this call, so a later re-arm cannot wake earlier.
@@ -312,14 +390,19 @@ final class SyncEngine: @unchecked Sendable {
         }
 
         let nowMs = clock.nowMs()
+        let backoffUntil = healthCheckBackoffEnd() ?? 0
         lock.withLock {
             guard ticket == rearmTicket, !isShutDown else { return }
             guard let wakeAt else {
                 retryTimer.cancel()
-                wakeAwaitingConnectivity = false
+                releaseHeldWakeLocked()
                 return
             }
-            retryTimer.arm(afterMs: max(0, max(wakeAt, holdUntil) - nowMs)) { [weak self] in
+            // Any new arm restarts a held wake's re-check backoff: the timer
+            // takes over, and a wake it finds still held starts again at 30 s.
+            heldWakeTimer.cancel()
+            heldWakeRecheckMs = kHeldWakeRecheckInitialMs
+            retryTimer.arm(afterMs: max(0, max(wakeAt, holdUntil, backoffUntil) - nowMs)) { [weak self] in
                 await self?.retryWakeFired()
             }
         }
@@ -329,35 +412,141 @@ final class SyncEngine: @unchecked Sendable {
         lock.withLock {
             rearmTicket &+= 1
             retryTimer.cancel()
-            wakeAwaitingConnectivity = false
+            releaseHeldWakeLocked()
         }
     }
 
+    /// Forgets a held wake, its pending re-check and its re-check backoff.
+    private func releaseHeldWakeLocked() {
+        wakeAwaitingConnectivity = false
+        heldWakeTimer.cancel()
+        heldWakeRecheckMs = kHeldWakeRecheckInitialMs
+    }
+
+    /// Arms the next silent re-check of a held wake and doubles the wait for
+    /// the one after, up to ``kHeldWakeRecheckMaxMs``.
+    private func scheduleHeldWakeRecheckLocked() {
+        let delayMs = heldWakeRecheckMs
+        heldWakeRecheckMs = min(delayMs * 2, kHeldWakeRecheckMaxMs)
+        heldWakeTimer.arm(afterMs: delayMs) { [weak self] in
+            await self?.heldWakeRecheckFired()
+        }
+    }
+
+    private func heldWakeRecheckFired() async {
+        guard lock.withLock({ wakeAwaitingConnectivity }) else { return }
+        await retryWakeFired()
+    }
+
+    /// The wait before the next re-check of a held wake. Test seam.
+    var heldWakeRecheckDelayMs: Int64 {
+        lock.withLock { heldWakeRecheckMs }
+    }
+
     /// Runs on timer expiry, where no JS caller exists to receive an error.
+    ///
+    /// A wake the network cannot take is remembered, not run: offline (neither
+    /// the dispatcher nor the session checks connectivity, so a flush now
+    /// would exhaust valid items against a dead network), or below
+    /// `minNetworkQuality`. Like an offline wake, a gated one emits nothing;
+    /// it runs once the network can take it.
     private func retryWakeFired() async {
         guard lock.withLock({ attachedHybrids > 0 && !isShutDown }) else { return }
         guard await !dispatcher.paused() else { return }
-        guard connectivity.current.isOnline else {
-            // Neither the dispatcher nor the session checks connectivity, so a
-            // flush now would exhaust valid items against a dead network.
-            lock.withLock { wakeAwaitingConnectivity = true }
-            SyncLogger.debug("Retry wake while offline; waiting for connectivity", category: "dispatcher")
+        let network = qualityMonitor.current
+        guard canTakeAutomaticFlush(network) else {
+            holdWake(on: network)
+            return
+        }
+        lock.withLock { releaseHeldWakeLocked() }
+        if healthCheckBackoffEnd() != nil {
+            // A health-check backoff is running, at least a second long for an
+            // automatic wake: like a gated wake, wait for it silently. The
+            // re-arm lands no earlier than its end.
+            SyncLogger.debug("Retry wake during a health-check backoff; waiting for its end", category: "dispatcher")
+            await rearmRetryTimer(scope: .allPending)
             return
         }
         do {
-            _ = try await dispatcher.flush()
+            // The grade can drop between the check above and the gate. That is
+            // a real attempt, so the gate reports it with `SYNC_FAILED`, as it
+            // does on Android; the wake is held again.
+            if case .skipped(_, .networkQualityTooLow) = try await dispatcher.flushOutcome() {
+                holdWake(on: qualityMonitor.current)
+            }
         } catch {
             SyncLogger.error("Timer-driven flush failed: \(error.localizedDescription)",
                              category: "dispatcher")
         }
     }
 
-    private func connectivityChanged(_ snapshot: ConnectionSnapshot) {
-        emitter.emit(.now(type: "CONNECTION_CHANGED", connectionStatus: snapshot.status.rawValue))
+    /// Remembers a wake the network cannot take. Offline, reconnecting runs
+    /// it. On a usable link below the minimum, a silent re-check is armed
+    /// with backoff, and a stale measurement is taken again in the background:
+    /// a new grade that meets the minimum runs the wake as soon as it lands.
+    private func holdWake(on network: NetworkState) {
+        let online = network.link.isOnline
+        if online {
+            qualityMonitor.refreshIfStale()
+        }
+        lock.withLock {
+            wakeAwaitingConnectivity = true
+            if online {
+                scheduleHeldWakeRecheckLocked()
+            } else {
+                heldWakeTimer.cancel()
+            }
+        }
+        SyncLogger.debug(online
+                             ? "Retry wake below the network-quality minimum; waiting for it"
+                             : "Retry wake while offline; waiting for connectivity",
+                         category: "dispatcher")
+    }
 
-        guard snapshot.isOnline else { return }
+    /// The end of the wait automatic wakes keep after a failed health check,
+    /// when one is set: its backoff, never shorter than
+    /// ``kMinHealthCheckRetryBackoffMs``. An explicit `flush()` keeps to the
+    /// backoff alone.
+    private func healthCheckBackoffEnd() -> Int64? {
+        guard lock.withLock({ options.healthCheckUrl != nil }) else { return nil }
+        return healthCheck.retryBackoffUntilMs(floorMs: kMinHealthCheckRetryBackoffMs)
+    }
+
+    /// `true` when an automatic wake may flush: online and, with a
+    /// `minNetworkQuality` set, graded at or above it.
+    private func canTakeAutomaticFlush(_ network: NetworkState) -> Bool {
+        let minimum = lock.withLock { options.minNetworkQuality }
+        return network.link.isOnline && network.quality.satisfies(minimum: minimum)
+    }
+
+    /// Runs for every change to what `ConnectionState` reports, the grade
+    /// included, synchronously from the path update or measurement behind it:
+    /// `CONNECTION_CHANGED` is emitted before the update returns, and the
+    /// emitter calls listeners on the main thread. Android emits it
+    /// asynchronously.
+    private func networkChanged(_ network: NetworkState) {
+        emitter.emit(.now(type: "CONNECTION_CHANGED", connectionStatus: network.link.status.rawValue))
+
+        let pathChanged = lock.withLock { () -> Bool in
+            defer { lastLink = network.link }
+            return lastLink != network.link
+        }
+        guard canTakeAutomaticFlush(network) else {
+            // Still held. A new path starts the re-check backoff over.
+            guard pathChanged else { return }
+            lock.withLock {
+                guard wakeAwaitingConnectivity else { return }
+                heldWakeRecheckMs = kHeldWakeRecheckInitialMs
+                if network.link.isOnline {
+                    scheduleHeldWakeRecheckLocked()
+                } else {
+                    heldWakeTimer.cancel()
+                }
+            }
+            return
+        }
         let hadWake = lock.withLock { () -> Bool in
-            defer { wakeAwaitingConnectivity = false }
+            defer { releaseHeldWakeLocked() }
             return wakeAwaitingConnectivity
         }
         if hadWake {

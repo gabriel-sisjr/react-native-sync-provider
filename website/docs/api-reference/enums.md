@@ -1,7 +1,7 @@
 ---
 sidebar_position: 5
 title: Enums
-description: All enum definitions for @gabriel-sisjr/react-native-sync-provider — ConnectionStatus, ConnectionType, SyncStrategy, SyncPriority, BackoffStrategy, HttpMethod, and SyncEventType.
+description: All enum definitions for @gabriel-sisjr/react-native-sync-provider — ConnectionStatus, ConnectionType, SyncStrategy, SyncPriority, BackoffStrategy, HttpMethod, SyncEventType, and NetworkQuality.
 keywords:
   - react-native
   - sync-provider
@@ -25,6 +25,7 @@ import {
   BackoffStrategy,
   HttpMethod,
   SyncEventType,
+  NetworkQuality,
 } from '@gabriel-sisjr/react-native-sync-provider';
 ```
 
@@ -45,10 +46,12 @@ enum ConnectionStatus {
 
 | Value | Description | Native mapping |
 |-------|-------------|----------------|
-| `CONNECTED` | Online on an unmetered connection. | iOS: `NWPath.status == .satisfied && !isExpensive` / Android: `NetworkCapabilities.NET_CAPABILITY_NOT_METERED` |
-| `DISCONNECTED` | No network. | iOS: `NWPath.status != .satisfied` / Android: `NetworkCallback.onLost` |
-| `METERED` | Online but the connection is metered (cellular, hotspot). | iOS: `NWPath.isExpensive == true` / Android: `!NET_CAPABILITY_NOT_METERED` |
-| `UNKNOWN` | State has not been determined yet. | Initial value before the first emission. |
+| `CONNECTED` | Online on an unmetered connection. | iOS: `NWPath.status == .satisfied && !isExpensive` / Android: the default network has `NET_CAPABILITY_NOT_METERED`, or, on Android 11 (API 30) and later, `NET_CAPABILITY_TEMPORARILY_NOT_METERED` |
+| `DISCONNECTED` | No network. | iOS: `NWPath.status != .satisfied` / Android: no default network. Losing a secondary network does not count |
+| `METERED` | Online but the connection is metered (cellular, hotspot). | iOS: `NWPath.isExpensive == true` / Android: the default network has neither capability above |
+| `UNKNOWN` | State has not been determined yet. | iOS: before the first `NWPathMonitor` report. Android has no such window: a network the OS has not described yet reads as `DISCONNECTED`. |
+
+Android follows only the default network: the one the app's traffic uses. Losing a secondary network, such as cellular alongside Wi-Fi or a VPN that does not apply to the app, does not report `DISCONNECTED`, and a VPN that was the default network hands over without a false disconnect. A temporarily unmetered link (some 5G plans) reads as `CONNECTED` with `isExpensive: false` on Android 11 and later, and as `METERED` again when the exemption is withdrawn.
 
 ---
 
@@ -189,40 +192,42 @@ enum SyncEventType {
   RESUMED = 'RESUMED',
   BACKGROUND_SYNC_STARTED = 'BACKGROUND_SYNC_STARTED',
   BACKGROUND_SYNC_COMPLETED = 'BACKGROUND_SYNC_COMPLETED',
+  ITEM_DEAD_LETTERED = 'ITEM_DEAD_LETTERED',
 }
 ```
 
 | Value | When it fires | Notable payload fields |
 |-------|---------------|------------------------|
-| `ITEM_ENQUEUED` | After `enqueue` / `enqueueBatch` persists an item. | `itemId` |
-| `ITEM_REMOVED` | After `removeItem` removes an item. A delivered item leaves the queue with `ITEM_SUCCEEDED` instead. | `itemId` |
+| `ITEM_ENQUEUED` | After `enqueue` / `enqueueBatch` persists an item, or `replayDeadLetter` puts a dead letter back in the queue. | `itemId` |
+| `ITEM_REMOVED` | After `removeItem` deletes a queued item or a dead letter, or `discardDeadLetter` deletes a dead letter. Not emitted when no row had that id. A delivered item leaves the queue with `ITEM_SUCCEEDED` instead. | `itemId` |
 | `SYNC_STARTED` | A flush cycle begins. | -- |
 | `SYNC_PROGRESS` | After each item in a cycle. **iOS only.** | `progress` (0..1) |
 | `SYNC_SUCCEEDED` | A cycle finishes with no permanent failure. That includes a 0/0 cycle with nothing eligible, and a cycle whose items all went back to wait for a retry. | -- |
-| `SYNC_FAILED` | A cycle finishes with one or more permanent failures, or dies. | `errorCode`, only when the cycle died |
+| `SYNC_FAILED` | A cycle finishes with one or more permanent failures, or dies. Also emitted, with no `SYNC_STARTED` before it and no history row, when the [quality gate](../guides/connectivity-detection.md#the-quality-gate) or the [health check](../guides/connectivity-detection.md#health-check) skips the cycle. | `errorCode`, only when the cycle died (its code) or was skipped (`NETWORK_QUALITY_TOO_LOW` or `HEALTH_CHECK_FAILED`) |
 | `ITEM_SUCCEEDED` | A single item dispatched successfully. | `itemId`, `statusCode`, `attempt` |
-| `ITEM_FAILED` | A single item failed permanently: a non-retryable failure, or a retriable one with no attempts left. | `itemId`, `errorCode`, `statusCode`, `attempt` |
+| `ITEM_FAILED` | A single item failed permanently: a non-retryable failure, or a retriable one with no attempts left. The item has already moved to the dead-letter queue, and `ITEM_DEAD_LETTERED` follows. An item [removed or cleared while its request was in flight](./functions.md#what-a-purge-stops) gets `ITEM_FAILED` alone. | `itemId`, `errorCode`, `statusCode`, `attempt` |
 | `ITEM_RETRYING` | A single item failed and went back to wait, including a [credential hold](../guides/background-sync.md#cold-start-configuration). | `itemId`, `errorCode`, `statusCode`, `attempt` |
-| `QUEUE_CLEARED` | After `clearQueue`. | -- |
-| `CONNECTION_CHANGED` | The native monitor reported a transition. | `connectionStatus` |
+| `QUEUE_CLEARED` | After `clearQueue`, which deletes dead letters too. Once per call. | -- |
+| `CONNECTION_CHANGED` | A reported [`ConnectionState`](./types.md#connectionstate) field changed: `status`, `type`, `isInternetReachable`, `isExpensive` or `networkQuality`. Never for a duplicate, and on Android never for the state it starts in. iOS starts at `UNKNOWN`, so its first path report emits one. A change of `networkQuality` alone emits it with an unchanged `connectionStatus`. Delivered synchronously on iOS, asynchronously on Android. | `connectionStatus` |
 | `PAUSED` | After `pauseSync`. | -- |
 | `RESUMED` | After `resumeSync`. iOS also emits it at launch when recovery put interrupted items back in the queue. A pause cleared by a launch emits nothing. | -- |
 | `BACKGROUND_SYNC_STARTED` | A background window starts: a BGTask on iOS, the periodic worker on Android. Android's one-time retry kick emits neither background event. | iOS processing task: `metadata.kind` (`"processing"`). Otherwise base fields only. |
 | `BACKGROUND_SYNC_COMPLETED` | The same window finishes. iOS emits it whether the window's flush succeeded or failed. Android emits it only after the flush returns, so a worker whose flush throws emits none. | iOS: `metadata.kind` (`"refresh"` or `"processing"`), and `metadata.ok: "false"` when the flush failed. Android: base fields only. `errorCode` is never set: a failed flush reports its code on that cycle's `SYNC_FAILED`. |
+| `ITEM_DEAD_LETTERED` | A permanently failed item was moved to the dead-letter queue. Emitted synchronously right after that item's `ITEM_FAILED`, on both platforms. Read the dead letter with [`listDeadLetter`](./functions.md#listdeadletter). | `itemId`, `errorCode: 'DEAD_LETTERED'`, `metadata.lastErrorCode` (the real failure code, the one `ITEM_FAILED` reported) |
 
 Events reach only listeners in a running JS engine. A worker or BGTask with no JS still dispatches, but nobody receives its events.
 
 The `metadata` field on these events is never the item's `metadata`. See [`SyncEvent`](./types.md#syncevent).
 
+:::note New members are appended
+`ITEM_DEAD_LETTERED` was added in v0.3. A `switch` over `SyncEventType` that ends in a `never` exhaustiveness check needs a case for it.
+:::
+
 ---
 
 ## `NetworkQuality`
 
-:::note Forward type for v0.3
-`NetworkQuality` is the network-quality classification slated for v0.3. It is introduced early so consumer types can depend on its final shape, but in v0.2 it is surfaced **only** as the optional [`UseSyncSnapshotResult.networkQuality`](./types.md#usesyncsnapshotresult) field and is **ALWAYS `undefined`** until the v0.3 classifier ships.
-:::
-
-Coarse network-quality classification. The value set is ordered **worst → best** so consumers can compare or threshold on it once the v0.3 classifier populates it.
+Coarse quality of the current link, ordered **worst → best**: `OFFLINE < POOR < MODERATE < GOOD < EXCELLENT`. Reported as [`ConnectionState.networkQuality`](./types.md#connectionstate) by [`getConnectionStatus`](./functions.md#getconnectionstatus) and the hooks, and used as the threshold of [`SyncOptions.minNetworkQuality`](./types.md#syncoptions).
 
 ```ts
 enum NetworkQuality {
@@ -234,13 +239,33 @@ enum NetworkQuality {
 }
 ```
 
-| Value | Description |
-|-------|-------------|
-| `OFFLINE` | No usable network path -- equivalent to [`ConnectionStatus.DISCONNECTED`](#connectionstatus). |
-| `POOR` | Connected but throughput/latency is poor -- sync should be conservative. |
-| `MODERATE` | Usable mid-tier link -- acceptable for most foreground sync. |
-| `GOOD` | Healthy link -- suitable for normal background and foreground sync. |
-| `EXCELLENT` | Best-tier link (typically unmetered Wi-Fi/ethernet) -- no constraints. |
+| Value | Reported when |
+|-------|---------------|
+| `OFFLINE` | No link, or a link the OS has not reported yet: exactly when the status is [`DISCONNECTED`](#connectionstatus) or `UNKNOWN`. The only level `minNetworkQuality: POOR` blocks. |
+| `POOR` | Online but slow: a measured median of 1000 ms or more, two or more failed probes, or an Android link without `NET_CAPABILITY_VALIDATED`. |
+| `MODERATE` | A measured median of 500–999 ms, a metered link with no measurement, or a faster link held back by iOS Low Data Mode. |
+| `GOOD` | A measured median of 200–499 ms, or an unmetered link with no measurement. The highest level a metered or expensive link reaches. |
+| `EXCELLENT` | A measured median under 200 ms on a link no cap lowers. Only reported with `healthCheckUrl` set. |
+
+Both platforms classify with the same fixed table, described in [Connectivity Detection](../guides/connectivity-detection.md#network-quality). Without `healthCheckUrl` nothing is measured, so the classification never reaches `EXCELLENT`.
+
+Compare two levels by their position in `Object.values(NetworkQuality)`, which lists them worst to best, never as strings:
+
+```ts
+import {
+  getConnectionStatus,
+  NetworkQuality,
+} from '@gabriel-sisjr/react-native-sync-provider';
+
+const LEVELS = Object.values(NetworkQuality);
+const isAtLeast = (quality: NetworkQuality, min: NetworkQuality) =>
+  LEVELS.indexOf(quality) >= LEVELS.indexOf(min);
+
+const { networkQuality } = await getConnectionStatus();
+if (isAtLeast(networkQuality, NetworkQuality.GOOD)) {
+  startLargeUpload();
+}
+```
 
 ---
 
@@ -248,4 +273,5 @@ enum NetworkQuality {
 
 - [`SyncEvent` type](./types.md#syncevent), [Listeners](./listeners.md), [`useSyncEvents`](./hooks/useSyncEvents.md).
 - [Errors](./errors.md) for `SyncErrorCode`.
-- [`useSyncSnapshot`](./hooks/useSyncSnapshot.md) and [`SyncDeadLetterItem`](./types.md#syncdeadletteritem) -- where the forward `NetworkQuality` is surfaced.
+- [Connectivity Detection](../guides/connectivity-detection.md) -- network quality, the quality gate and the health check.
+- [`SyncDeadLetterItem`](./types.md#syncdeadletteritem) -- the payload behind `ITEM_DEAD_LETTERED`.

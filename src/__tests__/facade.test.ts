@@ -26,7 +26,14 @@ import {
   SyncErrorCode,
   SYNC_EVENT_CHANNEL,
 } from '../index';
-import { BackoffStrategy, HttpMethod, SyncStrategy } from '../types/enums';
+import {
+  BackoffStrategy,
+  ConnectionStatus,
+  ConnectionType,
+  HttpMethod,
+  NetworkQuality,
+  SyncStrategy,
+} from '../types/enums';
 
 interface SyncMock {
   enqueue: jest.Mock;
@@ -35,6 +42,9 @@ interface SyncMock {
   clearQueue: jest.Mock;
   getQueueSize: jest.Mock;
   getPendingItems: jest.Mock;
+  listDeadLetter: jest.Mock;
+  replayDeadLetter: jest.Mock;
+  discardDeadLetter: jest.Mock;
   flush: jest.Mock;
   pauseSync: jest.Mock;
   resumeSync: jest.Mock;
@@ -260,8 +270,33 @@ describe('facade — config + history + connection + bg', () => {
     mock.getConnectionStatus.mockResolvedValueOnce({
       status: 'CONNECTED',
       type: 'WIFI',
+      networkQuality: 'GOOD',
     });
     expect((await getConnectionStatus()).status).toBe('CONNECTED');
+  });
+
+  it('getConnectionStatus surfaces networkQuality verbatim', async () => {
+    const mock = getMock();
+    const snapshot = {
+      status: ConnectionStatus.METERED,
+      type: ConnectionType.CELLULAR,
+      networkQuality: NetworkQuality.MODERATE,
+      isInternetReachable: true,
+      isExpensive: true,
+    };
+    mock.getConnectionStatus.mockResolvedValueOnce(snapshot);
+
+    expect(await getConnectionStatus()).toEqual(snapshot);
+  });
+
+  it('getConnectionStatus rewraps a native rejection with INVALID_PAYLOAD', async () => {
+    const mock = getMock();
+    mock.getConnectionStatus.mockRejectedValueOnce(new Error('monitor gone'));
+
+    await expect(getConnectionStatus()).rejects.toMatchObject({
+      code: SyncErrorCode.INVALID_PAYLOAD,
+      message: 'monitor gone',
+    });
   });
 
   it('enableBackgroundSync rewraps native rejection with BACKGROUND_TASK_REGISTRATION_FAILED', async () => {

@@ -44,14 +44,16 @@ function useAutoSync(options: UseAutoSyncExtraOptions): void
 |----------|------|----------|---------|-------------|
 | `enabled` | `boolean` | No | `false` | Master switch. When `false`, no triggers fire and nothing is subscribed. The hook does not read the strategy, so this is also how to turn it off under `MANUAL`. |
 | `intervalMs` | `number` | No | `60_000` | Period of the tick. A value that is not positive falls back to the default, so the tick cannot be turned off while the hook is enabled. |
-| `flushOnReconnect` | `boolean` | No | `true` | Flush when `CONNECTION_CHANGED` reports a transition to `CONNECTED`. |
+| `flushOnReconnect` | `boolean` | No | `true` | Flush when `CONNECTION_CHANGED` reports that the status changed to `CONNECTED`. An event that leaves the status as it was does not count. |
 | `flushOnMetered` | `boolean` | No | `false` | Also flush on a transition to `METERED`. Needs `flushOnReconnect`. It gates this trigger only: the interval flushes on any connection. |
 | `flushOnAppForeground` | `boolean` | No | `false` | Flush whenever React Native's `AppState` changes to `active`, unless the connection status is `DISCONNECTED`. |
 | `flushOnForeground` | `boolean` | No | -- | **Reserved.** The hook ignores it. Use `flushOnAppForeground`. |
 | `backgroundSync` | [`BackgroundSyncOptions`](../types.md#backgroundsyncoptions) | No | -- | **Reserved.** The hook ignores it. Call [`enableBackgroundSync`](../functions.md#enablebackgroundsync), or pass `backgroundSync` to [`<SyncProvider>`](../context.md). |
 
 :::info Flushes are skipped while offline
-The interval and the foreground trigger read the connection status first and do nothing while it is `DISCONNECTED`, because a flush while offline can spend retry attempts and mark valid items `FAILED`. `UNKNOWN` and `METERED` still flush. See [Skip flushes while offline](#skip-the-interval-while-offline).
+The interval and the foreground trigger read the connection status first and do nothing while it is `DISCONNECTED`, because a flush while offline can spend retry attempts and send valid items to the dead-letter queue. `UNKNOWN` and `METERED` still flush. See [Skip flushes while offline](#skip-the-interval-while-offline).
+
+With [`minNetworkQuality`](../types.md#syncoptions) set, the native gate also checks every flush the hook starts: below the minimum, that flush runs no cycle and emits `SYNC_FAILED` with `NETWORK_QUALITY_TOO_LOW`.
 
 Neither trigger checks queue size: on an empty queue each flush runs a 0/0 cycle that adds a row to the sync history.
 :::
@@ -66,12 +68,13 @@ Neither trigger checks queue size: on an empty queue each flush runs a 0/0 cycle
 
 ## Behavior
 
-- **`enabled` toggle** -- when `enabled` flips to `false`, all subscriptions tear down. Flipping back recreates them, with no immediate flush.
+- **`enabled` toggle** -- when `enabled` flips to `false`, all subscriptions tear down. Flipping back recreates them, with no immediate flush, and the reconnect trigger reads the starting status again.
 - **Interval** -- a `setInterval(intervalMs)` calls `flush()` unless the status is `DISCONNECTED` or a cycle is already running. If the status cannot be read, the flush is skipped. It runs in JS, so it stops while the OS suspends the app.
-- **Reconnect** -- subscribes to `CONNECTION_CHANGED`. On a transition to `CONNECTED`, or to `METERED` when `flushOnMetered` is `true`, it fires a guarded flush. It follows the event, so it does not read the status.
+- **Reconnect** -- reads the starting status once with [`getConnectionStatus()`](../functions.md#getconnectionstatus) when the hook is enabled, then follows `CONNECTION_CHANGED`. It fires a guarded flush when an event's `connectionStatus` differs from the last known status and is `CONNECTED`, or `METERED` when `flushOnMetered` is `true`. Events that arrive before that read resolves are judged against it, in arrival order. If the read fails, the first event only sets the status the next ones are compared with.
 - **AppState foreground** -- when `flushOnAppForeground` is `true`, it flushes on every change to `active`, with the same status check as the interval.
 - **Guarded flushes** -- every trigger calls `isSyncing()` before it flushes, and a call made during a cycle is skipped.
 - **Strategy** -- not read. Every trigger flushes under `MANUAL` as under `AUTOMATIC`. While the engine is paused, a flush runs no cycle.
+- **Quality-only changes** -- `CONNECTION_CHANGED` is also emitted when only the network quality changed. The status is unchanged then, so the reconnect trigger never fires for it, right after mount included. On iOS, a hook enabled before the first path report reads `UNKNOWN`, so that report is a real change: it flushes when it reports `CONNECTED`, or `METERED` with `flushOnMetered`.
 - **Errors** -- a failed flush is swallowed. The hook never throws to the consumer.
 - **Unmount** -- clears the interval and removes both subscriptions.
 

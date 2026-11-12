@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import com.google.common.truth.Truth.assertThat
 import com.margelo.nitro.syncprovider.BackoffStrategy
+import com.margelo.nitro.syncprovider.NetworkQuality
 import com.margelo.nitro.syncprovider.SyncOptions
 import com.margelo.nitro.syncprovider.SyncStrategy
 import com.margelo.nitro.syncprovider.testutil.InMemorySecretStore
@@ -46,7 +47,14 @@ internal class SyncConfigStoreTest {
     maxQueueSize = 321,
     persistQueue = false,
     defaultHeaders = defaultHeaders,
+    minNetworkQuality = NetworkQuality.MODERATE,
+    healthCheckUrl = "https://api.example.com/health",
+    healthCheckTtlMs = 0.0,
+    healthCheckBackoffMs = 15_000.0,
   )
+
+  private fun prefs() =
+    context.getSharedPreferences("syncprovider.config.prefs", Context.MODE_PRIVATE)
 
   @Test
   fun `nothing is loaded before the first save`() {
@@ -107,6 +115,68 @@ internal class SyncConfigStoreTest {
     val options = store.load()!!.options
     assertThat(options.batchSize).isNull()
     assertThat(options.persistQueue).isNull()
+    assertThat(options.minNetworkQuality).isNull()
+    assertThat(options.healthCheckUrl).isNull()
+    assertThat(options.healthCheckTtlMs).isNull()
+    assertThat(options.healthCheckBackoffMs).isNull()
+  }
+
+  @Test
+  fun `a record saved before the gate and health-check options existed loads without them`() {
+    store.save(fullOptions())
+    // What an older version left on disk: every key except these four.
+    prefs().edit()
+      .remove("minNetworkQuality")
+      .remove("healthCheckUrl")
+      .remove("healthCheckTtlMs")
+      .remove("healthCheckBackoffMs")
+      .commit()
+
+    val options = store.load()!!.options
+
+    assertThat(options).isEqualTo(
+      fullOptions().copy(
+        minNetworkQuality = null,
+        healthCheckUrl = null,
+        healthCheckTtlMs = null,
+        healthCheckBackoffMs = null,
+      ),
+    )
+  }
+
+  @Test
+  fun `damaged health-check values load as unset and keep the rest of the record`() {
+    val damaged = listOf(
+      Triple("healthCheckUrl", "not a url", null),
+      Triple("healthCheckTtlMs", null, -1.0),
+      Triple("healthCheckBackoffMs", null, Double.NaN),
+      Triple("healthCheckTtlMs", null, Double.POSITIVE_INFINITY),
+    )
+    for ((key, text, number) in damaged) {
+      store.save(fullOptions())
+      prefs().edit().apply {
+        if (number != null) putLong(key, number.toRawBits()) else putString(key, text)
+      }.commit()
+
+      val options = store.load()!!.options
+
+      val expected = when (key) {
+        "healthCheckUrl" -> fullOptions().copy(healthCheckUrl = null)
+        "healthCheckTtlMs" -> fullOptions().copy(healthCheckTtlMs = null)
+        else -> fullOptions().copy(healthCheckBackoffMs = null)
+      }
+      assertThat(options).isEqualTo(expected)
+    }
+  }
+
+  @Test
+  fun `an unreadable minNetworkQuality is left unset and keeps the rest of the record`() {
+    store.save(fullOptions())
+    prefs().edit().putString("minNetworkQuality", "SUPERB").commit()
+
+    val options = store.load()!!.options
+
+    assertThat(options).isEqualTo(fullOptions().copy(minNetworkQuality = null))
   }
 
   @Test

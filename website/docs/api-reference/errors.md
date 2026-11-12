@@ -14,7 +14,7 @@ keywords:
 
 # Errors
 
-Structured error type and discriminator thrown by the facade functions and reported per item through `SyncEvent.errorCode`.
+Structured error type and discriminator thrown by the facade functions, reported per item and per skipped cycle through `SyncEvent.errorCode`, and kept on each dead letter as `lastErrorCode`.
 
 ```ts
 import {
@@ -55,7 +55,7 @@ class SyncError extends Error {
 | `code`             | [`SyncErrorCode`](#syncerrorcode)       | Structured discriminator.                                                                                                                                                                                                                                          |
 | `message`          | `string`                                | Human-readable description.                                                                                                                                                                                                                                        |
 | `cause`            | `unknown`                               | Optional underlying error (the native rejection, for example). Native failures keep their detail here and in `message`.                                                                                                                                             |
-| `validationErrors` | [`ValidationIssue[]`](#validationissue) | Optional. Populated only on validation failures (`INVALID_URL` / `INVALID_PAYLOAD` from `enqueue` / `enqueueBatch`). Carries **every** detected issue — not just the first — so consumers can surface all problems at once. `undefined` for non-validation errors. |
+| `validationErrors` | [`ValidationIssue[]`](#validationissue) | Optional. Populated only on validation failures (`INVALID_URL` / `INVALID_PAYLOAD` from `enqueue`, `enqueueBatch` and `configureSync`). Carries **every** detected issue — not just the first — so consumers can surface all problems at once. `undefined` for non-validation errors. |
 | `stack`            | `string`                                | Standard stack trace, inherited from `Error`.                                                                                                                                                                                                                      |
 
 The constructor restores the prototype chain (`Object.setPrototypeOf(this, SyncError.prototype)`), so `instanceof SyncError` works reliably across bundlers and runtime targets.
@@ -77,8 +77,13 @@ type SyncErrorCode =
   | 'TIMEOUT'
   | 'MAX_ATTEMPTS_EXCEEDED'
   | 'DUPLICATE_ITEM'
-  | 'DRAIN_ALREADY_ACTIVE';
+  | 'DRAIN_ALREADY_ACTIVE'
+  | 'NETWORK_QUALITY_TOO_LOW'
+  | 'HEALTH_CHECK_FAILED'
+  | 'DEAD_LETTERED';
 ```
+
+The last three were added in v0.3. A `switch` over `SyncErrorCode` that ends in a `never` exhaustiveness check needs a case for each.
 
 ### Matrix
 
@@ -86,18 +91,21 @@ type SyncErrorCode =
 | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------- | ------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | `NETWORK_ERROR`                       | Transport failure (DNS, socket, TLS, no route). Also what `flush()` rejects with when its cycle dies, whatever the cause.                                                                         | Yes        | Item events. `flush()` rejection.                                                                 | Wait for connectivity; the engine will retry per `RetryPolicy`.                                                                               |
 | `SERVER_ERROR`                        | A response outside 2xx, other than 401/403.                                                                                                                                                       | If listed  | Item events. Retried when the status is in `RetryPolicy.retryOnStatusCodes`; otherwise terminal.  | Retry handled automatically. Investigate server-side if it persists.                                                                          |
-| `INVALID_PAYLOAD`                     | The item failed validation, with detail in `validationErrors`. Also the fallback for a native rejection in most functions, with no `validationErrors`.                                          | No         | `enqueue`, `enqueueBatch`, and most functions as a fallback.                                      | Fix the call site. With no `validationErrors`, read [Native rejections](#native-rejections).                                                  |
-| `QUEUE_FULL`                          | The queue is at `SyncOptions.maxQueueSize`. Raised by native only.                                                                                                                                | No         | Does not reach JS yet: see [Native rejections](#native-rejections).                               | Flush, drop the item, or surface a "retry later" UX.                                                                                          |
+| `INVALID_PAYLOAD`                     | The item or the options failed validation, with detail in `validationErrors`. Also the fallback for a native rejection in most functions, with no `validationErrors`.                            | No         | `enqueue`, `enqueueBatch`, `configureSync` (for `minNetworkQuality`, `healthCheckTtlMs`, `healthCheckBackoffMs`), and most functions as a fallback. | Fix the call site. With no `validationErrors`, read [Native rejections](#native-rejections).                                                  |
+| `QUEUE_FULL`                          | The queue is at `SyncOptions.maxQueueSize`. Raised by native only, by `enqueue`, `enqueueBatch` and `replayDeadLetter`.                                                                          | No         | Does not reach JS yet: see [Native rejections](#native-rejections).                               | Flush, drop the item, or surface a "retry later" UX. A rejected replay keeps the dead letter.                                                 |
 | `NATIVE_MODULE_UNAVAILABLE`           | Called on web / SSR or before native linking completed.                                                                                                                                           | No         | Every facade function, from the JS layer.                                                         | Guard with `isNativeModuleAvailable()` and provide a JS fallback or no-op.                                                                    |
 | `BACKGROUND_TASK_REGISTRATION_FAILED` | iOS: `com.gabriel-sisjr.syncprovider.background` missing from `BGTaskSchedulerPermittedIdentifiers`, or running on a simulator. Android: WorkManager rejected the request.                       | No         | `enableBackgroundSync`. Also the fallback for `disableBackgroundSync` and `isBackgroundSyncEnabled`. | See [Background sync guide](../guides/background-sync.md) and the per-platform [Production checklist](../production/production-checklist.md). |
-| `INVALID_URL`                         | `url` is missing, empty, or not an absolute `http(s)` URL.                                                                                                                                        | No         | `enqueue`. `enqueueBatch` reports URL problems under `INVALID_PAYLOAD`, in `validationErrors`.    | Validate URLs at the caller.                                                                                                                  |
-| `UNAUTHORIZED`                        | HTTP 401 / 403 from the server.                                                                                                                                                                   | No         | Item events. On `ITEM_RETRYING` during a [credential hold](../guides/background-sync.md#cold-start-configuration), otherwise on `ITEM_FAILED`. | Call `configureSync` with a fresh token. A failed item does not come back: enqueue it again. |
+| `INVALID_URL`                         | `url` or `SyncOptions.healthCheckUrl` is missing, empty, or not an absolute `http(s)` URL.                                                                                                       | No         | `enqueue`, `configureSync`. `enqueueBatch` reports URL problems under `INVALID_PAYLOAD`, in `validationErrors`. | Validate URLs at the caller.                                                                                                    |
+| `UNAUTHORIZED`                        | HTTP 401 / 403 from the server.                                                                                                                                                                   | No         | Item events. On `ITEM_RETRYING` during a [credential hold](../guides/background-sync.md#cold-start-configuration), otherwise on `ITEM_FAILED`, and as the dead letter's `lastErrorCode`. | Call `configureSync` with a fresh token, then [`replayDeadLetter`](./functions.md#replaydeadletter) the rejected items. |
 | `TIMEOUT`                             | Per-request `requestTimeoutMs` exceeded. Android can report this expiry as `NETWORK_ERROR`, which is retried the same way.                                                                       | Yes        | Item events.                                                                                      | Retry handled automatically per policy; consider increasing `requestTimeoutMs` for large bodies.                                              |
-| `MAX_ATTEMPTS_EXCEEDED`               | A retriable failure with no attempts left in `RetryPolicy.maxAttempts`. A non-retryable failure keeps its real code, even on the last attempt.                                                   | No         | `ITEM_FAILED`.                                                                                    | Decide whether to enqueue the request again. `ITEM_RETRYING` events show the failure that led here.                                           |
+| `MAX_ATTEMPTS_EXCEEDED`               | A retriable failure with no attempts left in `RetryPolicy.maxAttempts`, or an item whose attempts already reached a lowered `maxAttempts`, which is dead-lettered without a request. A non-retryable failure keeps its real code, even on the last attempt. Also the `lastErrorCode` of a dead letter moved by the upgrade with no usable code. | No | `ITEM_FAILED`, dead letters.                                                                    | Replay the dead letter once the cause is fixed, or discard it. `ITEM_RETRYING` events show the failure that led here.                       |
 | `DUPLICATE_ITEM`                      | Reserved. Neither platform raises it: ids are native-assigned ULIDs.                                                                                                                              | No         | Never.                                                                                            | None.                                                                                                                                         |
 | `DRAIN_ALREADY_ACTIVE`                | A [`drainUntilEmpty()`](./functions.md#drainuntilempty) loop is already running or still settling in this process. Only one bounded drain may run at a time.                                     | No         | `drainUntilEmpty`.                                                                                | Await the previous drain. Do not rely on [`cancelDrain()`](./functions.md#canceldrain) followed by an immediate restart.                      |
+| `NETWORK_QUALITY_TOO_LOW`             | A flush cycle was skipped because the network quality is below `SyncOptions.minNetworkQuality`. No item changes and no attempt is spent.                                                          | Yes        | `SYNC_FAILED`, with no `SYNC_STARTED` before it.                                                  | Nothing for automatic wakes: a blocked wake runs once the quality reaches the minimum. A `flush()` call is not repeated, so call it again later. See [The quality gate](../guides/connectivity-detection.md#the-quality-gate). |
+| `HEALTH_CHECK_FAILED`                 | A flush cycle was skipped because the `HEAD` to `SyncOptions.healthCheckUrl` did not end with a `2xx`, or because the backoff after such a failure (`healthCheckBackoffMs`) was still running. No item changes and no attempt is spent. | Yes | `SYNC_FAILED`, with no `SYNC_STARTED` before it. | Check the endpoint. The next retry wake waits for the backoff to end. See [Health check](../guides/connectivity-detection.md#health-check). |
+| `DEAD_LETTERED`                       | The item was moved to the dead-letter queue. Never a dead letter's `lastErrorCode`: the event's `metadata.lastErrorCode` and the dead letter carry the real code.                                | No         | `ITEM_DEAD_LETTERED`.                                                                             | Inspect with [`listDeadLetter`](./functions.md#listdeadletter), then replay or discard.                                                      |
 
-Use this matrix when designing your error UI -- any code marked retryable will be retried by the engine; non-retryable codes are terminal and signal that the item will not advance without code changes.
+Use this matrix when designing your error UI. A retryable item code is retried by the engine, and a retryable skip code (`NETWORK_QUALITY_TOO_LOW`, `HEALTH_CHECK_FAILED`) leaves every item queued for a later cycle. A non-retryable item code is terminal: the item moves to the [dead-letter queue](./types.md#syncdeadletteritem), and only a replay brings it back.
 
 ---
 
@@ -112,7 +120,7 @@ Native codes do not reach JS through a rejection yet. Each facade function maps 
 | Every other function                                                        | `INVALID_PAYLOAD`                     |
 
 :::warning `QUEUE_FULL` reaches you as `INVALID_PAYLOAD`
-The native layer raises `QUEUE_FULL`, but `enqueue` and `enqueueBatch` reject with `INVALID_PAYLOAD`, so `err.code === SyncErrorCode.QUEUE_FULL` never matches. A validation failure always carries `validationErrors`, and a native rejection never does, so test for that:
+The native layer raises `QUEUE_FULL`, but `enqueue`, `enqueueBatch` and `replayDeadLetter` reject with `INVALID_PAYLOAD`, so `err.code === SyncErrorCode.QUEUE_FULL` never matches. A validation failure always carries `validationErrors`, and a native rejection never does, so test for that:
 
 ```ts
 try {
@@ -131,13 +139,13 @@ try {
 
 :::
 
-Codes describing a dispatched request arrive on events instead, on `ITEM_FAILED` and `ITEM_RETRYING`. They are not rejections, because per-item failures never reject.
+Codes describing a dispatched request arrive on events instead, on `ITEM_FAILED` and `ITEM_RETRYING`, and stay on the dead letter as `lastErrorCode`. Codes for a cycle skipped at the start of a flush arrive on `SYNC_FAILED`. None of them are rejections, because per-item failures and skipped cycles never reject.
 
 ---
 
 ## `ValidationIssue`
 
-A single, machine-readable validation violation, attached to [`SyncError.validationErrors`](#syncerror) on `INVALID_URL` / `INVALID_PAYLOAD` failures. Instead of parsing one opaque `message`, consumers can react to **every** problem with a payload.
+A single, machine-readable validation violation, attached to [`SyncError.validationErrors`](#syncerror) on `INVALID_URL` / `INVALID_PAYLOAD` failures from `enqueue`, `enqueueBatch` and `configureSync`. Instead of parsing one opaque `message`, consumers can react to **every** problem with a payload.
 
 ```ts
 import type { ValidationIssue } from '@gabriel-sisjr/react-native-sync-provider';
@@ -152,10 +160,10 @@ type ValidationIssue = {
 
 | Property    | Type      | Description                                                                                                                           |
 | ----------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `field`     | `string`  | Dotted path of the offending field, e.g. `"url"`, `"method"`, `"headers.Authorization"`, or `"input"` when the whole item is invalid. |
+| `field`     | `string`  | Dotted path of the offending field, e.g. `"url"`, `"method"`, `"headers.Authorization"`, or `"input"` when the whole item is invalid. For `configureSync`, the `SyncOptions` field name, e.g. `"healthCheckUrl"`, or `"options"` when the argument is not an object. |
 | `reason`    | `string`  | Human-readable explanation of why `field` failed.                                                                                     |
-| `value`     | `unknown` | The offending value. Set only for `method`, `priority` and `contentType`. Never set for `url`, `body`, `headers`, `metadata` or a whole-item `input` failure, because errors end up in logs and those fields can hold credentials and personal data. |
-| `itemIndex` | `number`  | Zero-based index of the originating item in a batch. Omitted for single-item validation.                                              |
+| `value`     | `unknown` | The offending value. Set only for `method`, `priority` and `contentType`, and for the `SyncOptions` fields `minNetworkQuality`, `healthCheckTtlMs` and `healthCheckBackoffMs`. Never set for `url`, `body`, `headers`, `metadata`, a whole-item `input` failure or `healthCheckUrl`, because errors end up in logs and those fields can hold credentials and personal data. |
+| `itemIndex` | `number`  | Zero-based index of the originating item in a batch. Omitted for single-item validation and for `configureSync`.                      |
 
 ### Batch validation aggregates all issues
 

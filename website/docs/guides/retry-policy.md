@@ -14,7 +14,7 @@ keywords:
 
 # Retry Policy
 
-Every queued item carries a retry budget. When a retriable dispatch fails, the item waits out a cooldown from the configured backoff curve, then a later cycle tries again, up to `maxAttempts` attempts in total. After the budget is exhausted, the item fails permanently with `MAX_ATTEMPTS_EXCEEDED` and is reported on `ITEM_FAILED`.
+Every queued item carries a retry budget. When a retriable dispatch fails, the item waits out a cooldown from the configured backoff curve, then a later cycle tries again, up to `maxAttempts` attempts in total. After the budget is exhausted, the item fails permanently with `MAX_ATTEMPTS_EXCEEDED`, is reported on `ITEM_FAILED`, and moves to the [dead-letter queue](#permanent-failures).
 
 ## `RetryPolicy`
 
@@ -111,7 +111,7 @@ Status codes **not** in the list are permanent failures, with the matching `Sync
 
 ## Permanent Failures
 
-An item fails permanently when it hits a non-retryable failure, or a retriable one with no attempts left. Listen to `ITEM_FAILED`, which works on both platforms:
+An item fails permanently when it hits a non-retryable failure, or a retriable one with no attempts left. Listen to `ITEM_FAILED`, which works on both platforms, and to `ITEM_DEAD_LETTERED`, which follows it:
 
 ```ts
 import {
@@ -120,18 +120,28 @@ import {
 } from '@gabriel-sisjr/react-native-sync-provider';
 
 useSyncEvents({
-  types: [SyncEventType.ITEM_FAILED],
-  onEvent: (e) => console.warn(`item ${e.itemId} failed: ${e.errorCode}`),
+  types: [SyncEventType.ITEM_FAILED, SyncEventType.ITEM_DEAD_LETTERED],
+  onEvent: (e) => console.warn(`item ${e.itemId}: ${e.type} ${e.errorCode}`),
 });
 ```
 
 `MAX_ATTEMPTS_EXCEEDED` applies only to a retriable failure with no attempts left. A non-retryable failure keeps its real code, including on the last attempt, so a 401 stays `UNAUTHORIZED`. For an exhausted item, the `ITEM_RETRYING` events before it carry the failures that led there.
 
-The item stays in the queue store as a `FAILED` row. It is no longer counted by `getQueueSize()` or returned by `getPendingItems()`, and nothing retries it. Remove it with [`removeItem`](../api-reference/functions.md#removeitem), using the id from the event, or with [`clearQueue`](../api-reference/functions.md#clearqueue).
+Lowering `maxAttempts` can leave items whose budget is already spent. The next cycle dead-letters them without sending a request: `ITEM_FAILED` with `MAX_ATTEMPTS_EXCEEDED`, the stored attempt count and no `statusCode`, then `ITEM_DEAD_LETTERED`, with `lastErrorMessage` set to `Retry budget exhausted`. A `maxAttempts` below `1` reads as `1`, so a new item is always sent once.
 
-:::warning `FAILED` rows count toward the Android cap
-Until the v0.3 dead-letter queue, Android counts `FAILED` rows toward `maxQueueSize`, so they can fill the queue while `getQueueSize()` reads low. JS cannot list them, so remove them as `ITEM_FAILED` arrives if your app runs for long periods offline or against a failing endpoint.
+In one transaction, the item leaves the queue and enters the dead-letter queue, with its request, its attempt count, the last error code and message, and the time it was moved. Then `ITEM_FAILED` is emitted with the real code and, synchronously, `ITEM_DEAD_LETTERED` with `errorCode: 'DEAD_LETTERED'` and `metadata.lastErrorCode` set to that code. Nothing retries a dead letter on its own:
+
+- [`listDeadLetter`](../api-reference/functions.md#listdeadletter) reads them, oldest first.
+- [`replayDeadLetter`](../api-reference/functions.md#replaydeadletter) puts one back as a fresh item, with `attempts: 0` and `nextRetryAt: 0`. It counts toward `maxQueueSize` like an enqueue.
+- [`discardDeadLetter`](../api-reference/functions.md#discarddeadletter) or [`removeItem`](../api-reference/functions.md#removeitem) deletes one, and [`clearQueue`](../api-reference/functions.md#clearqueue) deletes them all with the queue.
+
+See [Dead-letter flows](./error-handling.md#dead-letter-flows) for the usual patterns.
+
+:::warning The dead-letter queue is unbounded
+Dead letters count toward no capacity cap, on either platform, and nothing prunes them. Each one keeps its headers and body. Discard what you will not replay, especially if your app runs for long periods offline or against a failing endpoint.
 :::
+
+Before v0.3, a permanently failed item stayed in the queue store, and Android counted it toward `maxQueueSize`. The upgrade moves those rows to the dead-letter queue.
 
 ## Retry Cooldown Across Restarts
 
@@ -164,7 +174,8 @@ Nothing re-dispatches an item before its `nextRetryAt`. These are the triggers t
 
 What the timer does and does not do:
 
-- **It never flushes offline.** Neither dispatcher checks connectivity, so a flush offline would spend every attempt and mark valid items `FAILED`. When the timer fires offline, it remembers the wake and flushes when connectivity returns. A manual `flush()` while offline keeps its behavior.
+- **It never flushes offline.** Without `minNetworkQuality`, neither dispatcher checks connectivity, so a flush offline would spend every attempt and send valid items to the dead-letter queue. When the timer fires offline, it remembers the wake and flushes when connectivity returns. A manual `flush()` while offline keeps its behavior unless `minNetworkQuality` is set.
+- **It holds below the quality gate, and during a health-check backoff.** With [`minNetworkQuality`](./connectivity-detection.md#the-quality-gate) set, the timer checks the gate first and holds the wake silently, with no event, until the quality reaches the minimum. It re-checks at 30, 60, 120, 240 and 480 seconds, then every 15 minutes, restarting that backoff when a wake passes, the network changes or the timer is armed again, as every `configureSync` does. See [Held wakes](./connectivity-detection.md#held-wakes).
 - **It only exists in a process with JS.** A worker, a boot broadcast, or an iOS background launch where JS never reaches the library arms no timer. Android relies on the kick there.
 - **It looks at items with a deadline.** Only items with `nextRetryAt > 0`, a cooldown or a credential hold, arm it. Items with `nextRetryAt: 0` do not, so it does not replace a flush for new items, though the cycle it starts takes them too. `resumeSync` is the exception: it considers every pending item, so items with no deadline are dispatched at once.
 - **On iOS it cannot fire while the app is suspended.** It fires on resume.
@@ -174,6 +185,8 @@ That owed wake is the only native flush tied to connectivity. There is no native
 `SyncWorker` reports `Result.success()` on any completed flush, so WorkManager's own backoff is reserved for a worker that fails as a whole and cannot race the cooldown.
 
 After a [rejected stored credential](./background-sync.md#when-a-stored-token-expires), the retry timer and the Android retry kick wait for the hold to end, even if other items are already due. The periodic worker and BGTasks do not wait for it, and a process restart drops it.
+
+After a failed [health check](./connectivity-detection.md#health-check), the next retry wake waits for its backoff to end too, and for at least 1000 ms after the failure, even with `healthCheckBackoffMs: 0`. The next wake is therefore the latest of the item's own deadline, the credential hold, the end of the health-check backoff and that one-second floor.
 
 ### `foregroundOnly` interaction
 

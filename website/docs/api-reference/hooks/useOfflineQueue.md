@@ -38,7 +38,7 @@ function useOfflineQueue(): UseOfflineQueueResult
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `connection` | [`UseConnectionResult`](../types.md#useconnectionresult) | Same shape as `useConnection`: `status`, `type`, `isOnline`, `isMetered`. |
+| `connection` | [`UseConnectionResult`](../types.md#useconnectionresult) | Same shape as `useConnection`: `status`, `type`, `isOnline`, `isMetered`, `networkQuality`. |
 | `size` | `number` | `PENDING` items, cooling ones included, mirroring [`getQueueSize`](../functions.md#getqueuesize). |
 | `items` | [`SyncItem[]`](../types.md#syncitem) | The same items, mirroring [`getPendingItems`](../functions.md#getpendingitems). |
 | `isSyncing` | `boolean` | Whether a flush is in flight. |
@@ -56,9 +56,9 @@ function useOfflineQueue(): UseOfflineQueueResult
 
 ## Behavior
 
-The hook owns its state and drives it from one [`addSyncEventListener`](../listeners.md#addsynceventlistener) subscription. On mount it reads the queue, the connection and `isSyncing()`. The queue is re-read on `ITEM_ENQUEUED`, `ITEM_REMOVED`, `QUEUE_CLEARED`, `ITEM_SUCCEEDED`, `ITEM_FAILED`, `SYNC_SUCCEEDED` and `SYNC_FAILED`, and the connection on `CONNECTION_CHANGED`. It unsubscribes on unmount.
+The hook owns its state and drives it from one [`addSyncEventListener`](../listeners.md#addsynceventlistener) subscription. On mount it reads the queue, the connection and `isSyncing()`. The queue is re-read on `ITEM_ENQUEUED`, `ITEM_REMOVED`, `QUEUE_CLEARED`, `ITEM_SUCCEEDED`, `ITEM_FAILED`, `ITEM_DEAD_LETTERED`, `SYNC_SUCCEEDED` and `SYNC_FAILED`, and the connection on every `CONNECTION_CHANGED`, including the ones emitted when only `networkQuality` changed. It unsubscribes on unmount.
 
-For finer-grained access (per-item removal, sync history), use [`useSyncQueue`](./useSyncQueue.md), [`useSyncStatus`](./useSyncStatus.md) or the facade directly.
+For finer-grained access (per-item removal, sync history, dead letters), use [`useSyncQueue`](./useSyncQueue.md), [`useSyncStatus`](./useSyncStatus.md), [`useSyncSnapshot`](./useSyncSnapshot.md) or the facade directly.
 
 ---
 

@@ -113,8 +113,10 @@ final class SyncEngineConfigTests: XCTestCase {
         fixture.clock.advance(ms: 1)
         _ = try await engine.dispatcher.flush()
 
-        let stored = try await item(id, in: engine)
-        XCTAssertEqual(stored.status, "FAILED")
+        let dead = try await engine.storage.deadLetter(id)
+        XCTAssertEqual(dead?.lastErrorCode, "MAX_ATTEMPTS_EXCEEDED")
+        let queued = try await engine.storage.isQueued(id)
+        XCTAssertFalse(queued, "a terminal failure leaves the queue")
         XCTAssertEqual(requestCount, 2, "the default policy would allow 5")
     }
 
@@ -554,10 +556,13 @@ final class SyncEngineConfigTests: XCTestCase {
 
         _ = try await engine.dispatcher.flush()
 
-        let stored = try await item(id, in: engine)
-        XCTAssertEqual(stored.status, "FAILED")
-        XCTAssertEqual(stored.lastErrorCode, "UNAUTHORIZED")
-        XCTAssertEqual(stored.attempts, 1)
+        let deadValue = try await engine.storage.deadLetter(id)
+
+        let dead = try XCTUnwrap(deadValue)
+        XCTAssertEqual(dead.lastErrorCode, "UNAUTHORIZED")
+        XCTAssertEqual(dead.attempts, 1)
+        let queued = try await engine.storage.isQueued(id)
+        XCTAssertFalse(queued)
     }
 
     func test_persistedConfig_withoutHeaders_rejectionStaysTerminal() async throws {
@@ -567,8 +572,8 @@ final class SyncEngineConfigTests: XCTestCase {
 
         _ = try await engine.dispatcher.flush()
 
-        let stored = try await item(id, in: engine)
-        XCTAssertEqual(stored.status, "FAILED", "no persisted credential is involved")
+        let dead = try await engine.storage.deadLetter(id)
+        XCTAssertNotNil(dead, "no persisted credential is involved: the rejection is terminal")
     }
 
     func test_staleCredential_recoversOnceTheAppConfigures() async throws {
@@ -621,7 +626,7 @@ final class SyncEngineConfigTests: XCTestCase {
         let hold = RecoveryWriteHold(stack: fixture.stack)
         defer { hold.release() }
         let cold = fixture.buildEngine(emitter: emitter)
-        await fulfillment(of: [hold.reached], timeout: 30)
+        await fulfillment(of: [hold.reached], timeout: livenessTimeout)
 
         let task = FakeBackgroundTask()
         fire(cold.background, task)

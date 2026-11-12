@@ -3,6 +3,7 @@ package com.margelo.nitro.syncprovider.testutil
 import com.margelo.nitro.syncprovider.BackgroundSyncOptions
 import com.margelo.nitro.syncprovider.BackoffStrategy
 import com.margelo.nitro.syncprovider.HttpMethod
+import com.margelo.nitro.syncprovider.NetworkQuality
 import com.margelo.nitro.syncprovider.RetryPolicy
 import com.margelo.nitro.syncprovider.SyncItemInput
 import com.margelo.nitro.syncprovider.SyncOptions
@@ -37,6 +38,10 @@ internal object TestData {
     persistQueue: Boolean? = true,
     defaultHeaders: Map<String, String>? = null,
     strategy: SyncStrategy = SyncStrategy.AUTOMATIC,
+    minNetworkQuality: NetworkQuality? = null,
+    healthCheckUrl: String? = null,
+    healthCheckTtlMs: Double? = null,
+    healthCheckBackoffMs: Double? = null,
   ): SyncOptions = SyncOptions(
     strategy = strategy,
     retryPolicy = retryPolicy,
@@ -45,6 +50,10 @@ internal object TestData {
     maxQueueSize = maxQueueSize?.toDouble(),
     persistQueue = persistQueue,
     defaultHeaders = defaultHeaders,
+    minNetworkQuality = minNetworkQuality,
+    healthCheckUrl = healthCheckUrl,
+    healthCheckTtlMs = healthCheckTtlMs,
+    healthCheckBackoffMs = healthCheckBackoffMs,
   )
 
   fun backgroundSyncOptions(

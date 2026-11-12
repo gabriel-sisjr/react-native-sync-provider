@@ -3,8 +3,9 @@
 //  SyncProvider
 //
 //  Keeps the configuration available to a process the app never spoke to: a
-//  BGTask launch runs with no JS, yet must honor the retry policy, timeouts
-//  and queue cap the app set, and send the headers it configured.
+//  BGTask launch runs with no JS, yet must honor the retry policy, timeouts,
+//  queue cap and network-health options the app set, and send the headers it
+//  configured.
 //
 
 import Foundation
@@ -19,6 +20,10 @@ struct LoadedSyncConfig: Sendable {
 }
 
 /// The non-secret half of `SyncOptions`. `defaultHeaders` is reduced to a flag.
+///
+/// The network-health fields are optional and absent while unset, so a record
+/// written before they existed still decodes, and an older build reading a
+/// newer record ignores them.
 private struct PersistedSyncRecord: Codable {
     var strategy: String
     var maxAttempts: Int
@@ -32,6 +37,10 @@ private struct PersistedSyncRecord: Codable {
     var maxQueueSize: Double
     var persistQueue: Bool
     var hasDefaultHeaders: Bool
+    var minNetworkQuality: String?
+    var healthCheckUrl: String?
+    var healthCheckTtlMs: Double?
+    var healthCheckBackoffMs: Double?
 
     init(_ options: SyncOptionsSnapshot) {
         strategy = options.strategy
@@ -46,10 +55,18 @@ private struct PersistedSyncRecord: Codable {
         maxQueueSize = options.maxQueueSize
         persistQueue = options.persistQueue
         hasDefaultHeaders = !options.defaultHeaders.isEmpty
+        minNetworkQuality = options.minNetworkQuality?.rawValue
+        healthCheckUrl = options.healthCheckUrl
+        healthCheckTtlMs = options.healthCheckTtlMs
+        healthCheckBackoffMs = options.healthCheckBackoffMs
     }
 
     var options: SyncOptionsSnapshot {
-        SyncOptionsSnapshot(
+        let quality = minNetworkQuality.flatMap(NetworkQualityLevel.init(rawValue:))
+        if minNetworkQuality != nil, quality == nil {
+            SyncLogger.error("Stored minNetworkQuality is unknown; ignoring it", category: "general")
+        }
+        return SyncOptionsSnapshot(
             strategy: strategy,
             retryPolicy: RetryPolicyValue(
                 maxAttempts: maxAttempts,
@@ -63,8 +80,12 @@ private struct PersistedSyncRecord: Codable {
             requestTimeoutMs: requestTimeoutMs,
             maxQueueSize: maxQueueSize,
             persistQueue: persistQueue,
-            defaultHeaders: [:]
-        )
+            defaultHeaders: [:],
+            minNetworkQuality: quality,
+            healthCheckUrl: healthCheckUrl,
+            healthCheckTtlMs: healthCheckTtlMs,
+            healthCheckBackoffMs: healthCheckBackoffMs
+        ).droppingInvalidNetworkHealth()
     }
 }
 

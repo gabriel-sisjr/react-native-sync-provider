@@ -5,6 +5,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Test
@@ -208,5 +209,231 @@ internal class RetryTimerTest {
     runCurrent()
 
     assertThat(calls).isEqualTo(2)
+  }
+
+  /* ------------------------------ held by a gate ------------------------------ */
+
+  /** Null while the gate is open; read by the timer before each dispatch, as the runtime does. */
+  private var hold: WakeHold? = null
+  private var holdChecks = 0
+
+  private fun TestScope.gatedTimer(flush: suspend () -> Unit = { flushes++ }): RetryTimer =
+    RetryTimer(
+      scope = backgroundScope,
+      isOffline = { offline },
+      flush = flush,
+      holdReason = {
+        holdChecks++
+        hold
+      },
+    )
+
+  @Test
+  fun `gate_automaticWake_rerunsWhenQualityReachesMinimum, holding it silently until then`() = runTest {
+    hold = WakeHold.Quality
+    val timer = gatedTimer()
+
+    timer.arm(1_000L)
+    advance(1_000L)
+    // Held without a flush, so the dispatcher emits nothing.
+    assertThat(flushes).isEqualTo(0)
+    assertThat(timer.isWaiting).isTrue()
+
+    hold = null
+    timer.onDispatchPossible()
+    runCurrent()
+    assertThat(flushes).isEqualTo(1)
+
+    // Delivered once: its next check does not run it again.
+    advance(GateRecheck.MAX_DELAY_MS)
+    assertThat(flushes).isEqualTo(1)
+    assertThat(timer.isWaiting).isFalse()
+  }
+
+  @Test
+  fun `a held wake is checked again after 30 s, doubling up to 15 min`() = runTest {
+    hold = WakeHold.Quality
+    val timer = gatedTimer()
+    timer.arm(0L)
+    runCurrent()
+    val checks = mutableListOf<Long>()
+
+    repeat(7) {
+      val before = holdChecks
+      val startedAt = currentTime
+      while (holdChecks == before) advance(1_000L)
+      checks += currentTime - startedAt
+    }
+
+    assertThat(checks).containsExactly(
+      30_000L, 60_000L, 120_000L, 240_000L, 480_000L, 900_000L, 900_000L,
+    ).inOrder()
+    assertThat(flushes).isEqualTo(0)
+  }
+
+  @Test
+  fun `a held wake runs on its own check once the gate opens`() = runTest {
+    hold = WakeHold.Quality
+    val timer = gatedTimer()
+    timer.arm(0L)
+    runCurrent()
+
+    hold = null
+    advance(GateRecheck.FIRST_DELAY_MS)
+
+    assertThat(flushes).isEqualTo(1)
+  }
+
+  @Test
+  fun `a held wake waits for the minimum, not just for the network`() = runTest {
+    hold = WakeHold.Quality
+    val timer = gatedTimer()
+    timer.arm(0L)
+    runCurrent()
+
+    timer.onNetworkAvailable()
+    runCurrent()
+
+    assertThat(flushes).isEqualTo(0)
+  }
+
+  @Test
+  fun `a wake that fired offline is held, not flushed, when the gate is closed once online`() = runTest {
+    offline = true
+    hold = WakeHold.Quality
+    val timer = gatedTimer()
+    timer.arm(0L)
+    runCurrent()
+
+    offline = false
+    timer.onNetworkAvailable()
+    runCurrent()
+    assertThat(flushes).isEqualTo(0)
+    assertThat(timer.isWaiting).isTrue()
+
+    hold = null
+    timer.onDispatchPossible()
+    runCurrent()
+    assertThat(flushes).isEqualTo(1)
+  }
+
+  @Test
+  fun `a new link starts the backoff over and checks a held wake within 30 s`() = runTest {
+    hold = WakeHold.Quality
+    val timer = gatedTimer()
+    timer.arm(0L)
+    runCurrent()
+    // Two checks in: the next one would come 120 s later.
+    advance(30_000L + 60_000L)
+    val before = holdChecks
+
+    timer.resetGateBackoff()
+    advance(GateRecheck.FIRST_DELAY_MS - 1L)
+    assertThat(holdChecks).isEqualTo(before)
+
+    advance(1L)
+    assertThat(holdChecks).isGreaterThan(before)
+  }
+
+  @Test
+  fun `a new arm starts the backoff over and supersedes a held wake`() = runTest {
+    hold = WakeHold.Quality
+    val timer = gatedTimer()
+    timer.arm(0L)
+    runCurrent()
+    advance(30_000L + 60_000L)
+
+    timer.arm(1_000L)
+    timer.onDispatchPossible()
+    runCurrent()
+    assertThat(flushes).isEqualTo(0)
+
+    advance(1_000L)
+    val before = holdChecks
+    advance(GateRecheck.FIRST_DELAY_MS - 1L)
+    assertThat(holdChecks).isEqualTo(before)
+    advance(1L)
+    assertThat(holdChecks).isGreaterThan(before)
+  }
+
+  @Test
+  fun `a gate that opens between the check and the hold releases the wake at once`() = runTest {
+    var checksLeft = 1
+    val timer = RetryTimer(
+      scope = backgroundScope,
+      isOffline = { false },
+      flush = { flushes++ },
+      holdReason = { if (checksLeft-- > 0) WakeHold.Quality else null },
+    )
+
+    timer.arm(0L)
+    runCurrent()
+
+    assertThat(flushes).isEqualTo(1)
+    assertThat(timer.isWaiting).isFalse()
+  }
+
+  @Test
+  fun `a wake the dispatcher turned back is held like one the timer held`() = runTest {
+    val timer = gatedTimer()
+    hold = WakeHold.Quality
+
+    timer.holdForQuality()
+    advance(GateRecheck.FIRST_DELAY_MS - 1L)
+    assertThat(flushes).isEqualTo(0)
+
+    hold = null
+    advance(1L)
+    assertThat(flushes).isEqualTo(1)
+  }
+
+  @Test
+  fun `a health-check backoff holds a wake silently until it ends, outside the quality backoff`() =
+    runTest {
+      hold = WakeHold.Health(remainingMs = 45_000L)
+      val timer = gatedTimer()
+      timer.arm(0L)
+      runCurrent()
+
+      advance(44_999L)
+      assertThat(flushes).isEqualTo(0)
+      // The backoff ends while the quality gate is closed: the quality backoff starts at 30 s.
+      hold = WakeHold.Quality
+      advance(1L)
+      val before = holdChecks
+      advance(GateRecheck.FIRST_DELAY_MS - 1L)
+      assertThat(holdChecks).isEqualTo(before)
+      advance(1L)
+      assertThat(holdChecks).isGreaterThan(before)
+      assertThat(flushes).isEqualTo(0)
+    }
+
+  @Test
+  fun `cancel forgets a held wake`() = runTest {
+    hold = WakeHold.Quality
+    val timer = gatedTimer()
+    timer.arm(0L)
+    runCurrent()
+
+    timer.cancel()
+    hold = null
+    timer.onDispatchPossible()
+    advance(GateRecheck.MAX_DELAY_MS)
+
+    assertThat(flushes).isEqualTo(0)
+  }
+
+  @Test
+  fun `a wake owed to the network is also delivered once dispatch is possible`() = runTest {
+    offline = true
+    val timer = gatedTimer()
+    timer.arm(0L)
+    runCurrent()
+
+    offline = false
+    timer.onDispatchPossible()
+    runCurrent()
+
+    assertThat(flushes).isEqualTo(1)
   }
 }

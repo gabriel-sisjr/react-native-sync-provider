@@ -1,10 +1,12 @@
 package com.margelo.nitro.syncprovider.http
 
 import android.util.Log
+import com.margelo.nitro.syncprovider.NetworkQuality
 import com.margelo.nitro.syncprovider.SyncErrorCode
 import com.margelo.nitro.syncprovider.SyncEventType
 import com.margelo.nitro.syncprovider.SyncOptions
 import com.margelo.nitro.syncprovider.SyncResult
+import com.margelo.nitro.syncprovider.connectivity.meetsMinimum
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
 import com.margelo.nitro.syncprovider.error.SyncException
 import com.margelo.nitro.syncprovider.events.SyncEventEmitter
@@ -16,6 +18,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -61,6 +65,11 @@ import kotlin.random.Random
  *   back-off jitter; injectable for reproducible delays in tests.
  * @param isPaused checked inside the mutex, so every caller obeys it, workers included.
  * @param credentialPolicy read once per cycle. See [CredentialPolicy].
+ * @param networkQuality the classification the `minNetworkQuality` gate compares. Read only
+ *   while a gate is configured.
+ * @param healthCheck run before the claim while `healthCheckUrl` is set.
+ * @param onHealthCheckSkipped called after every cycle the health check skipped, to arm the
+ *   next wake no earlier than its backoff.
  * @param onCycleFinished called after every cycle. Its argument, when present, is
  *   the earliest instant the next wake may fire. Failures are logged and never
  *   reject a cycle that already completed.
@@ -74,6 +83,9 @@ internal class SyncDispatcher(
   private val random: Random = Random.Default,
   private val isPaused: () -> Boolean = { false },
   private val credentialPolicy: () -> CredentialPolicy = { CredentialPolicy.TRUSTED },
+  private val networkQuality: () -> NetworkQuality = { NetworkQuality.GOOD },
+  private val healthCheck: HealthCheck = HealthCheck(HeadProbe()),
+  private val onHealthCheckSkipped: suspend () -> Unit = {},
   private val onCycleFinished: suspend (notBefore: Long?) -> Unit = {},
 ) {
   private val flushMutex = Mutex()
@@ -94,17 +106,42 @@ internal class SyncDispatcher(
    * failures are aggregated; the function only throws when the cycle itself
    * cannot run (e.g. the storage layer fails).
    *
-   * Paused, or with default headers that cannot be recovered, nothing is dispatched
-   * and an empty sentinel result is returned without starting a cycle.
+   * See [flushWithOutcome] for when no cycle runs.
    */
-  suspend fun flush(): SyncResult = flushMutex.withLock {
-    if (isPaused()) return@withLock emptyResult()
+  suspend fun flush(): SyncResult = flushWithOutcome().result
+
+  /**
+   * [flush], telling callers that act on it whether a cycle ran. Every flush passes these
+   * checks first, in order, and skips the cycle at the first that fails, with the empty
+   * sentinel result and no `SYNC_STARTED`:
+   * 1. paused;
+   * 2. default headers that cannot be recovered;
+   * 3. the network-quality gate: with `minNetworkQuality` set to more than `OFFLINE` and
+   *    [networkQuality] below it, `SYNC_FAILED` is emitted with `NETWORK_QUALITY_TOO_LOW`;
+   * 4. the health check, while `healthCheckUrl` is set: one `HEAD` unless a `2xx` answer is
+   *    younger than `healthCheckTtlMs`. A failure, and every flush during the backoff that
+   *    follows it, emits `SYNC_FAILED` with `HEALTH_CHECK_FAILED`.
+   * No history row is written and no item changes.
+   */
+  suspend fun flushWithOutcome(): FlushOutcome = flushMutex.withLock {
+    if (isPaused()) return@withLock FlushOutcome.Skipped(FlushSkip.PAUSED)
     val credentials = credentialPolicy()
     if (credentials == CredentialPolicy.UNAVAILABLE) {
       Log.w(TAG, "Default headers cannot be recovered; leaving the queue untouched.")
-      return@withLock emptyResult()
+      return@withLock FlushOutcome.Skipped(FlushSkip.CREDENTIALS_UNAVAILABLE)
     }
-    runCycle(getOptions(), credentials)
+    val options = getOptions()
+    if (isBelowMinimumQuality(options)) {
+      emitter.emit(
+        SyncEventEmitter.event(
+          type = SyncEventType.SYNC_FAILED,
+          errorCode = SyncErrorCode.NETWORK_QUALITY_TOO_LOW,
+        ),
+      )
+      return@withLock FlushOutcome.Skipped(FlushSkip.NETWORK_QUALITY_TOO_LOW)
+    }
+    healthCheckSkip(options)?.let { return@withLock FlushOutcome.Skipped(it) }
+    FlushOutcome.Ran(runCycle(options, credentials))
   }
 
   /**
@@ -115,6 +152,37 @@ internal class SyncDispatcher(
   suspend fun resetInFlight(): Int = flushMutex.withLock { storage.resetInFlight() }
 
   /* ------------------------------ internals ----------------------------- */
+
+  /** Null when the cycle may run. Otherwise the event is emitted and the next wake armed. */
+  private suspend fun healthCheckSkip(options: SyncOptions): FlushSkip? {
+    val url = options.healthCheckUrl ?: return null
+    val verdict = healthCheck.check(
+      url = url,
+      ttlMs = options.healthCheckTtlMs?.toLong() ?: HealthCheck.DEFAULT_TTL_MS,
+      backoffMs = options.healthCheckBackoffMs?.toLong() ?: HealthCheck.DEFAULT_BACKOFF_MS,
+    )
+    val skip = when (verdict) {
+      HealthCheck.Verdict.Healthy -> return null
+      is HealthCheck.Verdict.Failed -> FlushSkip.HEALTH_CHECK_FAILED
+      is HealthCheck.Verdict.BackingOff -> FlushSkip.HEALTH_CHECK_BACKOFF
+    }
+    emitter.emit(
+      SyncEventEmitter.event(
+        type = SyncEventType.SYNC_FAILED,
+        errorCode = SyncErrorCode.HEALTH_CHECK_FAILED,
+      ),
+    )
+    runCatching { onHealthCheckSkipped() }
+      .onFailure { Log.w(TAG, "Could not arm the wake after the health check", it) }
+    return skip
+  }
+
+  /** Reads [networkQuality] only while a gate is configured: unset and `OFFLINE` gate nothing. */
+  private fun isBelowMinimumQuality(options: SyncOptions): Boolean {
+    val minimum = options.minNetworkQuality ?: return false
+    if (minimum == NetworkQuality.OFFLINE) return false
+    return !networkQuality().meetsMinimum(minimum)
+  }
 
   private suspend fun runCycle(options: SyncOptions, credentials: CredentialPolicy): SyncResult {
     val startedAt = clock()
@@ -185,7 +253,8 @@ internal class SyncDispatcher(
   /**
    * With headers restored from disk, one item goes first. If the server rejects the
    * credential, the rest of the batch is released untouched, so an expired token
-   * costs one request per wake rather than a burst of `batchSize`.
+   * costs one request per wake rather than a burst of `batchSize`. An item purged before
+   * its turn is skipped, and the next one goes first in its place.
    */
   private suspend fun dispatchClaimed(
     claimed: List<SyncItemEntity>,
@@ -195,12 +264,19 @@ internal class SyncDispatcher(
     if (credentials != CredentialPolicy.PERSISTED) {
       return dispatchConcurrently(claimed, options, credentials)
     }
-    val first = dispatchRecordingOutcome(claimed.first(), options, credentials)
-    if (first is ItemOutcome.CredentialRejected) {
-      storage.resetInFlight()
-      return listOf(first)
+    val leading = mutableListOf<ItemOutcome>()
+    for (entity in claimed) {
+      // Dispatches are not cancellable once started: a cancelled cycle starts no more.
+      currentCoroutineContext().ensureActive()
+      val outcome = dispatchRecordingOutcome(entity, options, credentials)
+      leading += outcome
+      if (outcome is ItemOutcome.CredentialRejected) {
+        storage.resetInFlight()
+        return leading
+      }
+      if (outcome !is ItemOutcome.Gone) break
     }
-    return listOf(first) + dispatchConcurrently(claimed.drop(1), options, credentials)
+    return leading + dispatchConcurrently(claimed.drop(leading.size), options, credentials)
   }
 
   private suspend fun dispatchConcurrently(
@@ -244,29 +320,32 @@ internal class SyncDispatcher(
     val policy = options.retryPolicy
     val maxAttempts = policy.maxAttempts.toInt().coerceAtLeast(1)
 
+    // A purge since the claim, a logout say, leaves nothing to send: no request and no event
+    // of its own. Once the request is out, its outcome is reported even if a purge follows.
+    if (!storage.isQueued(entity.id)) return ItemOutcome.Gone(entity.id)
+
     // Cross-cycle attempt counter: this attempt is one past whatever prior
     // cycles persisted. Never reset to 0 — the budget must survive cycles.
     val attempt = entity.attempts + 1
     val startedAt = clock()
 
     // Defensive: a row that already exhausted its budget must not be re-attempted.
-    // Terminal rows are FAILED (not claimable), so this only fires if maxAttempts
+    // Terminal rows leave the queue for the dead letters, so this only fires if maxAttempts
     // was lowered via configureSync between cycles.
     if (entity.attempts >= maxAttempts) {
-      storage.markFailed(entity.id, entity.attempts, startedAt, SyncErrorCode.MAX_ATTEMPTS_EXCEEDED)
-      emitter.emit(
-        SyncEventEmitter.event(
-          type = SyncEventType.ITEM_FAILED,
-          itemId = entity.id,
-          errorCode = SyncErrorCode.MAX_ATTEMPTS_EXCEEDED,
-          attempt = entity.attempts,
-        ),
+      val message = "Retry budget exhausted"
+      val moved = deadLetter(
+        entity = entity,
+        attempts = entity.attempts,
+        lastAttemptAt = entity.lastAttemptAt?.takeIf { it > 0L } ?: startedAt,
+        code = SyncErrorCode.MAX_ATTEMPTS_EXCEEDED,
+        detail = message,
+        statusCode = null,
+        requestSent = false,
       )
-      return ItemOutcome.Failed(
-        entity.id,
-        SyncErrorCode.MAX_ATTEMPTS_EXCEEDED,
-        "Retry budget exhausted",
-      )
+      // Purged since the check above: no request went out, so there is nothing to end.
+      if (!moved) return ItemOutcome.Gone(entity.id)
+      return ItemOutcome.Failed(entity.id, SyncErrorCode.MAX_ATTEMPTS_EXCEEDED, message)
     }
 
     return when (val outcome = runOnce(entity, timeoutMs, options.defaultHeaders)) {
@@ -344,17 +423,68 @@ internal class SyncDispatcher(
     // A non-retryable failure keeps its real code; only a retriable one can run out
     // of budget.
     val terminalCode = if (outcome.retryable) SyncErrorCode.MAX_ATTEMPTS_EXCEEDED else outcome.code
-    storage.markFailed(entity.id, attempt, startedAt, terminalCode)
+    deadLetter(
+      entity = entity,
+      attempts = attempt,
+      lastAttemptAt = startedAt,
+      code = terminalCode,
+      detail = outcome.detail,
+      statusCode = outcome.statusCode,
+      requestSent = true,
+    )
+    return ItemOutcome.Failed(entity.id, terminalCode, outcome.message)
+  }
+
+  /**
+   * Move [entity] to the dead letters in one transaction, then report `ITEM_FAILED` with the
+   * real code and, right after it, `ITEM_DEAD_LETTERED` carrying that code in its metadata.
+   *
+   * A row that `clearQueue()` or `removeItem(id)` purged meanwhile is not moved: nothing is
+   * written and no `ITEM_DEAD_LETTERED` follows. When its request went out ([requestSent]),
+   * typically purged while that request was in flight, `ITEM_FAILED` still reports how it
+   * ended, as `ITEM_SUCCEEDED` and `ITEM_RETRYING` do for a purged row, and the cycle still
+   * counts it as failed. When none did, nothing is reported. The same holds on iOS.
+   *
+   * @return true when the row was moved.
+   */
+  @Suppress("LongParameterList")
+  private suspend fun deadLetter(
+    entity: SyncItemEntity,
+    attempts: Int,
+    lastAttemptAt: Long,
+    code: SyncErrorCode,
+    detail: String,
+    statusCode: Int?,
+    requestSent: Boolean,
+  ): Boolean {
+    val moved = storage.moveToDeadLetters(
+      entity = entity,
+      attempts = attempts,
+      lastAttemptAt = lastAttemptAt,
+      lastErrorCode = code,
+      lastErrorMessage = detail,
+      deadLetteredAt = clock(),
+    )
+    if (!moved && !requestSent) return false
     emitter.emit(
       SyncEventEmitter.event(
         type = SyncEventType.ITEM_FAILED,
         itemId = entity.id,
-        errorCode = terminalCode,
-        statusCode = outcome.statusCode,
-        attempt = attempt,
+        errorCode = code,
+        statusCode = statusCode,
+        attempt = attempts,
       ),
     )
-    return ItemOutcome.Failed(entity.id, terminalCode, outcome.message)
+    if (!moved) return false
+    emitter.emit(
+      SyncEventEmitter.event(
+        type = SyncEventType.ITEM_DEAD_LETTERED,
+        itemId = entity.id,
+        errorCode = SyncErrorCode.DEAD_LETTERED,
+        metadata = mapOf(METADATA_LAST_ERROR_CODE to code.name),
+      ),
+    )
+    return true
   }
 
   private suspend fun emitRetrying(
@@ -408,6 +538,8 @@ internal class SyncDispatcher(
           httpResponse.use { resp ->
             val code = resp.code
             val policy = getOptions().retryPolicy
+            // The status line only: the response's headers and body stay out of it.
+            val statusLine = "HTTP $code ${resp.message}".trim()
             when {
               code in 200..299 -> AttemptResult.Success(code)
               code == 401 || code == 403 -> AttemptResult.Failure(
@@ -415,24 +547,28 @@ internal class SyncDispatcher(
                 message = "HTTP $code",
                 statusCode = code,
                 retryable = false,
+                detail = statusLine,
               )
               RetryPolicyEvaluator.shouldRetryStatus(code, policy) -> AttemptResult.Failure(
                 code = SyncErrorCode.SERVER_ERROR,
                 message = "HTTP $code",
                 statusCode = code,
                 retryable = true,
+                detail = statusLine,
               )
               code in 400..499 -> AttemptResult.Failure(
                 code = SyncErrorCode.SERVER_ERROR,
                 message = "HTTP $code",
                 statusCode = code,
                 retryable = false,
+                detail = statusLine,
               )
               else -> AttemptResult.Failure(
                 code = SyncErrorCode.SERVER_ERROR,
                 message = "HTTP $code",
                 statusCode = code,
                 retryable = false,
+                detail = statusLine,
               )
             }
           }
@@ -513,7 +649,8 @@ internal class SyncDispatcher(
 
   /**
    * Rescheduled and held items count as neither success nor failure: they are still
-   * queued, and their outcome belongs to a later cycle.
+   * queued, and their outcome belongs to a later cycle. Nor do items purged before their
+   * dispatch started: they were never sent.
    */
   private fun buildResult(startedAt: Long, outcomes: List<ItemOutcome>): SyncResult {
     val succeeded = outcomes.filterIsInstance<ItemOutcome.Succeeded>().map { it.itemId }
@@ -531,11 +668,16 @@ internal class SyncDispatcher(
 
   private sealed interface AttemptResult {
     data class Success(val statusCode: Int) : AttemptResult
+    /**
+     * @property detail what a dead letter records: the status line, reason phrase included,
+     *   or the exception message. Never a header or a body.
+     */
     data class Failure(
       val code: SyncErrorCode,
       val message: String,
       val statusCode: Int?,
       val retryable: Boolean,
+      val detail: String = message,
     ) : AttemptResult
   }
 
@@ -548,6 +690,9 @@ internal class SyncDispatcher(
 
     /** Restored credential rejected: the item waits, without spending an attempt. */
     data class CredentialRejected(override val itemId: String, val nextRetryAt: Long) : ItemOutcome
+
+    /** Purged before its dispatch started: never sent, and nothing reported for it. */
+    data class Gone(override val itemId: String) : ItemOutcome
     data class Failed(
       override val itemId: String,
       val code: SyncErrorCode,
@@ -567,11 +712,14 @@ internal class SyncDispatcher(
     /** Floor for the wait after a restored credential is rejected. */
     const val MIN_CREDENTIAL_HOLD_MS: Long = 60_000L
 
+    /** Where `ITEM_DEAD_LETTERED` carries the real failure code. */
+    const val METADATA_LAST_ERROR_CODE = "lastErrorCode"
+
     /**
      * The zeroed result that means "no cycle ran". `flush()` returns it to JS unchanged
-     * while paused or while default headers cannot be recovered. `getLastSyncResult()`
-     * returns it when no result is stored, and only there does the facade map it to
-     * `undefined`.
+     * while paused, while default headers cannot be recovered, and while the
+     * network-quality gate holds flushes back. `getLastSyncResult()` returns it when no
+     * result is stored, and only there does the facade map it to `undefined`.
      */
     fun emptyResult(): SyncResult = SyncResult(
       startedAt = 0.0,

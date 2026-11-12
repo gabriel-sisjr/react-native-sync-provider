@@ -249,8 +249,9 @@ export async function runDrain(
         }
       }
 
-      // Neither dispatcher checks connectivity. Flushing offline would burn the
-      // retry budget and mark valid items FAILED, so wait for the network.
+      // Unless `minNetworkQuality` is set, neither dispatcher checks
+      // connectivity. Flushing offline would burn the retry budget and
+      // dead-letter valid items, so wait for the network.
       const connection = await guarded(native.getConnectionStatus);
       if (connection.status === ConnectionStatus.DISCONNECTED) {
         await wait(idleWaitMs);

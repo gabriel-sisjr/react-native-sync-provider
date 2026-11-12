@@ -39,7 +39,7 @@ Jest ignores `<rootDir>/example/node_modules` and `<rootDir>/lib/`. Don't put te
 - `react-native-nitro-modules` — `NitroModules.createHybridObject` returns a stable fake stored on `globalThis.__syncMock`.
 - `react-native` — `Platform`, `AppState`, `NativeEventEmitter`, `NativeModules`.
 - AppState helpers — `simulateAppStateChange('active' | 'background')`.
-- Full mock surface for all 21 HybridObject methods (queue/sync/config/history/connection/background + listeners).
+- Full mock surface for all 24 HybridObject methods (queue/dead letters/sync/config/history/connection/background + listeners).
 
 The facade caches `createHybridObject` on first import. To reset between tests, mutate the same singleton via `Object.assign(currentHybrid, fresh)` instead of recreating — that keeps the same reference alive across tests without `jest.resetModules()`.
 

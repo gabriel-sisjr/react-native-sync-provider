@@ -58,13 +58,16 @@ If `react-native-background-location` is what you reach for when you need GPS th
 - Cross-platform offline-first HTTP queue (Android and iOS)
 - Native persistence: Room (Android) / Core Data (iOS) — queue survives force-close and device reboot
 - OS-scheduled background sync: `WorkManager` (Android) / `BGTaskScheduler` (iOS) flush while the app is not running. The OS decides when, and iOS does not launch an app the user force-quit
-- Connectivity monitoring via `ConnectivityManager.NetworkCallback` (Android) and `NWPathMonitor` (iOS), used by the retry timer, `drainUntilEmpty` and `useAutoSync`
+- Connectivity monitoring via `ConnectivityManager` default-network callbacks (Android) and `NWPathMonitor` (iOS), used by the retry timer, `drainUntilEmpty` and `useAutoSync`
+- Network quality on every connection snapshot (`OFFLINE` / `POOR` / `MODERATE` / `GOOD` / `EXCELLENT`), from link signals or, with a `healthCheckUrl`, from a measured latency. An opt-in `minNetworkQuality` gate skips flushes on a poor link without spending attempts
+- Opt-in health check: a `HEAD` to your `healthCheckUrl` before each batch, with a cached healthy result and a backoff after a failure
+- Dead-letter queue: a request that fails permanently is kept, with its last error, until you replay or discard it (`listDeadLetter`, `replayDeadLetter`, `discardDeadLetter`)
 - Declarative retry policy with linear / exponential / fibonacci backoff, jitter, and a per-status-code allowlist. Cooldowns persist across restarts, and a timer brings items back while the app runs
 - Persisted configuration, so a worker or BGTask with no JS honors it. `defaultHeaders` are encrypted at rest (Android Keystore / iOS Keychain)
 - Priority lanes (`HIGH` / `NORMAL` / `LOW`) enforced by the native dispatcher
 - Two sync strategies: `AUTOMATIC` (the engine retries on its own) and `MANUAL` (it schedules nothing). `OPPORTUNISTIC` is reserved and currently behaves like `AUTOMATIC`
 - 9 fully typed React hooks for connection, queue, status, events, config, a read-only dashboard snapshot, an opt-in orchestrator, and Provider-context access
-- 15 typed event types streamed over a single `sync-event` channel for observability
+- 16 typed event types streamed over a single `sync-event` channel for observability
 - `SyncError` + `SyncErrorCode` discriminated error surface — with structured `validationErrors` — for clean pattern matching
 - At-least-once delivery. A request can be sent twice after a crash, so endpoints must be idempotent. See the [Idempotency guide](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/guides/idempotency)
 - Nitro-powered JSI bridge — no JSON marshalling tax, ~15× faster than legacy native modules
@@ -79,14 +82,14 @@ If `react-native-background-location` is what you reach for when you need GPS th
 | React Native                 | 0.74+                          |
 | React                        | 18.2+                          |
 | New Architecture             | **required**                   |
-| `react-native-nitro-modules` | ^0.35.6                        |
+| `react-native-nitro-modules` | ^0.35.8 (below 0.36)           |
 
 ## Installation
 
 ```sh
-npm install @gabriel-sisjr/react-native-sync-provider react-native-nitro-modules
+npm install @gabriel-sisjr/react-native-sync-provider "react-native-nitro-modules@^0.35.8"
 # or
-yarn add @gabriel-sisjr/react-native-sync-provider react-native-nitro-modules
+yarn add @gabriel-sisjr/react-native-sync-provider "react-native-nitro-modules@^0.35.8"
 ```
 
 ### Android Setup
@@ -210,14 +213,14 @@ For step-by-step setup, see the [Quick Start Guide](https://gabriel-sisjr.github
 
 | Hook                                                                                                                     | Purpose                                                                                        |
 | ------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
-| [`useConnection`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useConnection)     | Live connectivity snapshot (`status`, `type`, `isOnline`, `isMetered`).                        |
+| [`useConnection`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useConnection)     | Live connectivity snapshot (`status`, `type`, `isOnline`, `isMetered`, `networkQuality`).      |
 | [`useSyncQueue`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncQueue)       | Queue contents + write operations (`enqueue`, `enqueueBatch`, `removeItem`, `clearQueue`).     |
 | [`useSyncStatus`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncStatus)     | Sync engine state, progress, last result, `flush`/`pause`/`resume`.                            |
 | [`useOfflineQueue`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useOfflineQueue) | Convenience hook combining connection + queue + sync state for offline-first UIs.              |
-| [`useSyncEvents`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncEvents)     | Typed event stream (15 `SyncEventType`s) with optional filtering.                              |
+| [`useSyncEvents`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncEvents)     | Typed event stream (16 `SyncEventType`s) with optional filtering.                              |
 | [`useSyncConfig`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncConfig)     | Read / update the live `SyncOptions`.                                                          |
 | [`useAutoSync`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useAutoSync)         | Orchestrator: periodic interval + reconnect flush + opt-in AppState foreground trigger.        |
-| [`useSyncSnapshot`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncSnapshot) | Read-only dashboard aggregator (connection + queue + sync state) driven by one subscription.   |
+| [`useSyncSnapshot`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncSnapshot) | Read-only dashboard aggregator (connection + network quality + queue + dead letters + sync state) driven by one subscription. |
 | [`useSyncContext`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncContext)   | Read the `<SyncProvider>` context (`config` + `hasProvider`); never throws outside a Provider. |
 
 See the [Hooks API Reference](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncQueue) for complete documentation, options, and examples.
@@ -249,16 +252,24 @@ const result = await flush();
 | ----------------- | ----------------------------------------------- | ------------------------------------------------------- |
 | `enqueue`         | `(item: SyncItemInput) => Promise<string>`      | Persist a single HTTP request; returns its native ULID. |
 | `enqueueBatch`    | `(items: SyncItemInput[]) => Promise<string[]>` | Atomic batch enqueue; returns ULIDs in input order.     |
-| `removeItem`      | `(id: string) => Promise<boolean>`              | Remove an item by ULID, in any status. `false` if no row has that id. Does not cancel a request in flight. |
-| `clearQueue`      | `() => Promise<void>`                           | Drop every item, including failed ones.                 |
+| `removeItem`      | `(id: string) => Promise<boolean>`              | Remove an item by ULID, in any status, or the dead letter with that id. `false` if neither exists. Does not cancel a request in flight. |
+| `clearQueue`      | `() => Promise<void>`                           | Drop every item and every dead letter.                  |
 | `getQueueSize`    | `() => Promise<number>`                         | `PENDING` items, cooling ones included.                 |
 | `getPendingItems` | `() => Promise<SyncItem[]>`                     | `PENDING` items, cooling included, in dispatch order.   |
+
+### Dead letters
+
+| Method              | Signature                           | Description                                                                                         |
+| ------------------- | ----------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `listDeadLetter`    | `() => Promise<SyncDeadLetterItem[]>` | Every request that failed permanently, oldest first, with its last error. Unbounded: nothing prunes it. |
+| `replayDeadLetter`  | `(id: string) => Promise<void>`     | Put a dead letter back in the queue as a fresh item, same id. Does not flush. Unknown id: no change. |
+| `discardDeadLetter` | `(id: string) => Promise<void>`     | Delete a dead letter. Unknown id: no change.                                                        |
 
 ### Sync operations
 
 | Method            | Signature                                          | Description                                                                                                             |
 | ----------------- | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `flush`           | `() => Promise<SyncResult>`                        | Run one cycle: one batch of eligible items. Per-item failures never reject. Does not check connectivity.                |
+| `flush`           | `() => Promise<SyncResult>`                        | Run one cycle: one batch of eligible items. Per-item failures never reject. Checks connectivity only through `minNetworkQuality`. |
 | `drainUntilEmpty` | `(options?: DrainOptions) => Promise<DrainResult>` | Flush until the queue is empty or a bound stops it. Sleeps through cooldowns and does not flush offline.                |
 | `cancelDrain`     | `() => void`                                       | Hard stop for a running `drainUntilEmpty()`. No-op when none is running.                                                |
 | `pauseSync`       | `() => Promise<void>`                              | Pause the engine until `resumeSync()` or the next launch. Enqueues still accepted; no flushes.                          |
@@ -269,7 +280,7 @@ const result = await flush();
 
 | Method          | Signature                                 | Description                                                                                  |
 | --------------- | ----------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `configureSync` | `(options: SyncOptions) => Promise<void>` | Replace and persist the configuration. Omitting `defaultHeaders` deletes the stored copy.    |
+| `configureSync` | `(options: SyncOptions) => Promise<void>` | Replace and persist the configuration. Omitting `defaultHeaders` deletes the stored copy. Validates the quality-gate and health-check options. |
 | `getSyncConfig` | `() => Promise<SyncOptions>`              | Read the currently active configuration.                                                     |
 
 ### History
@@ -284,7 +295,7 @@ const result = await flush();
 
 | Method                | Signature                        | Description                                 |
 | --------------------- | -------------------------------- | ------------------------------------------- |
-| `getConnectionStatus` | `() => Promise<ConnectionState>` | One-shot read of the OS connectivity state. |
+| `getConnectionStatus` | `() => Promise<ConnectionState>` | One-shot read of the OS connectivity state, with the engine's `networkQuality`. |
 
 ### Background sync
 
@@ -373,10 +384,14 @@ interface SyncOptions {
   maxQueueSize?: number;
   persistQueue?: boolean;
   defaultHeaders?: Record<string, string>;
+  minNetworkQuality?: NetworkQuality; // opt-in gate; unset = no gate
+  healthCheckUrl?: string; // opt-in HEAD before each batch; also the latency target
+  healthCheckTtlMs?: number; // default 60000
+  healthCheckBackoffMs?: number; // default 30000
 }
 ```
 
-> `batchSize` defaults to `25` and `maxQueueSize` to `10000`. `persistQueue` is stored but not used yet: the queue is always persisted. `defaultHeaders` are encrypted at rest, and calling `configureSync` without them deletes the stored copy, which makes it the logout path.
+> `batchSize` defaults to `25` and `maxQueueSize` to `10000`. Dead letters count toward no cap. `persistQueue` is stored but not used yet: the queue is always persisted. `defaultHeaders` are encrypted at rest, and calling `configureSync` without them deletes the stored copy, which makes it the logout path. Below `minNetworkQuality`, or when the health check fails, a flush runs no cycle and emits `SYNC_FAILED` with `NETWORK_QUALITY_TOO_LOW` or `HEALTH_CHECK_FAILED`. The health-check probes carry no `defaultHeaders`. See [Connectivity Detection](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/guides/connectivity-detection).
 
 ### SyncResult
 
@@ -421,11 +436,11 @@ interface SyncEvent {
   timestamp: number;
   itemId?: string;
   progress?: number; // SYNC_PROGRESS only (iOS)
-  errorCode?: SyncErrorCode; // ITEM_FAILED, ITEM_RETRYING; SYNC_FAILED only if the cycle died
+  errorCode?: SyncErrorCode; // ITEM_FAILED, ITEM_RETRYING; DEAD_LETTERED on ITEM_DEAD_LETTERED; SYNC_FAILED only if the cycle died or was skipped
   statusCode?: number; // ITEM_SUCCEEDED, ITEM_FAILED, ITEM_RETRYING
   attempt?: number; // ITEM_SUCCEEDED, ITEM_FAILED, ITEM_RETRYING (1-based)
   connectionStatus?: ConnectionStatus; // CONNECTION_CHANGED
-  metadata?: Record<string, string>; // iOS engine diagnostics, not the item's metadata
+  metadata?: Record<string, string>; // lastErrorCode on ITEM_DEAD_LETTERED; iOS engine diagnostics; never the item's metadata
 }
 ```
 
@@ -450,10 +465,36 @@ interface BackgroundSyncOptions {
 interface ConnectionState {
   status: ConnectionStatus;
   type: ConnectionType;
+  networkQuality: NetworkQuality; // always present; OFFLINE when DISCONNECTED or UNKNOWN
   isInternetReachable?: boolean;
   isExpensive?: boolean;
 }
 ```
+
+> `networkQuality` is required, so hand-built fixtures and mocks must set it. Without `healthCheckUrl` it comes from link signals only and never reaches `EXCELLENT`.
+
+### SyncDeadLetterItem
+
+```typescript
+interface SyncDeadLetterItem {
+  id: string; // same ULID as the original item
+  method: HttpMethod;
+  url: string;
+  headers?: Record<string, string>;
+  body?: string;
+  contentType?: string;
+  priority?: SyncPriority;
+  createdAt: number; // original enqueue time
+  metadata?: Record<string, string>;
+  attempts: number;
+  lastAttemptAt: number;
+  lastErrorCode: SyncErrorCode; // the real failure code, never DEAD_LETTERED
+  lastErrorMessage?: string; // status line or error message; at most 1024 chars, never headers or bodies
+  deadLetteredAt: number;
+}
+```
+
+> Returned by `listDeadLetter()` and `useSyncSnapshot().deadLetter`. A dead letter keeps the request's headers and body until it is replayed, discarded, removed or cleared. Items that had failed permanently before v0.3 are moved to the dead-letter queue on upgrade. For an HTTP failure, iOS writes the status line with the system's reason phrase (`HTTP 404 Not Found`), while Android keeps the server's, which is empty under HTTP/2 (`HTTP 404`): branch on `lastErrorCode`.
 
 ### SyncError
 
@@ -538,25 +579,38 @@ type ValidationIssue = {
 | `NONE`      | No transport — paired with `DISCONNECTED`.                 |
 | `UNKNOWN`   | Transport could not be determined yet.                     |
 
+### NetworkQuality
+
+Ordered worst to best. Compare levels by their index in `Object.values(NetworkQuality)`, never as strings.
+
+| Value       | Reported when                                                                                       |
+| ----------- | --------------------------------------------------------------------------------------------------- |
+| `OFFLINE`   | Status `DISCONNECTED` or `UNKNOWN`. The only level `minNetworkQuality: POOR` blocks.                 |
+| `POOR`      | Measured median of 1000 ms or more (or two failed probes), or an Android network not validated.     |
+| `MODERATE`  | Measured median of 500–999 ms, a metered link with no measurement, or iOS Low Data Mode.            |
+| `GOOD`      | Measured median of 200–499 ms, or an unmetered link with no measurement. Most a metered link reaches. |
+| `EXCELLENT` | Measured median under 200 ms. Only with `healthCheckUrl` set, which turns the measurement on.        |
+
 ### SyncEventType
 
 | Value                       | Triggered when                                                         |
 | --------------------------- | ---------------------------------------------------------------------- |
-| `ITEM_ENQUEUED`             | A new item was accepted into the queue.                                |
-| `ITEM_REMOVED`              | An item was removed by `removeItem()`.                                 |
+| `ITEM_ENQUEUED`             | A new item was accepted into the queue, or `replayDeadLetter()` put one back. |
+| `ITEM_REMOVED`              | An item or a dead letter was removed by `removeItem()` or `discardDeadLetter()`. |
 | `SYNC_STARTED`              | A flush cycle has begun.                                               |
 | `SYNC_PROGRESS`             | Coarse progress update for the current flush. iOS only.                |
 | `SYNC_SUCCEEDED`            | The cycle finished with no permanent failure, including 0/0 cycles.    |
-| `SYNC_FAILED`               | The cycle finished with a permanent failure, or died.                  |
+| `SYNC_FAILED`               | The cycle finished with a permanent failure, died, or was skipped by the quality gate or the health check. |
 | `ITEM_SUCCEEDED`            | A single item dispatched successfully.                                 |
-| `ITEM_FAILED`               | A single item failed permanently.                                      |
+| `ITEM_FAILED`               | A single item failed permanently. `ITEM_DEAD_LETTERED` follows, unless the item was removed or cleared while its request was in flight. |
 | `ITEM_RETRYING`             | A single item went back to wait for a retry.                           |
-| `QUEUE_CLEARED`             | The queue was cleared by `clearQueue()`.                               |
-| `CONNECTION_CHANGED`        | Network connectivity changed.                                          |
+| `QUEUE_CLEARED`             | The queue and the dead letters were cleared by `clearQueue()`.         |
+| `CONNECTION_CHANGED`        | A reported connection field changed, `networkQuality` included. Never for duplicates. |
 | `PAUSED`                    | Sync was paused via `pauseSync()`.                                     |
 | `RESUMED`                   | Sync was resumed via `resumeSync()`, or iOS recovered items at launch. |
 | `BACKGROUND_SYNC_STARTED`   | A background window started: a BGTask on iOS, the periodic worker on Android. |
 | `BACKGROUND_SYNC_COMPLETED` | The same window finished. No `errorCode`: a failed flush reports it on `SYNC_FAILED`. |
+| `ITEM_DEAD_LETTERED`        | A permanently failed item moved to the dead-letter queue. `metadata.lastErrorCode` holds the real code. |
 
 ### SyncErrorCode
 
@@ -566,14 +620,17 @@ type ValidationIssue = {
 | `SERVER_ERROR`                        | if not retried  | Item events.                                                           |
 | `TIMEOUT`                             |       no        | Item events.                                                           |
 | `MAX_ATTEMPTS_EXCEEDED`               |       yes       | `ITEM_FAILED`, for a retriable failure with no attempts left.          |
-| `UNAUTHORIZED`                        |       yes       | Item events, on a 401 or 403.                                          |
-| `INVALID_PAYLOAD`                     |       yes       | `enqueue`, `enqueueBatch`, and most functions when native rejects.     |
-| `INVALID_URL`                         |       yes       | `enqueue`. `enqueueBatch` reports URLs under `INVALID_PAYLOAD`.        |
-| `QUEUE_FULL`                          |       yes       | Raised by native; reaches JS as `INVALID_PAYLOAD` for now.             |
+| `UNAUTHORIZED`                        |       yes       | Item events, on a 401 or 403. Replay the dead letter after `configureSync`. |
+| `INVALID_PAYLOAD`                     |       yes       | `enqueue`, `enqueueBatch`, `configureSync`, and most functions when native rejects. |
+| `INVALID_URL`                         |       yes       | `enqueue`, `configureSync` (`healthCheckUrl`). `enqueueBatch` reports URLs under `INVALID_PAYLOAD`. |
+| `QUEUE_FULL`                          |       yes       | Raised by native, also by `replayDeadLetter`; reaches JS as `INVALID_PAYLOAD` for now. |
 | `DUPLICATE_ITEM`                      |       yes       | Reserved. Neither platform raises it.                                  |
 | `BACKGROUND_TASK_REGISTRATION_FAILED` |       yes       | `enableBackgroundSync`, `disableBackgroundSync`, `isBackgroundSyncEnabled`. |
 | `NATIVE_MODULE_UNAVAILABLE`           |       yes       | Every function when the native module is missing.                      |
 | `DRAIN_ALREADY_ACTIVE`                |       yes       | `drainUntilEmpty`, when a drain is already running.                    |
+| `NETWORK_QUALITY_TOO_LOW`             |       no        | `SYNC_FAILED`, when the quality gate skipped the cycle. No item changes. |
+| `HEALTH_CHECK_FAILED`                 |       no        | `SYNC_FAILED`, when the health check skipped the cycle. No item changes. |
+| `DEAD_LETTERED`                       |       n/a       | `ITEM_DEAD_LETTERED`. The real code is in `metadata.lastErrorCode`.    |
 
 ## How it compares
 
@@ -687,7 +744,10 @@ No. `body` is a string sent as UTF-8 text, and there is no file-based body. You 
 On the next launch, the recovery layer marks orphaned items as `PENDING` and they re-enter the queue. With no JS loaded, an iOS BGTask or an Android worker does the same before it flushes, unless a pause or `foregroundOnly` blocks the Android worker. Android also runs it after a reboot or an app update. Their attempt counters and cooldowns are kept, and the server may already have processed the request, so delivery is at least once. Send an `Idempotency-Key` header, set through `headers` with a key you generate before enqueueing, and dedupe on the server.
 
 **Q. Is the queue encrypted at rest?**
-No. Per-item `headers` and `body` are stored in plain text. Put credentials in `SyncOptions.defaultHeaders`, which are encrypted at rest (Android Keystore / iOS Keychain).
+No. Per-item `headers` and `body` are stored in plain text, in the queue and in the dead-letter queue. Put credentials in `SyncOptions.defaultHeaders`, which are encrypted at rest (Android Keystore / iOS Keychain). `clearQueue()` deletes both queues, for example on logout. It does not need to wait for a running cycle: an item whose request has not started is not sent, and a request already in flight is not cancelled, but its item is never written back, as a queue row or as a dead letter.
+
+**Q. What happens to a request that fails permanently?**
+It moves to the dead-letter queue, with its last error code and message, and `ITEM_FAILED` then `ITEM_DEAD_LETTERED` are emitted. Nothing retries or prunes it: read it with `listDeadLetter()`, put it back with `replayDeadLetter(id)` once the cause is fixed, or delete it with `discardDeadLetter(id)`.
 
 ## Contributing
 

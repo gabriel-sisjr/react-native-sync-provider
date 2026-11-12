@@ -32,6 +32,11 @@ internal class RetryWakeTest {
   /** The delay of every timer arm, in order. */
   private val armed = mutableListOf<Long>()
   private val kicks = mutableListOf<Long>()
+
+  /** Every kick armed after the quality gate turned one back: its delay and streak. */
+  private val gatedKicks = mutableListOf<Pair<Long, Int>>()
+  private var gateOpen = false
+  private var healthBackoffUntil = 0L
   private val clock = MovingClock()
   private var halted = false
   private var live = true
@@ -45,6 +50,9 @@ internal class RetryWakeTest {
       isHalted = { halted },
       isEngineLive = { live },
       clock = clock::now,
+      isQualityGateOpen = { gateOpen },
+      scheduleGatedKick = { delayMs, streak -> gatedKicks += delayMs to streak },
+      healthBackoffUntil = { healthBackoffUntil },
     )
   }
 
@@ -295,6 +303,113 @@ internal class RetryWakeTest {
 
     assertThat(armed).containsExactly(HOLD_MS, 0L, 0L).inOrder()
     assertThat(kicks).containsExactly(HOLD_MS, 0L, 0L).inOrder()
+  }
+
+  /* ------------------------- after the quality gate ------------------------- */
+
+  @Test
+  fun `a kick the gate turned back comes back after the next backoff step, carrying the streak`() =
+    runTest {
+      insert("due", clock.now() - 1L)
+
+      wake.armAfterGate(gateStreak = 0)
+      wake.armAfterGate(gateStreak = 1)
+      wake.armAfterGate(gateStreak = 9)
+
+      assertThat(gatedKicks).containsExactly(
+        30_000L to 1,
+        60_000L to 2,
+        GateRecheck.MAX_DELAY_MS to 10,
+      ).inOrder()
+      assertThat(kicks).isEmpty()
+    }
+
+  @Test
+  fun `the in-process timer is left to hold its own wakes`() = runTest {
+    insert("due", clock.now() - 1L)
+
+    wake.armAfterGate(gateStreak = 0)
+
+    assertThat(armed).isEmpty()
+    verify(exactly = 0) { timer.cancel() }
+  }
+
+  @Test
+  fun `a later retry deadline wins over the backoff step`() = runTest {
+    insert("later", clock.now() + 90_000L)
+
+    wake.armAfterGate(gateStreak = 0)
+
+    assertThat(gatedKicks).containsExactly(90_000L to 1)
+  }
+
+  @Test
+  fun `a kick the gate turned back still waits for the credential hold`() = runTest {
+    insert("due", clock.now() - 1L)
+    wake.arm(notBefore = clock.now() + HOLD_MS)
+    kicks.clear()
+
+    wake.armAfterGate(gateStreak = 0)
+
+    assertThat(gatedKicks).containsExactly(HOLD_MS to 1)
+  }
+
+  @Test
+  fun `no row with a cooldown, no kick after the gate`() = runTest {
+    insert("fresh", nextRetryAt = 0L)
+
+    wake.armAfterGate(gateStreak = 0)
+
+    assertThat(gatedKicks).isEmpty()
+  }
+
+  @Test
+  fun `a gate that opened meanwhile makes it a plain arm, which starts the backoff over`() = runTest {
+    insert("due", clock.now() - 1L)
+    gateOpen = true
+
+    wake.armAfterGate(gateStreak = 3)
+
+    assertThat(gatedKicks).isEmpty()
+    assertThat(armed).containsExactly(0L)
+    assertThat(kicks).containsExactly(0L)
+  }
+
+  @Test
+  fun `nothing is re-armed after the gate while halted`() = runTest {
+    halted = true
+    insert("due", clock.now() - 1L)
+
+    wake.armAfterGate(gateStreak = 0)
+
+    assertThat(gatedKicks).isEmpty()
+    assertThat(kicks).isEmpty()
+    verify { timer.cancel() }
+  }
+
+  @Test
+  fun `no wake on any path fires before a health-check backoff ends`() = runTest {
+    insert("due", clock.now() - 1L)
+    insert("fresh", nextRetryAt = 0L)
+    healthBackoffUntil = clock.now() + 45_000L
+
+    wake.arm()
+    wake.armForResume()
+    wake.armAfterGate(gateStreak = 0)
+
+    assertThat(armed).containsExactly(45_000L, 45_000L).inOrder()
+    assertThat(kicks).containsExactly(45_000L, 45_000L).inOrder()
+    assertThat(gatedKicks).containsExactly(45_000L to 1)
+  }
+
+  @Test
+  fun `the later of the credential hold and the health backoff wins`() = runTest {
+    insert("due", clock.now() - 1L)
+    healthBackoffUntil = clock.now() + 30_000L
+
+    wake.arm(notBefore = clock.now() + HOLD_MS)
+
+    assertThat(armed).containsExactly(HOLD_MS)
   }
 
   private companion object {

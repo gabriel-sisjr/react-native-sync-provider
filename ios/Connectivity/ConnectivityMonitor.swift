@@ -33,6 +33,14 @@ struct ConnectionSnapshot: Sendable, Equatable {
     let type: Kind
     let isInternetReachable: Bool?
     let isExpensive: Bool?
+    /// Low Data Mode (`NWPath.isConstrained`). Engine-only: it caps the
+    /// network-quality grade, and `ConnectionState` has no field for it.
+    var isConstrained: Bool? = nil
+    /// The path's gateway addresses (`NWPath.gateways`), sorted. Engine-only:
+    /// `NWPath` names no network, so these are what tells one Wi-Fi network
+    /// from another of the same cost. Two networks behind the same gateway
+    /// address still look alike.
+    var gateways: [String]? = nil
 
     static let unknown = ConnectionSnapshot(status: .unknown,
                                             type: .unknown,
@@ -56,6 +64,9 @@ protocol ConnectivityProviding: AnyObject, Sendable {
     @discardableResult
     func subscribe(_ listener: @escaping @Sendable (ConnectionSnapshot) -> Void) -> UUID
     func unsubscribe(_ token: UUID)
+    /// Returns once the status is known (anything but `.unknown`), or after
+    /// `timeoutMs` if it is still unknown then.
+    func waitUntilKnown(timeoutMs: Int) async
 }
 
 /// Singleton-style monitor. Starts on first instantiation; consumers get the
@@ -70,6 +81,7 @@ final class ConnectivityMonitor: ConnectivityProviding, @unchecked Sendable {
 
     private var _current: ConnectionSnapshot = .unknown
     private var listeners: [UUID: @Sendable (ConnectionSnapshot) -> Void] = [:]
+    private var knownWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     private var didStart = false
 
     /// The last observed snapshot. Thread-safe.
@@ -131,22 +143,54 @@ final class ConnectivityMonitor: ConnectivityProviding, @unchecked Sendable {
         }
     }
 
+    /// A process launched by a BGTask has no path yet. Waiting here keeps a
+    /// flush from being judged on that unknown path instead of the real one.
+    func waitUntilKnown(timeoutMs: Int) async {
+        guard lock.withLock({ _current.status == .unknown }) else { return }
+        let id = UUID()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let known = lock.withLock { () -> Bool in
+                guard _current.status == .unknown else { return true }
+                knownWaiters[id] = continuation
+                return false
+            }
+            if known {
+                continuation.resume()
+                return
+            }
+            queue.asyncAfter(wallDeadline: .now() + .milliseconds(max(0, timeoutMs))) { [weak self] in
+                self?.releaseKnownWaiter(id)
+            }
+        }
+    }
+
+    private func releaseKnownWaiter(_ id: UUID) {
+        lock.withLock { knownWaiters.removeValue(forKey: id) }?.resume()
+    }
+
     // MARK: - Path translation
 
     private func handlePathUpdate(_ path: NWPath) {
         let snapshot = Self.translate(path)
 
-        let snapshotListeners = lock.withLock { () -> [@Sendable (ConnectionSnapshot) -> Void] in
+        let (snapshotListeners, waiters) = lock.withLock {
+            () -> ([@Sendable (ConnectionSnapshot) -> Void], [CheckedContinuation<Void, Never>]) in
             _current = snapshot
-            return Array(listeners.values)
+            var released: [CheckedContinuation<Void, Never>] = []
+            if snapshot.status != .unknown {
+                released = Array(knownWaiters.values)
+                knownWaiters.removeAll()
+            }
+            return (Array(listeners.values), released)
         }
 
-        SyncLogger.debug("Connectivity changed: status=\(snapshot.status.rawValue) type=\(snapshot.type.rawValue) expensive=\(snapshot.isExpensive ?? false)",
+        SyncLogger.debug("Connectivity changed: status=\(snapshot.status.rawValue) type=\(snapshot.type.rawValue) expensive=\(snapshot.isExpensive ?? false) constrained=\(snapshot.isConstrained ?? false)",
                          category: "connectivity")
 
         for listener in snapshotListeners {
             listener(snapshot)
         }
+        waiters.forEach { $0.resume() }
     }
 
     static func translate(_ path: NWPath) -> ConnectionSnapshot {
@@ -181,7 +225,9 @@ final class ConnectivityMonitor: ConnectivityProviding, @unchecked Sendable {
             status: status,
             type: type,
             isInternetReachable: path.status == .satisfied,
-            isExpensive: path.isExpensive
+            isExpensive: path.isExpensive,
+            isConstrained: path.isConstrained,
+            gateways: path.gateways.map { String(describing: $0) }.sorted()
         )
     }
 }

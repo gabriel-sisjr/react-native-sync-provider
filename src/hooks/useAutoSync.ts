@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect } from 'react';
 import { AppState } from 'react-native';
 import type { AppStateStatus, NativeEventSubscription } from 'react-native';
 
@@ -58,12 +58,23 @@ export interface UseAutoSyncExtraOptions extends UseAutoSyncOptions {
  *
  * The periodic tick and the foreground trigger read the connection status first
  * and do nothing while it is `DISCONNECTED`, because a flush while offline can
- * spend retry attempts and mark valid items `FAILED`. `UNKNOWN` and `METERED`
- * still flush, and a status read that fails skips the flush. Neither trigger
- * checks queue size, so on an empty queue a flush records a 0/0 result.
+ * spend retry attempts and move valid items to the dead-letter queue. `UNKNOWN`
+ * and `METERED` still flush, and a status read that fails skips the flush.
+ * Neither trigger checks queue size, so on an empty queue a flush records a
+ * 0/0 result.
  *
- * The reconnect trigger does not read the status: it follows the
- * `CONNECTION_CHANGED` event.
+ * Every flush the hook starts is a `flush()` call and runs its checks. With
+ * `SyncOptions.minNetworkQuality` set, each tick or trigger the gate blocks
+ * emits `SYNC_FAILED` with `NETWORK_QUALITY_TOO_LOW`, and each one during a
+ * health-check backoff `HEALTH_CHECK_FAILED`, an empty queue included, since
+ * both checks run before the queue is read.
+ *
+ * The reconnect trigger reads the status once when the hook is enabled, then
+ * follows `CONNECTION_CHANGED`: it flushes when an event's `connectionStatus`
+ * changes to `CONNECTED`, or to `METERED` with `flushOnMetered`. An event that
+ * leaves the status as it was, such as one for a change of `networkQuality`
+ * alone, does not trigger it. When that first read fails, the first event only
+ * sets the status the next ones are compared with.
  *
  * The hook never reads `SyncOptions.strategy`, so under `MANUAL` it keeps
  * flushing on its interval, reconnect and foreground triggers. `MANUAL` only
@@ -94,8 +105,6 @@ export function useAutoSync(options: UseAutoSyncExtraOptions): void {
     intervalMs,
   } = options;
 
-  const lastConnectionRef = useRef<ConnectionStatus | null>(null);
-
   useEffect(() => {
     if (enabled !== true) return undefined;
     if (!isNativeModuleAvailable()) return undefined;
@@ -119,9 +128,9 @@ export function useAutoSync(options: UseAutoSyncExtraOptions): void {
       }
     };
 
-    // Neither dispatcher checks connectivity, so a flush while offline would
-    // spend retry attempts and can mark valid items FAILED. A status read that
-    // rejects skips the flush too.
+    // Unless `minNetworkQuality` is set, neither dispatcher checks
+    // connectivity, so a flush while offline would spend retry attempts and can
+    // dead-letter valid items. A status read that rejects skips the flush too.
     const flushUnlessOffline = async () => {
       try {
         const connection = await facadeGetConnectionStatus();
@@ -136,6 +145,38 @@ export function useAutoSync(options: UseAutoSyncExtraOptions): void {
       void flushUnlessOffline();
     }, period);
 
+    // The status the next `CONNECTION_CHANGED` is compared with, read once
+    // here: native does not report the state it is already in, and it also
+    // reports changes that leave the status as it was (`networkQuality`
+    // alone), so only a change from a known status is a transition. `null`
+    // until known.
+    let lastStatus: ConnectionStatus | null = null;
+    // Set while that read is pending, so an event that arrives first is
+    // judged against it, in arrival order.
+    let statusRead: Promise<void> | null = null;
+    if (flushOnReconnect) {
+      statusRead = facadeGetConnectionStatus()
+        .then(
+          (snapshot) => {
+            lastStatus = snapshot.status;
+          },
+          // Unreadable: the first event becomes the status to compare with.
+          () => undefined
+        )
+        .then(() => {
+          statusRead = null;
+        });
+    }
+
+    const onStatusChanged = (next: ConnectionStatus) => {
+      const prev = lastStatus;
+      lastStatus = next;
+      if (prev === null || prev === next) return;
+      const becameConnected = next === ConnectionStatus.CONNECTED;
+      const becameMetered = flushOnMetered && next === ConnectionStatus.METERED;
+      if (becameConnected || becameMetered) void safeFlush();
+    };
+
     (async () => {
       try {
         subscriptionId = await addSyncEventListener((event: SyncEvent) => {
@@ -143,16 +184,14 @@ export function useAutoSync(options: UseAutoSyncExtraOptions): void {
           if (event.type !== SyncEventType.CONNECTION_CHANGED) return;
           const next = event.connectionStatus;
           if (next === undefined) return;
-          const prev = lastConnectionRef.current;
-          lastConnectionRef.current = next;
-          const becameConnected =
-            prev !== ConnectionStatus.CONNECTED &&
-            next === ConnectionStatus.CONNECTED;
-          const becameMetered =
-            flushOnMetered &&
-            prev !== ConnectionStatus.METERED &&
-            next === ConnectionStatus.METERED;
-          if (becameConnected || becameMetered) void safeFlush();
+          const pending = statusRead;
+          if (pending === null) {
+            onStatusChanged(next);
+            return;
+          }
+          void pending.then(() => {
+            if (!cancelled) onStatusChanged(next);
+          });
         });
       } catch {
         // ignore

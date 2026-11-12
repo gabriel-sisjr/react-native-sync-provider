@@ -32,9 +32,9 @@ graph TD
 
 ### Layer 1: TypeScript Facade
 
-Source of every public symbol: 21 functions (19 wrap the HybridObject, and `drainUntilEmpty` and `cancelDrain` are JS-side), 2 listener helpers, 9 hooks, the `SyncProvider` context, every type and enum, the `SyncError` class. Located under `src/`. Responsibilities:
+Source of every public symbol: 24 functions (22 wrap the HybridObject, and `drainUntilEmpty` and `cancelDrain` are JS-side), 2 listener helpers, 9 hooks, the `SyncProvider` context, every type and enum, the `SyncError` class. Located under `src/`. Responsibilities:
 
-- Validate inputs (`validateSyncItem`).
+- Validate inputs (`validateSyncItem`, and `validateSyncOptions` for the quality-gate and health-check options).
 - Translate the native sentinel `startedAt === 0 && finishedAt === 0` for `getLastSyncResult` into `undefined`.
 - Wrap raw native errors in [`SyncError`](../api-reference/errors.md) with a typed [`SyncErrorCode`](../api-reference/errors.md#syncerrorcode).
 - Provide React hooks that subscribe to native events and re-render on relevant transitions.
@@ -108,7 +108,7 @@ The recovery layer scans for items left in an `IN_FLIGHT` state by a previous ru
 
 ### Connectivity Monitoring
 
-A single native monitor per process (`ConnectivityMonitor`) emits `CONNECTION_CHANGED` events. The JS layer consumes them via `useConnection` and `useAutoSync`, and the retry timer uses the monitor to hold a wake while offline. The dispatcher itself does not check connectivity.
+A single native monitor per process (`ConnectivityMonitor`) emits `CONNECTION_CHANGED` events, only when a reported field changes, and grades the link with a [`networkQuality`](../guides/connectivity-detection.md#network-quality) level. The JS layer consumes them via `useConnection` and `useAutoSync`, and the retry timer uses the monitor to hold a wake while offline or below `minNetworkQuality`. The dispatcher checks connectivity only through that opt-in quality gate, at the start of every flush, before the opt-in health check.
 
 ## Next Steps
 

@@ -150,13 +150,13 @@ internal class SyncQueueStorageTest {
   }
 
   @Test
-  fun `getPending excludes IN_FLIGHT and FAILED rows`() = runTest {
+  fun `getPending excludes IN_FLIGHT rows and dead letters`() = runTest {
     val id = storage.enqueue(TestData.input())
     val claimed = storage.claimPending(1)
     assertThat(claimed).hasSize(1)
     assertThat(claimed.first().id).isEqualTo(id)
-    val failed = storage.enqueue(TestData.input())
-    storage.markFailed(failed, attempts = 1, lastAttemptAt = 1L, lastErrorCode = SyncErrorCode.TIMEOUT)
+    storage.enqueue(TestData.input())
+    deadLetter(storage.claimPending(1).single())
 
     val pending = storage.getPending()
 
@@ -319,17 +319,113 @@ internal class SyncQueueStorageTest {
     assertThat(dao.countByStatus(SyncItemEntity.STATUS_PENDING)).isEqualTo(0)
   }
 
+  /* ------------------------------- dead letters ------------------------------- */
+
+  private suspend fun deadLetter(entity: SyncItemEntity, message: String? = "HTTP 410 Gone") =
+    storage.moveToDeadLetters(
+      entity = entity,
+      attempts = 5,
+      lastAttemptAt = 9_999L,
+      lastErrorCode = SyncErrorCode.SERVER_ERROR,
+      lastErrorMessage = message,
+      deadLetteredAt = 10_000L,
+    )
+
   @Test
-  fun `markFailed marks the row as FAILED and records the error code`() = runTest {
+  fun `a terminal failure moves the row, never leaving it in both tables`() = runTest {
+    val id = storage.enqueue(TestData.input(metadata = mapOf("k" to "v")))
+    val queued = db.syncItemDao().findById(id)!!
+
+    assertThat(deadLetter(queued)).isTrue()
+
+    assertThat(db.syncItemDao().findById(id)).isNull()
+    val dead = db.syncDeadLetterDao().findById(id)!!
+    assertThat(dead.url).isEqualTo(queued.url)
+    assertThat(dead.headers).isEqualTo(queued.headers)
+    assertThat(dead.body).isEqualTo(queued.body)
+    assertThat(dead.metadata).isEqualTo(queued.metadata)
+    assertThat(dead.createdAt).isEqualTo(queued.createdAt)
+    assertThat(dead.attempts).isEqualTo(5)
+    assertThat(dead.lastAttemptAt).isEqualTo(9_999L)
+    assertThat(dead.lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
+    assertThat(dead.lastErrorMessage).isEqualTo("HTTP 410 Gone")
+    assertThat(dead.deadLetteredAt).isEqualTo(10_000L)
+  }
+
+  @Test
+  fun `dlq_moveOfARowPurgedAfterItsClaim_writesNothing`() = runTest {
+    val cleared = storage.enqueue(TestData.input())
+    val removed = storage.enqueue(TestData.input())
+    val claimed = storage.claimPending(2).associateBy { it.id }
+    assertThat(claimed.keys).containsExactly(cleared, removed)
+
+    assertThat(storage.removeItem(removed)).isTrue()
+    assertThat(deadLetter(claimed.getValue(removed))).isFalse()
+    storage.clear()
+    assertThat(deadLetter(claimed.getValue(cleared))).isFalse()
+
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(storage.count()).isEqualTo(0)
+  }
+
+  @Test
+  fun `dlq_replayedRow_purgedWhileInFlight_isNotDeadLetteredAgain`() = runTest {
+    val id = storage.enqueue(TestData.input())
+    deadLetter(db.syncItemDao().findById(id)!!)
+    assertThat(storage.replayDeadLetter(id)).isTrue()
+    val claimed = storage.claimPending(1).single()
+
+    storage.clear()
+
+    assertThat(deadLetter(claimed)).isFalse()
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(storage.count()).isEqualTo(0)
+  }
+
+  @Test
+  fun `the recorded message is cut to 1024 characters`() = runTest {
     val id = storage.enqueue(TestData.input())
 
-    storage.markFailed(id, attempts = 5, lastAttemptAt = 9_999L, lastErrorCode = SyncErrorCode.TIMEOUT)
+    deadLetter(db.syncItemDao().findById(id)!!, message = "x".repeat(5_000))
 
-    val row = db.syncItemDao().findById(id)!!
-    assertThat(row.status).isEqualTo(SyncItemEntity.STATUS_FAILED)
-    assertThat(row.attempts).isEqualTo(5)
-    assertThat(row.lastAttemptAt).isEqualTo(9_999L)
-    assertThat(row.lastErrorCode).isEqualTo(SyncErrorCode.TIMEOUT.name)
+    assertThat(db.syncDeadLetterDao().findById(id)!!.lastErrorMessage).hasLength(1_024)
+  }
+
+  @Test
+  fun `dlq_deadLetters_doNotCountTowardCapacity`() = runTest {
+    storage.maxQueueSize = 1
+    val first = storage.enqueue(TestData.input())
+    deadLetter(db.syncItemDao().findById(first)!!)
+
+    storage.enqueue(TestData.input())
+
+    assertThat(storage.count()).isEqualTo(1)
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(1)
+  }
+
+  @Test
+  fun `dlq_clearQueue_clearsDeadLetters, in the same purge as the queue`() = runTest {
+    val dead = storage.enqueue(TestData.input())
+    deadLetter(db.syncItemDao().findById(dead)!!)
+    storage.enqueue(TestData.input())
+
+    storage.clear()
+
+    assertThat(storage.count()).isEqualTo(0)
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+  }
+
+  @Test
+  fun `dlq_removeItem_fallsThroughToDeadLetters`() = runTest {
+    val dead = storage.enqueue(TestData.input())
+    deadLetter(db.syncItemDao().findById(dead)!!)
+    val queued = storage.enqueue(TestData.input())
+
+    assertThat(storage.removeItem(dead)).isTrue()
+    assertThat(storage.removeItem(queued)).isTrue()
+    assertThat(storage.removeItem("unknown")).isFalse()
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(storage.count()).isEqualTo(0)
   }
 
   @Test

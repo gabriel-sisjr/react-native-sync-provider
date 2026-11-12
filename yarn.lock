@@ -3530,12 +3530,12 @@ __metadata:
     eslint-plugin-prettier: "npm:^5.5.5"
     jest: "npm:^30.3.0"
     lefthook: "npm:^2.1.4"
-    nitrogen: "npm:^0.35.6"
+    nitrogen: "npm:^0.35.8"
     prettier: "npm:^3.8.1"
     react: "npm:19.2.3"
     react-native: "npm:0.85.0"
     react-native-builder-bob: "npm:^0.41.0"
-    react-native-nitro-modules: "npm:^0.35.6"
+    react-native-nitro-modules: "npm:^0.35.8"
     react-test-renderer: "npm:19.2.3"
     release-it: "npm:^19.2.4"
     turbo: "npm:^2.8.21"
@@ -3545,7 +3545,7 @@ __metadata:
     react: ">=18.2.0"
     react-native: ">=0.74.0"
     react-native-mmkv: ">=3.0.0"
-    react-native-nitro-modules: ^0.35.6
+    react-native-nitro-modules: ^0.35.8
   peerDependenciesMeta:
     "@react-native-community/netinfo":
       optional: true
@@ -5927,14 +5927,14 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@ts-morph/common@npm:~0.28.1":
-  version: 0.28.1
-  resolution: "@ts-morph/common@npm:0.28.1"
+"@ts-morph/common@npm:~0.29.0":
+  version: 0.29.0
+  resolution: "@ts-morph/common@npm:0.29.0"
   dependencies:
     minimatch: "npm:^10.0.1"
     path-browserify: "npm:^1.0.1"
     tinyglobby: "npm:^0.2.14"
-  checksum: 10c0/d51276d840997e0f8f83e04f8b1689135bb12588a7ddbed575f87848d5737eeae31e242685d6449de27573e8ed30892157fea643393cb875e175f2711200bc50
+  checksum: 10c0/97ab8ca66558b817e5475a8893ee1476ab760a3ac71fa9868413d95ddbaaf909eda81716e3a8d14291cbf449e624af66de81bcddd3ec2e36525728b4edf5e8ee
   languageName: node
   linkType: hard
 
@@ -15858,18 +15858,18 @@ __metadata:
   languageName: node
   linkType: hard
 
-"nitrogen@npm:^0.35.6":
-  version: 0.35.6
-  resolution: "nitrogen@npm:0.35.6"
+"nitrogen@npm:^0.35.8":
+  version: 0.35.8
+  resolution: "nitrogen@npm:0.35.8"
   dependencies:
     chalk: "npm:^5.3.0"
-    react-native-nitro-modules: "npm:^0.35.6"
-    ts-morph: "npm:^27.0.0"
+    react-native-nitro-modules: "npm:^0.35.8"
+    ts-morph: "npm:^28.0.0"
     yargs: "npm:^18.0.0"
     zod: "npm:^4.0.5"
   bin:
     nitrogen: lib/index.js
-  checksum: 10c0/3126cee262dc908717cfba21b38250bcf658afa6586ec2b66f3f9276050bf433af66cf072b70a4fc6814b812271f32566ac639f1c3147d26c20ba71c74a9a40a
+  checksum: 10c0/bea6a058dc601ef4344e77ecc9e644c3bd137f0cd1228096871dfe17f0f58346f985ab8b5fd72b290d5558e0d3e9d657ebba83549e3c0032d4bebb6d51464038
   languageName: node
   linkType: hard
 
@@ -18148,13 +18148,13 @@ __metadata:
   languageName: node
   linkType: hard
 
-"react-native-nitro-modules@npm:^0.35.6":
-  version: 0.35.6
-  resolution: "react-native-nitro-modules@npm:0.35.6"
+"react-native-nitro-modules@npm:^0.35.8":
+  version: 0.35.8
+  resolution: "react-native-nitro-modules@npm:0.35.8"
   peerDependencies:
     react: "*"
     react-native: "*"
-  checksum: 10c0/57ec2a2d2e57da923c5c8c81d28f323691be0373d528b81a1a6e1da0e6675f29faa443cc16babd0abd4cd5e08e51ff273ed04a139f368236662212f15cc3a678
+  checksum: 10c0/e8e2da1ac0be1a5feb02a3f373d28a65775b07ec9145987fd9c2c2611595c5c6cda8fcd67476fefd43e19bca5398f5f414b60fda73412ef800cbaae96bdf1691
   languageName: node
   linkType: hard
 
@@ -18202,7 +18202,7 @@ __metadata:
     react-native-builder-bob: "npm:^0.41.0"
     react-native-mmkv: "npm:^3.0.0"
     react-native-monorepo-config: "npm:^0.3.3"
-    react-native-nitro-modules: "npm:^0.35.6"
+    react-native-nitro-modules: "npm:^0.35.8"
     react-native-safe-area-context: "npm:^5.7.0"
     react-native-screens: "npm:^4.25.0"
   languageName: unknown
@@ -20239,13 +20239,13 @@ __metadata:
   languageName: node
   linkType: hard
 
-"ts-morph@npm:^27.0.0":
-  version: 27.0.2
-  resolution: "ts-morph@npm:27.0.2"
+"ts-morph@npm:^28.0.0":
+  version: 28.0.0
+  resolution: "ts-morph@npm:28.0.0"
   dependencies:
-    "@ts-morph/common": "npm:~0.28.1"
+    "@ts-morph/common": "npm:~0.29.0"
     code-block-writer: "npm:^13.0.3"
-  checksum: 10c0/224715cc6d97b8ff5afd3986f9629f912a0ebd83eaecbdca91c35cf10a98f607c663f666e7ea5e6afab00563d00dc80fa7a13552cc7f1cef735261c3217d0863
+  checksum: 10c0/969570a5e983b4193735fff43878ce7b78787b4860bf3d23f330c86d7de707286969e5a82d486dce333eea27bf9d373a46f9de58a80c0bf86d2a462620563a55
   languageName: node
   linkType: hard
 

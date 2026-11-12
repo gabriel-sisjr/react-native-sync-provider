@@ -18,7 +18,11 @@ import React, { createContext, useContext } from 'react';
 import { SyncError } from './errors/SyncError';
 import { SyncErrorCode } from './errors/SyncErrorCode';
 import type { UseAutoSyncExtraOptions } from './hooks';
-import { ConnectionStatus, ConnectionType } from './types/enums';
+import {
+  ConnectionStatus,
+  ConnectionType,
+  NetworkQuality,
+} from './types/enums';
 import type {
   UseConnectionResult,
   UseOfflineQueueResult,
@@ -30,6 +34,7 @@ import type {
 } from './types/hooks';
 import type {
   BackgroundSyncOptions,
+  SyncDeadLetterItem,
   SyncEvent,
   SyncItem,
   SyncItemInput,
@@ -107,6 +112,18 @@ export async function getQueueSize(): Promise<number> {
 /** @public */
 export async function getPendingItems(): Promise<SyncItem[]> {
   throw unavailable('getPendingItems');
+}
+/** @public */
+export async function listDeadLetter(): Promise<SyncDeadLetterItem[]> {
+  throw unavailable('listDeadLetter');
+}
+/** @public */
+export async function replayDeadLetter(_id: string): Promise<void> {
+  throw unavailable('replayDeadLetter');
+}
+/** @public */
+export async function discardDeadLetter(_id: string): Promise<void> {
+  throw unavailable('discardDeadLetter');
 }
 /** @public */
 export async function flush(): Promise<SyncResult> {
@@ -212,6 +229,7 @@ const INERT_CONNECTION: UseConnectionResult = {
   type: ConnectionType.NONE,
   isOnline: false,
   isMetered: false,
+  networkQuality: NetworkQuality.OFFLINE,
 };
 
 /** @public */
@@ -294,6 +312,9 @@ export function useSyncSnapshot(): UseSyncSnapshotResult {
     lastResult: null,
     isWaitingForConnection: false,
     error: null,
+    // Never loaded on web. The keys stay present to match the native hook.
+    networkQuality: undefined,
+    deadLetter: undefined,
   };
 }
 

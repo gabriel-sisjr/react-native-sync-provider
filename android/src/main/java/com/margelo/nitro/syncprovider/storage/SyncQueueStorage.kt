@@ -1,15 +1,19 @@
 package com.margelo.nitro.syncprovider.storage
 
 import com.margelo.nitro.syncprovider.HttpMethod
+import com.margelo.nitro.syncprovider.SyncDeadLetterItem
 import com.margelo.nitro.syncprovider.SyncErrorCode
 import com.margelo.nitro.syncprovider.SyncItem
 import com.margelo.nitro.syncprovider.SyncItemInput
 import com.margelo.nitro.syncprovider.SyncPriority
 import com.margelo.nitro.syncprovider.SyncResult
 import com.margelo.nitro.syncprovider.database.SyncDatabase
+import com.margelo.nitro.syncprovider.database.SyncDeadLetterDao
+import com.margelo.nitro.syncprovider.database.SyncDeadLetterEntity
 import com.margelo.nitro.syncprovider.database.SyncItemDao
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
 import com.margelo.nitro.syncprovider.database.SyncResultDao
+import com.margelo.nitro.syncprovider.database.ReplayOutcome
 import com.margelo.nitro.syncprovider.database.SyncResultEntity
 import com.margelo.nitro.syncprovider.error.SyncException
 import com.margelo.nitro.syncprovider.util.JsonMap
@@ -29,11 +33,13 @@ import java.util.UUID
  * may invoke this from any dispatcher.
  *
  * Capacity is enforced softly via [maxQueueSize]: when the consumer attempts
- * to enqueue beyond it, [SyncErrorCode.QUEUE_FULL] is thrown — no eviction.
+ * to enqueue beyond it, [SyncErrorCode.QUEUE_FULL] is thrown — no eviction. Only queued
+ * rows count: dead letters count toward no cap, and nothing prunes them.
  */
 internal class SyncQueueStorage(
   private val itemDao: SyncItemDao,
   private val resultDao: SyncResultDao,
+  private val deadLetterDao: SyncDeadLetterDao,
   @Volatile var maxQueueSize: Int = DEFAULT_MAX_QUEUE_SIZE,
 ) {
 
@@ -69,13 +75,21 @@ internal class SyncQueueStorage(
       entities.map { it.id }
     }
 
+  /** Remove a queued row, or else a dead letter with that id. True when either was deleted. */
   suspend fun removeItem(id: String): Boolean = withContext(Dispatchers.IO) {
-    itemDao.deleteById(id) > 0
+    itemDao.deleteById(id) > 0 || deadLetterDao.deleteById(id) > 0
   }
 
-  suspend fun clear(): Unit = withContext(Dispatchers.IO) { itemDao.clear() }
+  /** Empty the queue and the dead letters, together. */
+  suspend fun clear(): Unit = withContext(Dispatchers.IO) { deadLetterDao.clearAll() }
 
   suspend fun count(): Int = withContext(Dispatchers.IO) { itemDao.count() }
+
+  /**
+   * Whether row [id] is still queued. A claimed row stops being queued only when a purge
+   * (`clearQueue()`, `removeItem(id)`) deletes it, or when its outcome is recorded.
+   */
+  suspend fun isQueued(id: String): Boolean = withContext(Dispatchers.IO) { itemDao.exists(id) }
 
   suspend fun pendingCount(): Int = withContext(Dispatchers.IO) {
     itemDao.countByStatus(SyncItemEntity.STATUS_PENDING)
@@ -150,25 +164,78 @@ internal class SyncQueueStorage(
     )
   }
 
-  suspend fun markFailed(
-    id: String,
+  /**
+   * A terminal failure: move the claimed row to the dead letters, in one transaction, with
+   * the outcome of its final attempt. A row purged since the claim (`clearQueue()`,
+   * `removeItem(id)`) is not written back.
+   *
+   * @param attempts attempts made in total.
+   * @param lastErrorMessage cut to [SyncDeadLetterEntity.MAX_ERROR_MESSAGE_LENGTH].
+   * @return true when the row was moved; false when it was no longer queued and nothing was
+   *   written.
+   */
+  @Suppress("LongParameterList")
+  suspend fun moveToDeadLetters(
+    entity: SyncItemEntity,
     attempts: Int,
     lastAttemptAt: Long,
     lastErrorCode: SyncErrorCode,
-  ): Unit = withContext(Dispatchers.IO) {
-    itemDao.updateStatus(
-      id = id,
-      status = SyncItemEntity.STATUS_FAILED,
-      attempts = attempts,
-      lastAttemptAt = lastAttemptAt,
-      lastErrorCode = lastErrorCode.name,
-      // Terminal rows are never claimed; reset the cooldown sentinel for clarity.
-      nextRetryAt = 0L,
+    lastErrorMessage: String?,
+    deadLetteredAt: Long,
+  ): Boolean = withContext(Dispatchers.IO) {
+    deadLetterDao.moveFromQueue(
+      SyncDeadLetterEntity(
+        id = entity.id,
+        method = entity.method,
+        url = entity.url,
+        headers = entity.headers,
+        body = entity.body,
+        contentType = entity.contentType,
+        priority = entity.priority,
+        priorityWeight = entity.priorityWeight,
+        createdAt = entity.createdAt,
+        metadata = entity.metadata,
+        attempts = attempts,
+        lastAttemptAt = lastAttemptAt,
+        lastErrorCode = lastErrorCode.name,
+        lastErrorMessage = lastErrorMessage?.take(SyncDeadLetterEntity.MAX_ERROR_MESSAGE_LENGTH),
+        deadLetteredAt = deadLetteredAt,
+      ),
     )
   }
 
   suspend fun resetInFlight(): Int = withContext(Dispatchers.IO) {
     itemDao.resetInFlight()
+  }
+
+  /* ---------------------------- dead letters ---------------------------- */
+
+  /** Every dead letter, by `deadLetteredAt` then id. */
+  suspend fun listDeadLetters(): List<SyncDeadLetterItem> = withContext(Dispatchers.IO) {
+    deadLetterDao.listAll().map(::toDeadLetterItem)
+  }
+
+  /**
+   * Put the dead letter [id] back in the queue as a fresh item, under [maxQueueSize].
+   *
+   * @return true when it was replayed, false when no dead letter has that id.
+   * @throws SyncException [SyncErrorCode.QUEUE_FULL] when the queue is full; the dead letter
+   *   stays.
+   */
+  suspend fun replayDeadLetter(id: String): Boolean = withContext(Dispatchers.IO) {
+    when (deadLetterDao.replay(id, maxQueueSize)) {
+      ReplayOutcome.REPLAYED -> true
+      ReplayOutcome.UNKNOWN -> false
+      ReplayOutcome.QUEUE_FULL -> throw SyncException(
+        SyncErrorCode.QUEUE_FULL,
+        "Queue is full (max=$maxQueueSize); the dead letter stays.",
+      )
+    }
+  }
+
+  /** @return true when a dead letter with that id was deleted. */
+  suspend fun discardDeadLetter(id: String): Boolean = withContext(Dispatchers.IO) {
+    deadLetterDao.deleteById(id) > 0
   }
 
   fun observeAll(): Flow<List<SyncItem>> =
@@ -249,6 +316,27 @@ internal class SyncQueueStorage(
     metadata = JsonMap.decode(entity.metadata),
   )
 
+  private fun toDeadLetterItem(entity: SyncDeadLetterEntity): SyncDeadLetterItem = SyncDeadLetterItem(
+    id = entity.id,
+    method = parseMethod(entity.method),
+    url = entity.url,
+    headers = JsonMap.decode(entity.headers),
+    body = entity.body,
+    contentType = entity.contentType,
+    priority = parsePriority(entity.priority),
+    createdAt = entity.createdAt.toDouble(),
+    metadata = JsonMap.decode(entity.metadata),
+    attempts = entity.attempts.toDouble(),
+    lastAttemptAt = entity.lastAttemptAt.toDouble(),
+    lastErrorCode = parseErrorCode(entity.lastErrorCode),
+    lastErrorMessage = entity.lastErrorMessage,
+    deadLetteredAt = entity.deadLetteredAt.toDouble(),
+  )
+
+  /** A code this version does not know reads as the one a migrated row without a code gets. */
+  private fun parseErrorCode(name: String): SyncErrorCode =
+    SyncErrorCode.entries.firstOrNull { it.name == name } ?: SyncErrorCode.MAX_ATTEMPTS_EXCEEDED
+
   private fun toSyncResult(entity: SyncResultEntity): SyncResult = SyncResult(
     startedAt = entity.startedAt.toDouble(),
     finishedAt = entity.finishedAt.toDouble(),
@@ -291,6 +379,7 @@ internal class SyncQueueStorage(
     ): SyncQueueStorage = SyncQueueStorage(
       itemDao = database.syncItemDao(),
       resultDao = database.syncResultDao(),
+      deadLetterDao = database.syncDeadLetterDao(),
       maxQueueSize = maxQueueSize,
     )
   }
