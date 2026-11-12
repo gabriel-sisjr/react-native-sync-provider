@@ -18,9 +18,7 @@ Orchestrator hook that wires up the common flush triggers in one place: a period
 
 This hook is what dispatches new items while the app runs. The `AUTOMATIC` strategy does not flush on enqueue or on reconnect, so without this hook, a `flush()` call, or an OS background window, a new item stays in the queue.
 
-:::warning `useAutoSync` ignores the strategy
-The hook never reads `SyncOptions.strategy`, so under `MANUAL` it keeps flushing on its interval, reconnect and foreground triggers. `MANUAL` only stops the native engine from scheduling flushes on its own: the in-process retry timer and, on Android, the retry kick. Background windows enabled through [`enableBackgroundSync`](../functions.md#enablebackgroundsync) still run too. To stop the hook's flushes, pass `enabled: false` or unmount it. See [Manual flows](#manual-flows).
-:::
+> **Warning — `useAutoSync` ignores the strategy:** The hook never reads `SyncOptions.strategy`, so under `MANUAL` it keeps flushing on its interval, reconnect and foreground triggers. `MANUAL` only stops the native engine from scheduling flushes on its own: the in-process retry timer and, on Android, the retry kick. Background windows enabled through [`enableBackgroundSync`](../functions.md#enablebackgroundsync) still run too. To stop the hook's flushes, pass `enabled: false` or unmount it. See [Manual flows](#manual-flows).
 
 ```ts
 import { useAutoSync } from '@gabriel-sisjr/react-native-sync-provider';
@@ -50,13 +48,11 @@ function useAutoSync(options: UseAutoSyncExtraOptions): void
 | `flushOnForeground` | `boolean` | No | -- | **Reserved.** The hook ignores it. Use `flushOnAppForeground`. |
 | `backgroundSync` | [`BackgroundSyncOptions`](../types.md#backgroundsyncoptions) | No | -- | **Reserved.** The hook ignores it. Call [`enableBackgroundSync`](../functions.md#enablebackgroundsync), or pass `backgroundSync` to [`<SyncProvider>`](../context.md). |
 
-:::info Flushes are skipped while offline
-The interval and the foreground trigger read the connection status first and do nothing while it is `DISCONNECTED`, because a flush while offline can spend retry attempts and send valid items to the dead-letter queue. `UNKNOWN` and `METERED` still flush. See [Skip flushes while offline](#skip-the-interval-while-offline).
-
-With [`minNetworkQuality`](../types.md#syncoptions) set, the native gate also checks every flush the hook starts: below the minimum, that flush runs no cycle and emits `SYNC_FAILED` with `NETWORK_QUALITY_TOO_LOW`.
-
-Neither trigger checks queue size: on an empty queue each flush runs a 0/0 cycle that adds a row to the sync history.
-:::
+> **Note — Flushes are skipped while offline:** The interval and the foreground trigger read the connection status first and do nothing while it is `DISCONNECTED`, because a flush while offline can spend retry attempts and send valid items to the dead-letter queue. `UNKNOWN` and `METERED` still flush. See [Skip flushes while offline](#skip-the-interval-while-offline).
+>
+> With [`minNetworkQuality`](../types.md#syncoptions) set, the native gate also checks every flush the hook starts: below the minimum, that flush runs no cycle and emits `SYNC_FAILED` with `NETWORK_QUALITY_TOO_LOW`.
+>
+> Neither trigger checks queue size: on an empty queue each flush runs a 0/0 cycle that adds a row to the sync history.
 
 ---
 

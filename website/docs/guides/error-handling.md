@@ -66,9 +66,7 @@ try {
 }
 ```
 
-:::warning `QUEUE_FULL` does not reach JS yet
-Each facade function maps a native rejection to one fallback code, so a full queue rejects with `INVALID_PAYLOAD` and no `validationErrors`. See [Native rejections](../api-reference/errors.md#native-rejections).
-:::
+> **Warning — `QUEUE_FULL` does not reach JS yet:** Each facade function maps a native rejection to one fallback code, so a full queue rejects with `INVALID_PAYLOAD` and no `validationErrors`. See [Native rejections](../api-reference/errors.md#native-rejections).
 
 ## Full `SyncErrorCode` Matrix
 

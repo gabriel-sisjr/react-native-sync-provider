@@ -79,9 +79,7 @@ Smoother growth than `EXPONENTIAL` -- useful when you want more retries in the f
 
 When `jitter: true`, the computed delay is multiplied by a uniformly distributed equal-jitter factor in `[0.75, 1.25)` (±25%). A computed delay of `4000 ms` becomes a real delay anywhere in `[3000, 5000) ms`. The cap applies after the jitter, so a delay never exceeds `maxDelayMs`. This prevents synchronized retry storms when many devices come back online at the same time. The factor is aligned across JS, iOS, and Android.
 
-:::tip Always enable jitter in production
-Without jitter, every device that lost connectivity at the same time hammers your backend on the same retry tick. Jitter is the cheapest, most effective retry-storm mitigation available.
-:::
+> **Tip — Always enable jitter in production:** Without jitter, every device that lost connectivity at the same time hammers your backend on the same retry tick. Jitter is the cheapest, most effective retry-storm mitigation available.
 
 ## `retryOnStatusCodes`
 
@@ -137,9 +135,7 @@ In one transaction, the item leaves the queue and enters the dead-letter queue, 
 
 See [Dead-letter flows](./error-handling.md#dead-letter-flows) for the usual patterns.
 
-:::warning The dead-letter queue is unbounded
-Dead letters count toward no capacity cap, on either platform, and nothing prunes them. Each one keeps its headers and body. Discard what you will not replay, especially if your app runs for long periods offline or against a failing endpoint.
-:::
+> **Warning — The dead-letter queue is unbounded:** Dead letters count toward no capacity cap, on either platform, and nothing prunes them. Each one keeps its headers and body. Discard what you will not replay, especially if your app runs for long periods offline or against a failing endpoint.
 
 Before v0.3, a permanently failed item stayed in the queue store, and Android counted it toward `maxQueueSize`. The upgrade moves those rows to the dead-letter queue.
 
@@ -156,9 +152,7 @@ Each cycle makes at most one attempt per item, and `attempts` counts the attempt
 
 A cooldown and a hold look the same on a `SyncItem`, which carries neither the last error code nor the last attempt time. An `ITEM_RETRYING` event with `errorCode: 'UNAUTHORIZED'` marks a hold.
 
-:::note Capacity vs. eligibility
-A cooling item still counts toward `getQueueSize()` and the `maxQueueSize` cap — it is _in_ the queue, just not _dispatchable right now_. Cooldowns also survive launch recovery: resetting in-flight items back to pending does **not** clear their `nextRetryAt`.
-:::
+> **Note — Capacity vs. eligibility:** A cooling item still counts toward `getQueueSize()` and the `maxQueueSize` cap — it is _in_ the queue, just not _dispatchable right now_. Cooldowns also survive launch recovery: resetting in-flight items back to pending does **not** clear their `nextRetryAt`.
 
 ### Who wakes the queue, and when
 
@@ -192,9 +186,7 @@ After a failed [health check](./connectivity-detection.md#health-check), the nex
 
 When [`BackgroundSyncOptions.foregroundOnly`](../api-reference/types.md#backgroundsyncoptions) is `true`, the OS-scheduled wakes are suppressed: the Android retry kick, the periodic worker and BGTasks. Cooldowns are still **persisted and honored**, and acted upon while the app is alive: by the retry timer, which this flag does not stop, and by `flush()`, `useAutoSync` and [`drainUntilEmpty`](../api-reference/functions.md#drainuntilempty). Data-integrity recovery still runs.
 
-:::tip Draining cooling items on demand
-[`drainUntilEmpty`](../api-reference/functions.md#drainuntilempty) sleeps until the soonest `nextRetryAt` by itself, so you do not need `delayBetweenCyclesMs` for this. If that moment is past `timeoutMs`, it stops at once with `TIMEOUT`, so raise `timeoutMs` to wait out a long backoff.
-:::
+> **Tip — Draining cooling items on demand:** [`drainUntilEmpty`](../api-reference/functions.md#drainuntilempty) sleeps until the soonest `nextRetryAt` by itself, so you do not need `delayBetweenCyclesMs` for this. If that moment is past `timeoutMs`, it stops at once with `TIMEOUT`, so raise `timeoutMs` to wait out a long backoff.
 
 ## Configuration Example
 

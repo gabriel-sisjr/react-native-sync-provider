@@ -144,9 +144,7 @@ The default cap is `10000`. Any value below `1` is treated as `1`, so the cap ca
 
 When the cap is reached, subsequent `enqueue()` calls reject. The native layer raises `QUEUE_FULL`, but it [reaches JS as `INVALID_PAYLOAD` with no `validationErrors`](../api-reference/errors.md#native-rejections) for now. Catch that and decide: drop the new item, flush, or surface a retry-later UX.
 
-:::note What the cap counts
-Android counts pending and in-flight items toward the cap, and in-flight items are not in `getQueueSize()`. iOS counts `PENDING` items only. Dead letters count on neither platform: the dead-letter queue is unbounded, so discard what you will not replay. See [Permanent Failures](./retry-policy.md#permanent-failures).
-:::
+> **Note — What the cap counts:** Android counts pending and in-flight items toward the cap, and in-flight items are not in `getQueueSize()`. iOS counts `PENDING` items only. Dead letters count on neither platform: the dead-letter queue is unbounded, so discard what you will not replay. See [Permanent Failures](./retry-policy.md#permanent-failures).
 
 ## Manual Removal
 

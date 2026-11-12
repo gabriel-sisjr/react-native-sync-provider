@@ -14,17 +14,13 @@ keywords:
 
 The library is pre-1.0, so minor versions can carry breaking changes. Each upgrade is described here, newest first.
 
-:::note
-The canonical list of breaking and behavior changes lives in [`BREAKING_CHANGES.md`](https://github.com/gabriel-sisjr/react-native-sync-provider/blob/develop/BREAKING_CHANGES.md). This page turns it into an upgrade procedure.
-:::
+> **Note:** The canonical list of breaking and behavior changes lives in [`BREAKING_CHANGES.md`](https://github.com/gabriel-sisjr/react-native-sync-provider/blob/develop/BREAKING_CHANGES.md). This page turns it into an upgrade procedure.
 
 ## v0.2 → v0.3 {#v0-2-to-v0-3}
 
 No function, hook or error code was removed, and the quality gate and the health check are opt-in. Four things change for every app: `react-native-nitro-modules` must be 0.35.8 or later, permanently failed items move to a dead-letter queue, `networkQuality` is a required field, and connection events fire only on real changes. Read the whole list before you ship.
 
-:::danger Roll-forward only
-The upgrade migrates the stores in place, and there is no supported downgrade. Downgrading an Android install wipes the queue and the dead letters. See [Rolling back](#rolling-back-from-v03).
-:::
+> **Important — Roll-forward only:** The upgrade migrates the stores in place, and there is no supported downgrade. Downgrading an Android install wipes the queue and the dead letters. See [Rolling back](#rolling-back-from-v03).
 
 ### Step 1: Upgrade and rebuild
 
@@ -38,9 +34,7 @@ The upgrade migrates the stores in place, and there is no supported downgrade. D
 - **Pending items.** Untouched, with their attempts and cooldowns.
 - **Configuration.** The persisted options carry over. `minNetworkQuality` and the health-check options start unset, so flushes behave as in v0.2 until you opt in.
 
-:::note iOS migration
-The iOS migration runs before the store loads, on every launch path, BGTask launches included. If it fails, the original store is untouched, that launch runs without a store, so every call rejects with `NATIVE_MODULE_UNAVAILABLE`, and the next launch retries. Stores written from 0.1.1-rc on migrate. A store written by the 0.1.0-beta prerelease is not a recognized source: it fails to load the same way, and the file is kept.
-:::
+> **Note — iOS migration:** The iOS migration runs before the store loads, on every launch path, BGTask launches included. If it fails, the original store is untouched, that launch runs without a store, so every call rejects with `NATIVE_MODULE_UNAVAILABLE`, and the next launch retries. Stores written from 0.1.1-rc on migrate. A store written by the 0.1.0-beta prerelease is not a recognized source: it fails to load the same way, and the file is kept.
 
 ### Step 3: Compile-time fixes
 
@@ -140,9 +134,7 @@ Before you turn them on:
 
 ### Rolling back {#rolling-back-from-v03}
 
-:::danger Android downgrade wipes the store
-Downgrading an Android install to a v0.2 build wipes the persisted queue and the dead letters. There is no supported downgrade.
-:::
+> **Important — Android downgrade wipes the store:** Downgrading an Android install to a v0.2 build wipes the persisted queue and the dead letters. There is no supported downgrade.
 
 A v0.2 iOS build cannot open the migrated store: the load fails as incompatible, and every call rejects with `NATIVE_MODULE_UNAVAILABLE` until the app runs v0.3 again. The store file is kept, not deleted. That iOS outcome follows from the code and has not been exercised in a test.
 
@@ -152,9 +144,7 @@ If you must roll back, first drain the queue with `drainUntilEmpty()` and confir
 
 No function, hook or error code was removed. The upgrade does need native changes on iOS, and several behaviors changed, so read the whole list before you ship it.
 
-:::danger Do this first on iOS
-If your `AppDelegate` calls `BGTaskScheduler.shared.register` for a library identifier, delete that call. The library now registers its handlers at process start, and iOS traps on a second registration, so the app is expected to crash at launch. This is expected rather than reproduced on a device.
-:::
+> **Important — Do this first on iOS:** If your `AppDelegate` calls `BGTaskScheduler.shared.register` for a library identifier, delete that call. The library now registers its handlers at process start, and iOS traps on a second registration, so the app is expected to crash at launch. This is expected rather than reproduced on a device.
 
 ### Step 1: iOS native changes
 
@@ -240,9 +230,7 @@ Room v1→v2 on Android and Core Data model v2 on iOS migrate forward automatica
 
 ### Rolling back
 
-:::danger Android downgrade wipes the queue
-Downgrading an Android install past v0.2 wipes the persisted queue. There is no supported downgrade.
-:::
+> **Important — Android downgrade wipes the queue:** Downgrading an Android install past v0.2 wipes the persisted queue. There is no supported downgrade.
 
 If you must roll back, drain the queue first with `drainUntilEmpty()` and confirm `stoppedReason === 'EMPTY'`: any other reason means items remain.
 

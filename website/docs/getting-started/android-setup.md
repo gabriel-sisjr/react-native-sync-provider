@@ -66,9 +66,7 @@ The library declares the required permissions in its own `AndroidManifest.xml`. 
 
 You may copy the declarations into your app's manifest for visibility, but it is not required.
 
-:::note No foreground service
-Unlike background-location libraries, this library does **not** use a foreground service. There is no persistent notification, no `FOREGROUND_SERVICE` permission, and no `FOREGROUND_SERVICE_TYPE` declaration. All background work is handled by `WorkManager`'s deferrable, OS-respecting model.
-:::
+> **Note — No foreground service:** Unlike background-location libraries, this library does **not** use a foreground service. There is no persistent notification, no `FOREGROUND_SERVICE` permission, and no `FOREGROUND_SERVICE_TYPE` declaration. All background work is handled by `WorkManager`'s deferrable, OS-respecting model.
 
 ## 3. BootCompletedReceiver
 
@@ -109,9 +107,7 @@ You do not need to add rules to your app. If you have custom ProGuard rules that
 
 The library uses `PeriodicWorkRequest` for OS-scheduled background sync. Android imposes a hard floor:
 
-:::warning 15-minute floor
-`PeriodicWorkRequest.MIN_PERIODIC_INTERVAL_MILLIS` is **15 minutes**. A smaller `minimumIntervalMs` passed to `enableBackgroundSync` is silently raised to it.
-:::
+> **Warning — 15-minute floor:** `PeriodicWorkRequest.MIN_PERIODIC_INTERVAL_MILLIS` is **15 minutes**. A smaller `minimumIntervalMs` passed to `enableBackgroundSync` is silently raised to it.
 
 For tighter cadences while the app runs, mount `useAutoSync({ enabled: true, flushOnReconnect: true })` -- it flushes from JS on an interval and when connectivity returns, regardless of WorkManager's schedule. Failed items also come back on their own, through the [retry timer and kick](../guides/retry-policy.md#who-wakes-the-queue-and-when).
 
@@ -138,21 +134,13 @@ You should see log lines from `SyncProvider` and `SyncWorker` once you call `enq
 
 ## 8. Common Android Issues
 
-:::tip Manifest merger conflict on `RECEIVE_BOOT_COMPLETED`
-If another library declares the permission with `android:required="false"` or similar, add `tools:replace="android:required"` to your app's manifest.
-:::
+> **Tip — Manifest merger conflict on `RECEIVE_BOOT_COMPLETED`:** If another library declares the permission with `android:required="false"` or similar, add `tools:replace="android:required"` to your app's manifest.
 
-:::tip Sync never fires after reboot
-Check that the user has not Force Stopped your app. Android disables `RECEIVE_BOOT_COMPLETED` for apps in the "Force Stopped" state until the user opens the app at least once.
-:::
+> **Tip — Sync never fires after reboot:** Check that the user has not Force Stopped your app. Android disables `RECEIVE_BOOT_COMPLETED` for apps in the "Force Stopped" state until the user opens the app at least once.
 
-:::tip Periodic sync runs at random times
-This is expected. WorkManager batches periodic work to honor Doze and Adaptive Battery. Use `useSyncEvents` and listen for `BACKGROUND_SYNC_STARTED` to log actual fire times during development. The event reaches you only if JS is running.
-:::
+> **Tip — Periodic sync runs at random times:** This is expected. WorkManager batches periodic work to honor Doze and Adaptive Battery. Use `useSyncEvents` and listen for `BACKGROUND_SYNC_STARTED` to log actual fire times during development. The event reaches you only if JS is running.
 
-:::tip Items wait after a backup restore
-`defaultHeaders` are encrypted under a Keystore key that never leaves the device. With `allowBackup`, a restore onto another device brings the ciphertext back but not the key, so items wait until `configureSync` runs. See [Troubleshooting](../troubleshooting.md#symptom-items-stay-pending-and-flush-returns-00).
-:::
+> **Tip — Items wait after a backup restore:** `defaultHeaders` are encrypted under a Keystore key that never leaves the device. With `allowBackup`, a restore onto another device brings the ciphertext back but not the key, so items wait until `configureSync` runs. See [Troubleshooting](../troubleshooting.md#symptom-items-stay-pending-and-flush-returns-00).
 
 For the full list of issues, see [Troubleshooting](../troubleshooting.md).
 

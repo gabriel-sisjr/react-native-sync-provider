@@ -181,9 +181,7 @@ export default function App({ token }: { token: string }) {
 
 The Provider applies `configureSync(options)` on mount and on every change to `options`, and pairs `enableBackgroundSync(backgroundSync)` with a matching `disableBackgroundSync()` on unmount. The options are persisted, so background workers use them too. Keep them stable with `useMemo`, and rebuild them when the token changes. Hooks work without a Provider as well -- it is purely a convenience.
 
-:::warning Omitting `defaultHeaders` is a logout
-Each `configureSync` replaces the whole configuration, and omitting `defaultHeaders` deletes the stored copy. See [Cold-start configuration](../guides/background-sync.md#cold-start-configuration).
-:::
+> **Warning — Omitting `defaultHeaders` is a logout:** Each `configureSync` replaces the whole configuration, and omitting `defaultHeaders` deletes the stored copy. See [Cold-start configuration](../guides/background-sync.md#cold-start-configuration).
 
 ## Quick Tips
 

@@ -126,9 +126,7 @@ See [iOS Setup](../getting-started/ios-setup.md) for the full walkthrough.
 
 While the app is not active, uploads go through a background `URLSession`, so the OS can finish them while the app is suspended. With `foregroundOnly`, this session is not used.
 
-:::warning A relaunch can lose the outcome of an upload
-A background upload that finishes after a relaunch is not recorded. Launch recovery puts the item back to `PENDING` with its attempt spent and no cooldown, and the server may already have accepted the request. Delivery is at least once, so endpoints must be idempotent. See the [Idempotency guide](./idempotency.md).
-:::
+> **Warning — A relaunch can lose the outcome of an upload:** A background upload that finishes after a relaunch is not recorded. Launch recovery puts the item back to `PENDING` with its attempt spent and no cooldown, and the server may already have accepted the request. Delivery is at least once, so endpoints must be idempotent. See the [Idempotency guide](./idempotency.md).
 
 ## Android: `WorkManager`
 
@@ -203,9 +201,7 @@ A stored value that cannot be used, such as an unusable `healthCheckUrl` or a ne
 | Every option except `defaultHeaders`     | SharedPreferences                                                                  | UserDefaults suite `com.gabriel-sisjr.syncprovider`                                |
 | `defaultHeaders`                         | AES-256-GCM under a non-exportable Android Keystore key, ciphertext in SharedPreferences | Keychain, `AfterFirstUnlockThisDeviceOnly`, not synchronized                 |
 
-:::warning Only `defaultHeaders` are encrypted
-Per-item `headers` and `body` are stored in plain text in the queue. Put credentials in `defaultHeaders`.
-:::
+> **Warning — Only `defaultHeaders` are encrypted:** Per-item `headers` and `body` are stored in plain text in the queue. Put credentials in `defaultHeaders`.
 
 ### Tokens and logout
 
@@ -276,9 +272,7 @@ Sync still progresses while the app is alive: manual [`flush()`](../api-referenc
 
 The flag persists across relaunches.
 
-:::note Recovery is never suppressed
-`foregroundOnly` gates **scheduled background dispatch only**. Data-integrity recovery — launch recovery and the Android boot-completed recovery pass — still runs, so items left mid-flight by an OS kill are always reconciled. The flag is not a switch for crash/kill recovery.
-:::
+> **Note — Recovery is never suppressed:** `foregroundOnly` gates **scheduled background dispatch only**. Data-integrity recovery — launch recovery and the Android boot-completed recovery pass — still runs, so items left mid-flight by an OS kill are always reconciled. The flag is not a switch for crash/kill recovery.
 
 It can be flipped at runtime by calling `enableBackgroundSync` again with a different value. Typical uses: QA / development builds (where background dispatch interferes with logs and breakpoints) and corporate policies that forbid background networking.
 
@@ -311,9 +305,7 @@ A skipped worker never returns `Result.retry()`, so WorkManager's own backoff do
 
 On iOS, a skipped window is not a failed one: its `BACKGROUND_SYNC_COMPLETED` carries neither `errorCode` nor `metadata.ok: "false"`, and the next request was already scheduled at the top of the handler. Read the reason from the cycle's `SYNC_FAILED`.
 
-:::tip Keep the gate and the Android constraints consistent
-On Android, `minNetworkQuality` does not replace `requiresUnmeteredNetwork`. WorkManager checks its constraints before it starts a worker, while the gate runs inside the worker, after the window was granted, so a window the gate skips is spent. If you gate on `GOOD` without `healthCheckUrl`, which in practice means unmetered links, also set `requiresUnmeteredNetwork: true`.
-:::
+> **Tip — Keep the gate and the Android constraints consistent:** On Android, `minNetworkQuality` does not replace `requiresUnmeteredNetwork`. WorkManager checks its constraints before it starts a worker, while the gate runs inside the worker, after the window was granted, so a window the gate skips is spent. If you gate on `GOOD` without `healthCheckUrl`, which in practice means unmetered links, also set `requiresUnmeteredNetwork: true`.
 
 ## When Sync May Be Deferred
 

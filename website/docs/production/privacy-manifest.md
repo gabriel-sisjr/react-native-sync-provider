@@ -82,6 +82,4 @@ The library does not affect your Privacy Nutrition Labels — it does not collec
 
 Default headers are stored in the Keychain, encrypted at rest and on the device only. The Keychain is not a Required Reason API, so it adds no manifest entry. They are sent only to the URLs you enqueue.
 
-:::note
-Apple's manifest format is versioned and occasionally adds new Required Reason APIs. If your CI starts emitting "missing privacy manifest entry" warnings after an Xcode bump, audit your own app first — the library's manifest is updated in lockstep with Xcode's requirements.
-:::
+> **Note:** Apple's manifest format is versioned and occasionally adds new Required Reason APIs. If your CI starts emitting "missing privacy manifest entry" warnings after an Xcode bump, audit your own app first — the library's manifest is updated in lockstep with Xcode's requirements.

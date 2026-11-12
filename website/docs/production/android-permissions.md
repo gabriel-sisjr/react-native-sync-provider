@@ -64,9 +64,7 @@ The Android scheduler is the source of truth for when a flush actually runs. Imp
 - **App standby buckets** (Android 9+): apps the user rarely opens get put into restrictive buckets. Periodic work cadence drops accordingly.
 - **Manufacturer auto-start whitelisting**: Xiaomi MIUI, Huawei EMUI, OPPO ColorOS, and a handful of other ROMs aggressively kill WorkManager unless the user manually allows your app to "auto-start". Document this in your support docs if those markets are in scope.
 
-:::tip
-For latency-sensitive payloads while the app runs, mount `useAutoSync`, which flushes from JS on an interval and on reconnect, instead of relying on the periodic cadence. Failed items also come back through the [retry timer and the opt-in retry kick](../guides/retry-policy.md#who-wakes-the-queue-and-when).
-:::
+> **Tip:** For latency-sensitive payloads while the app runs, mount `useAutoSync`, which flushes from JS on an interval and on reconnect, instead of relying on the periodic cadence. Failed items also come back through the [retry timer and the opt-in retry kick](../guides/retry-policy.md#who-wakes-the-queue-and-when).
 
 ## Verifying the merged manifest
 

@@ -66,9 +66,7 @@ function useSyncStatus(): UseSyncStatusResult
 - **Errors** -- `flush()`, `pause()` and `resume()` reject on failure, so catch them yourself.
 - **Cleanup** -- unsubscribes on unmount.
 
-:::note `lastResult.failureCount > 0` does not throw
-A flush with partial failures still resolves to a `SyncResult`. `lastResult.errors` is always empty on iOS, so use `ITEM_FAILED` events for per-item details. See the [Error handling guide](../../guides/error-handling.md).
-:::
+> **Note — `lastResult.failureCount > 0` does not throw:** A flush with partial failures still resolves to a `SyncResult`. `lastResult.errors` is always empty on iOS, so use `ITEM_FAILED` events for per-item details. See the [Error handling guide](../../guides/error-handling.md).
 
 ---
 

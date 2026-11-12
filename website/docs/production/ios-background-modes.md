@@ -40,9 +40,7 @@ Add both of the library's identifiers to your `Info.plist`:
 
 The identifiers are fixed. `BackgroundSyncOptions.taskIdentifier` has no effect.
 
-:::warning
-The library reads this list at process start, and iOS validates it. An identifier added later takes effect on the next launch. A missing identifier does not crash: its handler is skipped, and `enableBackgroundSync` rejects with `BACKGROUND_TASK_REGISTRATION_FAILED` when `.background` is the one missing.
-:::
+> **Warning:** The library reads this list at process start, and iOS validates it. An identifier added later takes effect on the next launch. A missing identifier does not crash: its handler is skipped, and `enableBackgroundSync` rejects with `BACKGROUND_TASK_REGISTRATION_FAILED` when `.background` is the one missing.
 
 ## 3. Forward background URLSession events
 
@@ -90,6 +88,4 @@ So the first processing request exists only after a refresh window has run. Each
 
 `foregroundOnly: true`, `disableBackgroundSync()`, or a pause make a handler that fires complete without dispatching.
 
-:::tip
-`requiresCharging` applies to the processing task only. `requiresUnmeteredNetwork` and `requiresDeviceIdle` are not applied on iOS, and the processing task always requires network connectivity.
-:::
+> **Tip:** `requiresCharging` applies to the processing task only. `requiresUnmeteredNetwork` and `requiresDeviceIdle` are not applied on iOS, and the processing task always requires network connectivity.

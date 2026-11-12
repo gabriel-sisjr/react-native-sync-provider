@@ -119,25 +119,22 @@ Native codes do not reach JS through a rejection yet. Each facade function maps 
 | `enableBackgroundSync`, `disableBackgroundSync`, `isBackgroundSyncEnabled` | `BACKGROUND_TASK_REGISTRATION_FAILED` |
 | Every other function                                                        | `INVALID_PAYLOAD`                     |
 
-:::warning `QUEUE_FULL` reaches you as `INVALID_PAYLOAD`
-The native layer raises `QUEUE_FULL`, but `enqueue`, `enqueueBatch` and `replayDeadLetter` reject with `INVALID_PAYLOAD`, so `err.code === SyncErrorCode.QUEUE_FULL` never matches. A validation failure always carries `validationErrors`, and a native rejection never does, so test for that:
-
-```ts
-try {
-  await enqueue(item);
-} catch (err) {
-  if (
-    err instanceof SyncError &&
-    err.code === SyncErrorCode.INVALID_PAYLOAD &&
-    err.validationErrors === undefined
-  ) {
-    // Rejected by native, most often a full queue. The detail is in err.message.
-    console.warn(err.message);
-  }
-}
-```
-
-:::
+> **Warning — `QUEUE_FULL` reaches you as `INVALID_PAYLOAD`:** The native layer raises `QUEUE_FULL`, but `enqueue`, `enqueueBatch` and `replayDeadLetter` reject with `INVALID_PAYLOAD`, so `err.code === SyncErrorCode.QUEUE_FULL` never matches. A validation failure always carries `validationErrors`, and a native rejection never does, so test for that:
+>
+> ```ts
+> try {
+>   await enqueue(item);
+> } catch (err) {
+>   if (
+>     err instanceof SyncError &&
+>     err.code === SyncErrorCode.INVALID_PAYLOAD &&
+>     err.validationErrors === undefined
+>   ) {
+>     // Rejected by native, most often a full queue. The detail is in err.message.
+>     console.warn(err.message);
+>   }
+> }
+> ```
 
 Codes describing a dispatched request arrive on events instead, on `ITEM_FAILED` and `ITEM_RETRYING`, and stay on the dead letter as `lastErrorCode`. Codes for a cycle skipped at the start of a flush arrive on `SYNC_FAILED`. None of them are rejections, because per-item failures and skipped cycles never reject.
 
@@ -172,9 +169,7 @@ type ValidationIssue = {
 - **`enqueue`** throws on the **first** violation, preserving the specific code (`INVALID_URL` or `INVALID_PAYLOAD`) and message. The full list is still attached on `validationErrors`. `reason` never contains the URL, but this `message` can, so treat it with care in logs.
 - **`enqueueBatch`** collects issues across **every** item and throws **one** umbrella `SyncError(INVALID_PAYLOAD)` whose `validationErrors` carries all of them, each tagged with its `itemIndex`. **No items are enqueued** when any issue is present.
 
-:::warning Behavior change in v0.2
-Before v0.2, `enqueueBatch` threw the first bad item's specific code (e.g. `INVALID_URL`). It now always throws `INVALID_PAYLOAD` and exposes per-field, per-item detail via `validationErrors`. If you pattern-match on `err.code` from a batch call, branch on `INVALID_PAYLOAD` and read `err.validationErrors`. See [`BREAKING_CHANGES.md`](https://github.com/gabriel-sisjr/react-native-sync-provider/blob/develop/BREAKING_CHANGES.md).
-:::
+> **Warning — Behavior change in v0.2:** Before v0.2, `enqueueBatch` threw the first bad item's specific code (e.g. `INVALID_URL`). It now always throws `INVALID_PAYLOAD` and exposes per-field, per-item detail via `validationErrors`. If you pattern-match on `err.code` from a batch call, branch on `INVALID_PAYLOAD` and read `err.validationErrors`. See [`BREAKING_CHANGES.md`](https://github.com/gabriel-sisjr/react-native-sync-provider/blob/develop/BREAKING_CHANGES.md).
 
 ```ts
 import {

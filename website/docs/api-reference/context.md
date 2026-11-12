@@ -49,19 +49,16 @@ interface SyncProviderContextValue {
 
 Read this value with the [`useSyncContext`](./hooks/useSyncContext.md) hook (sugar over `useContext(SyncProviderContext)`). [`useSyncConfig`](./hooks/useSyncConfig.md) reads from this context when it is available and otherwise falls back to the native singleton.
 
-:::tip Disambiguating `config === undefined`
-`config` is `undefined` in two distinct situations. Gate on `hasProvider` to tell them apart:
-
-```tsx
-const { config, hasProvider } = useSyncContext();
-if (!hasProvider) {
-  // Rendered outside <SyncProvider> — fall back to direct facade calls.
-} else if (config === undefined) {
-  // Provider mounted, initial getSyncConfig() round-trip still loading.
-}
-```
-
-:::
+> **Tip — Disambiguating `config === undefined`:** `config` is `undefined` in two distinct situations. Gate on `hasProvider` to tell them apart:
+>
+> ```tsx
+> const { config, hasProvider } = useSyncContext();
+> if (!hasProvider) {
+>   // Rendered outside <SyncProvider> — fall back to direct facade calls.
+> } else if (config === undefined) {
+>   // Provider mounted, initial getSyncConfig() round-trip still loading.
+> }
+> ```
 
 ---
 

@@ -52,9 +52,7 @@ If the same user action can reach `enqueue` twice, such as a double tap, create 
 
 A resource id in the URL works too. `PUT /orders/{id}` with an id you generate is naturally idempotent, and the server only needs to check whether the resource already exists.
 
-:::note The native ULID does not reach the server
-`enqueue` returns a ULID, which the native layer assigns when it persists the item. It identifies the item for [`removeItem`](../api-reference/functions.md#removeitem) and for sync events. It is not sent with the request, and it only exists after `enqueue` returns, so you cannot put it in that request's headers.
-:::
+> **Note — The native ULID does not reach the server:** `enqueue` returns a ULID, which the native layer assigns when it persists the item. It identifies the item for [`removeItem`](../api-reference/functions.md#removeitem) and for sync events. It is not sent with the request, and it only exists after `enqueue` returns, so you cannot put it in that request's headers.
 
 `generateId` returns a UUID v4 backed by `Math.random()`. That is good enough for deduplication within a client, but do not use it for anything an adversary should not be able to guess.
 

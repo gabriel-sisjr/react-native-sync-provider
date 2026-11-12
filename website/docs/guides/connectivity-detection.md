@@ -173,9 +173,7 @@ await configureSync({
 | `GOOD` | `GOOD` and `EXCELLENT` links. |
 | `EXCELLENT` | Only a measured median under 200 ms on a link no cap lowers. Without `healthCheckUrl` it blocks every flush. |
 
-:::tip `GOOD` without a URL means unmetered
-With no measurement, a metered link is `MODERATE`. So without `healthCheckUrl`, `minNetworkQuality: GOOD` lets cycles run only on unmetered links, outside iOS Low Data Mode and, on Android, on validated networks.
-:::
+> **Tip — `GOOD` without a URL means unmetered:** With no measurement, a metered link is `MODERATE`. So without `healthCheckUrl`, `minNetworkQuality: GOOD` lets cycles run only on unmetered links, outside iOS Low Data Mode and, on Android, on validated networks.
 
 ### What the gate checks
 
@@ -213,9 +211,7 @@ How a cycle uses it:
 4. **Next wake.** The next retry wake is the latest of the item's own deadline, a [credential hold](./background-sync.md#when-a-stored-token-expires), the end of the backoff and 1000 ms after the failed check. That floor holds even with `healthCheckBackoffMs: 0`, for every automatic wake: the in-process retry timer and its held-wake re-checks, the wakes after `resumeSync()` and on reconnect, and the Android retry kick. A check that keeps failing therefore cannot make them spin. It does not apply to an explicit `flush()`: with a backoff of `0`, a `flush()` right after a failure sends a new `HEAD`.
 5. **Recovery.** A healthy check clears the backoff, and so does every `configureSync` call, which ends it early. The backoff is kept in memory only, so a new process starts without one.
 
-:::warning Point it at an endpoint that answers without authentication
-The probes carry no credentials, so an endpoint that requires them answers `401` and every cycle is skipped. Prefer `https://`: a captive portal can answer a plain `http://` probe with a `2xx`. Only Android's `NET_CAPABILITY_VALIDATED` cap covers that case, and only for the quality level.
-:::
+> **Warning — Point it at an endpoint that answers without authentication:** The probes carry no credentials, so an endpoint that requires them answers `401` and every cycle is skipped. Prefer `https://`: a captive portal can answer a plain `http://` probe with a `2xx`. Only Android's `NET_CAPABILITY_VALIDATED` cap covers that case, and only for the quality level.
 
 `configureSync` rejects a `healthCheckUrl` that is not an absolute `http(s)` URL with `INVALID_URL`, and a negative or non-finite duration with `INVALID_PAYLOAD`. The options are persisted for background workers. A stored value that cannot be used, which only a damaged record can hold, loads as unset.
 

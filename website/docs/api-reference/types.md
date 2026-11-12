@@ -72,9 +72,7 @@ interface SyncItemInput {
 | `priority`    | [`SyncPriority`](./enums.md#syncpriority) | No       | Dispatch lane. Defaults to `NORMAL`.                                                                |
 | `metadata`    | `Record<string, string>`                  | No       | Opaque tags persisted with the item and returned by `getPendingItems`. Not sent with the request and not echoed on events. Strings only. |
 
-:::note `contentType` vs. `headers`
-The platforms resolve a conflict differently. Android uses `contentType`, and sends `application/json` for any body when it is omitted, even if `headers` sets `Content-Type`. iOS uses the value in `headers` or `defaultHeaders`, and sets `contentType` only when neither has one.
-:::
+> **Note — `contentType` vs. `headers`:** The platforms resolve a conflict differently. Android uses `contentType`, and sends `application/json` for any body when it is omitted, even if `headers` sets `Content-Type`. iOS uses the value in `headers` or `defaultHeaders`, and sets `contentType` only when neither has one.
 
 ---
 
@@ -112,9 +110,7 @@ interface SyncItem {
 | `nextRetryAt` | `number`                                  | Yes      | [Retry cooldown](../guides/retry-policy.md#retry-cooldown-across-restarts). `0` means **eligible now**, not that the item was never attempted. A positive value is an epoch-ms deadline: a retry cooldown or a credential hold is pending, and the item is eligible once `nextRetryAt <= now`. The value stays in place afterwards, so a timestamp in the past means the wait has elapsed. |
 | `metadata`    | `Record<string, string>`                  | No       | Opaque tags.                                                                                                                                                                                                                                            |
 
-:::note `attempts` / `nextRetryAt` are never `undefined`
-Unlike [`getLastSyncResult`](./functions.md#getlastsyncresult), which maps a native sentinel (`startedAt === 0 && finishedAt === 0`) to `undefined`, a `SyncItem`'s `attempts` and `nextRetryAt` are surfaced **verbatim**. Their `0` values carry meaning, so they are filled in, not skipped.
-:::
+> **Note — `attempts` / `nextRetryAt` are never `undefined`:** Unlike [`getLastSyncResult`](./functions.md#getlastsyncresult), which maps a native sentinel (`startedAt === 0 && finishedAt === 0`) to `undefined`, a `SyncItem`'s `attempts` and `nextRetryAt` are surfaced **verbatim**. Their `0` values carry meaning, so they are filled in, not skipped.
 
 The two fields do not move together. Rows carried over from v0.1 can show `attempts >= 1` with `nextRetryAt: 0`, and so can an iOS row whose first attempt was cut short by a process kill. An item held after a credential rejection can show `attempts: 0` with `nextRetryAt > 0`. A cooldown and a hold look the same here, because `SyncItem` carries neither the last error code nor the last attempt time: an `ITEM_RETRYING` event with `errorCode: 'UNAUTHORIZED'` marks a hold.
 
@@ -160,9 +156,7 @@ interface SyncDeadLetterItem {
 | `lastErrorMessage` | `string`                                     | No       | Detail of the final failure: for an HTTP failure, the status line; otherwise the error message, such as `Retry budget exhausted`. At most 1024 characters. Never contains request or response headers or bodies. Absent for items moved by the upgrade, and when the platform reported no detail. |
 | `deadLetteredAt`   | `number`                                     | Yes      | Unix ms when the item was moved. [`listDeadLetter`](./functions.md#listdeadletter) sorts by it, oldest first. For an item moved by the upgrade: its last attempt time, or its enqueue time when none was recorded. |
 
-:::note The status line differs by platform
-iOS builds it with the system's reason phrase, as in `HTTP 404 Not Found`. Android uses the server's status line, whose reason phrase is empty under HTTP/2, as in `HTTP 404`. Branch on `lastErrorCode`, not on this text.
-:::
+> **Note — The status line differs by platform:** iOS builds it with the system's reason phrase, as in `HTTP 404 Not Found`. Android uses the server's status line, whose reason phrase is empty under HTTP/2, as in `HTTP 404`. Branch on `lastErrorCode`, not on this text.
 
 How an item becomes a dead letter:
 
@@ -171,9 +165,7 @@ How an item becomes a dead letter:
 - **On upgrade.** Items that had failed permanently under an earlier version are moved here when the upgraded library first opens its store.
 - **Same id.** A newer dead letter with the same id replaces the older one.
 
-:::warning The dead-letter queue is unbounded
-Nothing prunes it, and it counts toward no capacity cap, on either platform. Each dead letter keeps its request's headers and body until [`replayDeadLetter`](./functions.md#replaydeadletter), [`discardDeadLetter`](./functions.md#discarddeadletter), [`removeItem`](./functions.md#removeitem) or [`clearQueue`](./functions.md#clearqueue) deletes it. Discard what you do not replay.
-:::
+> **Warning — The dead-letter queue is unbounded:** Nothing prunes it, and it counts toward no capacity cap, on either platform. Each dead letter keeps its request's headers and body until [`replayDeadLetter`](./functions.md#replaydeadletter), [`discardDeadLetter`](./functions.md#discarddeadletter), [`removeItem`](./functions.md#removeitem) or [`clearQueue`](./functions.md#clearqueue) deletes it. Discard what you do not replay.
 
 ---
 
@@ -422,9 +414,7 @@ interface ConnectionState {
 | `isInternetReachable` | `boolean`                                         | No       | Optional reachability probe (iOS only on some setups).         |
 | `isExpensive`         | `boolean`                                         | No       | Mirrors `NWPath.isExpensive` (iOS) / metered status (Android). |
 
-:::warning `networkQuality` is required
-Code that only reads `ConnectionState` is unaffected, but a hand-built value, such as a test fixture or a mock of `getConnectionStatus`, must now set it. See the [v0.2 → v0.3 migration](../migration/index.md#v0-2-to-v0-3).
-:::
+> **Warning — `networkQuality` is required:** Code that only reads `ConnectionState` is unaffected, but a hand-built value, such as a test fixture or a mock of `getConnectionStatus`, must now set it. See the [v0.2 → v0.3 migration](../migration/index.md#v0-2-to-v0-3).
 
 ---
 

@@ -45,9 +45,7 @@ yarn add "react-native-nitro-modules@^0.35.8"
 npm install "react-native-nitro-modules@^0.35.8"
 ```
 
-:::note Why 0.35.8
-In 0.35.6 and 0.35.7, Nitro's Swift `Promise` had no lock, so an iOS call could leave its JS promise pending forever. The fix, [Nitro PR #1338](https://github.com/margelo/nitro/pull/1338), was first published in 0.35.8 on npm. Nitro's GitHub has no v0.35.8 release: the fix is listed in the [v0.35.9 release notes](https://github.com/margelo/nitro/releases/tag/v0.35.9).
-:::
+> **Note — Why 0.35.8:** In 0.35.6 and 0.35.7, Nitro's Swift `Promise` had no lock, so an iOS call could leave its JS promise pending forever. The fix, [Nitro PR #1338](https://github.com/margelo/nitro/pull/1338), was first published in 0.35.8 on npm. Nitro's GitHub has no v0.35.8 release: the fix is listed in the [v0.35.9 release notes](https://github.com/margelo/nitro/releases/tag/v0.35.9).
 
 ## iOS Setup
 
@@ -174,17 +172,11 @@ If the helper returns `false`, the most common causes are:
 
 ## Troubleshooting
 
-:::tip Build fails on iOS with "Multiple commands produce PrivacyInfo.xcprivacy"
-This happens when an older copy of the library was installed via `cp` or vendored. Run `pod deintegrate && pod install` and remove any duplicate `PrivacyInfo.xcprivacy` from your app target.
-:::
+> **Tip — Build fails on iOS with "Multiple commands produce PrivacyInfo.xcprivacy":** This happens when an older copy of the library was installed via `cp` or vendored. Run `pod deintegrate && pod install` and remove any duplicate `PrivacyInfo.xcprivacy` from your app target.
 
-:::tip Android KSP crash on Room schema generation
-Make sure you are on Kotlin 2.0.21 and Room 2.7.0+. Older Room versions (2.6.x) crash on KSP under Kotlin 2.0.x.
-:::
+> **Tip — Android KSP crash on Room schema generation:** Make sure you are on Kotlin 2.0.21 and Room 2.7.0+. Older Room versions (2.6.x) crash on KSP under Kotlin 2.0.x.
 
-:::tip "Native module not found" on first call
-Rebuild the native app after installing the package: `yarn example ios` / `yarn example android`. Hot-reload alone does not pick up new native modules.
-:::
+> **Tip — "Native module not found" on first call:** Rebuild the native app after installing the package: `yarn example ios` / `yarn example android`. Hot-reload alone does not pick up new native modules.
 
 For a full list of common issues, see [Troubleshooting](../troubleshooting.md).
 

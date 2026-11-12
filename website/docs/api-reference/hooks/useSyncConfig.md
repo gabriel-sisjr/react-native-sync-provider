@@ -58,9 +58,7 @@ function useSyncConfig(): UseSyncConfigResult
 - **`setConfig`** -- always calls `configureSync`, then re-reads the config. Only the calling hook updates: other `useSyncConfig` instances and the Provider's context value catch up on their next read. It is a full replace, like `configureSync`: spread `config` for the other fields, and set `defaultHeaders` from your app's own session instead of copying them from `config`.
 - **External changes** -- `configureSync` fires no sync event, so the hook does not see changes made elsewhere. Call `refresh()` if needed.
 
-:::warning `setConfig({ ...config })` can log the user out
-`config` comes from [`getSyncConfig`](../functions.md#getsyncconfig), so it can lack the stored headers: while they cannot be read, `defaultHeaders` is `undefined` on Android and `{}` on iOS. A config passed without them deletes the stored copy, which acts as a logout. Later requests go out without them, and a 401 or 403 fails those items permanently. See [Troubleshooting](../../troubleshooting.md#symptom-items-stay-pending-and-flush-returns-00).
-:::
+> **Warning — `setConfig({ ...config })` can log the user out:** `config` comes from [`getSyncConfig`](../functions.md#getsyncconfig), so it can lack the stored headers: while they cannot be read, `defaultHeaders` is `undefined` on Android and `{}` on iOS. A config passed without them deletes the stored copy, which acts as a logout. Later requests go out without them, and a 401 or 403 fails those items permanently. See [Troubleshooting](../../troubleshooting.md#symptom-items-stay-pending-and-flush-returns-00).
 
 ---
 

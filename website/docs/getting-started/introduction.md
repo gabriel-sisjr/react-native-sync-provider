@@ -64,9 +64,7 @@ keywords:
 | Android Gradle Plugin | 8.7.2 |
 | Node.js (dev) | >= 22.11 |
 
-:::warning
-This library requires the React Native New Architecture. Nitro Modules do not run on the legacy bridge. See the [Installation guide](./installation.md) for a verification step.
-:::
+> **Warning:** This library requires the React Native New Architecture. Nitro Modules do not run on the legacy bridge. See the [Installation guide](./installation.md) for a verification step.
 
 ## How It Works
 

@@ -42,9 +42,7 @@ The HybridObject implementation lives in `ios/SyncProvider.swift` (`final class 
 
 On start it loads the persisted configuration, starts `ConnectivityMonitor`, and runs launch recovery. It counts JS-facing hybrids: the retry timer runs only while there is one, and creating a hybrid clears a persisted pause, because JS cannot read the flag and starts out unpaused.
 
-:::note
-The Swift class is intentionally named `HybridSyncProvider`, not `SyncProvider`. Nitro generates a C++ `SyncProvider::SyncProvider` class inside the `margelo::nitro::syncprovider` namespace; reusing the same name from Swift would collide with the generated bridging header (`SyncProvider-Swift.h`) and break the build. The Nitro `iosModuleName` (`SyncProvider`) and the JS lookup (`NitroModules.createHybridObject<SyncProvider>('SyncProvider')`) are unchanged — only the underlying Swift class name differs. The Kotlin implementation has no analogous collision and remains `class SyncProvider`. The autolinking mapping lives in `nitro.json → autolinking.SyncProvider.ios.implementationClassName: "HybridSyncProvider"`.
-:::
+> **Note:** The Swift class is intentionally named `HybridSyncProvider`, not `SyncProvider`. Nitro generates a C++ `SyncProvider::SyncProvider` class inside the `margelo::nitro::syncprovider` namespace; reusing the same name from Swift would collide with the generated bridging header (`SyncProvider-Swift.h`) and break the build. The Nitro `iosModuleName` (`SyncProvider`) and the JS lookup (`NitroModules.createHybridObject<SyncProvider>('SyncProvider')`) are unchanged — only the underlying Swift class name differs. The Kotlin implementation has no analogous collision and remains `class SyncProvider`. The autolinking mapping lives in `nitro.json → autolinking.SyncProvider.ios.implementationClassName: "HybridSyncProvider"`.
 
 ## Core Data
 
@@ -64,9 +62,7 @@ If the migration fails, the original store is untouched, that launch runs withou
 
 A separate background `NSManagedObjectContext` is used for writes to keep the JSI thread free of Core Data work.
 
-:::tip
-The model is also reconstructed programmatically in `InMemoryCoreDataStack` (test target). When you change the production model in `SyncProvider.xcdatamodeld`, mirror the change in `InMemoryCoreDataStack.makeModel()` — this is the only test seam that mirrors the schema.
-:::
+> **Tip:** The model is also reconstructed programmatically in `InMemoryCoreDataStack` (test target). When you change the production model in `SyncProvider.xcdatamodeld`, mirror the change in `InMemoryCoreDataStack.makeModel()` — this is the only test seam that mirrors the schema.
 
 ## SyncQueueStorage
 
@@ -92,9 +88,7 @@ The dispatcher reads eligible rows from `SyncQueueStorage`, applies the active `
 
 `BackgroundURLSessionDelegate` routes a completion back to the dispatcher while the call that started the upload is still waiting, and receives the `application(_:handleEventsForBackgroundURLSession:completionHandler:)` call the host app forwards through `HybridSyncProvider.handleBackgroundURLSessionEvents`.
 
-:::warning A completion delivered after a relaunch is dropped
-The row stays `IN_FLIGHT` until launch recovery puts it back to `PENDING`, with no cooldown and its attempt spent. The server may have accepted the request, so it can be sent twice. See [Idempotency](../guides/idempotency.md).
-:::
+> **Warning — A completion delivered after a relaunch is dropped:** The row stays `IN_FLIGHT` until launch recovery puts it back to `PENDING`, with no cooldown and its attempt spent. The server may have accepted the request, so it can be sent twice. See [Idempotency](../guides/idempotency.md).
 
 ## Retry Wake
 
@@ -134,9 +128,7 @@ The health check sends its `HEAD` on the same probe session. A healthy result is
 
 Both handlers wait for launch recovery, call `SyncDispatcher.flush()` once, and emit `BACKGROUND_SYNC_STARTED` / `BACKGROUND_SYNC_COMPLETED`. `BackgroundSyncOptionsStore` persists the options, including `foregroundOnly`, so a handler honors them with no JS loaded. Under `foregroundOnly`, or after `disableBackgroundSync`, a task that fires completes inert. `requiresUnmeteredNetwork` and `requiresDeviceIdle` are not mapped, and `taskIdentifier` is not used.
 
-:::warning
-Both identifiers MUST appear in the host app's `Info.plist` under `BGTaskSchedulerPermittedIdentifiers`, and the `Background fetch` and `Background processing` capabilities MUST be enabled on the app target. A missing identifier skips its handler, and `enableBackgroundSync` throws `BACKGROUND_TASK_REGISTRATION_FAILED` when `.background` is the one missing. See [iOS Background Modes](../production/ios-background-modes.md).
-:::
+> **Warning:** Both identifiers MUST appear in the host app's `Info.plist` under `BGTaskSchedulerPermittedIdentifiers`, and the `Background fetch` and `Background processing` capabilities MUST be enabled on the app target. A missing identifier skips its handler, and `enableBackgroundSync` throws `BACKGROUND_TASK_REGISTRATION_FAILED` when `.background` is the one missing. See [iOS Background Modes](../production/ios-background-modes.md).
 
 ## RecoveryManager
 
@@ -165,15 +157,13 @@ The podspec advertises:
 
 The iOS test target is declared on the library side via `s.test_spec 'Tests'` in `SyncProvider.podspec`. CocoaPods 1.10+ defaults `:test_type` to `:unit` and auto-prefixes the resulting scheme with `Unit-`, so the generated Xcode scheme is **`SyncProvider-Unit-Tests`** (not `SyncProvider-Tests`). We did not rename the test_spec — the segment is added by CocoaPods.
 
-:::warning
-`use_native_modules!` autolinking does **not** propagate `:testspecs` to consuming apps. The example app opts in explicitly in `example/ios/Podfile`:
-
-```ruby
-pod 'SyncProvider', :path => '../..', :testspecs => ['Tests']
-```
-
-Without this line, `pod install` will not generate the test target and `xcodebuild -scheme SyncProvider-Unit-Tests` will fail to resolve the scheme. The `post_install` block also calls `installer.pods_project.recreate_user_schemes(false)` to ensure the generated test scheme is shared (the `false` keeps user-state untouched).
-:::
+> **Warning:** `use_native_modules!` autolinking does **not** propagate `:testspecs` to consuming apps. The example app opts in explicitly in `example/ios/Podfile`:
+>
+> ```ruby
+> pod 'SyncProvider', :path => '../..', :testspecs => ['Tests']
+> ```
+>
+> Without this line, `pod install` will not generate the test target and `xcodebuild -scheme SyncProvider-Unit-Tests` will fail to resolve the scheme. The `post_install` block also calls `installer.pods_project.recreate_user_schemes(false)` to ensure the generated test scheme is shared (the `false` keeps user-state untouched).
 
 After `yarn nitrogen` and `bundle exec pod install --project-directory=ios` (run from `example/`), run the suite with:
 

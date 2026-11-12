@@ -131,9 +131,7 @@ function enqueueBatch(items: SyncItemInput[]): Promise<string[]>;
 
 Array holes count as invalid items.
 
-:::warning Behavior change in v0.2
-`enqueueBatch` now throws `INVALID_PAYLOAD` with a populated `validationErrors` list instead of the first bad item's specific code (e.g. `INVALID_URL`). See [Errors → batch validation](./errors.md#batch-validation-aggregates-all-issues).
-:::
+> **Warning — Behavior change in v0.2:** `enqueueBatch` now throws `INVALID_PAYLOAD` with a populated `validationErrors` list instead of the first bad item's specific code (e.g. `INVALID_URL`). See [Errors → batch validation](./errors.md#batch-validation-aggregates-all-issues).
 
 #### Example
 
@@ -278,9 +276,7 @@ items.forEach((item) => console.log(item.id, item.url));
 
 An item that fails permanently is not dropped. In one transaction it leaves the queue and enters the dead-letter queue, then `ITEM_FAILED` reports the real code and `ITEM_DEAD_LETTERED` follows, unless the item was [removed or cleared while its request was in flight](#what-a-purge-stops). That covers attempts exhausted, a response that is not retried, and a 401 or 403 under a configuration set in the current process. Items that had failed permanently before the upgrade to v0.3 are moved there too. See [`SyncDeadLetterItem`](./types.md#syncdeadletteritem) for the fields.
 
-:::warning Nothing prunes the dead-letter queue
-It is unbounded and counts toward no capacity cap. Each dead letter keeps its request's headers and body until it is replayed, discarded, removed with [`removeItem`](#removeitem) or cleared with [`clearQueue`](#clearqueue). Discard what you do not replay.
-:::
+> **Warning — Nothing prunes the dead-letter queue:** It is unbounded and counts toward no capacity cap. Each dead letter keeps its request's headers and body until it is replayed, discarded, removed with [`removeItem`](#removeitem) or cleared with [`clearQueue`](#clearqueue). Discard what you do not replay.
 
 ### `listDeadLetter`
 
@@ -433,9 +429,7 @@ An item that went back to wait for a retry counts as neither a success nor a fai
 
 Per-item failures never throw, and neither does a cycle the quality gate or the health check skips.
 
-:::warning `flush()` resolves successfully even with failures
-A successful `Promise` resolution does **not** mean every item synced. Inspect `result.failureCount`, and listen to `ITEM_FAILED` for the per-item detail. See the [Error handling guide](../guides/error-handling.md).
-:::
+> **Warning — `flush()` resolves successfully even with failures:** A successful `Promise` resolution does **not** mean every item synced. Inspect `result.failureCount`, and listen to `ITEM_FAILED` for the per-item detail. See the [Error handling guide](../guides/error-handling.md).
 
 #### Checks before a cycle
 
@@ -507,9 +501,7 @@ None of these waits uses up an iteration, because `maxIterations` counts real fl
 
 A `flush()` that the [quality gate or the health check](#checks-before-a-cycle) skips does use up an iteration, and makes no progress. On a link below `minNetworkQuality`, or while a health-check backoff runs, the loop therefore ends with `MAX_ITERATIONS` or `TIMEOUT`.
 
-:::warning `timeoutMs` and `cancelDrain()` are hard stops
-Every wait ends at the deadline or on cancel, including a `flush()` still in flight. A native cycle that is already running is not aborted: it keeps going after the drain returns, and its items may still be dispatched.
-:::
+> **Warning — `timeoutMs` and `cancelDrain()` are hard stops:** Every wait ends at the deadline or on cancel, including a `flush()` still in flight. A native cycle that is already running is not aborted: it keeps going after the drain returns, and its items may still be dispatched.
 
 #### Example
 
@@ -686,11 +678,9 @@ function getSyncConfig(): Promise<SyncOptions>;
 
 `NATIVE_MODULE_UNAVAILABLE`.
 
-:::warning Do not pass the result back without setting `defaultHeaders`
-In a process where `configureSync` has not run yet, the result is the configuration an earlier process persisted, with the stored copy of the headers. While that copy cannot be read (the Android Keystore key was invalidated, the iOS device has not been unlocked since boot, or a backup was restored onto another device), the result carries no headers: `defaultHeaders` is `undefined` on Android and `{}` on iOS. That lasts until the library reads the copy again, which it retries on each flush while not paused, or until `configureSync` runs.
-
-`configureSync` replaces the whole configuration, so passing such a result back, for example `configureSync({ ...cfg, batchSize: 5 })`, deletes the stored headers, which acts as a logout. Later requests go out without them, and a 401 or 403 fails those items permanently. See [Troubleshooting](../troubleshooting.md#symptom-items-stay-pending-and-flush-returns-00).
-:::
+> **Warning — Do not pass the result back without setting `defaultHeaders`:** In a process where `configureSync` has not run yet, the result is the configuration an earlier process persisted, with the stored copy of the headers. While that copy cannot be read (the Android Keystore key was invalidated, the iOS device has not been unlocked since boot, or a backup was restored onto another device), the result carries no headers: `defaultHeaders` is `undefined` on Android and `{}` on iOS. That lasts until the library reads the copy again, which it retries on each flush while not paused, or until `configureSync` runs.
+>
+> `configureSync` replaces the whole configuration, so passing such a result back, for example `configureSync({ ...cfg, batchSize: 5 })`, deletes the stored headers, which acts as a logout. Later requests go out without them, and a 401 or 403 fails those items permanently. See [Troubleshooting](../troubleshooting.md#symptom-items-stay-pending-and-flush-returns-00).
 
 #### Example
 
@@ -718,9 +708,7 @@ function getLastSyncResult(): Promise<SyncResult | undefined>;
 
 `Promise<SyncResult | undefined>`. This includes 0/0 cycles, so a recent `successCount` of `0` does not mean nothing was ever sent.
 
-:::note Sentinel translation
-The native layer returns a result with `startedAt === 0 && finishedAt === 0` to mean "no run yet". The JS facade translates that sentinel into `undefined` so consumers can do a simple null check. `flush()` does not translate it.
-:::
+> **Note — Sentinel translation:** The native layer returns a result with `startedAt === 0 && finishedAt === 0` to mean "no run yet". The JS facade translates that sentinel into `undefined` so consumers can do a simple null check. `flush()` does not translate it.
 
 #### Example
 

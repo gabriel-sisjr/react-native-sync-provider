@@ -95,9 +95,7 @@ function ConfigBadge() {
 - **Read-only.** It exposes no setters; to change config, call [`configureSync`](../functions.md#configuresync) or update the Provider's `options` prop.
 - **Web parity.** On web the hook returns the inert context value; with the web `<SyncProvider>` mounted that is `{ config: undefined, hasProvider: true }`.
 
-:::warning Hooks rules apply
-Call `useSyncContext()` unconditionally at the top level of your component — never inside a condition, loop, or callback (the [Rules of Hooks](https://react.dev/reference/rules/rules-of-hooks)).
-:::
+> **Warning — Hooks rules apply:** Call `useSyncContext()` unconditionally at the top level of your component — never inside a condition, loop, or callback (the [Rules of Hooks](https://react.dev/reference/rules/rules-of-hooks)).
 
 ---
 

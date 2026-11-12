@@ -166,9 +166,7 @@ A cycle that found nothing eligible emits `SYNC_STARTED` and `SYNC_SUCCEEDED` an
 
 **Fix:** For unreadable headers, call `configureSync` with the headers again, which ends the wait. The library also retries the read on each flush, so an iOS device resumes after the first unlock.
 
-:::warning Do not re-apply `getSyncConfig()` in this state
-While headers are unreadable, `getSyncConfig()` returns none (`undefined` on Android, `{}` on iOS), so `setConfig({ ...config })` or `configureSync(await getSyncConfig())` deletes them, which acts as a logout. Pass `defaultHeaders` from your app's session.
-:::
+> **Warning — Do not re-apply `getSyncConfig()` in this state:** While headers are unreadable, `getSyncConfig()` returns none (`undefined` on Android, `{}` on iOS), so `setConfig({ ...config })` or `configureSync(await getSyncConfig())` deletes them, which acts as a logout. Pass `defaultHeaders` from your app's session.
 
 ### Symptom: Nothing syncs with `minNetworkQuality` or `healthCheckUrl` set {#symptom-nothing-syncs-with-minnetworkquality-or-healthcheckurl-set}
 

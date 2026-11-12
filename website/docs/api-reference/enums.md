@@ -219,9 +219,7 @@ Events reach only listeners in a running JS engine. A worker or BGTask with no J
 
 The `metadata` field on these events is never the item's `metadata`. See [`SyncEvent`](./types.md#syncevent).
 
-:::note New members are appended
-`ITEM_DEAD_LETTERED` was added in v0.3. A `switch` over `SyncEventType` that ends in a `never` exhaustiveness check needs a case for it.
-:::
+> **Note — New members are appended:** `ITEM_DEAD_LETTERED` was added in v0.3. A `switch` over `SyncEventType` that ends in a `never` exhaustiveness check needs a case for it.
 
 ---
 

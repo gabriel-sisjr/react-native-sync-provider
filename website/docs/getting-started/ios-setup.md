@@ -100,9 +100,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
 This is the only `AppDelegate` code the library needs. The call is Swift-only, because the pod generates no Objective-C header. If your `AppDelegate` is Objective-C, call it from a small Swift helper in your app target.
 
-:::danger Do not register the BGTask handlers yourself
-The library registers its handlers at process start, through `+load`, before `didFinishLaunchingWithOptions` runs and with no JS loaded. Do not call `BGTaskScheduler.shared.register` for either identifier: iOS traps on a second registration for the same identifier, so the app is expected to crash at launch. An earlier version of this page showed such a block. If your app has it, delete it. See [`BREAKING_CHANGES.md`](https://github.com/gabriel-sisjr/react-native-sync-provider/blob/develop/BREAKING_CHANGES.md).
-:::
+> **Important — Do not register the BGTask handlers yourself:** The library registers its handlers at process start, through `+load`, before `didFinishLaunchingWithOptions` runs and with no JS loaded. Do not call `BGTaskScheduler.shared.register` for either identifier: iOS traps on a second registration for the same identifier, so the app is expected to crash at launch. An earlier version of this page showed such a block. If your app has it, delete it. See [`BREAKING_CHANGES.md`](https://github.com/gabriel-sisjr/react-native-sync-provider/blob/develop/BREAKING_CHANGES.md).
 
 ## 6. Privacy Manifest
 
@@ -136,17 +134,11 @@ The processing request is submitted by the refresh handler, so simulate `.backgr
 
 ## 8. Common iOS Issues
 
-:::tip `enableBackgroundSync` throws `BACKGROUND_TASK_REGISTRATION_FAILED`
-Check that `com.gabriel-sisjr.syncprovider.background` is in `BGTaskSchedulerPermittedIdentifiers`, and that you are on a physical device.
-:::
+> **Tip — `enableBackgroundSync` throws `BACKGROUND_TASK_REGISTRATION_FAILED`:** Check that `com.gabriel-sisjr.syncprovider.background` is in `BGTaskSchedulerPermittedIdentifiers`, and that you are on a physical device.
 
-:::tip Background work stops after the user swipes the app away
-iOS does not launch a force-quit app for background tasks or uploads, until the user opens it again. The queue itself is safe: items stay on disk.
-:::
+> **Tip — Background work stops after the user swipes the app away:** iOS does not launch a force-quit app for background tasks or uploads, until the user opens it again. The queue itself is safe: items stay on disk.
 
-:::warning OS-imposed scheduling
-`BGTaskScheduler` treats your `minimumIntervalMs` as a **soft hint**. The OS schedules the task at its discretion based on battery level, network state, and usage patterns. Nothing guarantees when, or whether, a window runs. Do not depend on a specific cadence.
-:::
+> **Warning — OS-imposed scheduling:** `BGTaskScheduler` treats your `minimumIntervalMs` as a **soft hint**. The OS schedules the task at its discretion based on battery level, network state, and usage patterns. Nothing guarantees when, or whether, a window runs. Do not depend on a specific cadence.
 
 For the full list of issues, see [Troubleshooting](../troubleshooting.md).
 
