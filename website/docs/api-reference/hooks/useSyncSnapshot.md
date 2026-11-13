@@ -13,7 +13,7 @@ keywords:
   - dead-letter
 ---
 
-# `useSyncSnapshot`
+# useSyncSnapshot
 
 Read-only dashboard aggregator that combines connection, queue, dead-letter, and sync-engine state into a single reactive snapshot. Unlike [`useOfflineQueue`](./useOfflineQueue.md), it exposes **no** action methods (`enqueue`, `flush`, etc.) -- it is a pure observer intended for status dashboards, badges, and "what is the sync engine doing right now?" UIs.
 
@@ -21,7 +21,7 @@ Read-only dashboard aggregator that combines connection, queue, dead-letter, and
 import { useSyncSnapshot } from '@gabriel-sisjr/react-native-sync-provider';
 ```
 
-**Platform:** Android and iOS.
+**Platform:** Android and iOS. On web it returns an inert snapshot, with `networkQuality` and `deadLetter` always `undefined`.
 
 ---
 
@@ -37,7 +37,7 @@ Takes no parameters and always returns the full snapshot object. Consumers that 
 
 ## Return Value
 
-### State
+### State Properties
 
 | Property | Type | Description |
 |----------|------|-------------|
@@ -51,7 +51,7 @@ Takes no parameters and always returns the full snapshot object. Consumers that 
 | `isWaitingForConnection` | `boolean` | `size > 0 && !connection.isOnline`. The "Waiting for connection..." sentinel. |
 | `error` | [`SyncError`](../errors.md) `\| null` | Last error captured by the hook, or `null` once cleared. |
 
-### Network quality and dead letters
+### Network Quality and Dead Letters
 
 | Property | Type | Description |
 |----------|------|-------------|
@@ -62,7 +62,7 @@ Both are optional because they can still be loading: test for `undefined` before
 
 ---
 
-## Behavior
+## Behavior Details
 
 - **Single-subscription design** -- exactly **one** [`addSyncEventListener`](../listeners.md#addsynceventlistener) drives every field. Each native event triggers at most a bounded number of `setState` calls within a single callback, which React 18 auto-batches into one render -- so a burst of events never causes a per-field re-render storm.
 - **Initial fetch** -- on mount, the hook calls [`getQueueSize`](../functions.md#getqueuesize), [`getPendingItems`](../functions.md#getpendingitems), [`getConnectionStatus`](../functions.md#getconnectionstatus), [`getLastSyncResult`](../functions.md#getlastsyncresult), [`listDeadLetter`](../functions.md#listdeadletter), and [`isSyncing`](../functions.md#issyncing).
@@ -83,7 +83,7 @@ Both are optional because they can still be loading: test for `undefined` before
 
 ---
 
-## Example
+## Usage
 
 ### Sync status dashboard
 
@@ -160,8 +160,30 @@ A replay only puts the item back in the queue: a flush sends it.
 
 ---
 
-## See also
+## When to Use
 
-- [`useOfflineQueue`](./useOfflineQueue.md) -- similar composition that also exposes `enqueue` / `flush` actions.
-- [`useSyncStatus`](./useSyncStatus.md), [`useSyncQueue`](./useSyncQueue.md), [`useConnection`](./useConnection.md) -- the primitive hooks this snapshot aggregates.
-- [`UseSyncSnapshotResult`](../types.md#usesyncsnapshotresult), [`NetworkQuality`](../enums.md#networkquality), [`SyncDeadLetterItem`](../types.md#syncdeadletteritem).
+Use `useSyncSnapshot` for dashboards and badges that only observe. It is the only hook that returns the dead-letter queue, and the only combined hook with `isPaused`, `progress` and `lastResult`. It returns no methods: act through the facade functions or an action hook.
+
+- Use [`useOfflineQueue`](./useOfflineQueue.md) when the screen also enqueues or flushes.
+- Use [`useConnection`](./useConnection.md), [`useSyncQueue`](./useSyncQueue.md) or [`useSyncStatus`](./useSyncStatus.md) when a component needs one slice.
+
+| Feature | `useConnection` | `useSyncQueue` | `useSyncStatus` | `useOfflineQueue` | `useSyncSnapshot` |
+|---------|-----------------|----------------|-----------------|-------------------|-------------------|
+| Connection state | Yes | No | No | Yes (`connection`) | Yes (`connection`, `networkQuality`) |
+| Queue `size` and `items` | No | Yes | No | Yes | Yes |
+| `isSyncing` | No | No | Yes, from events only | Yes, read on mount, then from events | Yes, read on mount, then from events |
+| `isPaused`, `progress`, `lastResult` | No | No | Yes | No | Yes |
+| `isWaitingForConnection` | No | No | No | Yes | Yes |
+| Dead letters | No | No | No | No | Yes (`deadLetter`) |
+| Methods | None | `enqueue`, `enqueueBatch`, `removeItem`, `clearQueue`, `refresh` | `flush`, `pause`, `resume` | `enqueue`, `flush` | None |
+
+---
+
+## See Also
+
+- [useOfflineQueue](./useOfflineQueue.md) -- Similar composition that also exposes `enqueue` and `flush`
+- [useSyncStatus](./useSyncStatus.md) -- The focused hook for the sync engine state
+- [useSyncQueue](./useSyncQueue.md) -- The focused hook for the queue
+- [useConnection](./useConnection.md) -- The focused hook for the connection
+- [Types & Interfaces](../types.md) -- `UseSyncSnapshotResult` and `SyncDeadLetterItem`
+- [Enums](../enums.md) -- `NetworkQuality`

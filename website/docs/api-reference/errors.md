@@ -29,7 +29,7 @@ import {
 
 A custom `Error` subclass that carries a structured [`SyncErrorCode`](#syncerrorcode) so callers can branch on the failure reason without parsing the message string.
 
-### Class definition
+### Class Definition
 
 ```ts
 class SyncError extends Error {
@@ -89,15 +89,15 @@ The last three were added in v0.3. A `switch` over `SyncErrorCode` that ends in 
 
 | Code                                  | Meaning                                                                                                                                                                                          | Retryable? | Typically thrown by                                                                               | Suggested action                                                                                                                              |
 | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------- | ------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `NETWORK_ERROR`                       | Transport failure (DNS, socket, TLS, no route). Also what `flush()` rejects with when its cycle dies, whatever the cause.                                                                         | Yes        | Item events. `flush()` rejection.                                                                 | Wait for connectivity; the engine will retry per `RetryPolicy`.                                                                               |
+| `NETWORK_ERROR`                       | Transport failure (DNS, socket, TLS, no route). On Android, also a request that ran out of `requestTimeoutMs`. Also what `flush()` rejects with when its cycle dies, whatever the cause.          | Yes        | Item events. `flush()` rejection.                                                                 | Wait for connectivity; the engine will retry per `RetryPolicy`. On Android, a `NETWORK_ERROR` from anything other than an I/O failure is not retried. |
 | `SERVER_ERROR`                        | A response outside 2xx, other than 401/403.                                                                                                                                                       | If listed  | Item events. Retried when the status is in `RetryPolicy.retryOnStatusCodes`; otherwise terminal.  | Retry handled automatically. Investigate server-side if it persists.                                                                          |
-| `INVALID_PAYLOAD`                     | The item or the options failed validation, with detail in `validationErrors`. Also the fallback for a native rejection in most functions, with no `validationErrors`.                            | No         | `enqueue`, `enqueueBatch`, `configureSync` (for `minNetworkQuality`, `healthCheckTtlMs`, `healthCheckBackoffMs`), and most functions as a fallback. | Fix the call site. With no `validationErrors`, read [Native rejections](#native-rejections).                                                  |
-| `QUEUE_FULL`                          | The queue is at `SyncOptions.maxQueueSize`. Raised by native only, by `enqueue`, `enqueueBatch` and `replayDeadLetter`.                                                                          | No         | Does not reach JS yet: see [Native rejections](#native-rejections).                               | Flush, drop the item, or surface a "retry later" UX. A rejected replay keeps the dead letter.                                                 |
+| `INVALID_PAYLOAD`                     | The item or the options failed validation, with detail in `validationErrors`. Also the fallback for a native rejection in most functions, with no `validationErrors`.                            | No         | `enqueue`, `enqueueBatch`, `configureSync` (for `minNetworkQuality`, `healthCheckTtlMs`, `healthCheckBackoffMs`), and most functions as a fallback. | Fix the call site. With no `validationErrors`, read [Native Rejections](#native-rejections).                                                  |
+| `QUEUE_FULL`                          | The queue is at `SyncOptions.maxQueueSize`. Raised by native only, by `enqueue`, `enqueueBatch` and `replayDeadLetter`.                                                                          | No         | Does not reach JS yet: see [Native Rejections](#native-rejections).                               | Flush, drop the item, or surface a "retry later" UX. A rejected replay keeps the dead letter.                                                 |
 | `NATIVE_MODULE_UNAVAILABLE`           | Called on web / SSR or before native linking completed.                                                                                                                                           | No         | Every facade function, from the JS layer.                                                         | Guard with `isNativeModuleAvailable()` and provide a JS fallback or no-op.                                                                    |
-| `BACKGROUND_TASK_REGISTRATION_FAILED` | iOS: `com.gabriel-sisjr.syncprovider.background` missing from `BGTaskSchedulerPermittedIdentifiers`, or running on a simulator. Android: WorkManager rejected the request.                       | No         | `enableBackgroundSync`. Also the fallback for `disableBackgroundSync` and `isBackgroundSyncEnabled`. | See [Background sync guide](../guides/background-sync.md) and the per-platform [Production checklist](../production/production-checklist.md). |
+| `BACKGROUND_TASK_REGISTRATION_FAILED` | iOS: `com.gabriel-sisjr.syncprovider.background` missing from `BGTaskSchedulerPermittedIdentifiers`, running on a simulator, or Background App Refresh turned off. Android: WorkManager rejected the request, as it does when `requiresDeviceIdle` is `true`, or could not initialize, as when the app removes WorkManager's default initializer without implementing `Configuration.Provider`. | No         | `enableBackgroundSync`. Also the fallback for `disableBackgroundSync` and `isBackgroundSyncEnabled`. | See [Background sync guide](../guides/background-sync.md) and the per-platform [Production checklist](../production/production-checklist.md). |
 | `INVALID_URL`                         | `url` or `SyncOptions.healthCheckUrl` is missing, empty, or not an absolute `http(s)` URL.                                                                                                       | No         | `enqueue`, `configureSync`. `enqueueBatch` reports URL problems under `INVALID_PAYLOAD`, in `validationErrors`. | Validate URLs at the caller.                                                                                                    |
 | `UNAUTHORIZED`                        | HTTP 401 / 403 from the server.                                                                                                                                                                   | No         | Item events. On `ITEM_RETRYING` during a [credential hold](../guides/background-sync.md#cold-start-configuration), otherwise on `ITEM_FAILED`, and as the dead letter's `lastErrorCode`. | Call `configureSync` with a fresh token, then [`replayDeadLetter`](./functions.md#replaydeadletter) the rejected items. |
-| `TIMEOUT`                             | Per-request `requestTimeoutMs` exceeded. Android can report this expiry as `NETWORK_ERROR`, which is retried the same way.                                                                       | Yes        | Item events.                                                                                      | Retry handled automatically per policy; consider increasing `requestTimeoutMs` for large bodies.                                              |
+| `TIMEOUT`                             | iOS: the request exceeded `requestTimeoutMs`. Android: a socket timeout fired first, because connecting took over 10 s or a read or write stalled 30 s. Android reports `requestTimeoutMs` running out as `NETWORK_ERROR`, which is retried the same way. | Yes        | Item events.                                                                                      | Retry handled automatically per policy. For large bodies, consider increasing `requestTimeoutMs`: on Android, its expiry shows up as `NETWORK_ERROR`, and raising it does not lengthen the fixed socket timeouts. |
 | `MAX_ATTEMPTS_EXCEEDED`               | A retriable failure with no attempts left in `RetryPolicy.maxAttempts`, or an item whose attempts already reached a lowered `maxAttempts`, which is dead-lettered without a request. A non-retryable failure keeps its real code, even on the last attempt. Also the `lastErrorCode` of a dead letter moved by the upgrade with no usable code. | No | `ITEM_FAILED`, dead letters.                                                                    | Replay the dead letter once the cause is fixed, or discard it. `ITEM_RETRYING` events show the failure that led here.                       |
 | `DUPLICATE_ITEM`                      | Reserved. Neither platform raises it: ids are native-assigned ULIDs.                                                                                                                              | No         | Never.                                                                                            | None.                                                                                                                                         |
 | `DRAIN_ALREADY_ACTIVE`                | A [`drainUntilEmpty()`](./functions.md#drainuntilempty) loop is already running or still settling in this process. Only one bounded drain may run at a time.                                     | No         | `drainUntilEmpty`.                                                                                | Await the previous drain. Do not rely on [`cancelDrain()`](./functions.md#canceldrain) followed by an immediate restart.                      |
@@ -109,7 +109,7 @@ Use this matrix when designing your error UI. A retryable item code is retried b
 
 ---
 
-## Native rejections
+## Native Rejections
 
 Native codes do not reach JS through a rejection yet. Each facade function maps any rejection from native to one fallback code, and keeps the native text in `message` and the original error in `cause`:
 
@@ -119,25 +119,22 @@ Native codes do not reach JS through a rejection yet. Each facade function maps 
 | `enableBackgroundSync`, `disableBackgroundSync`, `isBackgroundSyncEnabled` | `BACKGROUND_TASK_REGISTRATION_FAILED` |
 | Every other function                                                        | `INVALID_PAYLOAD`                     |
 
-:::warning `QUEUE_FULL` reaches you as `INVALID_PAYLOAD`
-The native layer raises `QUEUE_FULL`, but `enqueue`, `enqueueBatch` and `replayDeadLetter` reject with `INVALID_PAYLOAD`, so `err.code === SyncErrorCode.QUEUE_FULL` never matches. A validation failure always carries `validationErrors`, and a native rejection never does, so test for that:
-
-```ts
-try {
-  await enqueue(item);
-} catch (err) {
-  if (
-    err instanceof SyncError &&
-    err.code === SyncErrorCode.INVALID_PAYLOAD &&
-    err.validationErrors === undefined
-  ) {
-    // Rejected by native, most often a full queue. The detail is in err.message.
-    console.warn(err.message);
-  }
-}
-```
-
-:::
+> **Warning — `QUEUE_FULL` reaches you as `INVALID_PAYLOAD`:** The native layer raises `QUEUE_FULL`, but `enqueue`, `enqueueBatch` and `replayDeadLetter` reject with `INVALID_PAYLOAD`, so `err.code === SyncErrorCode.QUEUE_FULL` never matches. A validation failure always carries `validationErrors`, and a native rejection never does, so test for that:
+>
+> ```ts
+> try {
+>   await enqueue(item);
+> } catch (err) {
+>   if (
+>     err instanceof SyncError &&
+>     err.code === SyncErrorCode.INVALID_PAYLOAD &&
+>     err.validationErrors === undefined
+>   ) {
+>     // Rejected by native, most often a full queue. The detail is in err.message.
+>     console.warn(err.message);
+>   }
+> }
+> ```
 
 Codes describing a dispatched request arrive on events instead, on `ITEM_FAILED` and `ITEM_RETRYING`, and stay on the dead letter as `lastErrorCode`. Codes for a cycle skipped at the start of a flush arrive on `SYNC_FAILED`. None of them are rejections, because per-item failures and skipped cycles never reject.
 
@@ -165,16 +162,14 @@ type ValidationIssue = {
 | `value`     | `unknown` | The offending value. Set only for `method`, `priority` and `contentType`, and for the `SyncOptions` fields `minNetworkQuality`, `healthCheckTtlMs` and `healthCheckBackoffMs`. Never set for `url`, `body`, `headers`, `metadata`, a whole-item `input` failure or `healthCheckUrl`, because errors end up in logs and those fields can hold credentials and personal data. |
 | `itemIndex` | `number`  | Zero-based index of the originating item in a batch. Omitted for single-item validation and for `configureSync`.                      |
 
-### Batch validation aggregates all issues
+### Batch Validation Aggregates All Issues
 
 `enqueue` and `enqueueBatch` differ in how they report validation failures:
 
 - **`enqueue`** throws on the **first** violation, preserving the specific code (`INVALID_URL` or `INVALID_PAYLOAD`) and message. The full list is still attached on `validationErrors`. `reason` never contains the URL, but this `message` can, so treat it with care in logs.
 - **`enqueueBatch`** collects issues across **every** item and throws **one** umbrella `SyncError(INVALID_PAYLOAD)` whose `validationErrors` carries all of them, each tagged with its `itemIndex`. **No items are enqueued** when any issue is present.
 
-:::warning Behavior change in v0.2
-Before v0.2, `enqueueBatch` threw the first bad item's specific code (e.g. `INVALID_URL`). It now always throws `INVALID_PAYLOAD` and exposes per-field, per-item detail via `validationErrors`. If you pattern-match on `err.code` from a batch call, branch on `INVALID_PAYLOAD` and read `err.validationErrors`. See [`BREAKING_CHANGES.md`](https://github.com/gabriel-sisjr/react-native-sync-provider/blob/develop/BREAKING_CHANGES.md).
-:::
+> **Warning — Behavior change in v0.2:** Before v0.2, `enqueueBatch` threw the first bad item's specific code (e.g. `INVALID_URL`). It now always throws `INVALID_PAYLOAD` and exposes per-field, per-item detail via `validationErrors`. If you pattern-match on `err.code` from a batch call, branch on `INVALID_PAYLOAD` and read `err.validationErrors`. See [`BREAKING_CHANGES.md`](https://github.com/gabriel-sisjr/react-native-sync-provider/blob/develop/BREAKING_CHANGES.md).
 
 ```ts
 import {
@@ -201,7 +196,11 @@ try {
 
 ---
 
-## Discrimination Pattern
+## Error Handling Patterns
+
+### Branching on error code
+
+Narrow with `instanceof SyncError`, then switch on `code`:
 
 ```ts
 import {
@@ -223,7 +222,7 @@ try {
         console.error('Bad URL -- fix the caller');
         break;
       case SyncErrorCode.INVALID_PAYLOAD:
-        // With no validationErrors, native rejected the call: see Native rejections
+        // With no validationErrors, native rejected the call: see Native Rejections
         console.warn(err.validationErrors ?? err.message);
         break;
       case SyncErrorCode.NATIVE_MODULE_UNAVAILABLE:
@@ -238,12 +237,54 @@ try {
 }
 ```
 
+### Failures that do not throw
+
+A per-item failure never rejects, and neither does a cycle the quality gate or the health check skips. Item codes arrive on `ITEM_FAILED` and `ITEM_RETRYING`, skipped-cycle codes on `SYNC_FAILED`, and `flush()` resolves with a [`SyncResult`](./types.md#syncresult):
+
+```ts
+import {
+  addSyncEventListener,
+  flush,
+  SyncEventType,
+} from '@gabriel-sisjr/react-native-sync-provider';
+
+// Subscribe once, at startup for example. Pass the id to removeSyncEventListener on cleanup.
+const subscriptionId = await addSyncEventListener((event) => {
+  if (event.type === SyncEventType.ITEM_FAILED) {
+    console.warn(`${event.itemId} failed with ${event.errorCode}`);
+  }
+});
+
+const result = await flush(); // resolves even when items fail
+if (result.failureCount > 0) {
+  console.warn(`${result.failureCount} item(s) failed permanently`);
+}
+```
+
+### Guarding against a missing native module
+
+Every async function on the [Functions](./functions.md) page throws `NATIVE_MODULE_UNAVAILABLE` when the native module is missing. Check first where that can happen:
+
+```ts
+import {
+  enqueue,
+  HttpMethod,
+  isNativeModuleAvailable,
+} from '@gabriel-sisjr/react-native-sync-provider';
+
+if (isNativeModuleAvailable()) {
+  await enqueue({ method: HttpMethod.POST, url: 'https://api.example.com/events' });
+} else {
+  // Web, or an app not rebuilt after installing the library: fall back, or skip.
+}
+```
+
 For an end-to-end pattern (try/catch + event subscriptions + result inspection), see the [Error handling guide](../guides/error-handling.md).
 
 ---
 
-## See also
+## See Also
 
-- [`SyncEvent.errorCode` field](./types.md#syncevent).
-- [`SyncResult.errors` map](./types.md#syncresult), Android only.
-- [Retry policy guide](../guides/retry-policy.md), [Error handling guide](../guides/error-handling.md).
+- [Types & Interfaces](./types.md) -- `SyncEvent.errorCode`, and the `SyncResult.errors` map, which only Android fills
+- [Retry Policy](../guides/retry-policy.md) -- Which responses are retried, and how the delay grows
+- [Error Handling](../guides/error-handling.md) -- Handler patterns end to end: try/catch, events, results and dead letters

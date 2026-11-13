@@ -55,9 +55,9 @@ flowchart LR
     C -- no --> D[throw SyncError INVALID_PAYLOAD or INVALID_URL]
     C -- yes --> E[Nitro HybridObject.enqueue]
     E --> H{under maxQueueSize?}
-    H -- no --> I[reject: QUEUE_FULL, reaches JS as INVALID_PAYLOAD]
-    H -- yes --> F[native: generate ULID]
-    F --> G[native: persist row]
+    H -- no --> I["reject: QUEUE_FULL, reaches JS as INVALID_PAYLOAD"]
+    H -- yes --> F["native: generate ULID"]
+    F --> G["native: persist row"]
     G --> J[emit ITEM_ENQUEUED on SYNC_EVENT_CHANNEL]
     J --> K[return id to JS]
 ```
@@ -80,14 +80,14 @@ Nothing is dispatched yet. A flush does that.
 ```mermaid
 flowchart TD
     A["flush()"] --> B{paused, or headers unreadable?}
-    B -- yes --> Z[return a 0/0 result: no cycle, no event, no history row]
+    B -- yes --> Z["return a 0/0 result: no cycle, no event, no history row"]
     B -- no --> Q{below minNetworkQuality, or health check failing?}
-    Q -- yes --> Y[emit SYNC_FAILED with the skip code, return a 0/0 result: no cycle, no history row]
+    Q -- yes --> Y["emit SYNC_FAILED with the skip code, return a 0/0 result: no cycle, no history row"]
     Q -- no --> C[emit SYNC_STARTED]
-    C --> D[take one batch: up to batchSize eligible items]
+    C --> D["take one batch: up to batchSize eligible items"]
     D --> E{items?}
-    E -- no --> F[persist 0/0 SyncResult, emit SYNC_SUCCEEDED]
-    E -- yes --> G[for each item: one HTTP request]
+    E -- no --> F["persist 0/0 SyncResult, emit SYNC_SUCCEEDED"]
+    E -- yes --> G["for each item: one HTTP request"]
     G --> H{response?}
     H -- 2xx --> I[delete row, emit ITEM_SUCCEEDED]
     H -- retriable, attempts left --> J[keep PENDING, write nextRetryAt, emit ITEM_RETRYING]
@@ -106,10 +106,10 @@ flowchart TD
 Notes:
 
 - A cycle takes **one batch** and makes **at most one attempt per item**. It does not loop: items left over wait for the next flush. Use [`drainUntilEmpty`](../api-reference/functions.md#drainuntilempty) to loop.
-- "Eligible" means `PENDING` with `nextRetryAt <= now`, so cooling items are skipped. Priority orders the batch.
-- Android sends a batch concurrently. iOS sends it one item at a time, and emits `SYNC_PROGRESS` after each one.
-- The dispatcher checks connectivity only through the opt-in quality gate (`minNetworkQuality`), and the backend only through the opt-in health check (`healthCheckUrl`). Both are skipped when unset. See [Checks before a cycle](../api-reference/functions.md#checks-before-a-cycle).
-- A permanent failure moves the item, in one transaction, from the queue to the dead-letter queue.
+- "Eligible" means `PENDING` with `nextRetryAt <= now`, so cooling items are skipped. Priority decides which items a cycle takes, and on iOS the order they go out.
+- Android sends a batch concurrently, except that with `defaultHeaders` restored from disk the first item goes out alone first. iOS sends it one item at a time, and emits `SYNC_PROGRESS` once per item, before that item's `ITEM_*` event.
+- The dispatcher checks connectivity only through the opt-in quality gate (`minNetworkQuality`), and the backend only through the opt-in health check (`healthCheckUrl`). Both are skipped when unset. See [Checks Before a Cycle](../api-reference/functions.md#checks-before-a-cycle).
+- A permanent failure moves the item, in one transaction, from the queue to the dead-letter queue, except an item removed or cleared while its request was in flight.
 - Cycles do not overlap. On Android, a concurrent `flush()` waits for the running cycle and then runs its own. On iOS, it returns the last result at once.
 - HTTP requests run on the native dispatcher's executor (`URLSession` on iOS, OkHttp + `Dispatchers.IO` on Android). The JS thread is never blocked.
 - The `SyncResult` is persisted to history before the promise resolves.
@@ -133,11 +133,15 @@ sequenceDiagram
     Native->>OS: setTaskCompleted(success: true)
 ```
 
-Per-platform specifics:
+On both platforms, the flush runs the same checks as a foreground one, from the persisted configuration. See [When the gate or the health check skips a window](../guides/background-sync.md#when-the-gate-or-the-health-check-skips-a-window).
 
-- **iOS**. `BGTaskScheduler` wakes a handler that was registered at process start. The handler re-submits the next request first, so the chain continues if the process is killed, then waits for launch recovery and flushes. It works with no JS loaded. A task that fires under `foregroundOnly` or after `disableBackgroundSync` completes inert. While paused, it completes without dispatching.
-- **Android**. WorkManager runs `SyncWorker`, at most every 15 minutes for the periodic job, and also for the opt-in retry kick. WorkManager enforces the constraints. The worker stays inert under `foregroundOnly` or a persisted pause. Otherwise, with no JS engine attached, it first resets rows a dead process left `IN_FLIGHT`. It then flushes and returns `Result.success()` on any completed flush, including one with failed items or one the quality gate or the health check skipped, so that WorkManager's backoff cannot race the persisted cooldowns. `Result.retry()` is reserved for a worker that fails as a whole.
-- **Both**. The flush runs the same checks as a foreground one, from the persisted configuration. See [When the gate or the health check skips a window](../guides/background-sync.md#when-the-gate-or-the-health-check-skips-a-window).
+### Android (WorkManager)
+
+WorkManager runs `SyncWorker`, at most every 15 minutes for the periodic job, and also for the opt-in retry kick. The exception is a retry after a periodic run that failed as a whole, which follows WorkManager's exponential backoff from 1 minute. WorkManager enforces the constraints. The worker stays inert under `foregroundOnly` or a persisted pause. Otherwise, with no JS engine attached, it first resets rows a dead process left `IN_FLIGHT`. It then flushes and returns `Result.success()` on any completed flush, including one with failed items or one the quality gate or the health check skipped, so that WorkManager's backoff cannot race the persisted cooldowns. `Result.retry()` is reserved for a worker that fails as a whole.
+
+### iOS (BGTaskScheduler)
+
+`BGTaskScheduler` wakes a handler that was registered at process start. The handler re-submits the next request first, so the chain continues if the process is killed, then waits for launch recovery and flushes. It works with no JS loaded. A task that fires under `foregroundOnly` or after `disableBackgroundSync` completes inert. While paused, it completes without dispatching.
 
 ## Connectivity Change Flow
 
@@ -151,7 +155,7 @@ flowchart LR
     D --> G[React re-render]
 ```
 
-The native monitor is a singleton per process. It emits an event only when a reported field of the snapshot changes, including `networkQuality` alone. Android never emits one for the state it starts in; iOS starts at `UNKNOWN`, so its first path report emits one. `useAutoSync` reads the starting status when it is enabled and compares each event's status with the last one it knows, so only a real change to `CONNECTED`, or to `METERED` with `flushOnMetered`, triggers its reconnect flush. A quality-only change never does.
+The native monitor is a singleton per process. An event is emitted only when a reported field of the snapshot changes, including `networkQuality` alone. Android never emits one for the state it starts in; iOS starts at `UNKNOWN`, so its first path report emits one. `useAutoSync` reads the starting status when it is enabled and compares each event's status with the last one it knows, so only a real change to `CONNECTED`, or to `METERED` with `flushOnMetered`, triggers its reconnect flush. A quality-only change never does.
 
 The event does not start a native flush. `useAutoSync` does that from JS. Natively, a reconnect only delivers a wake the [retry timer](../guides/retry-policy.md#who-wakes-the-queue-and-when) owes from firing offline.
 
@@ -169,13 +173,21 @@ flowchart TD
 
 Recovery handles the "process killed mid-dispatch" case. Without it, items would be stuck `IN_FLIGHT` forever. The reset is **transactional and idempotent** -- safe to run on every launch. It sends no request itself.
 
-What starts it differs by platform:
+What starts it differs by platform.
 
-- **iOS**: every engine start, including a BGTask launch with no JS. If it reset any item, it emits `RESUMED` with `metadata.recovered`.
-- **Android**: when a JS engine attaches, and on boot and app update through `BootCompletedReceiver`. `SyncWorker` runs the same reset before it flushes when no JS engine is attached, unless a persisted pause or `foregroundOnly` blocks it. No event is emitted.
+### Android (RecoveryWorker)
 
-## See also
+`RecoveryWorker` runs when a JS engine attaches, and on boot and app update through `BootCompletedReceiver`. `SyncWorker` runs the same reset before it flushes when no JS engine is attached, unless a persisted pause or `foregroundOnly` blocks it. No event is emitted.
 
-- [Architecture overview](./overview.md).
-- [iOS native architecture](./ios-native.md), [Android native architecture](./android-native.md).
-- [Background sync guide](../guides/background-sync.md), [Connectivity detection guide](../guides/connectivity-detection.md).
+### iOS (RecoveryManager)
+
+`RecoveryManager` runs on every engine start, including a BGTask launch with no JS. If it reset any item, it emits `RESUMED` with `metadata.recovered`.
+
+## Next Steps
+
+- [Architecture Overview](./overview.md) -- The three layers, the key design decisions and the technology stack
+- [iOS Native Architecture](./ios-native.md) -- Swift modules, Core Data stack, BGTaskScheduler wiring
+- [Android Native Architecture](./android-native.md) -- Kotlin modules, Room schema, WorkManager wiring
+- [Background Sync](../guides/background-sync.md) -- Enabling background windows and what the OS decides
+- [Crash Recovery](../guides/crash-recovery.md) -- What happens to queued and in-flight items after a crash, a reboot or an update
+- [Connectivity Detection](../guides/connectivity-detection.md) -- Connection state, network quality and the health check

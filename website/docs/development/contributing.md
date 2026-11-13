@@ -13,9 +13,9 @@ keywords:
 
 # Contributing
 
-Thanks for your interest in `@gabriel-sisjr/react-native-sync-provider`. This page captures the full developer workflow — toolchain, commands, conventions, and the Nitro spec lifecycle.
+Thanks for your interest in `@gabriel-sisjr/react-native-sync-provider`. This page captures the full developer workflow — toolchain, commands, conventions, and the Nitro spec lifecycle. The repo's [`CODE_OF_CONDUCT.md`](https://github.com/gabriel-sisjr/react-native-sync-provider/blob/develop/CODE_OF_CONDUCT.md) is in force in every interaction.
 
-The repo's [`CODE_OF_CONDUCT.md`](https://github.com/gabriel-sisjr/react-native-sync-provider/blob/develop/CODE_OF_CONDUCT.md) is in force in every interaction.
+---
 
 ## Toolchain
 
@@ -28,6 +28,8 @@ The repo's [`CODE_OF_CONDUCT.md`](https://github.com/gabriel-sisjr/react-native-
 | JDK           | 17 (Zulu)         | sdkman / brew                                |
 | Android Studio | latest stable    | Optional — for emulator and SDK manager     |
 
+---
+
 ## Install
 
 ```bash
@@ -36,7 +38,9 @@ yarn
 
 Always Yarn — never npm. The project relies on Yarn workspaces and immutable installs in CI.
 
-## The Nitro workflow (CRITICAL)
+---
+
+## The Nitro Workflow (CRITICAL)
 
 This is the single most important convention in the repo. Read it twice.
 
@@ -48,7 +52,7 @@ yarn nitrogen
 
 You MUST run `yarn nitrogen` after every edit to `src/SyncProvider.nitro.ts` — and after a fresh clone before anything else builds. The Nitro spec is the single source of truth for the JS↔native contract; both `ios/SyncProvider.swift` and `android/src/main/java/com/margelo/nitro/syncprovider/SyncProvider.kt` must implement the regenerated `HybridSyncProviderSpec`.
 
-### Adding or changing a Nitro method
+### Adding or Changing a Nitro Method
 
 1. Edit the interface in `src/SyncProvider.nitro.ts`.
 2. Run `yarn nitrogen` (regenerates the spec base classes — old method signatures will fail to compile).
@@ -57,7 +61,9 @@ You MUST run `yarn nitrogen` after every edit to `src/SyncProvider.nitro.ts` —
 5. Run `yarn typecheck && yarn lint && yarn test`.
 6. Rebuild the example app (`yarn example android` / `ios`) — JS-only changes hot-reload, native changes require a rebuild.
 
-## Common commands
+---
+
+## Common Commands
 
 ```bash
 yarn                           # install (uses workspaces)
@@ -89,7 +95,9 @@ For iOS, after a clean checkout or any `*.nitro.ts` change:
 cd example && bundle install && bundle exec pod install --project-directory=ios
 ```
 
-## Linting, types, tests
+---
+
+## Linting, Types, Tests
 
 The pre-commit hook enforces all three. Don't bypass it with `--no-verify` — fix the underlying issue.
 
@@ -97,11 +105,45 @@ The pre-commit hook enforces all three. Don't bypass it with `--no-verify` — f
 - **ESLint**: `yarn lint`. Config is flat (ESLint 9). Prettier runs through the eslint-plugin-prettier rule.
 - **Jest**: `yarn test`. Preset is `react-native`. Tests live under `src/__tests__/`. Do NOT put tests under `lib/` or `example/node_modules/` — they're ignored.
 
-## Commit convention
+---
+
+## Writing Documentation
+
+The documentation site is the `website/` workspace (Docusaurus). Its pages are Markdown files under `website/docs/`.
+
+- **Callouts are blockquotes**, not Docusaurus admonitions. Start the quote with a bold label: `> **Note:**`, `> **Tip:**`, `> **Warning:**` or `> **Important:**`. A titled callout puts the title after an em dash, as in `> **Warning — Roll-forward only:**`.
+- **Platform differences** go in `> **iOS:**` / `> **Android:**` callouts.
+- **Every code fence names its language.** Plain output uses `text`.
+- **Links between pages** are relative `.md` links, such as `../guides/background-sync.md#cold-start-configuration`.
+
+> **Important:** When making changes that affect both platforms, test on both Android and iOS before submitting a pull request. Platform-specific behavior differences should be documented with `> **iOS:**` / `> **Android:**` callouts in the documentation.
+
+---
+
+## Authoring Mermaid Diagrams
+
+Mermaid is enabled via `@docusaurus/theme-mermaid`. Use ```` ```mermaid ```` code fences in any `.md` file under `website/docs/`.
+
+**Quoting rule:** any node label containing reserved characters (`(`, `)`, `[`, `]`, `{`, `}`, `/`, `:`, `|`, `&`, `#`, `<br/>`) MUST be wrapped in double quotes. This applies to diamond `{...}`, square `[...]`, round `(...)`, and stadium `([...])` shapes alike.
+
+- Wrong: `NODE{Rate limit?<br/>(5/hour)}`
+- Right: `NODE{"Rate limit?<br/>(5/hour)"}`
+
+**Validation:** run the following before committing:
+
+```bash
+yarn workspace react-native-sync-provider-website validate:mermaid
+```
+
+The validator also runs inside the site's `build` script, which `yarn docs:build` calls, so a broken diagram fails the docs build. The `build:no-validate` script builds without it.
+
+---
+
+## Commit Convention
 
 Commits MUST follow [Conventional Commits](https://www.conventionalcommits.org/):
 
-```
+```text
 <type>(<scope>): <description>
 
 [optional body]
@@ -109,20 +151,22 @@ Commits MUST follow [Conventional Commits](https://www.conventionalcommits.org/)
 [optional footer]
 ```
 
-Allowed types: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `perf`, `style`, `ci`, `build`.
+Allowed types: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `perf`, `style`, `ci`, `build`, `revert`.
 
 The `commit-msg` lefthook hook runs `commitlint` against `@commitlint/config-conventional`. Bad messages are rejected.
 
 Examples:
 
-```
+```text
 feat(android): add WorkManager backoff override
 fix(ios): clear in-flight items on RecoveryManager launch
 docs(api): document SyncErrorCode.MAX_ATTEMPTS_EXCEEDED retryability
 test(facade): cover sentinel-translation in getLastSyncResult
 ```
 
-## Lefthook hooks
+---
+
+## Lefthook Hooks
 
 `lefthook.yml` runs on every commit:
 
@@ -131,15 +175,21 @@ test(facade): cover sentinel-translation in getLastSyncResult
 
 Skipping these masks real bugs. If a hook fails, fix the cause and re-stage.
 
-## Sending a pull request
+---
+
+## Sending a Pull Request
 
 - Keep PRs small and focused. One concern per PR.
-- Make sure CI is green (lint, typecheck, test, build-library, build-android, build-ios, test-android, test-ios).
+- Make sure CI is green: its seven jobs are `lint` (lint and typecheck), `test`, `build-library`, `build-android`, `build-ios`, `test-android` and `test-ios`. See [CI/CD Pipeline](./ci-cd.md#ci-workflow-ciyml).
 - Update documentation in the same PR. If you changed a public symbol, the API reference page must change too.
 - For UI / behavioral changes, include before/after screenshots or a short clip.
 - For native changes, mention the platforms touched in the PR title (`feat(android): ...` / `feat(ios): ...` / `feat(native): ...`).
 - Cross-platform feature changes go behind a single PR — the spec change, the iOS impl, the Android impl, the JS facade, and the docs all together.
 
+---
+
 ## Releases
 
-Releases go through pull requests, and CI does the publishing. A bump PR sets the version on `develop`. When that version reaches `main`, `publish.yml` publishes it to npm, tags it and creates the GitHub release. Pre-releases come from the `prerelease.yml` workflow; `yarn release` and `yarn release:beta` are not part of the flow. `CHANGELOG.md` is curated by hand in [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format: add your entry under `## [Unreleased]` in the PR that makes the change, and the bump PR turns it into the release heading. See the Releasing section of the root [`CONTRIBUTING.md`](https://github.com/gabriel-sisjr/react-native-sync-provider/blob/develop/CONTRIBUTING.md#releasing) for the full flow.
+Releases go through pull requests, and CI does the publishing. A bump PR sets the version on `develop`. When that version reaches `main`, `publish.yml` publishes it to npm, tags it and creates the GitHub release. Pre-releases come from the `prerelease.yml` workflow; `yarn release` and `yarn release:beta` are not part of the flow. `CHANGELOG.md` is curated by hand in [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format: add your entry under `## [Unreleased]` in the PR that makes the change, and the bump PR turns it into the release heading.
+
+See [Publishing](./publishing.md) for the full flow, and [CI/CD Pipeline](./ci-cd.md) for the workflows that check, build and publish. The Releasing section of the root [`CONTRIBUTING.md`](https://github.com/gabriel-sisjr/react-native-sync-provider/blob/develop/CONTRIBUTING.md#releasing) has a summary.

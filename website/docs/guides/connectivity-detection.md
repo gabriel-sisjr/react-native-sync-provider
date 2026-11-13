@@ -16,6 +16,10 @@ keywords:
 
 # Connectivity Detection
 
+This guide explains how the library detects connectivity and grades network quality, and what acts on each.
+
+## Overview
+
 The library tracks connectivity natively and exposes both a snapshot reader (`getConnectionStatus`) and a reactive hook (`useConnection`). Connection changes also surface as `CONNECTION_CHANGED` events on the `'sync-event'` channel.
 
 On top of the link state, the engine grades the link with a [network quality](#network-quality) level. Two opt-in options act on it: a [quality gate](#the-quality-gate) that skips flushes on a poor link, and a [health check](#health-check) that probes your backend before a batch.
@@ -97,13 +101,13 @@ The `e.connectionStatus` field carries the coarse [`ConnectionStatus`](../api-re
 
 - **Only real changes.** The event fires when a reported field changes: `status`, `type`, `isInternetReachable`, `isExpensive` or `networkQuality`. It does not fire for a duplicate. Android never emits it for the state it starts in. iOS starts at `UNKNOWN`, so its first path report, which replaces that, emits one. Before v0.3, iOS emitted it on every path update.
 - **Quality-only changes.** A change of `networkQuality` alone emits it too, with an unchanged `connectionStatus`.
-- **Delivery.** iOS delivers it synchronously, Android asynchronously.
+- **Delivery.** A JS listener receives it asynchronously, on the JS thread, on both platforms, after the new state is stored. iOS emits it from the update that caused it, the emitter queues each listener call on the main queue, and Nitro then queues the JS call on the JS thread. Android emits it from a background coroutine. So `getConnectionStatus()` in the handler returns that state or a later one.
 
 ## Network Quality {#network-quality}
 
 [`NetworkQuality`](../api-reference/enums.md#networkquality) grades the current link, worst to best: `OFFLINE < POOR < MODERATE < GOOD < EXCELLENT`. It is always present on `ConnectionState`, and `OFFLINE` exactly when the status is `DISCONNECTED` or `UNKNOWN`.
 
-### How it is classified
+### How It Is Classified
 
 Both platforms use the same fixed table.
 
@@ -132,19 +136,19 @@ Any HTTP status counts as a latency sample. A `5xx` is the [health check](#healt
 
 Without `healthCheckUrl` nothing is measured, so the level never reaches `EXCELLENT`.
 
-### When it is measured
+### When It Is Measured
 
 Nothing is ever measured without `healthCheckUrl`, and nothing is sent while the device is offline. The probes go to that URL only, never to a third-party host. They carry no `defaultHeaders` and no item header, and send `Cache-Control: no-cache`.
 
-- **Network change.** On a move to another network, a measurement starts after a 1000 ms debounce. Until it completes, the link-signal value is reported.
-- **Reuse.** A measurement belongs to one network. It does not expire, and it survives an offline blip: if the same network comes back within 30 s, the measurement is reused instead of taken again.
-- **Stale reads.** When the [quality gate](#the-quality-gate), at a flush or at a held-wake re-check, reads a measurement 30 s old or older, it starts one background re-measurement, at most one at a time. The gate decides on the current value, and held wakes are re-checked when the new result arrives. Only the gate reads it, and only with `minNetworkQuality` set above `OFFLINE`. Without a gate, a network change or a new URL still measures, but flushes and retry wakes do not, so on a network the device stays on, the level stays at its first measurement.
-- **URL change.** A new `healthCheckUrl` starts a new measurement.
+- **Network change.** After a path update on iOS, or on Android when the monitor starts or the default network or its capabilities change, a measurement starts after a 1000 ms debounce if the network has none, or only one 30 s old or older: the first report of a process, a move to another network, or a stale measurement on the same network. After a move, the link-signal value is reported until it completes.
+- **Reuse.** A measurement belongs to one network. It does not expire, and it survives an offline blip: if the same network comes back while the measurement is less than 30 s old, the measurement is reused instead of taken again.
+- **Stale reads.** When the [quality gate](#the-quality-gate), at a flush or at a held-wake re-check, reads a measurement 30 s old or older, it starts one background re-measurement, at most one at a time: at once on iOS, after the 1000 ms debounce on Android. The gate decides on the current value, and held wakes are re-checked when the new result arrives. Only the gate reads it, and only with `minNetworkQuality` set above `OFFLINE`. Without a gate, flushes and retry wakes never measure, so on a network the device stays on, the measurement is renewed only when a path or capability update, or on Android a `configureSync` call, finds it 30 s old or older.
+- **URL change.** A new `healthCheckUrl` starts a new measurement, after the same debounce. On Android, every `configureSync` call asks for one, and nothing is sent while a measurement of that network and URL is younger than 30 s, or one is running.
 
 How a platform tells networks apart:
 
 - **Android** keys a measurement by the OS network handle, its validation state and the URL.
-- **iOS** has no network identifier, so it uses the interface type, the expensive and constrained flags, the gateway addresses and the URL. Two networks with the same gateway address can therefore share a measurement for up to 30 s.
+- **iOS** has no network identifier, so it uses the interface type, the expensive and constrained flags, the gateway addresses and the URL. Two networks behind the same gateway address are therefore taken for one: a measurement under 30 s old when the path changes is kept until a later path update, or with `minNetworkQuality` a gate evaluation, finds it 30 s old or older and measures again.
 
 ## The Quality Gate {#the-quality-gate}
 
@@ -173,11 +177,9 @@ await configureSync({
 | `GOOD` | `GOOD` and `EXCELLENT` links. |
 | `EXCELLENT` | Only a measured median under 200 ms on a link no cap lowers. Without `healthCheckUrl` it blocks every flush. |
 
-:::tip `GOOD` without a URL means unmetered
-With no measurement, a metered link is `MODERATE`. So without `healthCheckUrl`, `minNetworkQuality: GOOD` lets cycles run only on unmetered links, outside iOS Low Data Mode and, on Android, on validated networks.
-:::
+> **Tip — `GOOD` without a URL means unmetered:** With no measurement, a metered link is `MODERATE`. So without `healthCheckUrl`, `minNetworkQuality: GOOD` lets cycles run only on unmetered links, outside iOS Low Data Mode and, on Android, on validated networks.
 
-### What the gate checks
+### What the Gate Checks
 
 Every flush, whoever starts it: `flush()`, [`useAutoSync`](../api-reference/hooks/useAutoSync.md), [`drainUntilEmpty`](../api-reference/functions.md#drainuntilempty), the Android retry kick and periodic worker, and the iOS BGTasks. It runs after the pause and stored-credentials checks and before the health check (see [`flush`](../api-reference/functions.md#checks-before-a-cycle)). The in-process retry timer checks it before it starts a flush, and [holds the wake silently](#held-wakes) instead.
 
@@ -185,7 +187,7 @@ Below the minimum, the flush runs no cycle: `SYNC_FAILED` is emitted with `error
 
 While the first measurement of a network is pending, the gate compares the link-signal level like any other. On iOS, a gated flush that finds the path not reported yet waits up to 1.5 s for the first path update, then grades the link `OFFLINE`, so a background launch is not spent on an unknown path.
 
-### Held wakes
+### Held Wakes
 
 The in-process [retry timer](./retry-policy.md#who-wakes-the-queue-and-when) checks the gate before it dispatches, the same way it checks for an offline device, and holds the wake silently: no event, no `SYNC_FAILED`. It re-runs the wake once the device is online and the quality reaches the minimum.
 
@@ -207,19 +209,17 @@ Set [`SyncOptions.healthCheckUrl`](../api-reference/types.md#syncoptions) to che
 
 How a cycle uses it:
 
-1. **Cached result.** If a healthy result younger than `healthCheckTtlMs` exists, no request is sent. A `2xx` sample from a kept [quality measurement](#when-it-is-measured) counts as a healthy result too, so the endpoint is not hit twice. The samples of a measurement cancelled midway, for example by an offline update, are discarded.
+1. **Cached result.** If a healthy result younger than `healthCheckTtlMs` exists, no request is sent. A `2xx` sample from a kept [quality measurement](#when-it-is-measured) counts as a healthy result too, for `healthCheckTtlMs`, so the endpoint is not hit twice, but it does not end a running backoff. The samples of a measurement cancelled midway, for example by an offline update, are discarded.
 2. **Probe.** Otherwise the engine sends one `HEAD`, with a 2 s timeout, no `defaultHeaders` or item headers, and `Cache-Control: no-cache`.
 3. **Failure.** The cycle is skipped like a gated one: `SYNC_FAILED` with `errorCode: 'HEALTH_CHECK_FAILED'`, no `SYNC_STARTED`, no history row, no item change. A backoff then runs until `healthCheckBackoffMs` has passed since the failed `HEAD` finished, and every cycle in it is skipped the same way without sending a request. The in-process retry timer holds silently during the backoff.
 4. **Next wake.** The next retry wake is the latest of the item's own deadline, a [credential hold](./background-sync.md#when-a-stored-token-expires), the end of the backoff and 1000 ms after the failed check. That floor holds even with `healthCheckBackoffMs: 0`, for every automatic wake: the in-process retry timer and its held-wake re-checks, the wakes after `resumeSync()` and on reconnect, and the Android retry kick. A check that keeps failing therefore cannot make them spin. It does not apply to an explicit `flush()`: with a backoff of `0`, a `flush()` right after a failure sends a new `HEAD`.
 5. **Recovery.** A healthy check clears the backoff, and so does every `configureSync` call, which ends it early. The backoff is kept in memory only, so a new process starts without one.
 
-:::warning Point it at an endpoint that answers without authentication
-The probes carry no credentials, so an endpoint that requires them answers `401` and every cycle is skipped. Prefer `https://`: a captive portal can answer a plain `http://` probe with a `2xx`. Only Android's `NET_CAPABILITY_VALIDATED` cap covers that case, and only for the quality level.
-:::
+> **Warning — Point it at an endpoint that answers without authentication:** The probes carry no credentials, so an endpoint that requires them answers `401` and every cycle is skipped. Prefer `https://`: a captive portal can answer a plain `http://` probe with a `2xx`. Only Android's `NET_CAPABILITY_VALIDATED` cap covers that case, and only for the quality level.
 
 `configureSync` rejects a `healthCheckUrl` that is not an absolute `http(s)` URL with `INVALID_URL`, and a negative or non-finite duration with `INVALID_PAYLOAD`. The options are persisted for background workers. A stored value that cannot be used, which only a damaged record can hold, loads as unset.
 
-On iOS, a healthy result is cached per URL, so a new `healthCheckUrl` is checked afresh, and overlapping checks share one `HEAD`. A `2xx` measurement sample refreshes the cache but does not end a running backoff. The backoff starts when the failed `HEAD` finishes. Ages use the wall clock, and a negative age, after the clock moved back, makes the cache stale and ends the backoff.
+On iOS, a healthy result is cached per URL, so a new `healthCheckUrl` is checked afresh, and overlapping checks share one `HEAD`. The backoff starts when the failed `HEAD` finishes. Ages use the wall clock, and a negative age, after the clock moved back, makes the cache stale and ends the backoff.
 
 ## Auto-Flush on Reconnect
 
@@ -286,7 +286,8 @@ The library does **not** probe `https://detectportal.firefox.com` or any other t
 
 ## Platform Notes
 
-- **Android probes.** The probe client falls back to a host's other addresses (IPv4 / IPv6) when a connection fails. A sample can occasionally cost two round trips, because OkHttp repeats a `408` once and silently retries on a stale pooled connection. A process with no JS engine may send a measurement when a retry kick runs on a stale one, and only with `healthCheckUrl` set and `minNetworkQuality` above `OFFLINE`.
+- **Android probes.** The probe client falls back to a host's other addresses (IPv4 / IPv6) when a connection fails. A sample can occasionally cost two round trips, because OkHttp repeats a `408` once and silently retries on a stale pooled connection.
+- **Android, no JS engine.** In a process with no JS engine, a `SyncWorker` run, periodic or retry kick, starts a latency measurement only when `minNetworkQuality` is above `OFFLINE`, `healthCheckUrl` is set, and the last measurement of that network is missing or 30 s old or older. It starts 1 s after the gate check and runs alongside the flush, which does not wait for it. In a new process the gate decides from the link signals (`GOOD` unmetered, `MODERATE` metered, at most `POOR` unvalidated), so `EXCELLENT` never passes there. With `healthCheckUrl` set, the worker also sends the health check's one `HEAD` before the cycle, unless a `2xx` younger than `healthCheckTtlMs` exists in that process.
 - **Android dispatch.** The dispatcher's own client does not fall back to a host's other addresses: a request whose first address fails is not retried on the next one. This is unchanged in v0.3.
 - **Android validation.** A network without `NET_CAPABILITY_VALIDATED`, such as a captive portal before sign-in, is at most `POOR`.
 - **iOS first path.** Before the first `NWPathMonitor` update the status is `UNKNOWN` and the quality `OFFLINE`. A gated flush waits up to 1.5 s for that update.
@@ -294,7 +295,8 @@ The library does **not** probe `https://detectportal.firefox.com` or any other t
 
 ## Next Steps
 
-- [`useConnection` hook reference](../api-reference/hooks/useConnection.md)
-- [`useAutoSync` hook reference](../api-reference/hooks/useAutoSync.md)
-- [Background Sync](./background-sync.md) -- Connectivity-aware OS scheduling, and what a gated window does.
-- [Troubleshooting](../troubleshooting.md#symptom-nothing-syncs-with-minnetworkquality-or-healthcheckurl-set) -- when nothing syncs with the gate or the health check on.
+- [useConnection](../api-reference/hooks/useConnection.md) -- The reactive connection hook
+- [useAutoSync](../api-reference/hooks/useAutoSync.md) -- Flush on reconnect, on an interval and on foreground
+- [Background Sync](./background-sync.md) -- Connectivity-aware OS scheduling, and what a gated window does
+- [Battery Optimization](./battery-optimization.md) -- The probe traffic `healthCheckUrl` adds, and the metered-network options
+- [Troubleshooting](../troubleshooting.md#symptom-nothing-syncs-with-minnetworkquality-or-healthcheckurl-set) -- When nothing syncs with the gate or the health check on

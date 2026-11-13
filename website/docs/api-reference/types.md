@@ -72,9 +72,7 @@ interface SyncItemInput {
 | `priority`    | [`SyncPriority`](./enums.md#syncpriority) | No       | Dispatch lane. Defaults to `NORMAL`.                                                                |
 | `metadata`    | `Record<string, string>`                  | No       | Opaque tags persisted with the item and returned by `getPendingItems`. Not sent with the request and not echoed on events. Strings only. |
 
-:::note `contentType` vs. `headers`
-The platforms resolve a conflict differently. Android uses `contentType`, and sends `application/json` for any body when it is omitted, even if `headers` sets `Content-Type`. iOS uses the value in `headers` or `defaultHeaders`, and sets `contentType` only when neither has one.
-:::
+> **Note — `contentType` vs. `headers`:** The platforms resolve a conflict differently. Android uses `contentType`, and sends `application/json` for any body when it is omitted, even if `headers` sets `Content-Type`. iOS uses the value in `headers` or `defaultHeaders`, and sets `contentType` only when neither has one.
 
 ---
 
@@ -112,9 +110,7 @@ interface SyncItem {
 | `nextRetryAt` | `number`                                  | Yes      | [Retry cooldown](../guides/retry-policy.md#retry-cooldown-across-restarts). `0` means **eligible now**, not that the item was never attempted. A positive value is an epoch-ms deadline: a retry cooldown or a credential hold is pending, and the item is eligible once `nextRetryAt <= now`. The value stays in place afterwards, so a timestamp in the past means the wait has elapsed. |
 | `metadata`    | `Record<string, string>`                  | No       | Opaque tags.                                                                                                                                                                                                                                            |
 
-:::note `attempts` / `nextRetryAt` are never `undefined`
-Unlike [`getLastSyncResult`](./functions.md#getlastsyncresult), which maps a native sentinel (`startedAt === 0 && finishedAt === 0`) to `undefined`, a `SyncItem`'s `attempts` and `nextRetryAt` are surfaced **verbatim**. Their `0` values carry meaning, so they are filled in, not skipped.
-:::
+> **Note — `attempts` / `nextRetryAt` are never `undefined`:** Unlike [`getLastSyncResult`](./functions.md#getlastsyncresult), which maps a native sentinel (`startedAt === 0 && finishedAt === 0`) to `undefined`, a `SyncItem`'s `attempts` and `nextRetryAt` are surfaced **verbatim**. Their `0` values carry meaning, so they are filled in, not skipped.
 
 The two fields do not move together. Rows carried over from v0.1 can show `attempts >= 1` with `nextRetryAt: 0`, and so can an iOS row whose first attempt was cut short by a process kill. An item held after a credential rejection can show `attempts: 0` with `nextRetryAt > 0`. A cooldown and a hold look the same here, because `SyncItem` carries neither the last error code nor the last attempt time: an `ITEM_RETRYING` event with `errorCode: 'UNAUTHORIZED'` marks a hold.
 
@@ -160,20 +156,16 @@ interface SyncDeadLetterItem {
 | `lastErrorMessage` | `string`                                     | No       | Detail of the final failure: for an HTTP failure, the status line; otherwise the error message, such as `Retry budget exhausted`. At most 1024 characters. Never contains request or response headers or bodies. Absent for items moved by the upgrade, and when the platform reported no detail. |
 | `deadLetteredAt`   | `number`                                     | Yes      | Unix ms when the item was moved. [`listDeadLetter`](./functions.md#listdeadletter) sorts by it, oldest first. For an item moved by the upgrade: its last attempt time, or its enqueue time when none was recorded. |
 
-:::note The status line differs by platform
-iOS builds it with the system's reason phrase, as in `HTTP 404 Not Found`. Android uses the server's status line, whose reason phrase is empty under HTTP/2, as in `HTTP 404`. Branch on `lastErrorCode`, not on this text.
-:::
+> **Note — The status line differs by platform:** iOS builds it with Foundation's reason phrase for the code, localized and capitalized, as in `HTTP 404 Not Found`. Android writes `HTTP <code> <reason>` with the reason phrase the server sent: `HTTP 404 Not Found` over HTTP/1.1, and `HTTP 404` over HTTP/2, which has no reason phrase. Branch on `lastErrorCode`, not on this text.
 
 How an item becomes a dead letter:
 
 - **Every permanent failure.** Attempts exhausted (`MAX_ATTEMPTS_EXCEEDED`), a response that is not retried (`SERVER_ERROR`), and a 401 or 403 under a configuration set in the current process (`UNAUTHORIZED`). An item whose attempts already reached `maxAttempts`, for example after `configureSync` lowered it, is dead-lettered with `MAX_ATTEMPTS_EXCEEDED` without sending a request. A [credential hold](../guides/background-sync.md#when-a-stored-token-expires) is not a failure: the held item stays queued.
-- **One transaction.** The item leaves the queue and enters the dead-letter queue atomically, so it is never in both. `ITEM_FAILED` follows with the real code, then, synchronously, `ITEM_DEAD_LETTERED` with `errorCode: 'DEAD_LETTERED'` and `metadata.lastErrorCode` set to the real code.
+- **One transaction.** The item leaves the queue and enters the dead-letter queue atomically, so it is never in both. `ITEM_FAILED` follows with the real code, then, right after it, `ITEM_DEAD_LETTERED` with `errorCode: 'DEAD_LETTERED'` and `metadata.lastErrorCode` set to the real code.
 - **On upgrade.** Items that had failed permanently under an earlier version are moved here when the upgraded library first opens its store.
 - **Same id.** A newer dead letter with the same id replaces the older one.
 
-:::warning The dead-letter queue is unbounded
-Nothing prunes it, and it counts toward no capacity cap, on either platform. Each dead letter keeps its request's headers and body until [`replayDeadLetter`](./functions.md#replaydeadletter), [`discardDeadLetter`](./functions.md#discarddeadletter), [`removeItem`](./functions.md#removeitem) or [`clearQueue`](./functions.md#clearqueue) deletes it. Discard what you do not replay.
-:::
+> **Warning — The dead-letter queue is unbounded:** Nothing prunes it, and it counts toward no capacity cap, on either platform. Each dead letter keeps its request's headers and body until [`replayDeadLetter`](./functions.md#replaydeadletter), [`discardDeadLetter`](./functions.md#discarddeadletter), [`removeItem`](./functions.md#removeitem) or [`clearQueue`](./functions.md#clearqueue) deletes it. Discard what you do not replay.
 
 ---
 
@@ -231,9 +223,9 @@ interface SyncOptions {
 | ------------------ | ----------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `strategy`         | [`SyncStrategy`](./enums.md#syncstrategy) | Yes      | What the engine schedules on its own: `AUTOMATIC`, `MANUAL`, or `OPPORTUNISTIC`. It does not control `flush()`.                                                                                                   |
 | `retryPolicy`      | [`RetryPolicy`](#retrypolicy)             | Yes      | Backoff policy.                                                                                                                                                                                                   |
-| `batchSize`        | `number`                                  | No       | Most items one cycle dispatches. Default `25`. Android sends them concurrently, iOS one at a time.                                                                                                                |
-| `requestTimeoutMs` | `number`                                  | No       | Per-request timeout. Default `30000`. Android enforces a floor of 1 second.                                                                                                                                       |
-| `maxQueueSize`     | `number`                                  | No       | Most items the queue may hold. Default `10000`. A value below `1` is treated as `1`, so the cap cannot be removed. Android counts pending and in-flight items toward it, iOS counts `PENDING` items only. Dead letters count on neither. `enqueue`, `enqueueBatch` and `replayDeadLetter` are rejected once it is reached: see [Native rejections](./errors.md#native-rejections) for how that surfaces. |
+| `batchSize`        | `number`                                  | No       | Most items one cycle dispatches. Default `25`. Android sends them concurrently, except with `defaultHeaders` restored from disk: then the first item goes alone, and a 401 or 403 on it releases the rest unsent. iOS sends them one at a time. |
+| `requestTimeoutMs` | `number`                                  | No       | Per-request timeout. Default `30000`. iOS applies it as given and reports its expiry as `TIMEOUT`. On Android it bounds the whole call, raised to 1 second when lower, and its expiry is reported as `NETWORK_ERROR`. The connection must also open within 10 s, and a read or write may stall for at most 30 s, whatever `requestTimeoutMs` is: when one of those fires first, Android reports `TIMEOUT`. Both codes are retried. |
+| `maxQueueSize`     | `number`                                  | No       | Most items the queue may hold. Default `10000`. A value below `1` is treated as `1`, so the cap cannot be removed: pick a finite cap, as the warning below explains. Android counts pending and in-flight items toward it, iOS counts `PENDING` items only. Dead letters count on neither. `enqueue`, `enqueueBatch` and `replayDeadLetter` are rejected once it is reached: see [Native Rejections](./errors.md#native-rejections) for how that surfaces. |
 | `persistQueue`     | `boolean`                                 | No       | Stored but not used yet. The queue is always persisted.                                                                                                                                                           |
 | `defaultHeaders`   | `Record<string, string>`                  | No       | Headers merged into every dispatched item. Per-item `headers` win on conflict. Encrypted at rest. Calling `configureSync` without them deletes the stored copy. See [Cold-start configuration](../guides/background-sync.md#cold-start-configuration). |
 | `minNetworkQuality` | [`NetworkQuality`](./enums.md#networkquality) | No | Lowest network quality at which a flush may run. Unset, the default, means no quality gate. `POOR` blocks only `OFFLINE`, and `OFFLINE` gates nothing, like leaving it unset. Below the minimum no cycle runs and `flush()` reports `NETWORK_QUALITY_TOO_LOW` on `SYNC_FAILED`. Without `healthCheckUrl` the quality never reaches `EXCELLENT`, so `EXCELLENT` then blocks every flush. See [The quality gate](../guides/connectivity-detection.md#the-quality-gate). |
@@ -242,6 +234,8 @@ interface SyncOptions {
 | `healthCheckBackoffMs` | `number`                              | No       | How long cycles are skipped after a failed health check, in ms. Default `30000`. `0` means no backoff, but automatic retry wakes still wait 1000 ms after a failure. Ignored without `healthCheckUrl`. |
 
 `configureSync` validates the last four fields in JS, in table order and only when present: `minNetworkQuality` must be a [`NetworkQuality`](./enums.md#networkquality) value, `healthCheckUrl` an absolute `http(s)` URL, and both durations finite numbers of at least `0`. The first invalid field sets the code, `INVALID_URL` for `healthCheckUrl` and `INVALID_PAYLOAD` for the others, and `validationErrors` lists them all. [`getSyncConfig`](./functions.md#getsyncconfig) returns them only when they were set, on both platforms: their defaults are not filled in. All four are persisted for background workers, and a stored value that cannot be used, which only a damaged record can hold, loads as unset.
+
+> **Warning:** On iOS, keep `batchSize`, `requestTimeoutMs`, `maxQueueSize` and the [`retryPolicy`](#retrypolicy) numbers finite and well inside the 64-bit integer range. JS does not check them, and iOS converts each one with Swift's `Int(_:)`, which crashes the app on `NaN`, `Infinity` or `-Infinity`, and on any value of 2^63 (about 9.2 × 10^18) or more, or below -2^63. `configureSync` persists `batchSize`, `requestTimeoutMs` and `maxQueueSize` before it converts them, so a finite value that large, such as `Number.MAX_VALUE`, is saved: the call crashes, and so does every engine start after it, at the first call into the native module after each launch and at each BGTask launch, until the app's data is cleared, for example by deleting and reinstalling the app. A non-finite value cannot be saved, and the `retryPolicy` numbers, each `retryOnStatusCodes` entry included, are converted before anything is saved, so those values crash only the call that passes them.
 
 ---
 
@@ -260,14 +254,14 @@ interface BackgroundSyncOptions {
 }
 ```
 
-| Property                   | Type      | Required | Description                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| -------------------------- | --------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `minimumIntervalMs`        | `number`  | Yes      | Minimum milliseconds between background runs. Android floor is 15 minutes. iOS treats this as a soft hint, with a floor of 60 seconds.                                                                                                                                                                                                       |
-| `requiresCharging`         | `boolean` | No       | When `true`, only run while plugged in. On iOS this applies to the processing task only, not to the app-refresh task.                                                                                                                                                                                                                        |
-| `requiresUnmeteredNetwork` | `boolean` | No       | When `true`, only run on unmetered networks. Android only: iOS does not apply it.                                                                                                                                                                                                                                                            |
-| `requiresDeviceIdle`       | `boolean` | No       | When `true`, only run while the device is idle. Android only.                                                                                                                                                                                                                                                                                |
-| `foregroundOnly`           | `boolean` | No       | Kill-switch for background work. When `true`, the library schedules **no** background dispatch (no `BGTaskScheduler` tasks on iOS, no `WorkManager` periodic or one-time flush jobs on Android), cancels anything it had already scheduled, and iOS stops using the background `URLSession`. The in-process retry timer keeps running, and launch/boot recovery is **not** suppressed. Defaults to `false`. Persists across relaunches. See [Background sync guide](../guides/background-sync.md#foreground-only-mode). |
-| `taskIdentifier`           | `string`  | No       | Stored but not used yet. Both platforms use fixed identifiers. On iOS, `Info.plist` must declare the two fixed identifiers whatever this field says: see [iOS Setup](../getting-started/ios-setup.md).                                                                                                                                       |
+| Property                   | Type      | Required | Platform | Description                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| -------------------------- | --------- | -------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `minimumIntervalMs`        | `number`  | Yes      | Both     | Android: the period of the periodic work, raised to 15 minutes when lower. iOS: only the refresh task's earliest begin date, at least 60 seconds after the submit. The processing task has none.                                                                                                                                            |
+| `requiresCharging`         | `boolean` | No       | Both     | When `true`, only run while plugged in. On iOS this applies to the processing task only, not to the app-refresh task.                                                                                                                                                                                                                        |
+| `requiresUnmeteredNetwork` | `boolean` | No       | Android  | When `true`, only run on unmetered networks. Android only: iOS does not apply it.                                                                                                                                                                                                                                                            |
+| `requiresDeviceIdle`       | `boolean` | No       | Android  | Leave it unset. On Android, `true` makes `enableBackgroundSync()` reject with `BACKGROUND_TASK_REGISTRATION_FAILED`: WorkManager refuses the backoff policy the library sets on an idle-constrained request. iOS does not apply it.                                                                                                       |
+| `foregroundOnly`           | `boolean` | No       | Both     | Kill-switch for background work. When `true`, the library schedules **no** background dispatch (no `BGTaskScheduler` tasks on iOS, no `WorkManager` periodic or one-time flush jobs on Android), cancels anything it had already scheduled, and iOS stops using the background `URLSession`. The in-process retry timer keeps running, and launch/boot recovery is **not** suppressed. Defaults to `false`. Persists across relaunches. See [Background sync guide](../guides/background-sync.md#foreground-only-mode). |
+| `taskIdentifier`           | `string`  | No       | Both     | Stored but not used yet. Both platforms use fixed identifiers. On iOS, `Info.plist` must declare the two fixed identifiers whatever this field says: see [iOS Setup](../getting-started/ios-setup.md).                                                                                                                                       |
 
 ---
 
@@ -344,15 +338,15 @@ interface SyncResult {
 }
 ```
 
-| Property       | Type                     | Required | Description                                                                                                                                                                              |
-| -------------- | ------------------------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `startedAt`    | `number`                 | Yes      | Unix ms when the run started. `0` on Android when `flush()` ran no cycle.                                                                                                                |
-| `finishedAt`   | `number`                 | Yes      | Unix ms when the run finished. `0` on Android when `flush()` ran no cycle.                                                                                                               |
-| `successCount` | `number`                 | Yes      | Items dispatched successfully.                                                                                                                                                           |
-| `failureCount` | `number`                 | Yes      | Items that failed permanently in this cycle, each one now in the [dead-letter queue](#syncdeadletteritem). An item waiting for a retry counts as neither a success nor a failure.         |
-| `succeededIds` | `string[]`               | Yes      | ULIDs of successful items. Always empty on iOS.                                                                                                                                          |
-| `failedIds`    | `string[]`               | Yes      | ULIDs of failed items. Always empty on iOS.                                                                                                                                              |
-| `errors`       | `Record<string, string>` | Yes      | Failed-item id to `"<SyncErrorCode>: <detail>"`, so split on the first `:` to get the code. Always empty on iOS: use `ITEM_FAILED` events there.                                        |
+| Property       | Type                     | Required | Platform | Description                                                                                                                                                                              |
+| -------------- | ------------------------ | -------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `startedAt`    | `number`                 | Yes      | Both     | Unix ms when the run started. `0` on Android when `flush()` ran no cycle.                                                                                                                |
+| `finishedAt`   | `number`                 | Yes      | Both     | Unix ms when the run finished. `0` on Android when `flush()` ran no cycle.                                                                                                               |
+| `successCount` | `number`                 | Yes      | Both     | Items dispatched successfully.                                                                                                                                                           |
+| `failureCount` | `number`                 | Yes      | Both     | Items that failed permanently in this cycle. Each is now in the [dead-letter queue](#syncdeadletteritem), except one that `removeItem` or `clearQueue` purged while its request was in flight: it counts here but is not dead-lettered. An item waiting for a retry counts as neither a success nor a failure. |
+| `succeededIds` | `string[]`               | Yes      | Android  | ULIDs of successful items. Always empty on iOS.                                                                                                                                          |
+| `failedIds`    | `string[]`               | Yes      | Android  | ULIDs of failed items. Always empty on iOS.                                                                                                                                              |
+| `errors`       | `Record<string, string>` | Yes      | Android  | Failed-item id to `"<SyncErrorCode>: <detail>"`, so split on the first `:` to get the code. Always empty on iOS: use `ITEM_FAILED` events there.                                        |
 
 A `flush()` that runs no cycle still resolves with a `SyncResult`. Nothing is dispatched, no item changes, no `SYNC_STARTED` is emitted and no history row is written. That happens when:
 
@@ -360,7 +354,7 @@ A `flush()` that runs no cycle still resolves with a `SyncResult`. Nothing is di
 - the network quality is below [`minNetworkQuality`](#syncoptions): `SYNC_FAILED` with `errorCode: 'NETWORK_QUALITY_TOO_LOW'`;
 - the health check fails, or its backoff is running: `SYNC_FAILED` with `errorCode: 'HEALTH_CHECK_FAILED'`.
 
-Both counts are `0`, and the result does not say why. Android sets `startedAt` and `finishedAt` to `0`. iOS sets both to the time of the call, so there the result alone cannot be told apart from an empty cycle: only the missing `SYNC_STARTED` event and history row show that no cycle ran.
+Both counts are `0`, and the result does not say why. Android sets `startedAt` and `finishedAt` to `0`. iOS sets both to the time the check stopped the flush, which can be a moment after the call while the gate waits for the link or the health check's request runs, so there the result alone cannot be told apart from an empty cycle: only the missing `SYNC_STARTED` event and history row show that no cycle ran. On iOS, a `flush()` that joins a running cycle returns the last finished cycle's result, or a 0/0 one, without the gate or the health check.
 
 ---
 
@@ -394,7 +388,7 @@ interface SyncEvent {
 | `statusCode`       | `number`                                          | No       | HTTP status code, present on dispatch-related events when available.   |
 | `attempt`          | `number`                                          | No       | 1-indexed attempt number, present on `ITEM_SUCCEEDED`, `ITEM_FAILED` and `ITEM_RETRYING`. |
 | `connectionStatus` | [`ConnectionStatus`](./enums.md#connectionstatus) | No       | Present on `CONNECTION_CHANGED`. Unchanged when only the network quality changed: read [`getConnectionStatus`](./functions.md#getconnectionstatus) for the new value. |
-| `metadata`         | `Record<string, string>`                          | No       | Engine diagnostics. On both platforms, `ITEM_DEAD_LETTERED` sets `lastErrorCode`, the code the item failed with. iOS also sets diagnostics on cycle-level events, such as attempted and succeeded counts, and on the `BACKGROUND_SYNC_*` events (`kind`, and `ok: "false"` on a failed window). This is **not** [`SyncItem.metadata`](#syncitem), which is never echoed on events. |
+| `metadata`         | `Record<string, string>`                          | No       | Engine diagnostics. On both platforms, `ITEM_DEAD_LETTERED` sets `lastErrorCode`, the code the item failed with. iOS also sets diagnostics on cycle-level events, such as attempted and succeeded counts, and on the `BACKGROUND_SYNC_*` events (`kind`, and `ok: "false"` when the window's flush throws). This is **not** [`SyncItem.metadata`](#syncitem), which is never echoed on events. |
 
 ---
 
@@ -419,12 +413,10 @@ interface ConnectionState {
 | `status`              | [`ConnectionStatus`](./enums.md#connectionstatus) | Yes      | High-level status.                                             |
 | `type`                | [`ConnectionType`](./enums.md#connectiontype)     | Yes      | Network family.                                                |
 | `networkQuality`      | [`NetworkQuality`](./enums.md#networkquality)     | Yes      | The engine's quality classification, always present. `OFFLINE` exactly when `status` is `DISCONNECTED` or `UNKNOWN`. Without `healthCheckUrl` it comes from link signals only and never reaches `EXCELLENT`. |
-| `isInternetReachable` | `boolean`                                         | No       | Optional reachability probe (iOS only on some setups).         |
+| `isInternetReachable` | `boolean`                                         | No       | Whether the link reaches the internet, as the OS reports it: `NET_CAPABILITY_VALIDATED` on the default network on Android, a satisfied `NWPath` on iOS. Absent while the state is not known yet. |
 | `isExpensive`         | `boolean`                                         | No       | Mirrors `NWPath.isExpensive` (iOS) / metered status (Android). |
 
-:::warning `networkQuality` is required
-Code that only reads `ConnectionState` is unaffected, but a hand-built value, such as a test fixture or a mock of `getConnectionStatus`, must now set it. See the [v0.2 → v0.3 migration](../migration/index.md#v0-2-to-v0-3).
-:::
+> **Warning — `networkQuality` is required:** Code that only reads `ConnectionState` is unaffected, but a hand-built value, such as a test fixture or a mock of `getConnectionStatus`, must now set it. See the [v0.2 → v0.3 migration](../migration/v0-3-0.md).
 
 ---
 
@@ -538,7 +530,9 @@ See [`useSyncSnapshot`](./hooks/useSyncSnapshot.md).
 
 ---
 
-## See also
+## See Also
 
-- [Enums](./enums.md), [Errors](./errors.md).
-- [Functions reference](./functions.md).
+- [Enums](./enums.md) -- The enums these types use
+- [Errors](./errors.md) -- `SyncError`, `SyncErrorCode` and `ValidationIssue`
+- [Functions](./functions.md) -- The calls that take and return these types
+- [Platform Comparison](../production/platform-comparison.md) -- Which fields each platform fills, and how their values differ

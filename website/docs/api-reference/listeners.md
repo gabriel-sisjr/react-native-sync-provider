@@ -31,6 +31,8 @@ import {
 
 The constant string identifier the native layer broadcasts events on. Exported as a `const` for callers that bridge sync events into another event bus.
 
+**Platform:** Android and iOS. Web exports the same value.
+
 ```ts
 const SYNC_EVENT_CHANNEL = 'sync-event' as const;
 ```
@@ -42,6 +44,8 @@ You rarely need this directly -- `addSyncEventListener` already wires it up.
 ## `addSyncEventListener`
 
 Subscribe to every [`SyncEvent`](./types.md#syncevent) emitted by the native layer. Returns a subscription id that you must pass back to `removeSyncEventListener` to unsubscribe.
+
+**Platform:** Android and iOS. On web it resolves with an empty id and registers nothing.
 
 ### Signature
 
@@ -57,19 +61,19 @@ function addSyncEventListener(
 |------|------|----------|-------------|
 | `callback` | `(event: SyncEvent) => void` | Yes | Invoked on the JS thread for every emitted event. Filter inside the callback if you only care about certain `event.type` values. |
 
-### Returns
+### Return Value
 
 `Promise<string>` -- the subscription id.
 
 ### Throws
 
-`NATIVE_MODULE_UNAVAILABLE` -- if called on web / SSR or before native linking.
+`NATIVE_MODULE_UNAVAILABLE` -- the native module is not linked. On web it does not throw.
 
-### Implementation notes
+### Implementation Notes
 
 This is a thin wrapper around the native module's `addListener('sync-event', cb)`. The promise resolves once the native side has registered the callback.
 
-### Example
+### Usage
 
 ```ts
 const subscriptionId = await addSyncEventListener((event) => {
@@ -86,27 +90,29 @@ await removeSyncEventListener(subscriptionId);
 
 Unsubscribe a previously-registered listener.
 
+**Platform:** Android and iOS. On web it resolves and does nothing.
+
 ### Signature
 
 ```ts
-function removeSyncEventListener(id: string): Promise<void>
+function removeSyncEventListener(subscriptionId: string): Promise<void>
 ```
 
 ### Parameters
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `id` | `string` | Yes | The subscription id returned by `addSyncEventListener`. |
+| `subscriptionId` | `string` | Yes | The subscription id returned by `addSyncEventListener`. |
 
-### Returns
+### Return Value
 
 `Promise<void>`.
 
 ### Throws
 
-`NATIVE_MODULE_UNAVAILABLE`. Unknown ids are silently ignored on the native side.
+`NATIVE_MODULE_UNAVAILABLE` -- the native module is not linked. On web it does not throw. Unknown ids are silently ignored on the native side.
 
-### Example
+### Usage
 
 ```ts
 await removeSyncEventListener(subscriptionId);
@@ -149,8 +155,8 @@ For a declarative version that ref-captures the callback (no `useCallback` / `us
 
 ---
 
-## See also
+## See Also
 
-- [`SyncEvent` type](./types.md#syncevent) -- the full payload shape.
-- [`SyncEventType` enum](./enums.md#synceventtype) -- every emitted type.
-- [`useSyncEvents` hook](./hooks/useSyncEvents.md) -- React-friendly wrapper.
+- [Types & Interfaces](./types.md) -- `SyncEvent`, the full payload shape
+- [Enums](./enums.md) -- `SyncEventType`, every emitted type
+- [useSyncEvents](./hooks/useSyncEvents.md) -- React-friendly wrapper

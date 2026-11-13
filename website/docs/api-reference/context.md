@@ -11,7 +11,7 @@ keywords:
   - provider
 ---
 
-# `SyncProvider` Context
+# SyncProvider Context
 
 Optional React context provider. Mounting it lets descendant hooks read the active [`SyncOptions`](./types.md#syncoptions) without an extra native call, and centralizes the `configureSync` / `enableBackgroundSync` lifecycle in a single place.
 
@@ -20,6 +20,8 @@ import { SyncProvider } from '@gabriel-sisjr/react-native-sync-provider';
 ```
 
 The provider is **optional**: every hook works without it. Use it when you have multiple consumers in the tree that all need the config, or when you want a Provider-driven pattern for swapping configs at runtime (e.g. dev vs. prod).
+
+**Platform:** Android and iOS. On web it renders its children with `{ config: undefined, hasProvider: true }` and makes no native call.
 
 ---
 
@@ -49,19 +51,16 @@ interface SyncProviderContextValue {
 
 Read this value with the [`useSyncContext`](./hooks/useSyncContext.md) hook (sugar over `useContext(SyncProviderContext)`). [`useSyncConfig`](./hooks/useSyncConfig.md) reads from this context when it is available and otherwise falls back to the native singleton.
 
-:::tip Disambiguating `config === undefined`
-`config` is `undefined` in two distinct situations. Gate on `hasProvider` to tell them apart:
-
-```tsx
-const { config, hasProvider } = useSyncContext();
-if (!hasProvider) {
-  // Rendered outside <SyncProvider> — fall back to direct facade calls.
-} else if (config === undefined) {
-  // Provider mounted, initial getSyncConfig() round-trip still loading.
-}
-```
-
-:::
+> **Tip — Disambiguating `config === undefined`:** `config` is `undefined` in two distinct situations. Gate on `hasProvider` to tell them apart:
+>
+> ```tsx
+> const { config, hasProvider } = useSyncContext();
+> if (!hasProvider) {
+>   // Rendered outside <SyncProvider> — fall back to direct facade calls.
+> } else if (config === undefined) {
+>   // Provider mounted, initial getSyncConfig() round-trip still loading.
+> }
+> ```
 
 ---
 
@@ -76,7 +75,7 @@ if (!hasProvider) {
 
 ---
 
-## Example
+## Usage
 
 ### Single-tree configuration
 
@@ -131,9 +130,9 @@ The provider re-applies `configureSync` whenever `options` changes identity, so 
 
 ---
 
-## See also
+## See Also
 
-- [`configureSync`](./functions.md#configuresync), [`enableBackgroundSync`](./functions.md#enablebackgroundsync) -- the underlying facade calls.
-- [`useSyncContext`](./hooks/useSyncContext.md) -- typed sugar for reading this context.
-- [`useSyncConfig`](./hooks/useSyncConfig.md) -- consumes the context.
-- [Background sync guide](../guides/background-sync.md).
+- [Functions](./functions.md) -- `configureSync` and `enableBackgroundSync`, the underlying facade calls
+- [useSyncContext](./hooks/useSyncContext.md) -- Typed sugar for reading this context
+- [useSyncConfig](./hooks/useSyncConfig.md) -- Consumes the context
+- [Background Sync](../guides/background-sync.md) -- OS-scheduled background sync, which the `backgroundSync` prop turns on

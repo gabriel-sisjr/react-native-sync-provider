@@ -1,5 +1,5 @@
 ---
-sidebar_position: 4
+sidebar_position: 3
 title: Android Native Architecture
 description: Deep dive into the Android native layer — Room database, OkHttp dispatcher, ConnectivityManager monitor, WorkManager-based background sync, retry wake, persisted configuration, and boot-time recovery.
 keywords:
@@ -16,17 +16,17 @@ keywords:
 
 # Android Native Architecture
 
-All Android native code lives under `android/src/main/java/com/margelo/nitro/syncprovider/`. The implementation uses Kotlin 2.0.21 with Coroutines, Room (KSP) for the persistent queue, OkHttp for HTTP, `ConnectivityManager.NetworkCallback` for connectivity, and WorkManager for the periodic background sync window.
+All Android native code lives under `android/src/main/java/com/margelo/nitro/syncprovider/`. The implementation uses Kotlin (2.0.21 by default, or the host's `kotlinVersion`) with Coroutines, Room (KSP) for the persistent queue, OkHttp for HTTP, `ConnectivityManager.NetworkCallback` for connectivity, and WorkManager for the periodic background sync window.
 
 ## Directory Map
 
 | Directory          | Purpose                                                                                                  |
 | ------------------ | -------------------------------------------------------------------------------------------------------- |
-| `database/`        | Room `SyncDatabase`, `SyncItemEntity`, `SyncResultEntity`, DAOs (suspend + Flow). KSP processes the schema. |
+| `database/`        | Room `SyncDatabase`, `SyncItemEntity`, `SyncDeadLetterEntity`, `SyncResultEntity`, DAOs (suspend + Flow). KSP processes the schema. |
 | `storage/`         | `SyncQueueStorage` — high-level wrapper around the DAOs (claim atomicity, status transitions, sort).    |
-| `http/`            | `SyncDispatcher` (OkHttp 4.12.0 + Coroutines) and `CredentialPolicy`.                                   |
-| `retry/`           | `RetryPolicyEvaluator` (the backoff math), `RetryTimer` (in-process timer), `RetryWake` (arms the timer and the kick). |
-| `config/`          | `SyncConfigStore`, `SecretStore`, `KeystoreSecretStore`.                                                |
+| `http/`            | `SyncDispatcher` (OkHttp 4.12.0 + Coroutines) and `CredentialPolicy`; `HeadProbe` (one `HEAD` request) and `HealthCheck` (the check before a cycle, with its cache and backoff); `FlushOutcome` (what a flush did, and why it skipped a cycle). |
+| `retry/`           | `RetryPolicyEvaluator` (the backoff math), `RetryTimer` (in-process timer), `RetryWake` (arms the timer and the kick), `GateRecheck` (when a wake the quality gate holds is checked again). |
+| `config/`          | `SyncConfigStore`, `SecretStore`, `KeystoreSecretStore`, `SyncOptionsValidator` (the checks `configureSync` runs before anything is applied). |
 | `connectivity/`    | `ConnectivityMonitor` over the default-network callback, `NetworkQualityClassifier`, `LatencyProbe`.     |
 | `work/`            | `SyncWorker` (`CoroutineWorker`), `BackgroundSyncManager`, `BootCompletedReceiver`, `RecoveryWorker`.   |
 | `events/`          | `SyncEventEmitter` — id-based listeners on the single `'sync-event'` channel.                            |
@@ -98,9 +98,9 @@ The background options live in `syncprovider.bgsync.prefs`, managed by `Backgrou
 
 ## ConnectivityMonitor
 
-`ConnectivityMonitor` registers a default-network callback (`registerDefaultNetworkCallback`) against the `ApplicationContext` (not an `Activity` — registering against an `Activity` loses callbacks during configuration changes), so it follows only the network the app's traffic uses. It exposes the latest `ConnectionState` as a `StateFlow<ConnectionState>` and emits `CONNECTION_CHANGED`, asynchronously, only when a reported field changes, `networkQuality` included. It seeds its state before it registers the callback, so the state it starts in is never emitted.
+`ConnectivityMonitor` registers a default-network callback (`registerDefaultNetworkCallback`), so it follows only the network the app's traffic uses. It registers against the `ApplicationContext`, not an `Activity`, so the registration never holds a screen in memory and outlives any one of them. It exposes the latest `ConnectionState` as a `StateFlow<ConnectionState>`. When a reported field changes, `networkQuality` included, it stores the new state first and emits `CONNECTION_CHANGED` from a background coroutine, so a JS listener receives it asynchronously, on the JS thread, and `getConnectionStatus()` can already return the new state, or a later one, when the event arrives. It seeds its state before it registers the callback, so the state it starts in is never emitted.
 
-`NetworkCapabilities` are inspected on every change. The link is `METERED` unless it has `NET_CAPABILITY_NOT_METERED`, or, on Android 11 (API 30) and later, `NET_CAPABILITY_TEMPORARILY_NOT_METERED`. `NetworkQualityClassifier` grades the link with the [shared threshold table](../guides/connectivity-detection.md#how-it-is-classified), capping a network without `NET_CAPABILITY_VALIDATED` at `POOR`. With `healthCheckUrl` set, `LatencyProbe` measures it over the `HeadProbe` client, which the health check (`http/HealthCheck.kt`) shares; a measurement is keyed by the network handle, its validation and the URL. The monitor starts when the first JS engine attaches.
+`NetworkCapabilities` are inspected on every change. A default network without `NET_CAPABILITY_INTERNET` is `DISCONNECTED`. Otherwise the link is `METERED` unless it has `NET_CAPABILITY_NOT_METERED`, or, on Android 11 (API 30) and later, `NET_CAPABILITY_TEMPORARILY_NOT_METERED`. `NetworkQualityClassifier` grades the link with the [shared threshold table](../guides/connectivity-detection.md#how-it-is-classified), capping a network without `NET_CAPABILITY_VALIDATED` at `POOR`. With `healthCheckUrl` set, `LatencyProbe` measures it over the `HeadProbe` client, which the health check (`http/HealthCheck.kt`) shares; a measurement is keyed by the network handle, its validation and the URL. The monitor starts when the first JS engine attaches.
 
 ## SyncWorker (WorkManager)
 
@@ -109,9 +109,9 @@ The background options live in `syncprovider.bgsync.prefs`, managed by `Backgrou
 - **`PeriodicWorkRequest`** (`syncprovider-flush-periodic`) for the regular cadence — enforced floor of **15 minutes** (WorkManager hard limit).
 - **`OneTimeWorkRequest`** (`syncprovider-flush-now`) for the [retry kick](#retry-wake).
 
-Both use `Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED)` (or `UNMETERED` when `BackgroundSyncOptions.requiresUnmeteredNetwork` is true) plus `setRequiresCharging` / `setRequiresDeviceIdle` mappings.
+Both use `Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED)` (or `UNMETERED` when `BackgroundSyncOptions.requiresUnmeteredNetwork` is true) plus `setRequiresCharging` / `setRequiresDeviceIdle` mappings. WorkManager refuses the backoff policy the library sets on an idle-constrained request, so `requiresDeviceIdle: true` makes `enableBackgroundSync()` reject with `BACKGROUND_TASK_REGISTRATION_FAILED`.
 
-`SyncWorker.doWork()` stays inert when dispatch is blocked by a persisted pause or `foregroundOnly`. `MANUAL` does not block it, because enabling background sync is an explicit request. Otherwise, with no JS engine attached, it first resets rows a dead process left `IN_FLIGHT`. It then calls `dispatcher.flush()` once and returns `Result.success()` on any completed flush, so WorkManager's backoff cannot race the persisted cooldowns. `Result.retry()` is reserved for a worker that fails as a whole.
+`SyncWorker.doWork()` stays inert when dispatch is blocked by a persisted pause or `foregroundOnly`. `MANUAL` does not block it, because enabling background sync is an explicit request. Otherwise, with no JS engine attached, it first resets rows a dead process left `IN_FLIGHT`. It then calls `dispatcher.flushWithOutcome()` once and returns `Result.success()` on any completed flush, so WorkManager's backoff cannot race the persisted cooldowns. `Result.retry()` is reserved for a worker that fails as a whole.
 
 Only the periodic job emits `BACKGROUND_SYNC_STARTED` / `BACKGROUND_SYNC_COMPLETED`.
 
@@ -123,7 +123,7 @@ Only the periodic job emits `BACKGROUND_SYNC_STARTED` / `BACKGROUND_SYNC_COMPLET
 - `android.intent.action.LOCKED_BOOT_COMPLETED`
 - `android.intent.action.MY_PACKAGE_REPLACED`
 
-On any of these, it enqueues a one-time `RecoveryWorker`, which also runs each time a JS engine attaches. The worker:
+`LOCKED_BOOT_COMPLETED` is in the filter, but the receiver is not direct-boot aware, so a locked device does not deliver it. On `BOOT_COMPLETED`, after the first unlock, and on `MY_PACKAGE_REPLACED`, it enqueues a one-time `RecoveryWorker`, which also runs each time a JS engine attaches. The worker:
 
 1. Resets items left `IN_FLIGHT` (e.g., process killed mid-dispatch) back to `PENDING`, under the flush mutex so a running cycle is not disturbed.
 2. Re-arms the periodic `SyncWorker` if background sync is enabled and `foregroundOnly` is off.
@@ -187,3 +187,10 @@ The library does **not** declare a foreground service. WorkManager + `BootComple
 - OkHttp / Okio / Coroutines internal class names that R8 would otherwise strip.
 
 The library ships its own ProGuard file via `consumerProguardFiles` so consumer apps inherit the rules automatically.
+
+## Next Steps
+
+- [iOS Native Architecture](./ios-native.md) -- The iOS counterpart: Core Data, URLSession, BGTaskScheduler and launch recovery
+- [Data Flow](./data-flow.md) -- Step-by-step traces of enqueue, flush, connectivity and recovery
+- [Architecture Overview](./overview.md) -- The three layers, the key design decisions and the technology stack
+- [Android Permissions](../production/android-permissions.md) -- What the library merges into your manifest, and why
