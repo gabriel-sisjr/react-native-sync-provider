@@ -14,13 +14,17 @@ keywords:
 
 # Idempotency
 
-`react-native-sync-provider` ships **at-least-once** delivery: a request may reach your server more than once. Endpoints that receive queued requests must be idempotent. This guide covers why, and the pattern that makes it safe.
+This guide covers why a request can reach your server more than once, and the pattern that makes it safe.
+
+## Overview
+
+`react-native-sync-provider` ships **at-least-once** delivery: a request may reach your server more than once. Endpoints that receive queued requests must be idempotent.
 
 ## When a Request Can Be Sent Twice
 
 The library can only record an outcome it received. A request is sent again when the server may have processed it but the device never learned that:
 
-- **The process died mid-request.** Launch recovery puts the item back to `PENDING`, and the next cycle sends it again.
+- **The process died mid-request.** [Launch recovery](./crash-recovery.md) puts the item back to `PENDING`, and the next cycle sends it again.
 - **The response was lost.** A timeout or a dropped connection after the server accepted the request looks like a retriable failure.
 - **An iOS background upload finished after a relaunch.** Its outcome is not recorded, so the item comes back through launch recovery with its attempt spent and no cooldown.
 
@@ -94,8 +98,9 @@ Keep the TTL longer than the longest time an item can stay queued. An item can w
 | Trusting the response body to dedup | Two requests with the same key can race on the server. Dedup on the key, atomically. |
 | Using the item's `metadata` to store an idempotency key | `metadata` is not transmitted. Use `headers`. |
 
-## See Also
+## Next Steps
 
-- [Retry policy](./retry-policy.md) -- how interrupted requests get retried in the first place.
-- [Background sync](./background-sync.md) -- the most likely place a request is dispatched twice.
-- [`enqueue` reference](../api-reference/functions.md#enqueue) -- the input shape.
+- [Retry Policy](./retry-policy.md) -- How interrupted requests get retried in the first place
+- [Background Sync](./background-sync.md) -- The most likely place a request is dispatched twice
+- [Crash Recovery](./crash-recovery.md) -- How an interrupted request goes back to the queue
+- [Functions](../api-reference/functions.md#enqueue) -- The `enqueue` input shape

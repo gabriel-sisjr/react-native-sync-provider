@@ -12,7 +12,7 @@ keywords:
   - queue-state
 ---
 
-# `useSyncQueue`
+# useSyncQueue
 
 Reactive view of the native pending queue, plus the write operations. Refreshes on the events that can change the queue. Dead letters are not part of `items`: read them with [`listDeadLetter`](../functions.md#listdeadletter) or [`useSyncSnapshot().deadLetter`](./useSyncSnapshot.md).
 
@@ -20,7 +20,7 @@ Reactive view of the native pending queue, plus the write operations. Refreshes 
 import { useSyncQueue } from '@gabriel-sisjr/react-native-sync-provider';
 ```
 
-**Platform:** Android and iOS. On web / SSR returns an empty, inert result, and its methods reject with `NATIVE_MODULE_UNAVAILABLE`.
+**Platform:** Android and iOS. On web it returns an empty, inert result, and its methods reject with `NATIVE_MODULE_UNAVAILABLE`.
 
 ---
 
@@ -34,7 +34,7 @@ function useSyncQueue(): UseSyncQueueResult
 
 ## Return Value
 
-### State
+### State Properties
 
 | Property | Type | Description |
 |----------|------|-------------|
@@ -55,7 +55,7 @@ function useSyncQueue(): UseSyncQueueResult
 
 ---
 
-## Behavior
+## Behavior Details
 
 - **Initial fetch** -- on mount, the hook calls [`getQueueSize`](../functions.md#getqueuesize) and [`getPendingItems`](../functions.md#getpendingitems) in parallel.
 - **Auto-refresh** -- subscribes via [`addSyncEventListener`](../listeners.md#addsynceventlistener) and re-fetches on:
@@ -68,7 +68,7 @@ function useSyncQueue(): UseSyncQueueResult
 
 ---
 
-## Example
+## Usage
 
 ### Pending badge
 
@@ -124,8 +124,27 @@ function EventComposer() {
 
 ---
 
-## See also
+## When to Use
 
-- [`enqueue`](../functions.md#enqueue), [`enqueueBatch`](../functions.md#enqueuebatch), [`getPendingItems`](../functions.md#getpendingitems) -- direct facade calls.
-- [Offline queue guide](../../guides/offline-queue.md) -- enqueue patterns and persistence guarantees.
-- [`useSyncStatus`](./useSyncStatus.md) -- complementary hook for sync progress.
+Use `useSyncQueue` when a component reads or changes the queue itself: a pending badge or list, a form that enqueues, a "clear all" action. It is the only hook that returns `enqueueBatch`, `removeItem` and `clearQueue`.
+
+- Use [`useOfflineQueue`](./useOfflineQueue.md) when the component also needs the connection, for a "waiting for connection" state.
+- Use [`useSyncSnapshot`](./useSyncSnapshot.md) to show dead letters: `items` holds pending items only.
+
+| Feature | `useConnection` | `useSyncQueue` | `useSyncStatus` | `useOfflineQueue` | `useSyncSnapshot` |
+|---------|-----------------|----------------|-----------------|-------------------|-------------------|
+| Connection state | Yes | No | No | Yes (`connection`) | Yes (`connection`, `networkQuality`) |
+| Queue `size` and `items` | No | Yes | No | Yes | Yes |
+| `isSyncing` | No | No | Yes, from events only | Yes, read on mount, then from events | Yes, read on mount, then from events |
+| `isPaused`, `progress`, `lastResult` | No | No | Yes | No | Yes |
+| `isWaitingForConnection` | No | No | No | Yes | Yes |
+| Dead letters | No | No | No | No | Yes (`deadLetter`) |
+| Methods | None | `enqueue`, `enqueueBatch`, `removeItem`, `clearQueue`, `refresh` | `flush`, `pause`, `resume` | `enqueue`, `flush` | None |
+
+---
+
+## See Also
+
+- [Functions](../functions.md) -- `enqueue`, `enqueueBatch` and `getPendingItems`, the direct facade calls
+- [Offline Queue](../../guides/offline-queue.md) -- Enqueue patterns and persistence guarantees
+- [useSyncStatus](./useSyncStatus.md) -- Complementary hook for sync progress

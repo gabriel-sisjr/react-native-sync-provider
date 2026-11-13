@@ -12,7 +12,7 @@ keywords:
   - reconnect
 ---
 
-# `useAutoSync`
+# useAutoSync
 
 Orchestrator hook that wires up the common flush triggers in one place: a periodic interval, a connectivity reconnect, and, opt-in, the app returning to the foreground. Inert until `enabled` is `true`. Every trigger is guarded by `isSyncing()`, so flushes do not stack.
 
@@ -62,7 +62,7 @@ function useAutoSync(options: UseAutoSyncExtraOptions): void
 
 ---
 
-## Behavior
+## Behavior Details
 
 - **`enabled` toggle** -- when `enabled` flips to `false`, all subscriptions tear down. Flipping back recreates them, with no immediate flush, and the reconnect trigger reads the starting status again.
 - **Interval** -- a `setInterval(intervalMs)` calls `flush()` unless the status is `DISCONNECTED` or a cycle is already running. If the status cannot be read, the flush is skipped. It runs in JS, so it stops while the OS suspends the app.
@@ -76,7 +76,7 @@ function useAutoSync(options: UseAutoSyncExtraOptions): void
 
 ---
 
-## Example
+## Usage
 
 ### Minimal opt-in
 
@@ -148,9 +148,10 @@ export default function App() {
 
 ---
 
-## See also
+## See Also
 
-- [`flush`](../functions.md#flush), [`enableBackgroundSync`](../functions.md#enablebackgroundsync).
-- [`SyncStrategy`](../enums.md#syncstrategy) -- what `MANUAL` stops, and what it does not.
-- [`useConnection`](./useConnection.md) -- read the connection status in your UI.
-- [Background sync guide](../../guides/background-sync.md), [Connectivity detection guide](../../guides/connectivity-detection.md).
+- [Functions](../functions.md) -- `flush`, which every trigger calls, and `enableBackgroundSync`
+- [Enums](../enums.md) -- `SyncStrategy`: what `MANUAL` stops, and what it does not
+- [useConnection](./useConnection.md) -- Read the connection status in your UI
+- [Background Sync](../../guides/background-sync.md) -- OS-scheduled windows while the app is not running
+- [Connectivity Detection](../../guides/connectivity-detection.md) -- How connectivity changes are detected and reported

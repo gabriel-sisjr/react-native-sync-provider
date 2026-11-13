@@ -12,7 +12,7 @@ keywords:
   - last-sync-result
 ---
 
-# `useSyncStatus`
+# useSyncStatus
 
 Reactive view of the sync engine. Mirrors `PAUSED`, `RESUMED`, `SYNC_STARTED`, `SYNC_PROGRESS`, `SYNC_SUCCEEDED`, and `SYNC_FAILED` events. Hydrates on mount with the last result via [`getLastSyncResult`](../functions.md#getlastsyncresult). State that comes from events starts at its default, so a cycle or a pause already in force at mount is not reflected.
 
@@ -20,7 +20,7 @@ Reactive view of the sync engine. Mirrors `PAUSED`, `RESUMED`, `SYNC_STARTED`, `
 import { useSyncStatus } from '@gabriel-sisjr/react-native-sync-provider';
 ```
 
-**Platform:** Android and iOS.
+**Platform:** Android and iOS. On web it returns an inert result, and its methods reject with `NATIVE_MODULE_UNAVAILABLE`.
 
 ---
 
@@ -34,7 +34,7 @@ function useSyncStatus(): UseSyncStatusResult
 
 ## Return Value
 
-### State
+### State Properties
 
 | Property | Type | Description |
 |----------|------|-------------|
@@ -54,7 +54,7 @@ function useSyncStatus(): UseSyncStatusResult
 
 ---
 
-## Behavior
+## Behavior Details
 
 - **Initial fetch** -- on mount, the hook calls [`getLastSyncResult`](../functions.md#getlastsyncresult). It does not read `isSyncing()`: [`useSyncSnapshot`](./useSyncSnapshot.md) does.
 - **Subscription** -- updates state on:
@@ -70,7 +70,7 @@ function useSyncStatus(): UseSyncStatusResult
 
 ---
 
-## Example
+## Usage
 
 ### Sync button with progress
 
@@ -106,8 +106,27 @@ function SyncButton() {
 
 ---
 
-## See also
+## When to Use
 
-- [`flush`](../functions.md#flush), [`pauseSync`](../functions.md#pausesync), [`resumeSync`](../functions.md#resumesync), [`isSyncing`](../functions.md#issyncing).
-- [`useSyncQueue`](./useSyncQueue.md) -- complementary hook for the queue itself.
-- [`useOfflineQueue`](./useOfflineQueue.md) -- combined view (connection + queue + sync slice).
+Use `useSyncStatus` for sync controls: a "Sync now" button, a progress indicator, pause and resume, the last result.
+
+- It starts with `isSyncing: false` and learns about a cycle only from events, so a cycle already running at mount does not show. [`useSyncSnapshot`](./useSyncSnapshot.md) and [`useOfflineQueue`](./useOfflineQueue.md) read `isSyncing()` on mount.
+- Use [`useSyncQueue`](./useSyncQueue.md) for the queue itself.
+
+| Feature | `useConnection` | `useSyncQueue` | `useSyncStatus` | `useOfflineQueue` | `useSyncSnapshot` |
+|---------|-----------------|----------------|-----------------|-------------------|-------------------|
+| Connection state | Yes | No | No | Yes (`connection`) | Yes (`connection`, `networkQuality`) |
+| Queue `size` and `items` | No | Yes | No | Yes | Yes |
+| `isSyncing` | No | No | Yes, from events only | Yes, read on mount, then from events | Yes, read on mount, then from events |
+| `isPaused`, `progress`, `lastResult` | No | No | Yes | No | Yes |
+| `isWaitingForConnection` | No | No | No | Yes | Yes |
+| Dead letters | No | No | No | No | Yes (`deadLetter`) |
+| Methods | None | `enqueue`, `enqueueBatch`, `removeItem`, `clearQueue`, `refresh` | `flush`, `pause`, `resume` | `enqueue`, `flush` | None |
+
+---
+
+## See Also
+
+- [Functions](../functions.md) -- `flush`, `pauseSync`, `resumeSync` and `isSyncing`, the direct facade calls
+- [useSyncQueue](./useSyncQueue.md) -- Complementary hook for the queue itself
+- [useOfflineQueue](./useOfflineQueue.md) -- Combined view: connection, queue and a slice of sync state

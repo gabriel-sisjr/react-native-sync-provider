@@ -12,7 +12,7 @@ keywords:
   - waiting-for-connection
 ---
 
-# `useOfflineQueue`
+# useOfflineQueue
 
 Connection state, queue state and a slice of sync state from a single subscription, the same data [`useConnection`](./useConnection.md), [`useSyncQueue`](./useSyncQueue.md) and [`useSyncStatus`](./useSyncStatus.md) expose separately. Use it when you want a single hook that powers an offline-first UI -- "X items pending, waiting for connection..." badges, retry buttons, etc.
 
@@ -20,7 +20,7 @@ Connection state, queue state and a slice of sync state from a single subscripti
 import { useOfflineQueue } from '@gabriel-sisjr/react-native-sync-provider';
 ```
 
-**Platform:** Android and iOS.
+**Platform:** Android and iOS. On web it returns an inert result, and `enqueue` and `flush` reject with `NATIVE_MODULE_UNAVAILABLE`.
 
 ---
 
@@ -34,14 +34,14 @@ function useOfflineQueue(): UseOfflineQueueResult
 
 ## Return Value
 
-### State
+### State Properties
 
 | Property | Type | Description |
 |----------|------|-------------|
 | `connection` | [`UseConnectionResult`](../types.md#useconnectionresult) | Same shape as `useConnection`: `status`, `type`, `isOnline`, `isMetered`, `networkQuality`. |
 | `size` | `number` | `PENDING` items, cooling ones included, mirroring [`getQueueSize`](../functions.md#getqueuesize). |
 | `items` | [`SyncItem[]`](../types.md#syncitem) | The same items, mirroring [`getPendingItems`](../functions.md#getpendingitems). |
-| `isSyncing` | `boolean` | Whether a flush is in flight. |
+| `isSyncing` | `boolean` | Whether a cycle is running. |
 | `isWaitingForConnection` | `boolean` | `size > 0 && !connection.isOnline`. The "Waiting for connection..." sentinel. `true` while the status is still `UNKNOWN`. |
 | `error` | [`SyncError`](../errors.md) `\| null` | Last failure refreshing the queue. `enqueue` and `flush` reject instead of setting it. |
 
@@ -54,7 +54,7 @@ function useOfflineQueue(): UseOfflineQueueResult
 
 ---
 
-## Behavior
+## Behavior Details
 
 The hook owns its state and drives it from one [`addSyncEventListener`](../listeners.md#addsynceventlistener) subscription. On mount it reads the queue, the connection and `isSyncing()`. The queue is re-read on `ITEM_ENQUEUED`, `ITEM_REMOVED`, `QUEUE_CLEARED`, `ITEM_SUCCEEDED`, `ITEM_FAILED`, `ITEM_DEAD_LETTERED`, `SYNC_SUCCEEDED` and `SYNC_FAILED`, and the connection on every `CONNECTION_CHANGED`, including the ones emitted when only `networkQuality` changed. It unsubscribes on unmount.
 
@@ -62,7 +62,7 @@ For finer-grained access (per-item removal, sync history, dead letters), use [`u
 
 ---
 
-## Example
+## Usage
 
 ### Offline-aware status bar
 
@@ -102,8 +102,29 @@ function OfflineStatusBar() {
 
 ---
 
-## See also
+## When to Use
 
-- [`useConnection`](./useConnection.md), [`useSyncQueue`](./useSyncQueue.md), [`useSyncStatus`](./useSyncStatus.md) -- the focused hooks for the same data.
-- [Offline queue guide](../../guides/offline-queue.md).
-- [Connectivity detection guide](../../guides/connectivity-detection.md).
+Use `useOfflineQueue` for an offline-aware screen that also acts: it combines the connection, the queue and `isSyncing` with `enqueue` and `flush`, from one subscription.
+
+- Use [`useSyncSnapshot`](./useSyncSnapshot.md) for a read-only view that also needs `isPaused`, `progress`, `lastResult` or dead letters.
+- Use [`useSyncQueue`](./useSyncQueue.md) for `removeItem` or `clearQueue`, and [`useSyncStatus`](./useSyncStatus.md) for `pause` or `resume`.
+
+| Feature | `useConnection` | `useSyncQueue` | `useSyncStatus` | `useOfflineQueue` | `useSyncSnapshot` |
+|---------|-----------------|----------------|-----------------|-------------------|-------------------|
+| Connection state | Yes | No | No | Yes (`connection`) | Yes (`connection`, `networkQuality`) |
+| Queue `size` and `items` | No | Yes | No | Yes | Yes |
+| `isSyncing` | No | No | Yes, from events only | Yes, read on mount, then from events | Yes, read on mount, then from events |
+| `isPaused`, `progress`, `lastResult` | No | No | Yes | No | Yes |
+| `isWaitingForConnection` | No | No | No | Yes | Yes |
+| Dead letters | No | No | No | No | Yes (`deadLetter`) |
+| Methods | None | `enqueue`, `enqueueBatch`, `removeItem`, `clearQueue`, `refresh` | `flush`, `pause`, `resume` | `enqueue`, `flush` | None |
+
+---
+
+## See Also
+
+- [useConnection](./useConnection.md) -- The focused hook for the connection
+- [useSyncQueue](./useSyncQueue.md) -- The focused hook for the queue
+- [useSyncStatus](./useSyncStatus.md) -- The focused hook for the sync engine state
+- [Offline Queue](../../guides/offline-queue.md) -- Enqueue patterns, persistence guarantees and observation
+- [Connectivity Detection](../../guides/connectivity-detection.md) -- How the native layer detects connectivity and classifies network quality

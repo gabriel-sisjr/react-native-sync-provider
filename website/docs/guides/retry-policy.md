@@ -14,6 +14,10 @@ keywords:
 
 # Retry Policy
 
+This guide explains how failed requests are retried: the retry budget, the backoff curves, jitter, which status codes are retried, and what happens when the budget runs out.
+
+## Overview
+
 Every queued item carries a retry budget. When a retriable dispatch fails, the item waits out a cooldown from the configured backoff curve, then a later cycle tries again, up to `maxAttempts` attempts in total. After the budget is exhausted, the item fails permanently with `MAX_ATTEMPTS_EXCEEDED`, is reported on `ITEM_FAILED`, and moves to the [dead-letter queue](#permanent-failures).
 
 ## `RetryPolicy`
@@ -43,7 +47,7 @@ Every queued item carries a retry budget. When a retriable dispatch fails, the i
 
 Use for predictable, slow-growing retry windows.
 
-### `EXPONENTIAL` (default)
+### `EXPONENTIAL` (Default)
 
 `delay = baseDelayMs * 2^(attempt - 1)` (capped at `maxDelayMs`).
 
@@ -127,7 +131,7 @@ useSyncEvents({
 
 Lowering `maxAttempts` can leave items whose budget is already spent. The next cycle dead-letters them without sending a request: `ITEM_FAILED` with `MAX_ATTEMPTS_EXCEEDED`, the stored attempt count and no `statusCode`, then `ITEM_DEAD_LETTERED`, with `lastErrorMessage` set to `Retry budget exhausted`. A `maxAttempts` below `1` reads as `1`, so a new item is always sent once.
 
-In one transaction, the item leaves the queue and enters the dead-letter queue, with its request, its attempt count, the last error code and message, and the time it was moved. Then `ITEM_FAILED` is emitted with the real code and, synchronously, `ITEM_DEAD_LETTERED` with `errorCode: 'DEAD_LETTERED'` and `metadata.lastErrorCode` set to that code. Nothing retries a dead letter on its own:
+In one transaction, the item leaves the queue and enters the dead-letter queue, with its request, its attempt count, the last error code and message, and the time it was moved. Then `ITEM_FAILED` is emitted with the real code and, right after it, `ITEM_DEAD_LETTERED` with `errorCode: 'DEAD_LETTERED'` and `metadata.lastErrorCode` set to that code. Nothing retries a dead letter on its own:
 
 - [`listDeadLetter`](../api-reference/functions.md#listdeadletter) reads them, oldest first.
 - [`replayDeadLetter`](../api-reference/functions.md#replaydeadletter) puts one back as a fresh item, with `attempts: 0` and `nextRetryAt: 0`. It counts toward `maxQueueSize` like an enqueue.
@@ -154,7 +158,7 @@ A cooldown and a hold look the same on a `SyncItem`, which carries neither the l
 
 > **Note — Capacity vs. eligibility:** A cooling item still counts toward `getQueueSize()` and the `maxQueueSize` cap — it is _in_ the queue, just not _dispatchable right now_. Cooldowns also survive launch recovery: resetting in-flight items back to pending does **not** clear their `nextRetryAt`.
 
-### Who wakes the queue, and when
+### Who Wakes the Queue, and When
 
 Nothing re-dispatches an item before its `nextRetryAt`. These are the triggers that can run a cycle:
 
@@ -171,7 +175,7 @@ What the timer does and does not do:
 - **It never flushes offline.** Without `minNetworkQuality`, neither dispatcher checks connectivity, so a flush offline would spend every attempt and send valid items to the dead-letter queue. When the timer fires offline, it remembers the wake and flushes when connectivity returns. A manual `flush()` while offline keeps its behavior unless `minNetworkQuality` is set.
 - **It holds below the quality gate, and during a health-check backoff.** With [`minNetworkQuality`](./connectivity-detection.md#the-quality-gate) set, the timer checks the gate first and holds the wake silently, with no event, until the quality reaches the minimum. It re-checks at 30, 60, 120, 240 and 480 seconds, then every 15 minutes, restarting that backoff when a wake passes, the network changes or the timer is armed again, as every `configureSync` does. See [Held wakes](./connectivity-detection.md#held-wakes).
 - **It only exists in a process with JS.** A worker, a boot broadcast, or an iOS background launch where JS never reaches the library arms no timer. Android relies on the kick there.
-- **It looks at items with a deadline.** Only items with `nextRetryAt > 0`, a cooldown or a credential hold, arm it. Items with `nextRetryAt: 0` do not, so it does not replace a flush for new items, though the cycle it starts takes them too. `resumeSync` is the exception: it considers every pending item, so items with no deadline are dispatched at once.
+- **It looks at items with a deadline.** Only items with `nextRetryAt > 0`, a cooldown or a credential hold, arm it. Items with `nextRetryAt: 0` do not, so it does not replace a flush for new items, though the cycle it starts takes them too. `resumeSync` is the exception: it considers every pending item, so items with no deadline are dispatched at once. On iOS, the timer re-armed after a failed health check also considers every `PENDING` item, cooldown or not.
 - **On iOS it cannot fire while the app is suspended.** It fires on resume.
 
 That owed wake is the only native flush tied to connectivity. There is no native flush on enqueue, and none on reconnect by itself: [`useAutoSync`](../api-reference/hooks/useAutoSync.md) is the mechanism.
@@ -182,7 +186,7 @@ After a [rejected stored credential](./background-sync.md#when-a-stored-token-ex
 
 After a failed [health check](./connectivity-detection.md#health-check), the next retry wake waits for its backoff to end too, and for at least 1000 ms after the failure, even with `healthCheckBackoffMs: 0`. The next wake is therefore the latest of the item's own deadline, the credential hold, the end of the health-check backoff and that one-second floor.
 
-### `foregroundOnly` interaction
+### `foregroundOnly` Interaction
 
 When [`BackgroundSyncOptions.foregroundOnly`](../api-reference/types.md#backgroundsyncoptions) is `true`, the OS-scheduled wakes are suppressed: the Android retry kick, the periodic worker and BGTasks. Cooldowns are still **persisted and honored**, and acted upon while the app is alive: by the retry timer, which this flag does not stop, and by `flush()`, `useAutoSync` and [`drainUntilEmpty`](../api-reference/functions.md#drainuntilempty). Data-integrity recovery still runs.
 
@@ -210,7 +214,7 @@ await configureSync({
 });
 ```
 
-## JS-Side Override (planned)
+## JS-Side Override (Planned)
 
 A JS-side, per-attempt retry override is planned for a later release. Its shape is not settled yet.
 
@@ -220,6 +224,8 @@ Until it ships, configure the declarative `RetryPolicy` carefully -- it covers t
 
 ## Next Steps
 
-- [Error Handling](./error-handling.md) -- The full `SyncErrorCode` matrix.
-- [Background Sync](./background-sync.md) -- How retries interact with OS-scheduled fires.
-- [`useSyncStatus` hook](../api-reference/hooks/useSyncStatus.md) -- Live progress and last-result observation.
+- [Error Handling](./error-handling.md) -- The full `SyncErrorCode` matrix
+- [Background Sync](./background-sync.md) -- How retries interact with OS-scheduled fires
+- [Crash Recovery](./crash-recovery.md) -- What recovery keeps of an item's attempts and cooldown
+- [Battery Optimization](./battery-optimization.md) -- Every trigger that starts a flush, and the option that controls it
+- [useSyncStatus](../api-reference/hooks/useSyncStatus.md) -- Live progress and last-result observation

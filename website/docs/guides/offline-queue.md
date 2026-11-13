@@ -14,7 +14,11 @@ keywords:
 
 # Offline Queue
 
-The offline queue is the heart of `react-native-sync-provider`. Every outbound HTTP request is persisted natively before any network attempt is made. This guide explains the persistence model, enqueue patterns, and how to observe the queue from React.
+This guide explains the persistence model, enqueue patterns, and how to observe the queue from React.
+
+## Overview
+
+The offline queue is the heart of `react-native-sync-provider`. Every outbound HTTP request is persisted natively before any network attempt is made.
 
 ## Persistence Guarantees
 
@@ -27,9 +31,11 @@ Items are written to disk **before** `enqueue()` resolves -- the function never 
 
 The queue is not encrypted at rest: per-item `headers` and `body` are stored in plain text. Put credentials in `SyncOptions.defaultHeaders`, which are [encrypted at rest](./background-sync.md#cold-start-configuration), and encrypt sensitive bodies on the JS side before enqueueing. `SyncOptions.persistQueue` is stored but not used yet, so it cannot turn persistence off.
 
+An item whose request was in flight when the process died is not lost either: see [Crash Recovery](./crash-recovery.md).
+
 ## Enqueue Patterns
 
-### Single item
+### Single Item
 
 ```ts
 import { enqueue, HttpMethod } from '@gabriel-sisjr/react-native-sync-provider';
@@ -46,7 +52,7 @@ The returned `id` is a ULID assigned by the native layer. Store it if you need t
 
 Enqueueing does not dispatch the item. See [When Items Are Dispatched](#when-items-are-dispatched).
 
-### Atomic batch
+### Atomic Batch
 
 ```ts
 import { enqueueBatch, HttpMethod } from '@gabriel-sisjr/react-native-sync-provider';
@@ -60,7 +66,7 @@ const ids = await enqueueBatch([
 
 `enqueueBatch` is **atomic**: either every item is persisted (and `ids` returns all ULIDs), or the call throws and no items are added. It is atomic for persistence, not for delivery: each item is dispatched and retried on its own, and Android sends a batch concurrently, so do not rely on the arrival order.
 
-### With metadata
+### With Metadata
 
 Attach opaque tags to an item. They are persisted with it and returned by `getPendingItems()`. They are not sent with the request and not echoed on sync events:
 
@@ -104,7 +110,7 @@ function PendingBadge() {
 
 The hook re-fetches `items` and `size` whenever an `ITEM_ENQUEUED`, `ITEM_REMOVED`, `ITEM_SUCCEEDED`, `ITEM_FAILED`, `ITEM_DEAD_LETTERED`, `QUEUE_CLEARED`, `SYNC_SUCCEEDED` or `SYNC_FAILED` event fires.
 
-### Direct facade calls
+### Direct Facade Calls
 
 For one-off reads, use the facade:
 
@@ -183,8 +189,24 @@ The [strategy](../api-reference/enums.md#syncstrategy) only decides what the eng
 
 See the [`useSyncStatus` hook](../api-reference/hooks/useSyncStatus.md) for live progress reporting.
 
+## Best Practices
+
+1. **Start a flush.** Enqueueing stores an item and never sends it. Mount `useAutoSync`, call `flush()`, or enable background sync. See [When Items Are Dispatched](#when-items-are-dispatched).
+
+2. **Send an `Idempotency-Key`.** Delivery is at least once, so generate a key before `enqueue` and send it in `headers`. See the [Idempotency guide](./idempotency.md).
+
+3. **Keep credentials out of items.** Per-item `headers` and `body` are stored in plain text. Put credentials in `defaultHeaders`, which are encrypted at rest.
+
+4. **Use `enqueueBatch` for items that belong together.** Either every item is persisted or none is.
+
+5. **Cap the queue for high-rate producers.** Set `maxQueueSize`, and handle the rejection a full queue returns. See [Queue Size Limits](#queue-size-limits).
+
+6. **Drain the dead-letter queue.** It is unbounded and nothing prunes it, so replay or discard what lands there. See [Permanent Failures](./retry-policy.md#permanent-failures).
+
 ## Next Steps
 
-- [Background Sync](./background-sync.md) -- Flush the queue while the app is not running.
-- [Retry Policy](./retry-policy.md) -- How failed items are retried.
-- [Idempotency](./idempotency.md) -- Avoid double-sending after a crash.
+- [Background Sync](./background-sync.md) -- Flush the queue while the app is not running
+- [Retry Policy](./retry-policy.md) -- How failed items are retried
+- [Idempotency](./idempotency.md) -- Avoid double-sending after a crash
+- [Crash Recovery](./crash-recovery.md) -- What happens to an item in flight when the process dies
+- [Battery Optimization](./battery-optimization.md) -- What a flush costs, and how batch size and triggers change it

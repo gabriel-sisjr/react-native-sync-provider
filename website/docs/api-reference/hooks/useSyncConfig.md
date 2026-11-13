@@ -12,7 +12,7 @@ keywords:
   - context
 ---
 
-# `useSyncConfig`
+# useSyncConfig
 
 Reactive view of the active [`SyncOptions`](../types.md#syncoptions) plus a setter that round-trips through [`configureSync`](../functions.md#configuresync). Mirrors the `SyncProvider` context if one is mounted. Otherwise it reads `getSyncConfig()` from native on mount and again on every `RESUMED` event.
 
@@ -20,7 +20,7 @@ Reactive view of the active [`SyncOptions`](../types.md#syncoptions) plus a sett
 import { useSyncConfig } from '@gabriel-sisjr/react-native-sync-provider';
 ```
 
-**Platform:** Android and iOS.
+**Platform:** Android and iOS. On web `config` stays `null`, and `setConfig` and `refresh` reject with `NATIVE_MODULE_UNAVAILABLE`.
 
 ---
 
@@ -34,7 +34,7 @@ function useSyncConfig(): UseSyncConfigResult
 
 ## Return Value
 
-### State
+### State Properties
 
 | Property | Type | Description |
 |----------|------|-------------|
@@ -51,7 +51,7 @@ function useSyncConfig(): UseSyncConfigResult
 
 ---
 
-## Behavior
+## Behavior Details
 
 - **With a Provider** -- if a [`SyncProvider`](../context.md) is mounted higher in the tree, the hook mirrors the context `config` and makes no probe of its own, even while the Provider is still loading. A context value that carries a `config` counts as a Provider, so a test wrapper rendering `SyncProviderContext.Provider` directly works without setting `hasProvider`.
 - **Without a Provider** -- the hook calls [`getSyncConfig`](../functions.md#getsyncconfig) on mount and on every `RESUMED` event.
@@ -62,7 +62,7 @@ function useSyncConfig(): UseSyncConfigResult
 
 ---
 
-## Example
+## Usage
 
 ### Read + display retry policy
 
@@ -108,8 +108,8 @@ function BatchSizeControl() {
 
 ---
 
-## See also
+## See Also
 
-- [`configureSync`](../functions.md#configuresync), [`getSyncConfig`](../functions.md#getsyncconfig) -- direct facade calls.
-- [`SyncProvider` context](../context.md) -- when to mount a provider.
-- [Retry policy guide](../../guides/retry-policy.md).
+- [Functions](../functions.md) -- `configureSync` and `getSyncConfig`, the direct facade calls
+- [SyncProvider Context](../context.md) -- When to mount a provider
+- [Retry Policy](../../guides/retry-policy.md) -- What each `retryPolicy` field does

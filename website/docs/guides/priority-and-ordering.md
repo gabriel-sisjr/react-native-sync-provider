@@ -13,7 +13,11 @@ keywords:
 
 # Priority and Ordering
 
-The queue dispatches items in a deterministic order: **priority descending, `createdAt` ascending**. Within the same priority bucket, older items go first. This guide explains how to use `SyncPriority` and how `defaultHeaders` interact with per-item headers.
+This guide explains how to use `SyncPriority` and how `defaultHeaders` interact with per-item headers.
+
+## Overview
+
+The queue dispatches items in a deterministic order: **priority descending, `createdAt` ascending**. Within the same priority bucket, older items go first.
 
 ## `SyncPriority`
 
@@ -129,7 +133,7 @@ The merged headers attached to the dispatched request are:
 }
 ```
 
-### `Content-Type` priority
+### `Content-Type` Priority
 
 Set the type through `SyncItemInput.contentType`, and leave it out of `headers` and `defaultHeaders`. The platforms resolve a conflict differently:
 
@@ -149,7 +153,7 @@ await enqueue({
 
 ```ts
 await configureSync({
-  ...
+  ...SYNC_OPTIONS,
   batchSize: 4,
 });
 ```
@@ -162,6 +166,6 @@ await configureSync({
 
 ## Next Steps
 
-- [Idempotency](./idempotency.md) -- ULIDs and `Idempotency-Key`.
-- [Retry Policy](./retry-policy.md) -- Backoff curves and budgets.
-- [`SyncOptions` reference](../api-reference/types.md#syncoptions)
+- [Idempotency](./idempotency.md) -- ULIDs and `Idempotency-Key`
+- [Retry Policy](./retry-policy.md) -- Backoff curves and budgets
+- [Types & Interfaces](../api-reference/types.md#syncoptions) -- The `SyncOptions` reference, including `batchSize` and `defaultHeaders`

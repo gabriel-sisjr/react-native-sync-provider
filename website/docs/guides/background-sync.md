@@ -15,7 +15,11 @@ keywords:
 
 # Background Sync
 
-Background sync lets `react-native-sync-provider` flush the queue while the app is **not running**. iOS uses `BGTaskScheduler`; Android uses `WorkManager`. This guide covers configuration, OS limits, and what to expect in production.
+This guide covers how to configure background sync on iOS and Android, the limits each OS imposes, and what to expect in production.
+
+## Overview
+
+Background sync lets `react-native-sync-provider` flush the queue while the app is **not running**. iOS uses `BGTaskScheduler`; Android uses `WorkManager`.
 
 The OS decides when a window runs, and each window runs one flush cycle, which dispatches up to `batchSize` items. Nothing guarantees a window at a given time. A process started for a window has no JS, so it works from the [persisted configuration](#cold-start-configuration).
 
@@ -58,18 +62,18 @@ The Provider calls `enableBackgroundSync` on mount and `disableBackgroundSync` o
 
 ## `BackgroundSyncOptions`
 
-| Field                      | Type      | Default | Description                                                                                                     |
-| -------------------------- | --------- | ------- | --------------------------------------------------------------------------------------------------------------- |
-| `minimumIntervalMs`        | `number`  | --      | Minimum gap between background fires. Soft hint on iOS with a floor of 60 seconds, hard floor of 15 minutes on Android. |
-| `requiresCharging`         | `boolean` | `false` | Only fire when the device is plugged in. On iOS this applies to the processing task only.                       |
-| `requiresUnmeteredNetwork` | `boolean` | `false` | Only fire on Wi-Fi / ethernet. Android only.                                                                    |
-| `requiresDeviceIdle`       | `boolean` | `false` | Only fire when the device is idle. Android only.                                                                |
-| `foregroundOnly`           | `boolean` | `false` | Kill-switch that schedules **no** OS background work at all. See [Foreground-only mode](#foreground-only-mode).  |
-| `taskIdentifier`           | `string`  | --      | Stored but not used yet. Both platforms use fixed identifiers.                                                  |
+| Field                      | Type      | Default | Platform | Description                                                                                                     |
+| -------------------------- | --------- | ------- | -------- | --------------------------------------------------------------------------------------------------------------- |
+| `minimumIntervalMs`        | `number`  | --      | Both     | Android: the period of the periodic work, raised to 15 minutes when lower. iOS: only the refresh task's earliest begin date, at least 60 seconds after the submit. The processing task has none. |
+| `requiresCharging`         | `boolean` | `false` | Both     | Only fire when the device is plugged in. On iOS this applies to the processing task only.                       |
+| `requiresUnmeteredNetwork` | `boolean` | `false` | Android  | Only fire on Wi-Fi / ethernet.                                                                                  |
+| `requiresDeviceIdle`       | `boolean` | `false` | Android  | Leave it unset: `true` makes `enableBackgroundSync()` reject with `BACKGROUND_TASK_REGISTRATION_FAILED`, because WorkManager refuses the backoff policy the library sets on an idle-constrained request. iOS does not apply it. |
+| `foregroundOnly`           | `boolean` | `false` | Both     | Kill-switch that schedules **no** OS background work at all. See [Foreground-only mode](#foreground-only-mode).  |
+| `taskIdentifier`           | `string`  | --      | Neither  | Stored but not used yet. Both platforms use fixed identifiers.                                                  |
 
 The options persist across relaunches, on both platforms.
 
-## What stops what
+## What Stops What
 
 | Control                   | Retry timer                      | Android retry kick | Periodic worker / BGTask                    |
 | ------------------------- | -------------------------------- | ------------------ | ------------------------------------------- |
@@ -84,7 +88,7 @@ None of these controls turns off [`useAutoSync`](../api-reference/hooks/useAutoS
 
 A pause lasts until `resumeSync()` or the next launch that reaches the library, including a JS reload. A launch clears it without emitting `RESUMED`. On iOS, React Native can start during a background launch, and if JS reaches the library there, that counts as a launch.
 
-## iOS: `BGTaskScheduler`
+## `BGTaskScheduler` (iOS) {#ios-bgtaskscheduler}
 
 The library uses two task types, each with a fixed identifier:
 
@@ -93,7 +97,7 @@ The library uses two task types, each with a fixed identifier:
 
 Each handler re-submits before doing any work, so the chain continues from the persisted options with no JS loaded.
 
-### Identifier registration
+### Identifier Registration
 
 The handlers register at process start through `+load`, with no JS and no `AppDelegate` code. Do not register them yourself: see [iOS Setup](../getting-started/ios-setup.md#5-forward-background-urlsession-events). Declare both identifiers in your app's `Info.plist`:
 
@@ -107,32 +111,34 @@ The handlers register at process start through `+load`, with no JS and no `AppDe
 
 A missing identifier does not crash: that handler is skipped. `enableBackgroundSync` rejects with `BACKGROUND_TASK_REGISTRATION_FAILED` when `.background` is the one missing.
 
-### OS-imposed scheduling
+### OS-Imposed Scheduling
 
-`minimumIntervalMs` is a **soft hint**. iOS uses on-device usage patterns, battery level, and network state to decide when to fire. In practice:
+`minimumIntervalMs` is a **soft hint**: it only sets the refresh task's earliest begin date, at least 60 seconds after the submit, and the processing task has none. iOS uses on-device usage patterns, battery level, and network state to decide when to fire. In practice:
 
 - New apps or rarely opened apps may go hours between fires.
 - Frequently used apps fire more often.
 - Low Power Mode delays fires until the device exits it.
 - A force-quit app is not launched for background tasks or uploads until the user opens it again.
 
-### Capability requirement
+### Capability Requirement
 
 **Background fetch** and **Background processing** must be enabled in Xcode -> Signing & Capabilities, and your `AppDelegate` must [forward `handleEventsForBackgroundURLSession`](../getting-started/ios-setup.md#5-forward-background-urlsession-events).
 
 See [iOS Setup](../getting-started/ios-setup.md) for the full walkthrough.
 
-### Background uploads
+### Background Uploads
 
 While the app is not active, uploads go through a background `URLSession`, so the OS can finish them while the app is suspended. With `foregroundOnly`, this session is not used.
 
 > **Warning — A relaunch can lose the outcome of an upload:** A background upload that finishes after a relaunch is not recorded. Launch recovery puts the item back to `PENDING` with its attempt spent and no cooldown, and the server may already have accepted the request. Delivery is at least once, so endpoints must be idempotent. See the [Idempotency guide](./idempotency.md).
 
-## Android: `WorkManager`
+The [Crash Recovery](./crash-recovery.md) guide covers launch recovery in full.
+
+## `WorkManager` (Android) {#android-workmanager}
 
 The library uses a unique `PeriodicWorkRequest` for the recurring schedule, and a unique `OneTimeWorkRequest` for the [retry kick](./retry-policy.md#who-wakes-the-queue-and-when).
 
-### 15-minute floor
+### 15-Minute Floor
 
 ```ts
 await enableBackgroundSync({
@@ -142,17 +148,17 @@ await enableBackgroundSync({
 
 `PeriodicWorkRequest.MIN_PERIODIC_INTERVAL_MILLIS` is 15 minutes. The library clamps smaller values rather than rejecting them.
 
-### Constraints map to `Constraints.Builder`
+### Constraints Map to `Constraints.Builder`
 
 | `BackgroundSyncOptions`          | `Constraints`                                    |
 | -------------------------------- | ------------------------------------------------ |
 | `requiresCharging: true`         | `.setRequiresCharging(true)`                     |
 | `requiresUnmeteredNetwork: true` | `.setRequiredNetworkType(NetworkType.UNMETERED)` |
-| `requiresDeviceIdle: true`       | `.setRequiresDeviceIdle(true)`                   |
+| `requiresDeviceIdle: true`       | `.setRequiresDeviceIdle(true)`, which WorkManager refuses with the backoff policy the library sets, so `enableBackgroundSync()` rejects with `BACKGROUND_TASK_REGISTRATION_FAILED`. Leave it unset. |
 
 When no constraints are set, the library defaults to `NetworkType.CONNECTED` so the worker only fires when the device has any network. The retry kick honors the same constraints.
 
-### Doze mode
+### Doze Mode
 
 Android Doze (API 23+) defers periodic work during deep idle. Expect:
 
@@ -160,11 +166,11 @@ Android Doze (API 23+) defers periodic work during deep idle. Expect:
 - Resumed fires within a maintenance window when the device moves or is plugged in.
 - OEM battery optimizers (Xiaomi MIUI, Huawei EMUI, Samsung Adaptive Battery) further restrict execution.
 
-The library does not request battery whitelisting -- that is a UX choice for the host app.
+The library does not request battery whitelisting -- that is a UX choice for the host app. For the work the library itself adds, see [Battery Optimization](./battery-optimization.md).
 
-### Reboot recovery
+### Reboot Recovery
 
-The library's `BootCompletedReceiver` is registered automatically. On `BOOT_COMPLETED`, `LOCKED_BOOT_COMPLETED` and `MY_PACKAGE_REPLACED`:
+The library's `BootCompletedReceiver` is registered automatically. `LOCKED_BOOT_COMPLETED` is in its filter, but the receiver is not direct-boot aware, so a locked device does not deliver it. On `BOOT_COMPLETED`, which arrives after the first unlock, and on `MY_PACKAGE_REPLACED`:
 
 1. The receiver enqueues a one-time `RecoveryWorker`.
 2. The worker resets items left in flight back to `PENDING`, keeping their cooldowns.
@@ -175,20 +181,24 @@ It sends no request of its own. Pending items wait for the next window, kick or 
 
 Users that Force Stop the app must open it once before any of this runs again -- this is an Android-wide constraint, not library-specific.
 
+See [Crash Recovery](./crash-recovery.md) for recovery on both platforms.
+
 ## Platform Comparison
 
-| Concern                 | iOS (`BGTaskScheduler`)                                | Android (`WorkManager`)                 |
-| ----------------------- | ------------------------------------------------------ | --------------------------------------- |
-| Min interval            | Soft hint, floor of 60 seconds                         | Hard 15-minute floor                    |
-| Charging constraint     | Processing task only                                   | Supported                               |
-| Unmetered constraint    | Not applied                                            | Supported                               |
-| Idle constraint         | Not applied                                            | Supported                               |
-| Network required        | Always, on the processing task                         | Always                                  |
-| Retry kick              | None                                                   | Opt-in, through `enableBackgroundSync`  |
-| Identifier registration | Required in `Info.plist`, both identifiers             | Implicit (unique work names)            |
-| Reboot recovery         | No boot hook: recovery runs when the app or a BGTask next starts | `BootCompletedReceiver` reschedules |
-| OS deferral             | Aggressive (battery/usage based)                       | Doze-aware, OEM-restricted              |
-| Capability flag         | Background Modes (`fetch` + `processing`)              | None (auto via merged manifest)         |
+| Concern                 | Android (`WorkManager`)                 | iOS (`BGTaskScheduler`)                                |
+| ----------------------- | --------------------------------------- | ------------------------------------------------------ |
+| Min interval            | Hard 15-minute floor                    | Earliest start of the refresh task, at least 60 seconds; none on the processing task |
+| Charging constraint     | Supported                               | Processing task only                                   |
+| Unmetered constraint    | Supported                               | Not applied                                            |
+| Idle constraint         | Makes `enableBackgroundSync()` reject   | Not applied                                            |
+| Network required        | Always                                  | Always, on the processing task                         |
+| Retry kick              | Opt-in, through `enableBackgroundSync`  | None                                                   |
+| Identifier registration | Implicit (unique work names)            | Required in `Info.plist`, both identifiers             |
+| Reboot recovery         | `BootCompletedReceiver` reschedules     | No boot hook: recovery runs when the app or a BGTask next starts |
+| OS deferral             | Doze-aware, OEM-restricted              | Aggressive (battery/usage based)                       |
+| Capability flag         | None (auto via merged manifest)         | Background Modes (`fetch` + `processing`)              |
+
+For the platform differences across the whole library, see [Platform Comparison](../production/platform-comparison.md).
 
 ## Cold-Start Configuration
 
@@ -203,7 +213,7 @@ A stored value that cannot be used, such as an unusable `healthCheckUrl` or a ne
 
 > **Warning — Only `defaultHeaders` are encrypted:** Per-item `headers` and `body` are stored in plain text in the queue. Put credentials in `defaultHeaders`.
 
-### Tokens and logout
+### Tokens and Logout
 
 `configureSync` replaces the whole configuration, so:
 
@@ -223,7 +233,7 @@ await configureSync({
 await configureSync({ strategy: SyncStrategy.AUTOMATIC, retryPolicy });
 ```
 
-### When a stored token expires
+### When a Stored Token Expires
 
 A token read back from storage can be stale, and only the app can renew it. So in a process that has not called `configureSync`, a 401 or 403 does not fail the item. It stays `PENDING`, no attempt is spent, the next try waits at least 60 seconds, and the cycle stops, so an expired token costs one request per wake. You see `ITEM_RETRYING` with `UNAUTHORIZED`, if anything is listening.
 
@@ -236,7 +246,7 @@ Two cases can still send a request with the rejected token:
 - **A process restart.** The hold lives in memory, so an OS kill, a reboot or an app update drops it. The rejected item keeps its own `nextRetryAt`, but another due item can wake the queue in the new process. That costs at most one request, whose rejection sets a new hold.
 - **A background window.** The periodic worker and the BGTasks are not retry wakes and do not wait for the hold, so a window that opens during one can cost one request.
 
-### When stored headers cannot be read
+### When Stored Headers Cannot Be Read
 
 If headers were configured but cannot be read, nothing is dispatched: sending without them would fail every item. Items stay `PENDING`, the worker or task reports success, and the library tries again on each flush. `flush()` resolves with 0/0. This happens when:
 
@@ -246,13 +256,13 @@ If headers were configured but cannot be read, nothing is dispatched: sending wi
 
 Calling `configureSync` ends the wait in every case. While headers are unreadable, `getSyncConfig()` returns none, so `setConfig({ ...config })` deletes them: pass `defaultHeaders` from your app's session instead. See [Troubleshooting](../troubleshooting.md#symptom-items-stay-pending-and-flush-returns-00).
 
-### What needs a running app
+### What Needs a Running App
 
 A process with no JS-facing hybrid, such as a worker, a boot broadcast or an iOS background launch where JS never reaches the library, runs no retry timer: it would dispatch outside the constraints you set. Android relies on the kick there. Events are not delivered either, since nothing is listening.
 
-With `healthCheckUrl` set, such a process can still send requests of its own: an Android retry kick that finds a stale network-quality measurement may send a measurement before its flush.
+With `healthCheckUrl` set, such a process can still send requests of its own. On Android, a `SyncWorker` run, periodic or retry kick, starts a latency measurement only when `minNetworkQuality` is above `OFFLINE`, `healthCheckUrl` is set, and the last measurement of that network is missing or 30 s old or older. It starts 1 s after the gate check and runs alongside the flush, which does not wait for it. In a new process the gate decides from the link signals (`GOOD` unmetered, `MODERATE` metered, at most `POOR` unvalidated), so `EXCELLENT` never passes there. The worker also sends the health check's one `HEAD` before the cycle, unless a `2xx` younger than `healthCheckTtlMs` exists in that process.
 
-## Foreground-only mode
+## Foreground-Only Mode
 
 **Added in v0.2.** Set `foregroundOnly: true` to turn OS-scheduled background dispatch **off** entirely while keeping the rest of the library working:
 
@@ -289,15 +299,21 @@ useSyncEvents({
 
 These events reach a listener only if a JS engine is running at the time of the OS callback. If the OS delivers a fire with no JS loaded, the queue still flushes, but you will not see the event. On Android, the periodic worker emits them and the retry kick does not.
 
-Neither event carries `errorCode`: a window whose flush fails reports the code on that cycle's `SYNC_FAILED`. On iOS, `metadata.kind` is `"refresh"` or `"processing"` on every `BACKGROUND_SYNC_COMPLETED` and on the processing task's `BACKGROUND_SYNC_STARTED`, and `metadata.ok` is `"false"` when the window's flush failed. Android sends base fields only, and emits `BACKGROUND_SYNC_COMPLETED` only after the flush returns, so a worker whose flush throws emits none.
+Neither event carries `errorCode`, on either platform. The codes go elsewhere:
 
-## When the gate or the health check skips a window {#when-the-gate-or-the-health-check-skips-a-window}
+- **A cycle that dies** emits `SYNC_FAILED` with its code. On iOS, `BACKGROUND_SYNC_COMPLETED` follows with `metadata.ok: "false"`. On Android, the periodic worker then emits no `BACKGROUND_SYNC_COMPLETED`.
+- **A cycle that ends with permanent item failures** emits `SYNC_FAILED` without a code, and each item's code is on its `ITEM_FAILED`.
+- **A skipped window** emits `SYNC_FAILED` with `NETWORK_QUALITY_TOO_LOW` or `HEALTH_CHECK_FAILED`, then `BACKGROUND_SYNC_COMPLETED`. See [When the Gate or the Health Check Skips a Window](#when-the-gate-or-the-health-check-skips-a-window).
+
+On iOS, `metadata.kind` is `"refresh"` or `"processing"` on every `BACKGROUND_SYNC_COMPLETED` and on the processing task's `BACKGROUND_SYNC_STARTED`, and `metadata.ok` is set only when the flush throws. Android sends base fields only.
+
+## When the Gate or the Health Check Skips a Window {#when-the-gate-or-the-health-check-skips-a-window}
 
 A background window runs the same [checks as any flush](../api-reference/functions.md#checks-before-a-cycle). With [`minNetworkQuality`](./connectivity-detection.md#the-quality-gate) or [`healthCheckUrl`](./connectivity-detection.md#health-check) set, a window can therefore run no cycle. It spends no attempt and changes no item, and the skipped flush emits `SYNC_FAILED` with `NETWORK_QUALITY_TOO_LOW` or `HEALTH_CHECK_FAILED`, which a listener receives only if JS is running.
 
 | Window | Below `minNetworkQuality` | Health check failed, or its backoff running |
 | ------ | ------------------------- | ------------------------------------------- |
-| Android periodic worker | Returns `Result.success()`. The next period tries again. | Returns `Result.success()`. The next period tries again. |
+| Android periodic worker | Returns `Result.success()`. The next period tries again. | Returns `Result.success()`, and arms the [retry kick](./retry-policy.md#who-wakes-the-queue-and-when) for the soonest cooldown, no earlier than the end of the backoff. The next period tries again. |
 | Android retry kick | Returns `Result.success()` and re-arms itself on the held-wake backoff: 30 s, doubling up to 15 minutes. The streak survives process death. | Returns `Result.success()` and re-arms no earlier than the end of the backoff, and at least 1000 ms after the failed check. |
 | iOS BGTask | The flush returns normally, `BACKGROUND_SYNC_COMPLETED` fires with `metadata.kind` only, and the task completes successfully. The next attempt is the next window the OS grants. | The same as below the minimum. |
 
@@ -309,20 +325,65 @@ On iOS, a skipped window is not a failed one: its `BACKGROUND_SYNC_COMPLETED` ca
 
 ## When Sync May Be Deferred
 
-| Cause                        | iOS                   | Android                               |
-| ---------------------------- | --------------------- | ------------------------------------- |
-| Low battery / Low Power Mode | Defers fires          | Defers fires                          |
-| Doze mode                    | n/a                   | Defers periodic work                  |
-| OEM battery optimizer        | n/a                   | Often defers heavily                  |
-| User force-quit / Force Stop | Until the app is opened | Until the app is opened             |
-| App not opened recently      | iOS reduces frequency | WorkManager respects Adaptive Battery |
-| Network constraint not met   | Skips this fire       | Skips this fire                       |
+| Cause                        | Android                               | iOS                   |
+| ---------------------------- | ------------------------------------- | --------------------- |
+| Low battery / Low Power Mode | Defers fires                          | Defers fires          |
+| Doze mode                    | Defers periodic work                  | n/a                   |
+| OEM battery optimizer        | Often defers heavily                  | n/a                   |
+| User force-quit / Force Stop | Until the app is opened               | Until the app is opened |
+| App not opened recently      | WorkManager respects Adaptive Battery | iOS reduces frequency |
+| Network constraint not met   | Skips this fire                       | Skips this fire       |
 | Below `minNetworkQuality`, or health check failing | Window runs no cycle | Window runs no cycle |
 
 For predictable cadence in development, use `useAutoSync({ enabled: true, flushOnReconnect: true, flushOnAppForeground: true })` -- it triggers a JS-side flush on the events you care about, independent of OS scheduling.
 
+## Best Practices
+
+1. **Do not depend on a cadence.** The OS decides when a window runs: `minimumIntervalMs` only sets the earliest start of the iOS refresh task, and has a 15-minute floor on Android. For predictable flushes while the app runs, mount [`useAutoSync`](../api-reference/hooks/useAutoSync.md).
+
+2. **Call `configureSync` at launch and whenever the token changes.** A window runs from the persisted configuration, so pass `defaultHeaders` on every call that should keep them. See [Tokens and Logout](#tokens-and-logout).
+
+3. **Turn background dispatch off with `foregroundOnly`, not `MANUAL`.** `MANUAL` does not stop background windows. See [What Stops What](#what-stops-what).
+
+4. **Keep the gate and the Android constraints consistent.** If you gate on `GOOD` without `healthCheckUrl`, also set `requiresUnmeteredNetwork: true`, so WorkManager does not start windows the gate then skips.
+
+5. **Make endpoints idempotent.** A relaunch can lose the outcome of an iOS background upload, and the item is then sent again. See the [Idempotency guide](./idempotency.md).
+
+6. **Test on a physical device.** The iOS Simulator rejects `enableBackgroundSync`. Use the LLDB command in [iOS Setup](../getting-started/ios-setup.md#7-test-the-background-handler).
+
+## Troubleshooting
+
+Common background sync problems. For the full list, see [Troubleshooting](../troubleshooting.md).
+
+### Background Sync Never Fires (iOS)
+
+1. Declare both identifiers in `BGTaskSchedulerPermittedIdentifiers`, and enable **Background fetch** and **Background processing**.
+2. Test on a physical device: the Simulator does not accept `BGTaskScheduler` requests.
+3. Check that the user did not force-quit the app. iOS grants it no window until the user opens it again.
+4. Allow for the OS: nothing guarantees when a window runs.
+
+See [`BGTaskScheduler` never fires](../troubleshooting.md#symptom-bgtaskscheduler-never-fires) in Troubleshooting.
+
+### Periodic Work Runs Late or Not at All (Android)
+
+1. Expect at least 15 minutes between periodic runs, and longer under Doze, App Standby Buckets or an OEM battery manager.
+2. Check that the user did not Force Stop the app: background work waits until the user opens it again.
+3. Check the constraints. Every window needs a network, and with `requiresUnmeteredNetwork` or `requiresCharging` it also waits until those are met. Leave `requiresDeviceIdle` unset: `true` makes `enableBackgroundSync()` reject.
+
+See [WorkManager flushes deferred for hours during normal phone use](../troubleshooting.md#symptom-workmanager-flushes-deferred-for-hours-during-normal-phone-use) in Troubleshooting.
+
+### A Window Runs but Sends Nothing
+
+1. If JS is running, read the cycle's `SYNC_FAILED`: `NETWORK_QUALITY_TOO_LOW` or `HEALTH_CHECK_FAILED` means the gate or the health check skipped it. See [When the Gate or the Health Check Skips a Window](#when-the-gate-or-the-health-check-skips-a-window).
+2. Check that the engine is not paused: workers and BGTasks stay inert while a pause is in force.
+3. Check that stored headers can be read. See [When Stored Headers Cannot Be Read](#when-stored-headers-cannot-be-read).
+
+See [Items stay pending and `flush()` returns 0/0](../troubleshooting.md#symptom-items-stay-pending-and-flush-returns-00) in Troubleshooting.
+
 ## Next Steps
 
-- [Connectivity Detection](./connectivity-detection.md) -- Trigger flushes on reconnect.
-- [iOS Setup](../getting-started/ios-setup.md) -- Background Modes + Info.plist.
-- [Android Setup](../getting-started/android-setup.md) -- Permissions + Doze.
+- [Connectivity Detection](./connectivity-detection.md) -- Trigger flushes on reconnect
+- [Crash Recovery](./crash-recovery.md) -- How items left in flight come back after a kill or a reboot
+- [Battery Optimization](./battery-optimization.md) -- What wakes the device and uses the network, and the option that controls each
+- [iOS Setup](../getting-started/ios-setup.md) -- Background Modes + Info.plist
+- [Android Setup](../getting-started/android-setup.md) -- Permissions + Doze

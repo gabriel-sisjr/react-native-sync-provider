@@ -15,6 +15,8 @@ keywords:
 
 # Installation
 
+This page installs the package and its peer dependency, then summarizes the native setup each platform needs.
+
 ## Install the Package
 
 ```bash
@@ -47,96 +49,39 @@ npm install "react-native-nitro-modules@^0.35.8"
 
 > **Note — Why 0.35.8:** In 0.35.6 and 0.35.7, Nitro's Swift `Promise` had no lock, so an iOS call could leave its JS promise pending forever. The fix, [Nitro PR #1338](https://github.com/margelo/nitro/pull/1338), was first published in 0.35.8 on npm. Nitro's GitHub has no v0.35.8 release: the fix is listed in the [v0.35.9 release notes](https://github.com/margelo/nitro/releases/tag/v0.35.9).
 
+## Android Setup
+
+Android needs no manual step beyond meeting the toolchain versions. Gradle's manifest merger adds the library's permissions (`INTERNET`, `ACCESS_NETWORK_STATE`, `RECEIVE_BOOT_COMPLETED`) and its `BootCompletedReceiver`, and the library's ProGuard / R8 rules apply through `consumerProguardFiles`.
+
+See the dedicated [Android Setup](./android-setup.md) page for:
+
+- The Gradle versions: `minSdkVersion` 24, `compileSdkVersion` and `targetSdkVersion` 36, Kotlin 2.0.21 to 2.2.21 and Android Gradle Plugin 8.7.2
+- What the boot receiver and its `RecoveryWorker` do after a reboot or an app update
+- The `WorkManager` 15-minute floor for periodic work
+- Doze mode and OEM battery managers
+
 ## iOS Setup
 
-### 1. Install Pods
+iOS requires configuration beyond installing the package. See the dedicated [iOS Setup](./ios-setup.md) page for complete instructions, including:
+
+- The iOS 15.0 minimum deployment target
+- The **Background fetch** and **Background processing** background modes
+- Both BGTask identifiers in `Info.plist`
+- Forwarding `handleEventsForBackgroundURLSession` from your `AppDelegate` ([Step 5](./ios-setup.md#5-forward-background-urlsession-events))
+- The bundled privacy manifest, which needs nothing from you
+
+Quick summary for minimal setup:
 
 ```bash
+# 1. Set the iOS deployment target to 15.0 or later
+# 2. In Xcode, enable Background Modes > Background fetch and Background processing
+# 3. Add both identifiers to BGTaskSchedulerPermittedIdentifiers in Info.plist
+# 4. Forward handleEventsForBackgroundURLSession from your AppDelegate
+# 5. Install pods
 cd ios && pod install && cd ..
 ```
 
-This pulls in the `SyncProvider` pod (the iOS module name -- not the npm package name) and its native dependencies (`Foundation`, `CoreData`, `Network`, `BackgroundTasks`, `Security`).
-
-### 2. Enable Background Modes
-
-In Xcode, open your app target -> **Signing & Capabilities** -> **+ Capability** -> **Background Modes**. Enable:
-
-- **Background fetch**
-- **Background processing**
-
-### 3. Declare the Background Task Identifiers
-
-Add both of the library's identifiers to your app's `Info.plist`. They are fixed:
-
-```xml
-<key>BGTaskSchedulerPermittedIdentifiers</key>
-<array>
-  <string>com.gabriel-sisjr.syncprovider.background</string>
-  <string>com.gabriel-sisjr.syncprovider.processing</string>
-</array>
-```
-
-### 4. Forward Background URLSession Events
-
-Forward `handleEventsForBackgroundURLSession` from your `AppDelegate`, as shown in [iOS Setup](./ios-setup.md#5-forward-background-urlsession-events). The library registers its BGTask handlers by itself, so do not register them yourself.
-
-### 5. Privacy Manifest
-
-The library ships its own `PrivacyInfo.xcprivacy` (declared as a `resource_bundles` entry in `SyncProvider.podspec`). Consumers do **not** need to add anything for the library -- Apple's required reasons are already declared. See [Privacy Manifest](../production/privacy-manifest.md) for full details.
-
-### 6. Minimum iOS Version
-
-Set `IPHONEOS_DEPLOYMENT_TARGET = 15.0` (or higher) in your project. The library's podspec enforces this floor, and React Native 0.85 raises the built pod to 15.1.
-
-## Android Setup
-
-### 1. Permissions (Auto-Merged)
-
-The library declares the required permissions in its own `AndroidManifest.xml`. Gradle's manifest merger pulls them into your app automatically:
-
-```xml
-<uses-permission android:name="android.permission.INTERNET" />
-<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-<uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-```
-
-You do not need to copy them into your app's manifest, but listing them is good practice for transparency.
-
-### 2. Gradle Versions
-
-Verify your project meets the floor:
-
-| Setting | Required |
-|---|---|
-| `minSdkVersion` | 24 |
-| `compileSdkVersion` | 36 |
-| `targetSdkVersion` | 36 |
-| Kotlin | 2.0.21 |
-| Android Gradle Plugin | 8.7.2 |
-
-In `android/build.gradle`:
-
-```gradle
-buildscript {
-  ext {
-    minSdkVersion = 24
-    compileSdkVersion = 36
-    targetSdkVersion = 36
-    kotlinVersion = "2.0.21"
-  }
-  dependencies {
-    classpath("com.android.tools.build:gradle:8.7.2")
-  }
-}
-```
-
-### 3. Boot Receiver
-
-The library's `BootCompletedReceiver` is already registered in the merged manifest. It schedules a `RecoveryWorker` at boot to reset in-flight items and re-arm background work. No action required.
-
-### 4. ProGuard / R8
-
-ProGuard rules are bundled with the library (`android/proguard-rules.pro`) and applied via the consumer-side `consumerProguardFiles`. No additional rules are required.
+The library registers its BGTask handlers by itself, so do not register them in your `AppDelegate`.
 
 ## New Architecture Verification
 
@@ -172,16 +117,22 @@ If the helper returns `false`, the most common causes are:
 
 ## Troubleshooting
 
-> **Tip — Build fails on iOS with "Multiple commands produce PrivacyInfo.xcprivacy":** This happens when an older copy of the library was installed via `cp` or vendored. Run `pod deintegrate && pod install` and remove any duplicate `PrivacyInfo.xcprivacy` from your app target.
+Common installation issues. For the full list, see [Troubleshooting](../troubleshooting.md).
 
-> **Tip — Android KSP crash on Room schema generation:** Make sure you are on Kotlin 2.0.21 and Room 2.7.0+. Older Room versions (2.6.x) crash on KSP under Kotlin 2.0.x.
+### Build Fails on iOS with `Multiple commands produce PrivacyInfo.xcprivacy`
 
-> **Tip — "Native module not found" on first call:** Rebuild the native app after installing the package: `yarn example ios` / `yarn example android`. Hot-reload alone does not pick up new native modules.
+This happens when an older copy of the library was installed via `cp` or vendored. Run `pod deintegrate && pod install` and remove any duplicate `PrivacyInfo.xcprivacy` from your app target. For a podspec that lists the manifest as a plain resource, see [Troubleshooting](../troubleshooting.md#symptom-pod-install-fails-with-multiple-commands-produce-privacyinfoxcprivacy).
 
-For a full list of common issues, see [Troubleshooting](../troubleshooting.md).
+### Android KSP Crash on Room Schema Generation
+
+Make sure you are on Room 2.7.0+ and on a Kotlin version the library supports, 2.0.21 to 2.2.21 (see [Android Setup](./android-setup.md#1-gradle-versions)). Older Room versions (2.6.x) crash on KSP under Kotlin 2.0.x.
+
+### Native Module Not Found on the First Call
+
+Rebuild the native app after installing the package, from Xcode and Android Studio or with `npx react-native run-ios` / `npx react-native run-android`. Hot-reload alone does not pick up new native modules.
 
 ## Next Steps
 
-- [Quick Start](./quick-start.md) -- A working hooks-first screen in five minutes.
-- [iOS Setup](./ios-setup.md) -- Detailed iOS configuration.
-- [Android Setup](./android-setup.md) -- Detailed Android configuration.
+- [Quick Start](./quick-start.md) -- A working hooks-first screen in five minutes
+- [iOS Setup](./ios-setup.md) -- Detailed iOS configuration
+- [Android Setup](./android-setup.md) -- Detailed Android configuration

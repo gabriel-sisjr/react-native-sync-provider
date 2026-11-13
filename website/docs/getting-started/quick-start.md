@@ -15,7 +15,7 @@ keywords:
 
 # Quick Start
 
-Get an offline-first HTTP sync queue running in five minutes. This guide uses the hooks-first approach for the simplest integration. The direct facade API is shown at the end for callers that prefer it.
+Get an offline-first HTTP sync queue running in five minutes. This guide uses the hooks-first approach for the simplest integration, then breaks the setup down step by step, including the direct facade API for callers that prefer it.
 
 ## Prerequisites
 
@@ -101,36 +101,9 @@ The hooks subscribe to native events and re-render whenever the queue, sync engi
 
 Enqueueing stores an item, and a flush sends it. Here the button does that. To flush without one, see [Configure the Sync Engine](#configure-the-sync-engine) below.
 
-## Direct API
+## Step-by-Step Breakdown
 
-If you prefer to call the facade directly (for example, from a non-React module or a background callback), use the top-level functions:
-
-```tsx
-import {
-  enqueue,
-  flush,
-  getQueueSize,
-  HttpMethod,
-} from '@gabriel-sisjr/react-native-sync-provider';
-
-// 1. Enqueue an item
-const id = await enqueue({
-  method: HttpMethod.POST,
-  url: 'https://api.example.com/events',
-  contentType: 'application/json',
-  body: JSON.stringify({ kind: 'app_opened' }),
-});
-console.log('Enqueued', id);
-
-// 2. Flush. One cycle dispatches up to `batchSize` eligible items.
-const result = await flush();
-console.log(`${result.successCount} ok / ${result.failureCount} failed`);
-
-// 3. Inspect the queue
-console.log('Pending:', await getQueueSize());
-```
-
-## Configure the Sync Engine
+### 1. Configure the Sync Engine {#configure-the-sync-engine}
 
 Most apps configure the sync engine once at startup, and mount `useAutoSync` so items go out without a button. Wrap your tree with `<SyncProvider>` to centralize the lifecycle:
 
@@ -183,9 +156,51 @@ The Provider applies `configureSync(options)` on mount and on every change to `o
 
 > **Warning — Omitting `defaultHeaders` is a logout:** Each `configureSync` replaces the whole configuration, and omitting `defaultHeaders` deletes the stored copy. See [Cold-start configuration](../guides/background-sync.md#cold-start-configuration).
 
+### 2. Enqueue a Request
+
+In a component, take `enqueue` from `useSyncQueue()`, as the minimal example does. If you prefer to call the facade directly (for example, from a non-React module or a background callback), use the top-level function:
+
+```tsx
+import { enqueue, HttpMethod } from '@gabriel-sisjr/react-native-sync-provider';
+
+const id = await enqueue({
+  method: HttpMethod.POST,
+  url: 'https://api.example.com/events',
+  contentType: 'application/json',
+  body: JSON.stringify({ kind: 'app_opened' }),
+});
+console.log('Enqueued', id);
+```
+
+The item is stored. It is not sent until a flush runs.
+
+### 3. Flush the Queue
+
+In a component, take `flush` and `isSyncing` from `useSyncStatus()`. Elsewhere, call `flush()`:
+
+```tsx
+import { flush } from '@gabriel-sisjr/react-native-sync-provider';
+
+// One cycle dispatches up to `batchSize` eligible items.
+const result = await flush();
+console.log(`${result.successCount} ok / ${result.failureCount} failed`);
+```
+
+### 4. Inspect the Queue
+
+`useSyncQueue()` keeps `size` and `items` current in a component. For a one-off read, call `getQueueSize()`:
+
+```tsx
+import { getQueueSize } from '@gabriel-sisjr/react-native-sync-provider';
+
+console.log('Pending:', await getQueueSize());
+```
+
+It counts `PENDING` items, including items waiting out a retry cooldown.
+
 ## Quick Tips
 
-### Pick the right strategy
+### Pick the Right Strategy
 
 | Strategy | When to use |
 |---|---|
@@ -216,7 +231,7 @@ await enqueue({
 
 See the [Idempotency guide](../guides/idempotency.md) for the server side.
 
-### Use `useOfflineQueue` for offline-first UIs
+### Use `useOfflineQueue` for Offline-First UIs
 
 ```tsx
 import { useOfflineQueue } from '@gabriel-sisjr/react-native-sync-provider';
@@ -228,9 +243,29 @@ const { size, isWaitingForConnection, enqueue, flush } = useOfflineQueue();
 
 ## Testing
 
-- **Real device recommended** -- emulators are fine for queue / retry logic but background scheduling cannot be reproduced reliably.
-- **Simulate offline** -- toggle Airplane Mode (or Network Link Conditioner on iOS) to see `CONNECTION_CHANGED` events fire.
-- **Force a background fire** -- on iOS, use the LLDB command in [iOS Setup](./ios-setup.md#7-test-the-background-handler), on a physical device. **Debug -> Simulate Background Fetch** does not exercise the BGTask handlers.
+A real device is recommended: emulators are fine for queue and retry logic, but background scheduling cannot be reproduced reliably on them.
+
+### On Android Device
+
+- **Simulate offline** -- toggle Airplane Mode to see `CONNECTION_CHANGED` events fire. Over adb: `adb shell svc wifi disable && adb shell svc data disable`.
+- **Force a background fire** -- after `enableBackgroundSync`, find the `WorkManager` job id and run it:
+
+  ```bash
+  adb shell dumpsys jobscheduler | grep com.your.app
+  adb shell cmd jobscheduler run -f com.your.app <jobid>
+  ```
+
+### On iOS Device
+
+- **Simulate offline** -- toggle Airplane Mode, or use Network Link Conditioner, to see `CONNECTION_CHANGED` events fire.
+- **Force a background fire** -- use the LLDB command in [iOS Setup](./ios-setup.md#7-test-the-background-handler), on a physical device. **Debug -> Simulate Background Fetch** does not exercise the BGTask handlers.
+
+### On Emulator / Simulator
+
+- Queue and retry logic can be tested here.
+- The iOS Simulator does not accept `BGTaskScheduler` requests, so `enableBackgroundSync` rejects there with `BACKGROUND_TASK_REGISTRATION_FAILED`.
+
+See [Debugging](../development/debugging.md) for log filters and for inspecting the persisted queue.
 
 ## Common Issues
 
@@ -243,7 +278,7 @@ const { size, isWaitingForConnection, enqueue, flush } = useOfflineQueue();
 
 ## Next Steps
 
-- [Hooks Reference](../api-reference/hooks/useSyncQueue.md) -- Every hook with options and return types.
-- [Background Sync](../guides/background-sync.md) -- Deep dive into BGTaskScheduler and WorkManager constraints.
-- [Retry Policy](../guides/retry-policy.md) -- Backoff curves, jitter, and status-code allowlists.
-- [Production Checklist](../production/production-checklist.md) -- Pre-launch checklist.
+- [useSyncQueue](../api-reference/hooks/useSyncQueue.md) -- The hook that mirrors the pending queue, with its state, methods and re-render behavior
+- [Background Sync](../guides/background-sync.md) -- Deep dive into BGTaskScheduler and WorkManager constraints
+- [Retry Policy](../guides/retry-policy.md) -- Backoff curves, jitter, and status-code allowlists
+- [Production Checklist](../production/production-checklist.md) -- Pre-launch checklist

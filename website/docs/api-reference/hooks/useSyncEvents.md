@@ -12,7 +12,7 @@ keywords:
   - listener
 ---
 
-# `useSyncEvents`
+# useSyncEvents
 
 Declarative subscription to [`SyncEvent`](../types.md#syncevent)s with built-in cleanup, type filtering, and an `enabled` flag for conditional subscription. The callback is captured in a ref so you do not need `useCallback` / `useMemo`.
 
@@ -20,7 +20,7 @@ Declarative subscription to [`SyncEvent`](../types.md#syncevent)s with built-in 
 import { useSyncEvents } from '@gabriel-sisjr/react-native-sync-provider';
 ```
 
-**Platform:** Android and iOS.
+**Platform:** Android and iOS. On web it subscribes to nothing, so `onEvent` never runs.
 
 ---
 
@@ -54,7 +54,7 @@ The hook accepts a single options object.
 
 ---
 
-## Behavior
+## Behavior Details
 
 - **Mount** -- when `enabled !== false`, registers a listener via [`addSyncEventListener`](../listeners.md#addsynceventlistener).
 - **Filter** -- if `types` is provided, the hook filters events by `type` before calling `onEvent`.
@@ -64,7 +64,7 @@ The hook accepts a single options object.
 
 ---
 
-## Example
+## Usage
 
 ### Toast on every failure
 
@@ -102,7 +102,8 @@ function DebugLogger({ enabled }: { enabled: boolean }) {
 
 ---
 
-## See also
+## See Also
 
-- [`addSyncEventListener` / `removeSyncEventListener`](../listeners.md) -- the imperative equivalent.
-- [`SyncEvent` type](../types.md#syncevent), [`SyncEventType` enum](../enums.md#synceventtype).
+- [Event Listeners](../listeners.md) -- `addSyncEventListener` and `removeSyncEventListener`, the imperative equivalent
+- [Types & Interfaces](../types.md) -- `SyncEvent`, the payload `onEvent` receives
+- [Enums](../enums.md) -- `SyncEventType`, the values `types` accepts

@@ -48,7 +48,7 @@ function HeroBanner() {
         <p className="hero__subtitle">{siteConfig.tagline}</p>
         <div className="install-command">
           yarn add @gabriel-sisjr/react-native-sync-provider
-          react-native-nitro-modules
+          "react-native-nitro-modules@^0.35.8"
         </div>
         <div className="buttons">
           <Link
@@ -79,7 +79,7 @@ function HeroBanner() {
           />
           <img
             alt="new architecture"
-            src="https://img.shields.io/badge/New%20Architecture-supported-green"
+            src="https://img.shields.io/badge/New%20Architecture-required-green"
           />
         </div>
       </div>
