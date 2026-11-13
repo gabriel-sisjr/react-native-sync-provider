@@ -1,6 +1,6 @@
 # Breaking Changes
 
-This document tracks consumer-facing breaking changes in **`@gabriel-sisjr/react-native-sync-provider`** across versions. Each entry summarizes the change and links to the full migration guide; the migration guides under [`website/docs/migration/`](https://github.com/gabriel-sisjr/react-native-sync-provider/tree/main/website/docs/migration) are the authoritative reference.
+This document tracks consumer-facing breaking changes in **`@gabriel-sisjr/react-native-sync-provider`** across versions. Each entry summarizes the change and links to its full migration guide; the [migration guides](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/migration) on the documentation site are the authoritative reference.
 
 > **Pre-1.0 notice:** while the library is on `0.x`, minor version bumps (`0.x.0`) may include breaking changes per [SemVer 0.x semantics](https://semver.org/#spec-item-4).
 
@@ -49,7 +49,7 @@ Use the table at the bottom of each entry to enumerate every renamed, removed, o
 
 > **Upgrade path:** v0.2.z --> v0.3.0
 >
-> **Full migration guide:** [`docs/migration#v0-2-to-v0-3`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/migration#v0-2-to-v0-3)
+> **Full migration guide:** [`docs/migration/v0-3-0`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/migration/v0-3-0)
 >
 > **Changelog:** see the [`[Unreleased]` entries in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
 
@@ -130,13 +130,11 @@ An item that fails permanently used to stay in the queue store as a `FAILED` row
 
 Three consequences to check:
 
-- **Storage migration.** Existing `FAILED` rows move to the dead-letter store when the upgraded library first opens it: Room v2→v3 on Android, v1→v2→v3 included, and Core Data model v3 on iOS, with explicit mappings from v1 and v2. Pending rows are untouched. A migrated row has no `lastErrorMessage` and takes its last attempt time, or else its enqueue time, as `deadLetteredAt`, and one with no usable error code reports `MAX_ATTEMPTS_EXCEEDED`. On iOS the migration runs before the store loads, BGTask launches included. If it fails, the original store is untouched, that launch runs without a store, with every call rejecting `NATIVE_MODULE_UNAVAILABLE`, and the next launch retries. An iOS store written by the 0.1.0-beta prerelease is not a recognized source and fails to load the same way.
+- **Storage migration.** Existing `FAILED` rows move to the dead-letter store when the upgraded library first opens it: Room v2→v3 on Android, v1→v2→v3 included, and Core Data model v3 on iOS, with explicit mappings from v1 and v2. Pending rows are untouched. A migrated row has no `lastErrorMessage` and takes its last attempt time, or else its enqueue time, as `deadLetteredAt`, and one with no usable error code reports `MAX_ATTEMPTS_EXCEEDED`. On iOS the migration runs before the store loads, BGTask launches included. If it fails, the original store is untouched and the next launch tries again. Until then, every call that reads or writes the queue, the dead letters or the history rejects, with the facade's fallback code (`INVALID_PAYLOAD`, or `NETWORK_ERROR` for `flush`) and the store error in `message`, while `configureSync`, `getSyncConfig` and `getConnectionStatus` still work. An iOS store written by the 0.1.0-beta prerelease is not a recognized source and fails to load the same way.
 - **Android `QUEUE_FULL` accounting.** Android counted `FAILED` rows toward `maxQueueSize`. Dead letters count toward no cap, so a queue that used to be full of failed rows accepts items again. The Android cap now counts pending and in-flight items, and the iOS cap `PENDING` items, as before.
 - **`removeItem` and `clearQueue`.** `removeItem(id)` falls through to the dead letter with that id, and `clearQueue()` deletes every dead letter too, with one `QUEUE_CLEARED`. Code that removed failed items by id keeps working.
 
-:::danger Roll-forward only
-Once shipped, the v3 schema has no supported downgrade. Downgrading an Android install to a v0.2 build triggers `fallbackToDestructiveMigrationOnDowngrade()` and wipes the store, queue and dead letters included. A v0.2 iOS build cannot open a v3 store: the load fails as incompatible, every call rejects with `NATIVE_MODULE_UNAVAILABLE`, and the store file is kept. That iOS outcome follows from the code and has not been exercised in a test.
-:::
+> **Important — Roll-forward only:** Once shipped, the v3 schema has no supported downgrade. Downgrading an Android install to a v0.2 build triggers `fallbackToDestructiveMigrationOnDowngrade()` and wipes the store, queue and dead letters included. A v0.2 iOS build cannot open a v3 store: the load fails as incompatible, the calls that use the store reject with the facade's fallback code (`INVALID_PAYLOAD`, or `NETWORK_ERROR` for `flush`), and the store file is kept. That iOS outcome follows from the code and has not been exercised in a test.
 
 #### Before
 
@@ -170,7 +168,7 @@ for (const item of await listDeadLetter()) {
 2. Decide what to do with dead letters: list them with `listDeadLetter()` or `useSyncSnapshot().deadLetter`, replay with `replayDeadLetter(id)` once the cause is fixed, discard with `discardDeadLetter(id)`. A replay does not flush by itself, and it respects `maxQueueSize`.
 3. If you removed failed items on `ITEM_FAILED` only to stay under the Android cap, that is no longer needed. Keep discarding what you will not replay, because the dead-letter queue is unbounded.
 4. Keep `clearQueue()` in your logout path: dead letters keep their request headers and body, and it purges them. It does not need to wait for a running cycle: an item whose request has not started is not sent, and a request already in flight is not cancelled, but its item is never written back, as a queue row or as a dead letter.
-5. If you must roll back, drain the queue first and handle the dead letters, which the older build cannot read. See the [migration guide](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/migration#v0-2-to-v0-3).
+5. If you must roll back, drain the queue first and handle the dead letters, which the older build cannot read. See [Rolling Back](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/migration/v0-3-0#rolling-back-from-v03) in the migration guide.
 
 #### Affected symbols
 
@@ -191,7 +189,7 @@ for (const item of await listDeadLetter()) {
 >
 > **Changelog:** see the [`[Unreleased]` Changed entry in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
 
-iOS emitted `CONNECTION_CHANGED` on every path update, including the first one and repeats of the same state. Both platforms now emit it only when `status`, `type`, `isInternetReachable`, `isExpensive` or `networkQuality` changes, never for a duplicate. Android already behaved this way, and never emits it for the state it starts in. iOS starts at `UNKNOWN`, so its first path report, which replaces that, still emits one. The event is also emitted when only `networkQuality` changed, with an unchanged `connectionStatus`. iOS delivers it synchronously, Android asynchronously.
+iOS emitted `CONNECTION_CHANGED` on every path update, including the first one and repeats of the same state. Both platforms now emit it only when `status`, `type`, `isInternetReachable`, `isExpensive` or `networkQuality` changes, never for a duplicate. Android already behaved this way, and never emits it for the state it starts in. iOS starts at `UNKNOWN`, so its first path report, which replaces that, still emits one. The event is also emitted when only `networkQuality` changed, with an unchanged `connectionStatus`. Both platforms deliver it to JS asynchronously, after the new state is stored.
 
 #### Migration steps
 
@@ -232,7 +230,7 @@ On Android 11 (API 30) and later, a temporarily unmetered link, as some 5G plans
 
 > **Upgrade path:** v0.1.z --> v0.2.0
 >
-> **Full migration guide:** [`docs/migration#v0-1-to-v0-2`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/migration#v0-1-to-v0-2)
+> **Full migration guide:** [`docs/migration/v0-2-0`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/migration/v0-2-0)
 
 Most entries below are observable behavior changes rather than renamed APIs. Start with the first one: it is the only entry that can stop an app from launching.
 
@@ -553,9 +551,7 @@ try {
 
 v0.2 ships **Room v1→v2** (Android) and **Core Data model v2** (iOS) to persist `nextRetryAt`. Both are **roll-forward only** once shipped to consumers: a forward upgrade migrates existing rows in place. There is **no supported downgrade** — recovery from a regression is a new forward migration, never a revert.
 
-:::danger Android downgrade is destructive
-Downgrading a shipped Android install from a v0.2+ schema (v2) back to a pre-v0.2 build (v1) triggers `fallbackToDestructiveMigrationOnDowngrade()` — **the entire persisted queue is wiped**. Pin or roll forward; never ship a downgrade that crosses the v0.2 schema boundary with a non-empty queue you need to keep.
-:::
+> **Important — Android downgrade is destructive:** Downgrading a shipped Android install from a v0.2+ schema (v2) back to a pre-v0.2 build (v1) triggers `fallbackToDestructiveMigrationOnDowngrade()` — **the entire persisted queue is wiped**. Pin or roll forward; never ship a downgrade that crosses the v0.2 schema boundary with a non-empty queue you need to keep.
 
 #### Migration steps
 

@@ -4,12 +4,15 @@ Contributions are always welcome, no matter how large or small!
 
 We want this community to be friendly and respectful to each other. Please follow it in all your interactions with the project. Before contributing, please read the [code of conduct](./CODE_OF_CONDUCT.md).
 
+The documentation site goes deeper in its development pages: [Contributing](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/development/contributing), [Testing](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/development/testing), [Debugging](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/development/debugging), [CI/CD](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/development/ci-cd) and [Publishing](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/development/publishing).
+
 ## Development workflow
 
 This project is a monorepo managed using [Yarn workspaces](https://yarnpkg.com/features/workspaces). It contains the following packages:
 
 - The library package in the root directory.
 - An example app in the `example/` directory.
+- The documentation site in the `website/` directory.
 
 To get started with the project, make sure you have the correct version of [Node.js](https://nodejs.org/) installed. See the [`.nvmrc`](./.nvmrc) file for the version used in this project.
 
@@ -36,7 +39,7 @@ To invoke **Nitrogen**, use the following command:
 yarn nitrogen
 ```
 
-#### The Nitro workflow (CRITICAL)
+### The Nitro workflow (CRITICAL)
 
 `src/SyncProvider.nitro.ts` is the single source of truth for the JS↔native contract. Both `ios/SyncProvider.swift` and `android/src/main/java/com/margelo/nitro/syncprovider/SyncProvider.kt` implement the regenerated `HybridSyncProviderSpec` base class — old method signatures will fail to compile after the spec changes.
 
@@ -49,13 +52,13 @@ The full lifecycle for adding or changing a Nitro method:
 5. Run `yarn typecheck && yarn lint && yarn test`.
 6. Rebuild the example app (`yarn example android` / `ios`) — JS-only changes hot-reload, native changes need a rebuild.
 
-The [example app](/example/) demonstrates usage of the library. You need to run it to test any changes you make.
+The [example app](./example/) demonstrates usage of the library. You need to run it to test any changes you make.
 
 It is configured to use the local version of the library, so any changes you make to the library's source code will be reflected in the example app. Changes to the library's JavaScript code will be reflected in the example app without a rebuild, but native code changes will require a rebuild of the example app.
 
-If you want to use Android Studio or Xcode to edit the native code, you can open the `example/android` or `example/ios` directories respectively in those editors. To edit the Objective-C or Swift files, open `example/ios/SyncProviderExample.xcworkspace` in Xcode and find the source files at `Pods > Development Pods > react-native-sync-provider`.
+If you want to use Android Studio or Xcode to edit the native code, you can open the `example/android` or `example/ios` directories respectively in those editors. To edit the Objective-C or Swift files, open `example/ios/SyncProviderExample.xcworkspace` in Xcode and find the source files at `Pods > Development Pods > SyncProvider`.
 
-To edit the Java or Kotlin files, open `example/android` in Android studio and find the source files at `react-native-sync-provider` under `Android`.
+To edit the Kotlin files, open `example/android` in Android Studio and find the source files at `gabriel-sisjr_react-native-sync-provider` under `Android`.
 
 You can use various commands from the root directory to work with the project.
 
@@ -84,6 +87,8 @@ Running "SyncProviderExample" with {"fabric":true,"initialProps":{"concurrentRoo
 ```
 
 Note the `"fabric":true` and `"concurrentRoot":true` properties.
+
+> **Important:** When making changes that affect both platforms, test on both Android and iOS before submitting a pull request. Platform-specific behavior differences should be documented with `> **iOS:**` / `> **Android:**` callouts in the documentation.
 
 Make sure your code passes TypeScript:
 
@@ -142,6 +147,14 @@ We follow the [conventional commits specification](https://www.conventionalcommi
 - `chore`: tooling changes, e.g. change CI config.
 
 Our pre-commit hooks verify that your commit message matches this format when committing.
+
+### Linting and tests
+
+[ESLint](https://eslint.org/), [Prettier](https://prettier.io/), [TypeScript](https://www.typescriptlang.org/)
+
+We use [TypeScript](https://www.typescriptlang.org/) for type checking, [ESLint](https://eslint.org/) with [Prettier](https://prettier.io/) for linting and formatting the code, and [Jest](https://jestjs.io/) for testing.
+
+Our pre-commit hooks lint the staged files with ESLint and type-check the project with TypeScript when committing. They do not run the tests: run `yarn test` yourself.
 
 ### Releasing
 
@@ -249,7 +262,7 @@ Pre-releases come only from `prerelease.yml`: **Actions → Pre-release to NPM �
 
 #### Changelog
 
-`CHANGELOG.md` is curated by hand in [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format; no tool writes to it. Add your entry under `## [Unreleased]` at the top, in the PR that makes the change, and create that section if there is none. The bump PR turns it into `## [x.y.z] - YYYY-MM-DD`. A breaking or behavior change also needs an entry in [`BREAKING_CHANGES.md`](./BREAKING_CHANGES.md), following the template at its top, and a section in the migration guide under `website/docs/migration/`.
+`CHANGELOG.md` is curated by hand in [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format; no tool writes to it. Add your entry under `## [Unreleased]` at the top, in the PR that makes the change, and create that section if there is none. The bump PR turns it into `## [x.y.z] - YYYY-MM-DD`. A breaking or behavior change also needs an entry in [`BREAKING_CHANGES.md`](./BREAKING_CHANGES.md), following the template at its top, and a page under `website/docs/migration/`.
 
 Conventional commits are still enforced on every commit by the `commit-msg` hook (lefthook running commitlint) and still shape PR titles, but they no longer decide the version or the changelog.
 
@@ -300,6 +313,11 @@ The `package.json` file contains various scripts for common tasks:
 - `yarn typecheck`: type-check files with TypeScript.
 - `yarn lint`: lint files with [ESLint](https://eslint.org/).
 - `yarn test`: run unit tests with [Jest](https://jestjs.io/).
+- `yarn nitrogen`: generate the Nitro bindings in `nitrogen/` from `src/SyncProvider.nitro.ts`. Run it after a fresh clone and after every spec change.
+- `yarn prepare`: build the library into `lib/` with react-native-builder-bob, running `nitrogen` first.
+- `yarn clean`: delete `lib/`, the library's `android/build`, and the example app's Android and iOS build outputs.
+- `yarn docs:dev` / `yarn docs:build`: run or build the documentation site. The build validates every mermaid diagram first.
+- `yarn docs:serve` / `yarn docs:clear`: serve the built site, or clear Docusaurus's generated files and caches.
 - `yarn example start`: start the Metro server for the example app.
 - `yarn example android`: run the example app on Android.
 - `yarn example ios`: run the example app on iOS.
@@ -312,6 +330,8 @@ When you're sending a pull request:
 
 - Prefer small pull requests focused on one change.
 - Verify that linters and tests are passing.
+- Test on both Android and iOS when changes affect shared code or the TypeScript layer.
 - Review the documentation to make sure it looks good.
-- Follow the pull request template when opening a pull request.
+- In the pull request description, say what the change does and which platforms you tested it on, link the issue where an API or implementation change was discussed, and add before/after screenshots or a short clip for a UI or behavior change.
 - For pull requests that change the API or implementation, discuss with maintainers first by opening an issue.
+- For platform-specific changes, clearly indicate which platform is affected in the PR title (e.g., `feat(ios): ...` or `fix(android): ...`).
