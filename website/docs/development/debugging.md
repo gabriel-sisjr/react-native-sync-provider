@@ -26,7 +26,7 @@ The library only supports the New Architecture (Fabric + concurrent root). When 
 "fabric":true,"concurrentRoot":true
 ```
 
-If `fabric` is `false`, the lib will throw `NATIVE_MODULE_UNAVAILABLE` on every call. Re-check the host app's Podfile (`:fabric_enabled => true`) and `gradle.properties` (`newArchEnabled=true`).
+If `fabric` is `false`, the app runs on the legacy architecture, where the library is not tested. Re-check the host app's Podfile (`:fabric_enabled => true`) and `gradle.properties` (`newArchEnabled=true`).
 
 ---
 
@@ -76,11 +76,10 @@ Useful tags:
 | Tag                  | What it tells you                                                   |
 | -------------------- | ------------------------------------------------------------------- |
 | `SyncProvider`, `SyncDispatcher` | Problems only, not state. `SyncProvider` logs an error when a bridge call or one of its coroutines throws unexpectedly. `SyncDispatcher` logs a warning when stored `defaultHeaders` cannot be read, which skips the cycle, or when the next retry wake cannot be armed, and an error when a request cannot be built or an aborted cycle cannot be cleaned up. Requests are not logged. A cycle skipped by the quality gate or the health check is not logged either: it emits `SYNC_FAILED`. |
-| `SyncWorker`, `RecoveryWorker`, `RetryTimer`, `BackgroundSyncManager` | Background work and retry wakes. |
+| `SyncWorker`, `RecoveryWorker`, `RetryTimer`, `BackgroundSyncManager` | Failures only, plus the number of items `RecoveryWorker` reset. Arming or running a wake is not logged. |
 | `SyncProviderRuntime`, `SyncConfigStore`, `KeystoreSecretStore` | The process-wide runtime, the persisted configuration and the encrypted `defaultHeaders`. |
-| `ConnectivityMonitor`, `SyncEventEmitter`, `BootCompletedReceiver` | The default-network callback and its quality grade, event delivery, and the recovery scheduled on boot and app update. |
-| `WM-WorkerWrapper`   | WorkManager scheduling decisions and `Result.success/retry/failure`.|
-| `WorkerLifecycle`    | Worker start/stop transitions.                                      |
+| `ConnectivityMonitor`, `SyncEventEmitter`, `BootCompletedReceiver` | `ConnectivityMonitor` logs only a callback that fails to register or unregister: no network change and no quality grade. `SyncEventEmitter` logs a listener that throws. `BootCompletedReceiver` logs each boot or update broadcast it receives, at info level, and an error when it cannot schedule the recovery. |
+| `WM-WorkerWrapper`   | The result of each run, `SUCCESS`, `RETRY` or `FAILURE`, at info level. Scheduling decisions go to other `WM-` tags, mostly at debug level, which WorkManager drops unless the app lowers its minimum logging level. |
 | `JobScheduler`       | Underlying job scheduling state — useful if work seems "stuck".     |
 
 ---
@@ -93,7 +92,9 @@ The library logs through `os.log` with subsystem `com.gabriel-sisjr.syncprovider
 subsystem:com.gabriel-sisjr.syncprovider
 ```
 
-Categories used: `core-data`, `dispatcher`, `queue`, `background`, `events`, `connectivity`, `recovery`, `general`.
+Categories: `core-data`, `dispatcher`, `background`, `connectivity`, `recovery`, `general`.
+
+Per-update lines, such as connectivity changes and held wakes, are debug-level: they appear only in a Debug build of the pod, with Debug messages turned on.
 
 Do not treat a log line as proof of dispatch: check the request log on your endpoint.
 
@@ -198,11 +199,11 @@ To confirm everything is working:
 - [ ] `isNativeModuleAvailable()` returns `true`
 - [ ] `enqueue()` resolves with an id, and `ITEM_ENQUEUED` reaches `useSyncEvents`
 - [ ] The item's row is in the persisted queue (`ZSYNCITEMENTITY` / `sync_items`) before a successful flush, and gone after it
-- [ ] A `flush()` emits `SYNC_STARTED`, then `SYNC_SUCCEEDED` or `SYNC_FAILED` (a paused engine emits nothing, and a skipped cycle emits `SYNC_FAILED` alone)
+- [ ] A `flush()` emits `SYNC_STARTED`, then `SYNC_SUCCEEDED` or `SYNC_FAILED` (a paused engine, or one whose stored `defaultHeaders` cannot be read, emits nothing, and a skipped cycle emits `SYNC_FAILED` alone)
 - [ ] Your endpoint's request log shows the request
 - [ ] Toggling airplane mode emits `CONNECTION_CHANGED`
-- [ ] iOS: Console.app shows `Registered BGTask handlers for 2 declared identifiers` at launch
-- [ ] A forced background window emits `BACKGROUND_SYNC_STARTED` and `BACKGROUND_SYNC_COMPLETED`
+- [ ] iOS: Console.app shows `Registered BGTask handlers for N declared identifiers` at launch, where N counts every identifier in `BGTaskSchedulerPermittedIdentifiers`
+- [ ] A forced background window emits `BACKGROUND_SYNC_STARTED` and `BACKGROUND_SYNC_COMPLETED` to a running JS engine. On Android only the periodic job emits them, so a forced run of the retry kick emits neither. A window under `foregroundOnly` emits nothing, nor does a paused one on Android
 
 ---
 

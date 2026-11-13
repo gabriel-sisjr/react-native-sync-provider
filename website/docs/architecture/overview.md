@@ -57,7 +57,7 @@ Each platform implements the spec using platform-idiomatic patterns:
 
 | Concern | Android | iOS |
 |---------|---------|-----|
-| Language | Kotlin 2.0.21 | Swift 5.9+ |
+| Language | Kotlin 2.0.21 by default, or the host's `kotlinVersion` | Swift 5.9+ |
 | Persistence | Room (KSP, SQLite) | Core Data (SQLite) |
 | HTTP dispatch | OkHttp 4.12.0 + Coroutines 1.8.1 | `URLSession` + `URLSessionConfiguration.background` |
 | Connectivity | `ConnectivityManager.NetworkCallback` | `NWPathMonitor` (Network framework) |
@@ -76,9 +76,8 @@ Nitro Modules cross the JSI boundary as **typed JS objects** -- no JSON `parse` 
 - Object payloads (`SyncItem`, `SyncEvent`) are dispatched as native objects, not JSON.
 - Enum values are passed through as-is.
 - Async functions return `Promise`s without bridge serialization.
-- The library lives entirely on the New Architecture (Fabric + TurboModules + JSI).
 
-The trade-off: Nitro requires the New Architecture to be enabled in the host app. The library does not provide a legacy bridge fallback.
+The New Architecture is required: the library is built and tested only on it. Nitro itself can install on the legacy bridge, but this library is not tested there.
 
 ### A Native Engine That Runs Without JS
 
@@ -114,16 +113,16 @@ The library declares no foreground service. WorkManager and `BootCompletedReceiv
 |-----------|-----------|-----------|
 | JS/TS layer | TypeScript, React | Typed public API; hooks that re-render on native events |
 | Bridge | Nitro Modules + `nitrogen` codegen | Typed objects across JSI with no JSON step; one spec generates both native bases |
-| Android module | Kotlin 2.0.21 | Coroutines for the dispatcher, the workers and the connectivity flow |
+| Android module | Kotlin 2.0.21 by default, or the host's `kotlinVersion` | Coroutines for the dispatcher, the workers and the connectivity flow |
 | Android persistence | Room 2.7.0 (KSP, SQLite) | The floor whose KSP processor works with Kotlin 2.0.x; exported, versioned schemas |
 | Android HTTP | OkHttp 4.12.0 | One shared client for every cycle |
 | Android concurrency | Kotlin Coroutines 1.8.1 | `supervisorScope`, so one failed item never cancels a cycle |
 | Android background | WorkManager 2.9.1 | Periodic work, and a retry kick that survives process death |
 | Android secrets | Android Keystore | AES-256-GCM under a non-exportable key for `defaultHeaders` |
 | iOS module | Swift | Actors and `async` `URLSession` calls in the dispatcher |
-| iOS persistence | Core Data (SQLite) | Versioned model that migrates stores in place |
+| iOS persistence | Core Data (SQLite) | Versioned model that migrates an older store into a side file, then swaps it in with `replacePersistentStore` |
 | iOS HTTP | `URLSession` (foreground and background sessions) | The background session lets the OS finish an upload while the app is suspended |
-| iOS background | `BGTaskScheduler` | App-refresh and processing windows that run with no JS loaded |
+| iOS background | `BGTaskScheduler` | App-refresh and processing windows that need no JS |
 | iOS secrets | Keychain | `defaultHeaders`, readable after first unlock, on this device only |
 | Build system | react-native-builder-bob | Runs `nitrogen`, then emits ESM modules and TypeScript declarations |
 | Monorepo | Yarn 4.11.0 workspaces + Turborepo | Library, example app and docs site in one repo; cached native example builds |
@@ -166,7 +165,7 @@ A single native monitor per process (`ConnectivityMonitor`) emits `CONNECTION_CH
 
 - The bridge is **Nitro Modules**, not TurboModules. Object payloads (e.g. `SyncItem`) cross the JSI boundary as native objects — no JSON `parse`/`stringify` tax.
 - The native dispatcher runs off the JS thread. Hooks subscribe via Nitro callbacks.
-- Default batch size is `25`. Tunable via `configureSync({ batchSize })`. Android sends a batch concurrently, iOS one item at a time.
+- Default batch size is `25`. Tunable via `configureSync({ batchSize })`. Android sends a batch concurrently, except that with `defaultHeaders` restored from disk the first item goes out alone first. iOS sends one item at a time.
 - Background dispatch on iOS uses `URLSessionConfiguration.background` when the app is not active, unless `foregroundOnly` is set, so the OS may finish an upload while the app is suspended.
 
 ## Next Steps

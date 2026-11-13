@@ -30,11 +30,13 @@ This guide walks through every iOS-specific step required for `@gabriel-sisjr/re
 
 The library requires **iOS 15.0 or later**, and its podspec enforces that floor. React Native 0.85 raises the built pod to 15.1. Set `IPHONEOS_DEPLOYMENT_TARGET` to 15.0 or higher, and verify it in Xcode under your app target -> **General** -> **Minimum Deployments**.
 
-In `ios/Podfile`:
+In `ios/Podfile`, keep the platform line React Native generates:
 
 ```ruby
-platform :ios, '15.0'
+platform :ios, min_ios_version_supported
 ```
+
+`min_ios_version_supported` is React Native's own minimum: 15.1 on React Native 0.85. Its pods declare 15.1, so `platform :ios, '15.0'` makes `pod install` fail there. A value of 15.0 works only with a React Native whose own minimum is 15.0 or lower. The library's own floor is still iOS 15.0.
 
 ## Step 2: Install Pods {#2-install-pods}
 
@@ -44,7 +46,7 @@ After installing the npm package:
 cd ios && pod install && cd ..
 ```
 
-The pod is named **`SyncProvider`** (the iOS module name, distinct from the npm package name `@gabriel-sisjr/react-native-sync-provider`). It is autolinked through Nitro Modules' generated podspec lookup, and it links the `Foundation`, `CoreData`, `Network`, `BackgroundTasks` and `Security` frameworks.
+The pod is named **`SyncProvider`** (the iOS module name, distinct from the npm package name `@gabriel-sisjr/react-native-sync-provider`). React Native's autolinking (`use_native_modules!`) finds `SyncProvider.podspec`, which loads Nitro's generated `SyncProvider+autolinking.rb` to add the generated sources. The pod links the `Foundation`, `CoreData`, `Network`, `BackgroundTasks` and `Security` frameworks.
 
 ## Step 3: Enable Background Modes {#3-enable-background-modes}
 
@@ -86,7 +88,7 @@ A missing identifier does not crash the app: its handler is skipped. `enableBack
 
 ## Step 5: Forward Background URLSession Events {#5-forward-background-urlsession-events}
 
-When the app is not active, the library sends uploads through a background `URLSession`, which the OS can finish while the app is suspended. iOS then delivers the result through your `AppDelegate`, and a library cannot intercept that call. Forward it:
+When the app is not active, the library sends uploads through a background `URLSession`, which the OS can finish while the app is suspended. iOS then hands your `AppDelegate` a completion handler for the session's events, and a library cannot intercept that call. The results themselves go to the library's session delegate. Forward the call:
 
 ```swift
 import SyncProvider

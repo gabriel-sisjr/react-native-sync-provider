@@ -42,7 +42,7 @@ The HybridObject implementation lives in `ios/SyncProvider.swift` (`final class 
 
 On start it loads the persisted configuration, starts `ConnectivityMonitor`, and runs launch recovery. It counts JS-facing hybrids: the retry timer runs only while there is one, and creating a hybrid clears a persisted pause, because JS cannot read the flag and starts out unpaused.
 
-> **Note:** The Swift class is intentionally named `HybridSyncProvider`, not `SyncProvider`. Nitro generates a C++ `SyncProvider::SyncProvider` class inside the `margelo::nitro::syncprovider` namespace; reusing the same name from Swift would collide with the generated bridging header (`SyncProvider-Swift.h`) and break the build. The Nitro `iosModuleName` (`SyncProvider`) and the JS lookup (`NitroModules.createHybridObject<SyncProvider>('SyncProvider')`) are unchanged — only the underlying Swift class name differs. The Kotlin implementation has no analogous collision and remains `class SyncProvider`. The autolinking mapping lives in `nitro.json → autolinking.SyncProvider.ios.implementationClassName: "HybridSyncProvider"`.
+> **Note:** The Swift class is named `HybridSyncProvider`, not `SyncProvider`, as `nitro.json` maps it (`autolinking.SyncProvider.ios.implementationClassName: "HybridSyncProvider"`). The name was chosen in v0.1.1 to avoid a symbol clash with the code Nitro generated then. The Nitro `iosModuleName` (`SyncProvider`) and the JS lookup (`NitroModules.createHybridObject<SyncProvider>('SyncProvider')`) are unchanged — only the underlying Swift class name differs. The Kotlin implementation remains `class SyncProvider`.
 
 ## Core Data
 
@@ -60,7 +60,7 @@ The model has three versions: `SyncProvider`, `SyncProvider 2` and `SyncProvider
 
 If the migration fails, the original store is untouched and the next launch tries again. Until then, every call that reads or writes the queue, the dead letters or the history rejects, with the facade's fallback code (`INVALID_PAYLOAD`, or `NETWORK_ERROR` for `flush`) and the store error in `message`: see [Native Rejections](../api-reference/errors.md#native-rejections). `configureSync`, `getSyncConfig` and `getConnectionStatus` still work. A store the code does not recognize as a source, such as one written by the 0.1.0-beta prerelease, fails to load as incompatible the same way. So does a v3 store opened by a downgraded v0.2 build: there, the calls that use the store reject with the same fallback codes. The file is never deleted. That last case follows from the code and has not been exercised in a test.
 
-A separate background `NSManagedObjectContext` is used for writes to keep the JSI thread free of Core Data work.
+Every store operation runs on a fresh background `NSManagedObjectContext`, which keeps the JSI thread free of Core Data work. Only the persistent container is shared.
 
 > **Tip:** The model is also reconstructed programmatically in `InMemoryCoreDataStack` (test target). When you change the production model in `SyncProvider.xcdatamodeld`, mirror the change in `InMemoryCoreDataStack.makeModel()` — this is the only test seam that mirrors the schema.
 

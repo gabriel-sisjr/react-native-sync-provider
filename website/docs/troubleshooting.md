@@ -45,12 +45,11 @@ The Android build fails while KSP generates the Room code.
 
 After airplane mode is turned off, no `CONNECTION_CHANGED` event reports the restored connection.
 
-**Cause.** `NetworkCallback` was registered against an `Activity` instead of `ApplicationContext`. The `Activity` is destroyed during config changes, taking the callback registration with it.
+**Cause.** The library registers its callback on the application context, so a configuration change cannot drop it. No event usually means the monitor was not running yet, because it starts at the first library call in the process, or nothing was subscribed, or the restored state equals the last one reported, as when Wi-Fi stays on in airplane mode.
 
 **Fix.**
 
-1. The library registers against `ApplicationContext` internally — verify your fork did not change this in `connectivity/ConnectivityMonitor.kt`.
-2. If you wrap the lib in your own foreground service, register your additional callbacks against `getApplicationContext()` too.
+1. Make a library call early, for example mount `useConnection`, and subscribe before toggling.
 
 **Related:** [Connectivity Detection](./guides/connectivity-detection.md)
 
@@ -58,7 +57,7 @@ After airplane mode is turned off, no `CONNECTION_CHANGED` event reports the res
 
 ### Periodic flush never fires at intervals shorter than 15 minutes {#symptom-periodic-flush-never-fires-at-intervals-shorter-than-15-minutes}
 
-The periodic worker runs at most once every 15 minutes, whatever `minimumIntervalMs` you pass.
+The periodic worker never runs more often than every 15 minutes, however low `minimumIntervalMs` is.
 
 **Cause.** `WorkManager.PeriodicWorkRequest` enforces a hard 15-minute floor. The library clamps `BackgroundSyncOptions.minimumIntervalMs` to that value.
 
@@ -91,11 +90,11 @@ Periodic background flushes run hours apart, although the device is in daily use
 
 The Android build prints a `[CXX5304]` warning about the SDK XML version.
 
-**Cause.** CMake step from a transitive dep (often `netinfo`) targets an older Android SDK XML format than your installed NDK.
+**Cause.** AGP prints it when the SDK's package metadata was written by newer SDK tools than it understands (SDK XML version 4). Any module with a CMake build can print it, this library's included (`android/CMakeLists.txt`).
 
 **Fix.**
 
-1. Harmless. Pre-existing in the React Native ecosystem. Ignore.
+1. Ignore it: the warning is harmless.
 
 **Related:** [Android Setup](./getting-started/android-setup.md)
 
@@ -107,7 +106,7 @@ The Android build prints a `[CXX5304]` warning about the SDK XML version.
 
 The Xcode build stops with a `Multiple commands produce` error for a `PrivacyInfo.xcprivacy` path.
 
-**Cause.** RN 0.85+ aggregates every pod's privacy manifest into the host app's manifest at build time. If a pod lists its `PrivacyInfo.xcprivacy` under `s.resources` instead of `s.resource_bundles`, both the listing and the aggregator's output try to land at the same path.
+**Cause.** RN 0.85+ aggregates every pod's privacy manifest into the host app's manifest at `pod install` time. If a pod lists its `PrivacyInfo.xcprivacy` under `s.resources` instead of `s.resource_bundles`, both the listing and the aggregator's output try to land at the same path.
 
 **Fix.**
 
@@ -155,6 +154,7 @@ No background window ever runs for the app.
 - An identifier is missing from `BGTaskSchedulerPermittedIdentifiers`. Both fixed identifiers are needed, and `taskIdentifier` has no effect.
 - The `Background fetch` and/or `Background processing` capabilities are not enabled on the app target.
 - Running on the iOS Simulator, where `BGTaskScheduler` does not accept requests. `enableBackgroundSync` rejects there.
+- Background App Refresh is off for the app in Settings, which also makes `enableBackgroundSync` reject.
 - The user force-quit the app. iOS does not launch it for background tasks until the user opens it again.
 - The OS has not granted a window. Nothing guarantees when one runs.
 
@@ -191,7 +191,7 @@ Xcode disables every simulator destination, although the simulator runtime is in
 **Fix.**
 
 1. This is the maintainer's Mac being broken, not a code issue. Run on CI (`macos-latest`, with `XCODE_VERSION: 'latest-stable'`, which resolves to the newest stable Xcode on the runner image) for ground truth.
-2. Locally: pick a specific simulator instead of `Any iOS Device`, or wipe `~/Library/Developer/CoreSimulator/` and reinstall the runtime via `xcrun simctl runtime install`.
+2. Locally: pick a specific simulator instead of `Any iOS Device`, or wipe `~/Library/Developer/CoreSimulator/` and reinstall the runtime with `xcodebuild -downloadPlatform iOS`, or with `xcrun simctl runtime add <runtime.dmg>`.
 
 **Related:** [CI/CD Pipeline](./development/ci-cd.md), [Testing](./development/testing.md)
 
@@ -291,7 +291,7 @@ After an upgrade, the type checker reports errors in files that did not change.
 - **Quality gate.** The network quality is below `minNetworkQuality`. The flush emits `SYNC_FAILED` with `NETWORK_QUALITY_TOO_LOW`. See [the next entry](#symptom-nothing-syncs-with-minnetworkquality-or-healthcheckurl-set).
 - **Health check.** The `HEAD` to `healthCheckUrl` failed, or its backoff is running. The flush emits `SYNC_FAILED` with `HEALTH_CHECK_FAILED`. See [the next entry](#symptom-nothing-syncs-with-minnetworkquality-or-healthcheckurl-set).
 
-A cycle that found nothing eligible emits `SYNC_STARTED` and `SYNC_SUCCEEDED` and adds a 0/0 row to the sync history. A `flush()` blocked by a pause, unreadable headers, the gate or the health check runs no cycle: it emits no `SYNC_STARTED` and writes no history row. On Android it also returns `0` for `startedAt` and `finishedAt`. On iOS both are the time of the call, so only the missing event and history row tell the two apart.
+A cycle that found nothing eligible emits `SYNC_STARTED` and `SYNC_SUCCEEDED` and adds a 0/0 row to the sync history. A `flush()` blocked by a pause, unreadable headers, the gate or the health check runs no cycle: it emits no `SYNC_STARTED` and writes no history row. On Android it also returns `0` for `startedAt` and `finishedAt`. On iOS both are the time the check stopped the flush, so only the missing event and history row tell the two apart. On iOS, a `flush()` that joins a running cycle returns the last finished cycle's result, or a 0/0 one.
 
 **Fix.**
 
@@ -515,7 +515,7 @@ During an Android flush, `useSyncStatus().progress` stays at `0` until the cycle
    });
    ```
 
-`result.failedIds` and `result.errors` hold the same detail on Android, and are always empty on iOS. The failed items themselves are in the dead-letter queue: read them with [`listDeadLetter`](./api-reference/functions.md#listdeadletter).
+`result.failedIds` and `result.errors` hold the same detail on Android, and are always empty on iOS. The failed items themselves are in the dead-letter queue, except one purged while its request was in flight: read them with [`listDeadLetter`](./api-reference/functions.md#listdeadletter).
 
 **Related:** [Error Handling](./guides/error-handling.md#listening-for-failures-via-events)
 
@@ -530,7 +530,7 @@ A second `flush()` right after a failure skips the failed item.
 **Fix.**
 
 1. This is by design. In a running app with a strategy other than `MANUAL`, the retry timer brings the item back on its own.
-2. Inspect the per-item deadline via `getPendingItems()` — `item.nextRetryAt` is `0` for an item that is eligible now, and otherwise the epoch-ms time it becomes eligible, after a cooldown or a credential hold. A cooling item still counts toward `getQueueSize()`.
+2. Inspect the per-item deadline via `getPendingItems()` — `item.nextRetryAt` is `0` when no cooldown or credential hold was set, and otherwise the epoch-ms time the item becomes eligible. A time already past means it is eligible now. A cooling item still counts toward `getQueueSize()`.
 
    ```ts
    const pending = await getPendingItems();
@@ -616,7 +616,7 @@ The docs build stops before Docusaurus runs, and the log lists each diagram that
 
 ### Will this work without the New Architecture?
 
-No. The library is built on Nitro Modules, which do not run on the legacy bridge. See [New Architecture Verification](./getting-started/installation.md#new-architecture-verification) to check that it is enabled.
+Not supported. The New Architecture is required: the library is built and tested only on it. Nitro itself can install on the legacy bridge, but this library is not tested there. See [New Architecture Verification](./getting-started/installation.md#new-architecture-verification) to check that it is enabled.
 
 **Related:** [Introduction](./getting-started/introduction.md#requirements)
 
@@ -624,7 +624,7 @@ No. The library is built on Nitro Modules, which do not run on the legacy bridge
 
 ### Does it work on Expo?
 
-Only in a development build. The library contains native code, so it does not run in Expo Go. It ships no Expo config plugin, so apply the [iOS Setup](./getting-started/ios-setup.md) steps to the native project yourself: the Background Modes, the two BGTask identifiers and the `AppDelegate` forwarding. Android needs no manual step, because the manifest merger adds the library's permissions and its boot receiver. The New Architecture must be enabled, as in any app.
+Only in a development build. The library contains native code, so it does not run in Expo Go. It ships no Expo config plugin, so apply the [iOS Setup](./getting-started/ios-setup.md) steps to the native project yourself: the Background Modes, the two BGTask identifiers and the `AppDelegate` forwarding. With Continuous Native Generation, `expo prebuild` regenerates `ios/`, so set `UIBackgroundModes` and `BGTaskSchedulerPermittedIdentifiers` through `ios.infoPlist` in the app config, and add the `AppDelegate` forwarding with a config plugin. Hand edits last only in a project you no longer prebuild. Android needs no manual step, because the manifest merger adds the library's permissions and its boot receiver. The New Architecture must be enabled, as in any app.
 
 **Related:** [Installation](./getting-started/installation.md), [Android Setup](./getting-started/android-setup.md)
 
@@ -640,7 +640,7 @@ You would be writing all of this yourself: native persistence, retry policy, pri
 
 ### Does `enqueue` send the request?
 
-No. It stores the item. A flush sends it, from `useAutoSync`, `flush()`, or an OS background window. `AUTOMATIC` retries failed items on its own, but it does not flush on enqueue.
+No. It stores the item. A flush sends it, from `useAutoSync`, `flush()`, or an OS background window. `AUTOMATIC` retries failed items on its own, but it does not flush on enqueue. After `resumeSync()`, and on iOS also after a failed health check, its retry timer flushes items with no cooldown too.
 
 **Related:** [Offline Queue](./guides/offline-queue.md#when-items-are-dispatched)
 
@@ -664,7 +664,7 @@ On the next launch, the recovery layer marks orphaned items as `PENDING` and the
 
 ### Is the queue encrypted at rest?
 
-No. Per-item `headers` and `body` are stored in plain text, in the queue and in the dead-letter queue. Put credentials in `SyncOptions.defaultHeaders`, which are encrypted at rest (Android Keystore / iOS Keychain). `clearQueue()` deletes both queues, for example on logout. It does not need to wait for a running cycle: an item whose request has not started is not sent, and a request already in flight is not cancelled, but its item is never written back, as a queue row or as a dead letter.
+The library does not encrypt it. Per-item `headers` and `body` are stored in plain text, in the queue and in the dead-letter queue, and on iOS the store has only the system's default file protection. Put credentials in `SyncOptions.defaultHeaders`, which are encrypted at rest (Android Keystore / iOS Keychain). `clearQueue()` deletes both queues, for example on logout. It does not need to wait for a running cycle: an item whose request has not started is not sent, and a request already in flight is not cancelled, but its item is never written back, as a queue row or as a dead letter.
 
 **Related:** [Background Sync](./guides/background-sync.md#cold-start-configuration), [Error Handling](./guides/error-handling.md#purge-on-logout)
 

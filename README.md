@@ -19,7 +19,7 @@ Offline-first HTTP request queue for React Native, with native persistence and O
 ![Platform iOS](https://img.shields.io/badge/platform-iOS-blue)
 ![TypeScript](https://img.shields.io/badge/TypeScript-Ready-blue)
 
-A cross-platform React Native library for offline-first HTTP sync built on Nitro Modules (New Architecture). Persists outbound requests on the native side, retries them on a persisted backoff, and can dispatch them in OS-scheduled background windows while the app is not running, on both Android and iOS.
+A cross-platform React Native library for offline-first HTTP sync built on Nitro Modules, for the New Architecture. Persists outbound requests on the native side, retries them on a persisted backoff, and can dispatch them in OS-scheduled background windows while the app is not running, on both Android and iOS.
 
 **[Read the full documentation](https://gabriel-sisjr.github.io/react-native-sync-provider/)**
 

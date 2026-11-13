@@ -163,13 +163,15 @@ In a component, take `enqueue` from `useSyncQueue()`, as the minimal example doe
 ```tsx
 import { enqueue, HttpMethod } from '@gabriel-sisjr/react-native-sync-provider';
 
-const id = await enqueue({
-  method: HttpMethod.POST,
-  url: 'https://api.example.com/events',
-  contentType: 'application/json',
-  body: JSON.stringify({ kind: 'app_opened' }),
-});
-console.log('Enqueued', id);
+export async function trackAppOpened() {
+  const id = await enqueue({
+    method: HttpMethod.POST,
+    url: 'https://api.example.com/events',
+    contentType: 'application/json',
+    body: JSON.stringify({ kind: 'app_opened' }),
+  });
+  console.log('Enqueued', id);
+}
 ```
 
 The item is stored. It is not sent until a flush runs.
@@ -181,9 +183,11 @@ In a component, take `flush` and `isSyncing` from `useSyncStatus()`. Elsewhere, 
 ```tsx
 import { flush } from '@gabriel-sisjr/react-native-sync-provider';
 
-// One cycle dispatches up to `batchSize` eligible items.
-const result = await flush();
-console.log(`${result.successCount} ok / ${result.failureCount} failed`);
+export async function syncNow() {
+  // One cycle dispatches up to `batchSize` eligible items.
+  const result = await flush();
+  console.log(`${result.successCount} ok / ${result.failureCount} failed`);
+}
 ```
 
 ### 4. Inspect the Queue
@@ -193,7 +197,9 @@ console.log(`${result.successCount} ok / ${result.failureCount} failed`);
 ```tsx
 import { getQueueSize } from '@gabriel-sisjr/react-native-sync-provider';
 
-console.log('Pending:', await getQueueSize());
+export async function logQueueSize() {
+  console.log('Pending:', await getQueueSize());
+}
 ```
 
 It counts `PENDING` items, including items waiting out a retry cooldown.
@@ -221,12 +227,14 @@ import {
   HttpMethod,
 } from '@gabriel-sisjr/react-native-sync-provider';
 
-await enqueue({
-  method: HttpMethod.POST,
-  url: 'https://api.example.com/orders',
-  headers: { 'Idempotency-Key': generateId() },
-  body: JSON.stringify({ productId: 'sku-42' }),
-});
+export async function placeOrder() {
+  await enqueue({
+    method: HttpMethod.POST,
+    url: 'https://api.example.com/orders',
+    headers: { 'Idempotency-Key': generateId() },
+    body: JSON.stringify({ productId: 'sku-42' }),
+  });
+}
 ```
 
 See the [Idempotency guide](../guides/idempotency.md) for the server side.
@@ -234,11 +242,16 @@ See the [Idempotency guide](../guides/idempotency.md) for the server side.
 ### Use `useOfflineQueue` for Offline-First UIs
 
 ```tsx
+import { Text } from 'react-native';
 import { useOfflineQueue } from '@gabriel-sisjr/react-native-sync-provider';
 
-const { size, isWaitingForConnection, enqueue, flush } = useOfflineQueue();
+export function OfflineQueueBadge() {
+  const { size, isWaitingForConnection, enqueue, flush } = useOfflineQueue();
 
-// `isWaitingForConnection === true` => show a "Will sync when online" badge.
+  // `isWaitingForConnection === true` => show a "Will sync when online" badge.
+  if (!isWaitingForConnection) return null;
+  return <Text>Will sync when online ({size} pending)</Text>;
+}
 ```
 
 ## Testing

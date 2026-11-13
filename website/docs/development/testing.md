@@ -76,7 +76,7 @@ cd example/android
 ./gradlew :gabriel-sisjr_react-native-sync-provider:testDebugUnitTest --stacktrace
 ```
 
-CI runs the same command on `ubuntu-latest` with JDK 17 (Zulu) and uploads the HTML/JaCoCo reports as artifacts.
+CI runs the same command on `ubuntu-latest` with JDK 17 (Zulu) and uploads the HTML test report and the JUnit XML results as artifacts. CI does not run `jacocoTestReport`, so no coverage report is uploaded.
 
 ### Suites
 
@@ -98,7 +98,7 @@ CI runs the same command on `ubuntu-latest` with JDK 17 (Zulu) and uploads the H
 | `config/SyncConfigStoreTest`           | 19    | Round trip of every option, damaged values, and the secret lifecycle.                   |
 | `config/SyncOptionsValidatorTest`      | 5     | The checks `configureSync` runs on the network-quality and health-check options.        |
 | `config/KeystoreSecretStoreTest`       | 4     | Encryption behind the `SecretStore` seam.                                               |
-| `connectivity/ConnectivityMonitorTest` | 20    | Lifecycle, idempotency, the initial StateFlow value, the default network and the offline invariant. |
+| `connectivity/ConnectivityMonitorTest` | 20 (22 runs: two cases run on SDK 30 and 31) | Lifecycle, idempotency, the initial StateFlow value, the default network and the offline invariant. |
 | `connectivity/ConnectivityMonitorQualityTest` | 23 | The latency measurement behind `networkQuality`: when it is taken, how long it is reused, what it reports. |
 | `connectivity/LatencyProbeTest`        | 2     | The three back-to-back `HEAD`s of a measurement.                                        |
 | `connectivity/NetworkQualityClassifierTest` | 23 | The shared threshold table, one parameterized case per scenario.                     |
@@ -107,9 +107,9 @@ CI runs the same command on `ubuntu-latest` with JDK 17 (Zulu) and uploads the H
 | `work/SyncWorkerTest`                  | 11    | `TestListenableWorkerBuilder` + `mockkObject(SyncProviderRuntime.Companion)`. Results, inert runs, and runs the quality gate holds. |
 | `work/RecoveryWorkerTest`              | 5     | Reset-in-flight + reschedule + failure → retry.                                         |
 
-### Robolectric SDK 30 (The Sweet Spot)
+### Robolectric SDK 30
 
-Robolectric 4.13 does not ship shadows for `compileSdk 36`. SDK 30 (Android 11) is the highest fully-shadowed level that still covers `ConnectivityManager`, `Room`, and `WorkManager`. Every test that needs Robolectric annotates `@Config(sdk = [30])`.
+Robolectric 4.13 provides SDKs up to 34, so it cannot run `compileSdk 36`. The suites pin SDK 30 at class level: every test class that needs Robolectric annotates `@Config(sdk = [30])`. Four `ConnectivityMonitorTest` cases override it: two run on SDK 30 and 31, two on 31.
 
 For tests that only need pure JVM behavior (e.g. `RetryPolicyEvaluator`), `testOptions.unitTests.returnDefaultValues = true` lets Android shims return defaults without Robolectric entirely.
 

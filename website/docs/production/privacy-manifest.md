@@ -1,7 +1,7 @@
 ---
 sidebar_position: 3
 title: iOS Privacy Manifest
-description: What the library declares in its PrivacyInfo.xcprivacy, how RN 0.85+ aggregates manifests at build time, and what you may need to add to your own app manifest.
+description: What the library declares in its PrivacyInfo.xcprivacy, how RN 0.85+ aggregates manifests during pod install, and what you may need to add to your own app manifest.
 keywords:
   - ios
   - privacy manifest
@@ -13,15 +13,15 @@ keywords:
 
 # iOS Privacy Manifest
 
-Apple requires every iOS app to ship a Privacy Manifest (`PrivacyInfo.xcprivacy`) declaring which Required Reason APIs it uses, what data it collects, and whether it tracks users. SDKs that ship one of their own get aggregated into the host app's manifest at build time. The library ships its own manifest, so consumers usually have nothing extra to do. This page documents what's in it and when you do need to add to your own manifest.
+Apple requires every iOS app to ship a Privacy Manifest (`PrivacyInfo.xcprivacy`) declaring which Required Reason APIs it uses, what data it collects, and whether it tracks users. In a React Native app, `pod install` merges the Required Reason entries of the pods' own manifests into the host app's manifest. The library ships its own manifest, so consumers usually have nothing extra to do. This page documents what's in it and when you do need to add to your own manifest.
 
 ## Overview of Requirements
 
 | Requirement | Provided by | Your action |
 | --- | --- | --- |
 | Library Privacy Manifest | The library, in the `SyncProvider_Privacy` resource bundle | Nothing. |
-| Merge into the app's manifest | React Native 0.85's CocoaPods aggregation, at build time | Nothing. |
-| App-level Privacy Manifest | Your app | Needed when your app uses Required Reason APIs, collects data or contains tracking SDKs. |
+| Merge into the app's manifest | React Native 0.85's CocoaPods post-install step, during `pod install`, on by default | Nothing. |
+| App-level Privacy Manifest | Your app. `pod install` creates or updates it with the pods' reasons | Add your own collected data, tracking and reasons to it. |
 | Privacy Nutrition Labels | Your app, in App Store Connect | Describe what your app does. The library adds nothing. |
 
 ## What the Library Declares
@@ -44,7 +44,7 @@ Specifically, the library does **not** access:
 
 ## How RN 0.85+ Aggregates the Manifest
 
-React Native 0.85's CocoaPods integration aggregates every pod's `PrivacyInfo.xcprivacy` into the host app's final manifest at build time. The aggregator (`privacy_manifest_utils.rb`) iterates `file_accessor.resource_bundles` — which is exactly why this library uses `s.resource_bundles` and not `s.resources` to expose the manifest:
+React Native 0.85's CocoaPods integration merges the Required Reason entries of every pod's `PrivacyInfo.xcprivacy` into the app target's `PrivacyInfo.xcprivacy`, and creates that file if there is none. It runs in React Native's post-install step, during `pod install`, and is on by default (`use_react_native!(privacy_file_aggregation_enabled: true)`). The aggregator (`privacy_manifest_utils.rb`) iterates `file_accessor.resource_bundles` — which is exactly why this library uses `s.resource_bundles` and not `s.resources` to expose the manifest:
 
 ```ruby
 # Excerpt — RN 0.85 privacy_manifest_utils.rb (lines 124–125)
@@ -65,7 +65,7 @@ error: Multiple commands produce '.../PrivacyInfo.xcprivacy'
 
 In most cases, **nothing**. The aggregator handles the merge.
 
-You DO need your own `PrivacyInfo.xcprivacy` if:
+You DO need to add your own entries to the app's `PrivacyInfo.xcprivacy`, which `pod install` creates or updates, if:
 
 - Your app independently uses any Required Reason API (the most common: `UserDefaults` `CA92.1`, `SystemBootTime` `35F9.1`, `DiskSpace` `E174.1`).
 - Your app collects user data beyond what the library does (basically anything — the lib collects nothing).

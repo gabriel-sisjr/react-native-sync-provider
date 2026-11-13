@@ -18,7 +18,7 @@ The library is pre-1.0, so minor versions can carry breaking changes. Each upgra
 
 ## v0.2 → v0.3 {#v0-2-to-v0-3}
 
-No function, hook or error code was removed, and the quality gate and the health check are opt-in. Four things change for every app: `react-native-nitro-modules` must be 0.35.8 or later, permanently failed items move to a dead-letter queue, `networkQuality` is a required field, and connection events fire only on real changes. The stores migrate in place, and there is no supported downgrade: see [Rolling back](./v0-3-0.md#rolling-back-from-v03).
+No function, hook or error code was removed, and the quality gate and the health check are opt-in. Four things change for every app: `react-native-nitro-modules` must be 0.35.8 or later, permanently failed items move to a dead-letter queue, `networkQuality` is a required field, and connection events fire only on real changes. The stores migrate automatically, and there is no supported downgrade: see [Rolling back](./v0-3-0.md#rolling-back-from-v03).
 
 Follow the [v0.3.0 migration guide](./v0-3-0.md) for the steps.
 

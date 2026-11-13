@@ -76,15 +76,15 @@ try {
 
 | Code | Retryable? | Where you see it | Suggested action |
 |---|---|---|---|
-| `NETWORK_ERROR` | Yes | Item events. `flush()` also rejects with it when its cycle dies. | Wait for connectivity; the engine retries automatically. |
+| `NETWORK_ERROR` | Yes | Item events. `flush()` also rejects with it when its cycle dies. | Wait for connectivity; the engine retries automatically. On Android, a `NETWORK_ERROR` from anything other than an I/O failure is not retried. |
 | `SERVER_ERROR` | If in `retryOnStatusCodes` | Item events | The engine retries a listed status; surface only if persistent. |
 | `INVALID_PAYLOAD` | No | `enqueue`, `enqueueBatch`, `configureSync`, and most functions when native rejects | Fix the input shape. With no `validationErrors`, native rejected the call. |
 | `QUEUE_FULL` | No (until drained) | `enqueue`, `enqueueBatch`, `replayDeadLetter`. Reaches JS as `INVALID_PAYLOAD` for now | Flush or raise `maxQueueSize`. A rejected replay keeps the dead letter. |
 | `NATIVE_MODULE_UNAVAILABLE` | No | every facade method | Verify New Architecture; rebuild native app. |
-| `BACKGROUND_TASK_REGISTRATION_FAILED` | No | `enableBackgroundSync`, `disableBackgroundSync`, `isBackgroundSyncEnabled` | iOS: check the `Info.plist` identifiers, that you are on a physical device, and that Background App Refresh is on. Android: leave `requiresDeviceIdle` unset. |
+| `BACKGROUND_TASK_REGISTRATION_FAILED` | No | `enableBackgroundSync`. `disableBackgroundSync` and `isBackgroundSyncEnabled` reject with it only as the fallback code for a native rejection | iOS: check the `Info.plist` identifiers, that you are on a physical device, and that Background App Refresh is on. Android: leave `requiresDeviceIdle` unset, and make sure WorkManager can initialize: an app that removes its default initializer must implement `Configuration.Provider`. |
 | `INVALID_URL` | No | `enqueue`, `configureSync` (`healthCheckUrl`) | Pass an absolute http(s) URL. |
 | `UNAUTHORIZED` | No | Item events, dead letters | Call `configureSync` with a fresh token, then replay the dead letters. |
-| `TIMEOUT` | Yes | Item events | Engine retries; raise `requestTimeoutMs` if requests legitimately take longer. On Android, that limit running out is reported as `NETWORK_ERROR`, and `TIMEOUT` means a socket timeout fired first. |
+| `TIMEOUT` | Yes | Item events | Engine retries; raise `requestTimeoutMs` if requests legitimately take longer. On Android, that limit running out is reported as `NETWORK_ERROR`, and `TIMEOUT` means a fixed socket timeout fired first: 10 s to connect, or 30 s for a stalled read or write. Raising `requestTimeoutMs` does not lengthen those. |
 | `MAX_ATTEMPTS_EXCEEDED` | No | `ITEM_FAILED`, dead letters | Replay once the cause is fixed. Raise `maxAttempts` or expand `retryOnStatusCodes` if it recurs. |
 | `DUPLICATE_ITEM` | No | Never: reserved | None. |
 | `DRAIN_ALREADY_ACTIVE` | No | `drainUntilEmpty` | Await the previous drain. |

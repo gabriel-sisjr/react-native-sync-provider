@@ -31,20 +31,20 @@ Most offline queues for React Native flush only while the app is in the foregrou
 - **iOS** -- The queue persists in Core Data, requests go out through `URLSession`, and `BGTaskScheduler` (BackgroundTasks framework) flushes it in the background.
 - **JS** -- A thin, typed facade and React hooks over [Nitro Modules](https://nitro.margelo.com/), so payloads cross the bridge as native objects, with no JSON serialization.
 
-The OS decides when a background window runs, and it gives none to an app the user force-quit until the user opens it again. See [Background Sync](../guides/background-sync.md).
+The OS decides when a background window runs, and it gives none to an app the user force-quit on iOS, or Force Stopped on Android, until the user opens it again. See [Background Sync](../guides/background-sync.md).
 
 If you use `react-native-background-location` for GPS that keeps working in the background, this library is its sibling for HTTP requests. See [Ecosystem](#ecosystem).
 
 ## Key Features
 
 - **Native persistent queue** -- Requests survive app force-quit, process kill, and device reboot (Core Data on iOS, Room on Android).
-- **Background dispatch** -- Flushes via `BGTaskScheduler` (iOS) and `WorkManager` (Android) with no JS runtime required. The OS decides when, and a force-quit stops it until the user opens the app again.
+- **Background dispatch** -- Flushes via `BGTaskScheduler` (iOS) and `WorkManager` (Android) with no JS runtime required. The OS decides when, and an iOS force-quit or an Android Force Stop stops it until the user opens the app again.
 - **Connectivity awareness** -- `NWPathMonitor` (iOS) and `ConnectivityManager` (Android) report the network state. `useAutoSync` flushes on reconnect, and the retry timer and `drainUntilEmpty` wait for the network.
 - **Network quality and health checks** -- Every connection snapshot carries a `networkQuality` level. Opt in to `minNetworkQuality` to skip flushes on a poor link without spending attempts, and to `healthCheckUrl` to probe your backend before a batch. See [Connectivity Detection](../guides/connectivity-detection.md).
 - **Dead-letter queue** -- A request that fails permanently is kept with its last error until you replay or discard it.
 - **Declarative retry policy** -- Linear, exponential, or Fibonacci backoff with jitter, configurable retry-on-status codes, and a per-item attempt budget. Cooldowns persist across restarts, and a timer brings items back while the app runs.
 - **Persisted configuration** -- A worker or BGTask with no JS honors your options, and `defaultHeaders` are encrypted at rest (Android Keystore, iOS Keychain).
-- **Per-item priority lanes** -- `HIGH` / `NORMAL` / `LOW` dispatch order, deterministic within a flush cycle.
+- **Per-item priority lanes** -- `HIGH` / `NORMAL` / `LOW` claim order, deterministic within a flush cycle. On Android, which sends a batch concurrently, priority decides which items a cycle takes, not the order its requests go out.
 - **At-least-once delivery** -- A request can be sent twice after a crash, so endpoints must be idempotent. See the [Idempotency guide](../guides/idempotency.md).
 - **First-class TypeScript** -- 24 facade functions, 2 listener helpers, 9 React hooks, and a complete type / enum / error surface, all strict-mode clean.
 - **Optional Provider** -- An optional `<SyncProvider>` Context wraps `configureSync` + `enableBackgroundSync` lifecycle for app-level setup.
@@ -60,7 +60,7 @@ If you use `react-native-background-location` for GPS that keeps working in the 
 | Connectivity detection | Supported | Supported | ConnectivityManager / NWPathMonitor |
 | Hooks | Supported | Supported | React 18+ hooks |
 | Item ids (ULID) | Supported | Supported | Native ULID generator |
-| Priority lanes | Supported | Supported | HIGH / NORMAL / LOW dispatch order |
+| Priority lanes | Supported | Supported | HIGH / NORMAL / LOW claim order |
 | Crash recovery | `RecoveryWorker` on JS attach, boot and app update; `SyncWorker` with no JS attached | `RecoveryManager` on engine start, including a BGTask launch | Native |
 
 ## Requirements
@@ -69,16 +69,16 @@ If you use `react-native-background-location` for GPS that keeps working in the 
 |---|---|
 | React Native | >= 0.74 |
 | React | >= 18.2 |
-| New Architecture (Nitro / Fabric) | Required |
+| New Architecture | Required |
 | `react-native-nitro-modules` | ^0.35.8 (peer) |
 | iOS deployment target | 15.0 |
 | Android `minSdkVersion` | 24 |
 | Android `compileSdkVersion` / `targetSdkVersion` | 36 |
-| Kotlin | 2.0.21 |
-| Android Gradle Plugin | 8.7.2 |
+| Kotlin | 2.0.21 to 2.2.21 |
+| Android Gradle Plugin | Set by your app. See [Android Setup](./android-setup.md#1-gradle-versions) |
 | Node.js (dev) | >= 22.11 |
 
-> **Warning:** This library requires the React Native New Architecture. Nitro Modules do not run on the legacy bridge. See the [Installation guide](./installation.md) for a verification step.
+> **Warning:** The New Architecture is required: the library is built and tested only on it. Nitro itself can install on the legacy bridge, but this library is not tested there. See the [Installation guide](./installation.md) for a verification step.
 
 ## How It Works
 
@@ -124,12 +124,12 @@ How the library compares with other offline-queue approaches for React Native:
 | New Architecture / JSI | yes | n/a | n/a | no |
 | Configurable retry + jitter | yes | yes | partial | yes |
 | Priority lanes | yes | no | no | yes |
-| Connectivity-aware flush | yes | partial | yes | partial |
+| Connectivity-aware flush | partial | partial | yes | partial |
 | TypeScript-first | yes | yes | partial | partial |
 
 `yes` first-class · `partial` requires plugins / not the default · `no` not supported
 
-Background sync runs in windows the OS schedules, and not at all after a force-quit until the user opens the app again. See [Background Sync](../guides/background-sync.md).
+This library's connectivity-aware flush is `partial`: the retry wakes and Android's background windows wait for a network, but an explicit `flush()` checks connectivity only with `minNetworkQuality` set. Background sync runs in windows the OS schedules, and on Android not at all after a Force Stop, nor on iOS after a force-quit, until the user opens the app again. Swiping an Android app from Recents does not stop its WorkManager work on stock Android. See [Background Sync](../guides/background-sync.md).
 
 ## Ecosystem
 

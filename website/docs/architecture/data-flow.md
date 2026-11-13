@@ -106,10 +106,10 @@ flowchart TD
 Notes:
 
 - A cycle takes **one batch** and makes **at most one attempt per item**. It does not loop: items left over wait for the next flush. Use [`drainUntilEmpty`](../api-reference/functions.md#drainuntilempty) to loop.
-- "Eligible" means `PENDING` with `nextRetryAt <= now`, so cooling items are skipped. Priority orders the batch.
-- Android sends a batch concurrently. iOS sends it one item at a time, and emits `SYNC_PROGRESS` once per item, before that item's `ITEM_*` event.
+- "Eligible" means `PENDING` with `nextRetryAt <= now`, so cooling items are skipped. Priority decides which items a cycle takes, and on iOS the order they go out.
+- Android sends a batch concurrently, except that with `defaultHeaders` restored from disk the first item goes out alone first. iOS sends it one item at a time, and emits `SYNC_PROGRESS` once per item, before that item's `ITEM_*` event.
 - The dispatcher checks connectivity only through the opt-in quality gate (`minNetworkQuality`), and the backend only through the opt-in health check (`healthCheckUrl`). Both are skipped when unset. See [Checks Before a Cycle](../api-reference/functions.md#checks-before-a-cycle).
-- A permanent failure moves the item, in one transaction, from the queue to the dead-letter queue.
+- A permanent failure moves the item, in one transaction, from the queue to the dead-letter queue, except an item removed or cleared while its request was in flight.
 - Cycles do not overlap. On Android, a concurrent `flush()` waits for the running cycle and then runs its own. On iOS, it returns the last result at once.
 - HTTP requests run on the native dispatcher's executor (`URLSession` on iOS, OkHttp + `Dispatchers.IO` on Android). The JS thread is never blocked.
 - The `SyncResult` is persisted to history before the promise resolves.
@@ -137,7 +137,7 @@ On both platforms, the flush runs the same checks as a foreground one, from the 
 
 ### Android (WorkManager)
 
-WorkManager runs `SyncWorker`, at most every 15 minutes for the periodic job, and also for the opt-in retry kick. WorkManager enforces the constraints. The worker stays inert under `foregroundOnly` or a persisted pause. Otherwise, with no JS engine attached, it first resets rows a dead process left `IN_FLIGHT`. It then flushes and returns `Result.success()` on any completed flush, including one with failed items or one the quality gate or the health check skipped, so that WorkManager's backoff cannot race the persisted cooldowns. `Result.retry()` is reserved for a worker that fails as a whole.
+WorkManager runs `SyncWorker`, at most every 15 minutes for the periodic job, and also for the opt-in retry kick. The exception is a retry after a periodic run that failed as a whole, which follows WorkManager's exponential backoff from 1 minute. WorkManager enforces the constraints. The worker stays inert under `foregroundOnly` or a persisted pause. Otherwise, with no JS engine attached, it first resets rows a dead process left `IN_FLIGHT`. It then flushes and returns `Result.success()` on any completed flush, including one with failed items or one the quality gate or the health check skipped, so that WorkManager's backoff cannot race the persisted cooldowns. `Result.retry()` is reserved for a worker that fails as a whole.
 
 ### iOS (BGTaskScheduler)
 

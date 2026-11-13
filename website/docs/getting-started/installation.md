@@ -27,7 +27,7 @@ yarn add @gabriel-sisjr/react-native-sync-provider
 npm install @gabriel-sisjr/react-native-sync-provider
 ```
 
-The library is autolinked through Nitro Modules on RN 0.74+ with the New Architecture enabled. No `react-native link` step is required.
+React Native's autolinking registers the library with Gradle and CocoaPods, so no `react-native link` step is required.
 
 ## Peer Dependencies
 
@@ -55,7 +55,7 @@ Android needs no manual step beyond meeting the toolchain versions. Gradle's man
 
 See the dedicated [Android Setup](./android-setup.md) page for:
 
-- The Gradle versions: `minSdkVersion` 24, `compileSdkVersion` and `targetSdkVersion` 36, Kotlin 2.0.21 to 2.2.21 and Android Gradle Plugin 8.7.2
+- The Gradle versions: `minSdkVersion` 24, `compileSdkVersion` and `targetSdkVersion` 36, Kotlin 2.0.21 to 2.2.21, and which Android Gradle Plugin version applies
 - What the boot receiver and its `RecoveryWorker` do after a reboot or an app update
 - The `WorkManager` 15-minute floor for periodic work
 - Doze mode and OEM battery managers
@@ -85,7 +85,7 @@ The library registers its BGTask handlers by itself, so do not register them in 
 
 ## New Architecture Verification
 
-The library only runs on the New Architecture. After installation, run the example or your app and check Metro logs for:
+The New Architecture is required: the library is built and tested only on it. Nitro itself can install on the legacy bridge, but this library is not tested there. After installation, run the example or your app and check Metro logs for:
 
 ```text
 Running "AppName" with {"fabric":true,"initialProps":{"concurrentRoot":true},"rootTag":1}

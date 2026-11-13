@@ -459,19 +459,19 @@ Before a cycle starts, `flush()` runs these checks in order:
 
 1. **Pause.**
 2. **Stored credentials.** `defaultHeaders` that were configured but cannot be read.
-3. **A running cycle, iOS only.** The call returns the last result at once, without the checks below.
+3. **A running cycle, iOS only.** The call joins it and returns at once with the last finished cycle's result, or a 0/0 one, without the checks below.
 4. **Quality gate.** The network quality is below [`SyncOptions.minNetworkQuality`](./types.md#syncoptions). Not checked when the option is unset.
 5. **Health check.** The `HEAD` to [`SyncOptions.healthCheckUrl`](./types.md#syncoptions) fails, or the backoff after a failed one is running. Not checked when the option is unset.
 
 When the pause, the credentials, the gate or the health check stops the flush, no cycle runs: nothing is dispatched, no item changes, no `SYNC_STARTED` is emitted and no history row is written. The pause and the credentials emit no event at all. The gate emits `SYNC_FAILED` with `errorCode: 'NETWORK_QUALITY_TOO_LOW'`, and the health check `SYNC_FAILED` with `errorCode: 'HEALTH_CHECK_FAILED'`.
 
-The result of a skipped flush is 0/0 on both platforms and does not say why. Android returns `0` for `startedAt` and `finishedAt`, the zeroed shape that [`getLastSyncResult`](#getlastsyncresult) reports as `undefined`; `flush()` returns it as is. iOS sets both to the time of the call, so the result looks like an empty cycle's: only the missing `SYNC_STARTED` event and history row tell them apart.
+The result of a skipped flush is 0/0 on both platforms and does not say why. Android returns `0` for `startedAt` and `finishedAt`, the zeroed shape that [`getLastSyncResult`](#getlastsyncresult) reports as `undefined`; `flush()` returns it as is. iOS sets both to the time the check stopped the flush, which can be a moment after the call while the gate waits for the link or the health check's request runs, so the result looks like an empty cycle's: only the missing `SYNC_STARTED` event and history row tell them apart.
 
 #### Behavior Worth Knowing
 
 - **Nothing eligible.** With an empty queue, or every item cooling, the cycle resolves with a 0/0 result, emits `SYNC_SUCCEEDED`, and adds a row to the sync history.
 - **Connectivity is checked only through the gate.** Without `minNetworkQuality`, calling `flush()` offline can spend retry attempts and send valid items to the dead-letter queue. On iOS the foreground session waits for connectivity, so the call may stay pending until the network returns instead. Any `minNetworkQuality` other than `OFFLINE` blocks an offline flush. Otherwise check [`getConnectionStatus`](#getconnectionstatus) first, or use [`drainUntilEmpty`](#drainuntilempty), which does not flush while `DISCONNECTED`.
-- **While a cycle is running.** iOS returns the last result at once. Android waits, then runs its own cycle.
+- **While a cycle is running.** iOS returns the last finished cycle's result at once, or a 0/0 one. Android waits, then runs its own cycle.
 
 #### Usage
 
@@ -938,7 +938,7 @@ function enableBackgroundSync(options: BackgroundSyncOptions): Promise<void>;
 
 #### Throws
 
-- `BACKGROUND_TASK_REGISTRATION_FAILED` -- iOS: the OS refused the request, because `com.gabriel-sisjr.syncprovider.background` is not in `BGTaskSchedulerPermittedIdentifiers`, because you are on a simulator, where `BGTaskScheduler` does not accept requests, or because the user turned off Background App Refresh. Android: WorkManager rejected the request, as it does when `requiresDeviceIdle` is `true`.
+- `BACKGROUND_TASK_REGISTRATION_FAILED` -- iOS: the OS refused the request, because `com.gabriel-sisjr.syncprovider.background` is not in `BGTaskSchedulerPermittedIdentifiers`, because you are on a simulator, where `BGTaskScheduler` does not accept requests, or because the user turned off Background App Refresh. Android: WorkManager rejected the request, as it does when `requiresDeviceIdle` is `true`, or could not initialize, as when the app removes WorkManager's default initializer without implementing `Configuration.Provider`.
 - `NATIVE_MODULE_UNAVAILABLE`.
 
 #### Usage

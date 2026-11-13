@@ -36,7 +36,7 @@ The library declares its required permissions in its own `AndroidManifest.xml`. 
 
 | Permission                            | Why the library needs it                                                                                                       |
 | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `INTERNET`                            | OkHttp dispatch of every queued request.                                                                                       |
+| `INTERNET`                            | OkHttp dispatch of every queued request, and the `HEAD` requests to `healthCheckUrl`.                                          |
 | `ACCESS_NETWORK_STATE`                | `ConnectivityMonitor` reads `NetworkCapabilities` to drive the metered/unmetered discriminator and emit `CONNECTION_CHANGED`.  |
 | `RECEIVE_BOOT_COMPLETED`              | `BootCompletedReceiver` schedules `RecoveryWorker` after a device reboot, which resets in-flight items and re-arms the periodic `SyncWorker` when background sync is enabled and `foregroundOnly` is off. |
 
@@ -57,7 +57,7 @@ None of these are runtime ("dangerous") permissions on Android 6+ — they are i
 </receiver>
 ```
 
-`MY_PACKAGE_REPLACED` is included so an OTA update of your app also re-runs recovery. The receiver runs recovery right after an app update, and after a reboot once the device is first unlocked, before any JS runs. `LOCKED_BOOT_COMPLETED` is in the filter, but the receiver is not direct-boot aware, so a locked device does not deliver it. Recovery also runs each time a JS engine attaches, and `SyncWorker` resets in-flight rows itself when no JS engine is attached, unless a persisted pause or `foregroundOnly` blocks it. Without the receiver, items left in flight at update time would wait for one of those.
+`MY_PACKAGE_REPLACED` is included so an update of your app, a new version installed over the old one, also re-runs recovery. The receiver enqueues recovery as a WorkManager job right after an app update and, after a reboot, once the device is first unlocked. It usually runs before the user opens the app, but nothing orders it before JS, and a JS engine that attaches first schedules the same job. `LOCKED_BOOT_COMPLETED` is in the filter, but the receiver is not direct-boot aware, so a locked device does not deliver it. Recovery also runs each time a JS engine attaches, and `SyncWorker` resets in-flight rows itself when no JS engine is attached, unless a persisted pause or `foregroundOnly` blocks it. Without the receiver, items left in flight at update time would wait for one of those.
 
 ## What the Library Does NOT Request
 
@@ -79,7 +79,7 @@ The Android scheduler is the source of truth for when a flush actually runs. Imp
 
 ## Google Play Data Safety
 
-The library collects no data of its own. It sends the requests your app enqueues, to the URLs your app chooses, and, when you set `healthCheckUrl`, `HEAD` requests to that URL that carry no headers. Answer the Data safety form from what your requests send.
+The library collects no data of its own. It sends the requests your app enqueues, to the URLs your app chooses, and, when you set `healthCheckUrl`, `HEAD` requests to that URL that carry none of your headers: only `Cache-Control: no-cache` and OkHttp's standard `Host`, `Connection`, `Accept-Encoding` and `User-Agent` headers. Answer the Data safety form from what your requests send.
 
 On the device, a queued request, its headers and body included, stays in the library's Room database until it is delivered, removed or cleared. A dead letter keeps them until it is replayed, discarded or cleared. `defaultHeaders` are encrypted with a non-exportable Android Keystore key, while per-item `headers` are stored in plain text, so keep credentials in `defaultHeaders`.
 
@@ -89,10 +89,10 @@ After building a release APK / AAB:
 
 ```bash
 ./gradlew :app:bundleRelease
-unzip -p app/build/outputs/bundle/release/app-release.aab base/manifest/AndroidManifest.xml | head -100
+bundletool dump manifest --bundle app/build/outputs/bundle/release/app-release.aab
 ```
 
-You should see all three permissions and the receiver in the output. If any are missing, your app likely declares `tools:node="remove"` on a parent permission node — remove it.
+An AAB stores its manifest in protobuf format, so read it with `bundletool` rather than `unzip`. Android Studio's Merged Manifest tab shows the same result. You should see all three permissions and the receiver. If any are missing, your app likely declares `tools:node="remove"` on a parent permission node — remove it.
 
 ## Checklist Before Submission
 

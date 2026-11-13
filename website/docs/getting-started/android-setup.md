@@ -37,7 +37,7 @@ Verify your project meets the required versions. The library will fail to compil
 | `compileSdkVersion` | 36 |
 | `targetSdkVersion` | 36 |
 | Kotlin | 2.0.21 to 2.2.21 |
-| Android Gradle Plugin | 8.7.2 |
+| Android Gradle Plugin | Set by your app's root buildscript |
 | JDK (host) | 17 |
 
 In `android/build.gradle`:
@@ -50,14 +50,12 @@ buildscript {
     targetSdkVersion = 36
     kotlinVersion = "2.0.21"
   }
-  dependencies {
-    classpath("com.android.tools.build:gradle:8.7.2")
-    classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.0.21")
-  }
 }
 ```
 
 The library reads `minSdkVersion`, `compileSdkVersion`, `targetSdkVersion` and `kotlinVersion` from this `ext` block, and uses the values above for any that is not set. It picks the KSP version that matches your `kotlinVersion` from a table of the Kotlin releases from 2.0.21 to 2.2.21. Any other version gets the KSP version for 2.0.21.
+
+The library's own buildscript declares Android Gradle Plugin 8.7.2, but the version in your app's root buildscript is the one that applies. The example app builds with AGP 8.12.0 and Kotlin 2.1.20.
 
 ## Step 2: Permissions (Auto-Merged) {#2-permissions-auto-merged}
 
@@ -111,7 +109,8 @@ The library bundles `android/proguard-rules.pro` and applies it via `consumerPro
 - `@com.facebook.proguard.annotations.DoNotStrip`-marked classes (the Nitro `HybridSyncProviderSpec` subclass).
 - Room-generated DAO and database classes.
 - `WorkManager` worker classes, which `WorkManager` instantiates by reflection.
-- Coroutines metadata required by the `SyncWorker`.
+- The `kotlinx.coroutines` class names its service loader needs, its `volatile` fields for atomic updates, and `kotlin.Metadata`.
+- Every class of the library, through a blanket `-keep class com.margelo.nitro.syncprovider.** { *; }`.
 
 You do not need to add rules to your app. If you have custom ProGuard rules that strip Kotlin metadata, restore them only for your own packages.
 

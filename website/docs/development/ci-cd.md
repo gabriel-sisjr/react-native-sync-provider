@@ -150,7 +150,7 @@ cd example/android
 ./gradlew :gabriel-sisjr_react-native-sync-provider:testDebugUnitTest --stacktrace
 ```
 
-It uploads `android/build/reports/tests/`, `android/build/reports/jacoco/` and `android/build/test-results/` as the `android-test-reports` artifact on every run, kept for 14 days.
+It uploads `android/build/reports/tests/`, `android/build/reports/jacoco/` and `android/build/test-results/` as the `android-test-reports` artifact on every run, kept for 14 days. CI does not run `jacocoTestReport`, so the `jacoco/` path matches nothing and no coverage report is uploaded.
 
 **`test-ios`** selects Xcode, runs `yarn nitrogen`, installs the pods, and lists the workspace schemes and the available simulators. It then picks one simulator with `.github/scripts/pick-ios-simulator.mjs`: on the newest iOS runtime that has an iPhone, the first of `iPhone 17`, `iPhone 17 Pro` and `iPhone Air` that exists, else the first iPhone on that runtime by name. The suite runs once, so a failure is never retried on another device:
 

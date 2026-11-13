@@ -19,7 +19,7 @@ Requirements:
 - Optional peers: @react-native-community/netinfo >= 11.0.0, react-native-mmkv >= 3.0.0.
 - Android: minSdk 24. The library reads `minSdkVersion`, `compileSdkVersion`, `targetSdkVersion` and `kotlinVersion` from the app's `ext` block, defaulting to 24, 36, 36 and Kotlin 2.0.21, and has a matching KSP version for Kotlin 2.0.21 to 2.2.21.
 - iOS: 15.0+.
-- Expo: a development build only. The library ships no config plugin and does not run in Expo Go: apply the iOS setup below to the native project.
+- Expo: a development build only. The library ships no config plugin and does not run in Expo Go: apply the iOS setup below to the native project. With Continuous Native Generation, `expo prebuild` regenerates `ios/`: set `UIBackgroundModes` and `BGTaskSchedulerPermittedIdentifiers` through `ios.infoPlist` in the app config, and add the `AppDelegate` forwarding with a config plugin.
 
 ### iOS setup
 
@@ -242,7 +242,7 @@ Before the cycle, the flush checks, in this order: the pause, the stored credent
 
 The counts are then 0/0. Android returns `0` for `startedAt` and `finishedAt`. iOS sets both to the time the check stopped the flush, so the result looks like an empty cycle's.
 
-Without `minNetworkQuality`, `flush()` does not check connectivity: calling it offline can spend attempts and move valid items to the dead-letter queue. Any `minNetworkQuality` other than `OFFLINE` blocks an offline flush. While a cycle is running, iOS returns the last result at once, without the gate or the health check, and Android waits, then runs its own cycle with every check.
+Without `minNetworkQuality`, `flush()` does not check connectivity: calling it offline can spend attempts and move valid items to the dead-letter queue. Any `minNetworkQuality` other than `OFFLINE` blocks an offline flush. While a cycle is running, iOS returns the last finished cycle's result at once, or a 0/0 one, without the gate or the health check, and Android waits, then runs its own cycle with every check.
 
 ### drainUntilEmpty
 

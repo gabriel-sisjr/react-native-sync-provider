@@ -11,7 +11,7 @@
 
 ## Overview
 
-A cross-platform React Native library for offline-first HTTP sync built on Nitro Modules (New Architecture). Persists outbound requests on the native side, retries them on a persisted backoff, and can dispatch them in OS-scheduled background windows while the app is not running, on both Android and iOS. Android uses Room, OkHttp and WorkManager; iOS uses Core Data, URLSession and BGTaskScheduler. Features include a queue that survives a force-quit and a reboot, linear, exponential or Fibonacci backoff with jitter, a dead-letter queue for requests that fail permanently, a network-quality level on every connection snapshot with an opt-in quality gate and health check, configuration persisted for background workers with `defaultHeaders` encrypted at rest, priority lanes, nine React hooks, and typed events and errors.
+A cross-platform React Native library for offline-first HTTP sync built on Nitro Modules, for the New Architecture. Persists outbound requests on the native side, retries them on a persisted backoff, and can dispatch them in OS-scheduled background windows while the app is not running, on both Android and iOS. Android uses Room, OkHttp and WorkManager; iOS uses Core Data, URLSession and BGTaskScheduler. Features include a queue that survives a force-quit and a reboot, linear, exponential or Fibonacci backoff with jitter, a dead-letter queue for requests that fail permanently, a network-quality level on every connection snapshot with an opt-in quality gate and health check, configuration persisted for background workers with `defaultHeaders` encrypted at rest, priority lanes, nine React hooks, and typed events and errors.
 
 ## Requirements
 
@@ -22,11 +22,11 @@ A cross-platform React Native library for offline-first HTTP sync built on Nitro
 - Optional peer: react-native-mmkv >= 3.0.0
 - Android: minSdk 24. The library reads `minSdkVersion`, `compileSdkVersion`, `targetSdkVersion` and `kotlinVersion` from the app's `ext` block, defaulting to 24, 36, 36 and Kotlin 2.0.21, and has a matching KSP version for Kotlin 2.0.21 to 2.2.21
 - iOS: 15.0+
-- Expo: development build only. There is no config plugin, so apply the iOS setup to the native project; see /docs/troubleshooting#faq
+- Expo: development build only. There is no config plugin, so apply the iOS setup to the native project. With Continuous Native Generation, `expo prebuild` regenerates `ios/`: set `UIBackgroundModes` and `BGTaskSchedulerPermittedIdentifiers` through `ios.infoPlist`, and add the `AppDelegate` forwarding with a config plugin; see /docs/troubleshooting#faq
 
 ## Facts that are easy to get wrong
 
-- `enqueue` stores an item. It does not dispatch it, under any strategy. A flush does, from `useAutoSync`, `flush()`, `drainUntilEmpty()` or an OS background window. `replayDeadLetter()` does not flush either.
+- `enqueue` stores an item. It does not dispatch it, under any strategy. A flush does, from `useAutoSync`, `flush()`, `drainUntilEmpty()` or an OS background window. After `resumeSync()`, and on iOS also after a failed health check, the retry timer flushes items with no cooldown too, unless the strategy is `MANUAL`. `replayDeadLetter()` does not flush either.
 - `AUTOMATIC` means the engine retries failed items on its own: an in-process timer, plus the Android retry kick while background sync is enabled. Enqueueing does not trigger a native flush, and a reconnect alone does not either: only a retry wake the timer held while offline runs then.
 - `MANUAL` stops the engine from scheduling flushes, not `useAutoSync`: the hook never reads the strategy. Pass `enabled: false` for a manual flow.
 - Each cycle dispatches one batch of eligible items, up to `batchSize` (default 25). Use `drainUntilEmpty()` to loop.

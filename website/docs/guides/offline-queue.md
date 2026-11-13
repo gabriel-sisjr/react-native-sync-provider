@@ -29,7 +29,7 @@ The offline queue is the heart of `react-native-sync-provider`. Every outbound H
 
 Items are written to disk **before** `enqueue()` resolves -- the function never returns until durability is confirmed. There is no in-memory-only mode.
 
-The queue is not encrypted at rest: per-item `headers` and `body` are stored in plain text. Put credentials in `SyncOptions.defaultHeaders`, which are [encrypted at rest](./background-sync.md#cold-start-configuration), and encrypt sensitive bodies on the JS side before enqueueing. `SyncOptions.persistQueue` is stored but not used yet, so it cannot turn persistence off.
+The library does not encrypt the queue: per-item `headers` and `body` are stored in plain text, and on iOS the store has only the system's default file protection. Put credentials in `SyncOptions.defaultHeaders`, which are [encrypted at rest](./background-sync.md#cold-start-configuration), and encrypt sensitive bodies on the JS side before enqueueing. `SyncOptions.persistQueue` is stored but not used yet, so it cannot turn persistence off.
 
 An item whose request was in flight when the process died is not lost either: see [Crash Recovery](./crash-recovery.md).
 

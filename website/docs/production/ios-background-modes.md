@@ -14,7 +14,7 @@ keywords:
 
 # iOS Background Modes
 
-The library drives background sync through Apple's `BGTaskScheduler`. Two host-app changes are required for it to function, and a third, one `AppDelegate` method, keeps background uploads from stalling. The library registers its task handlers by itself, at process start, so there is no registration code to write.
+The library drives background sync through Apple's `BGTaskScheduler`. Two host-app changes are required for it to function. A third, one `AppDelegate` method, hands the library iOS's completion handler for background-session events, which the library calls once the session has delivered them. The library registers its task handlers by itself, at process start, so there is no registration code to write.
 
 ## Step 1: Enable the Capabilities {#1-enable-the-capabilities}
 
@@ -51,8 +51,10 @@ Forward `handleEventsForBackgroundURLSession` from your `AppDelegate` to `Hybrid
 `BGTaskScheduler` does not accept requests on a simulator, so use a physical device. In Console.app, select the device, filter by `subsystem:com.gabriel-sisjr.syncprovider`, turn on **Include Info Messages**, and look for this line at launch:
 
 ```text
-Registered BGTask handlers for 2 declared identifiers
+Registered BGTask handlers for N declared identifiers
 ```
+
+N counts every identifier in `BGTaskSchedulerPermittedIdentifiers`, yours included: it is 2 when the list holds only the library's two.
 
 You can also force a window from the Xcode debugger while the app is paused, after calling `enableBackgroundSync`:
 
@@ -60,7 +62,7 @@ You can also force a window from the Xcode debugger while the app is paused, aft
 e -l objc -- (void)[[BGTaskScheduler sharedScheduler] _simulateLaunchForTaskWithIdentifier:@"com.gabriel-sisjr.syncprovider.background"]
 ```
 
-The library emits `BACKGROUND_SYNC_STARTED` and `BACKGROUND_SYNC_COMPLETED` events around each window. Those reach a running JS engine only, so also check that your endpoint received the requests.
+The library emits `BACKGROUND_SYNC_STARTED` and `BACKGROUND_SYNC_COMPLETED` events around each window, except one that fires while background sync is disabled or `foregroundOnly` is set, which completes silently. Those reach a running JS engine only, so also check that your endpoint received the requests.
 
 ## What the OS Actually Guarantees
 
@@ -83,8 +85,8 @@ What the library does with the queue depends on the app's state:
 | --- | --- |
 | Active | Dispatches on the foreground `URLSession`, which waits for connectivity. |
 | Not active | Dispatches on the background `URLSession`, unless `foregroundOnly` is set. The body goes through a temporary file, and the OS may finish the upload while the app is suspended. |
-| Launched for a BGTask | The handler re-submits its request, waits for launch recovery and runs one flush cycle, with no JS loaded. |
-| Force-quit | iOS does not launch the app for background tasks or uploads until the user opens it again. On that launch, recovery puts items left in flight back to `PENDING`. |
+| Launched for a BGTask | The handler re-submits the chain (the refresh handler submits both requests), waits for launch recovery and calls `flush()` once, whether or not JS has loaded. |
+| Force-quit | iOS cancels the background uploads in flight, and does not launch the app for background tasks or uploads until the user opens it again. On that launch, recovery puts items left in flight back to `PENDING`. |
 
 > **Warning:** A background-upload completion delivered after a relaunch is dropped. Launch recovery puts the item back to `PENDING`, with no cooldown and its attempt spent, so the server may receive the request twice. See [Idempotency](../guides/idempotency.md).
 
@@ -97,7 +99,7 @@ The library uses both task types, each with its own identifier, and you do not c
 | `BGAppRefreshTaskRequest` | `.background` | By `enableBackgroundSync`, and by its own handler. |
 | `BGProcessingTaskRequest` | `.processing` | By the refresh handler, and by its own handler. |
 
-So the first processing request exists only after a refresh window has run. Each handler re-submits before doing any work, using the options persisted by `enableBackgroundSync`, so the chain continues with no JS loaded. It runs one flush cycle, which dispatches up to `batchSize` items.
+So the first processing request exists only after a refresh window has run. Each handler re-submits before doing any work, using the options persisted by `enableBackgroundSync`, so the chain continues whether or not JS has loaded. It runs one flush cycle, which dispatches up to `batchSize` items.
 
 `foregroundOnly: true`, `disableBackgroundSync()`, or a pause make a handler that fires complete without dispatching.
 
