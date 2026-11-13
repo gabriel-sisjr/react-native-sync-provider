@@ -1,23 +1,25 @@
 # React Native Sync Provider — Full API Reference
 
-> React Native Nitro Module for offline-first HTTP sync. Requests are persisted natively (Core Data on iOS, Room on Android), retried with a persisted backoff, and flushed from JS or in OS-scheduled background windows (BGTaskScheduler, WorkManager).
+> React Native Nitro Module for offline-first HTTP sync. Requests are persisted natively (Room on Android, Core Data on iOS), retried with a persisted backoff, and flushed from JS or in OS-scheduled background windows (WorkManager, BGTaskScheduler).
 > npm: @gabriel-sisjr/react-native-sync-provider
 > Documentation: https://gabriel-sisjr.github.io/react-native-sync-provider/
 
 ## Installation
 
 ```bash
-yarn add @gabriel-sisjr/react-native-sync-provider react-native-nitro-modules
+yarn add @gabriel-sisjr/react-native-sync-provider "react-native-nitro-modules@^0.35.8"
 # or
-npm install @gabriel-sisjr/react-native-sync-provider react-native-nitro-modules
+npm install @gabriel-sisjr/react-native-sync-provider "react-native-nitro-modules@^0.35.8"
 ```
 
 Requirements:
 - React Native >= 0.74.0 with the New Architecture (Fabric + concurrent root) enabled.
 - React >= 18.2.0.
-- react-native-nitro-modules ^0.35.6.
-- Android: minSdk 24, targetSdk 36, Kotlin 2.0+.
-- iOS: 15+.
+- react-native-nitro-modules ^0.35.8: 0.35.8 or later, below 0.36. With 0.35.6 and 0.35.7, a JS promise could stay pending forever on iOS.
+- Optional peers: @react-native-community/netinfo >= 11.0.0, react-native-mmkv >= 3.0.0.
+- Android: minSdk 24. The library reads `minSdkVersion`, `compileSdkVersion`, `targetSdkVersion` and `kotlinVersion` from the app's `ext` block, defaulting to 24, 36, 36 and Kotlin 2.0.21, and has a matching KSP version for Kotlin 2.0.21 to 2.2.21.
+- iOS: 15.0+.
+- Expo: a development build only. The library ships no config plugin and does not run in Expo Go: apply the iOS setup below to the native project.
 
 ### iOS setup
 
@@ -55,24 +57,26 @@ The library registers its BGTask handlers at process start through +load. Do not
 
 ### Android setup
 
-Nothing to add. The manifest merger brings in INTERNET, ACCESS_NETWORK_STATE, RECEIVE_BOOT_COMPLETED and BootCompletedReceiver.
+Nothing to add. The manifest merger brings in `INTERNET`, `ACCESS_NETWORK_STATE`, `RECEIVE_BOOT_COMPLETED` and `BootCompletedReceiver`.
 
 ## How dispatch works
 
 - `enqueue` stores an item. It does not dispatch it, under any strategy.
 - A flush dispatches. It comes from `useAutoSync`, `flush()`, `drainUntilEmpty()`, the retry timer, or an OS background window.
-- A cycle takes one batch of eligible items, up to `batchSize`, ordered by priority and then age, and makes at most one attempt per item. Android sends a batch concurrently, iOS one item at a time.
-- An item is eligible when it is PENDING and `nextRetryAt <= now`.
-- On a retriable failure with attempts left, the item goes back to PENDING with `nextRetryAt` measured from the end of the attempt.
-- A permanent failure leaves the item as a FAILED row. It is not returned by `getPendingItems()`, and nothing retries it.
-- `AUTOMATIC` means the engine retries on its own: an in-process timer flushes when the soonest cooldown ends. It does not flush on enqueue or on reconnect.
-- The timer never flushes offline. It remembers the wake and flushes when connectivity returns.
+- Before a cycle starts, the flush checks, in this order: the pause, the stored credentials, on iOS a cycle already running, the network-quality gate (`minNetworkQuality`) and the health check (`healthCheckUrl`). When one fails, no cycle runs.
+- A cycle takes one batch of eligible items, up to `batchSize`, ordered by priority and then age, and makes at most one attempt per item. Android sends a batch concurrently, except that with `defaultHeaders` restored from disk the first item goes alone; iOS sends one item at a time.
+- An item is eligible when it is `PENDING` and `nextRetryAt <= now`.
+- On a retriable failure with attempts left, the item goes back to `PENDING` with `nextRetryAt` measured from the end of the attempt.
+- A permanent failure moves the item to the dead-letter queue, in one transaction: `ITEM_FAILED`, then `ITEM_DEAD_LETTERED`. `getPendingItems()` no longer returns it, and nothing retries it until `replayDeadLetter(id)`.
+- `AUTOMATIC` means the engine retries on its own: an in-process timer flushes when the soonest cooldown ends. It does not flush on enqueue, and a reconnect alone does not flush.
+- The timer never flushes offline. It remembers the wake and flushes when connectivity returns. With `minNetworkQuality` set, it also holds a wake the gate blocks, without an event, and checks it again after 30 s, 60 s, 120 s, 240 s and 480 s, then every 15 min. It does not flush during a health-check backoff.
 - Delivery is at least once.
 
 ## Quick Start
 
 ```typescript
 import { useMemo } from 'react';
+import { Button, Text, View } from 'react-native';
 import {
   SyncProvider,
   useAutoSync,
@@ -133,170 +137,380 @@ export default function App({ token }: { token: string }) {
 
 ## Queue Functions
 
+### enqueue
+
 ```typescript
 function enqueue(item: SyncItemInput): Promise<string>;
+```
+
+Persists one request and returns its native ULID once it is stored. Does not dispatch it: that takes a flush.
+
+Parameters:
+- `item` (SyncItemInput) — The request. `id` and `createdAt` are assigned by native.
+
+Throws `INVALID_URL` when `url` is not an absolute http(s) URL, and `INVALID_PAYLOAD` with `validationErrors` for any other malformed field. Also `INVALID_PAYLOAD` with no `validationErrors` when native rejects the call, most often because the queue is full: native reports `QUEUE_FULL`, but native codes do not reach JS yet.
+
+### enqueueBatch
+
+```typescript
 function enqueueBatch(items: SyncItemInput[]): Promise<string[]>;
+```
+
+Atomic: every item is persisted and the ULIDs come back in input order, or nothing is added. On invalid input it throws one `INVALID_PAYLOAD` with every issue in `validationErrors`, each with `itemIndex`, an invalid URL included. With no `validationErrors`, `INVALID_PAYLOAD` means `items` is not an array, or native rejected the call, for example a batch that would exceed `maxQueueSize`.
+
+### removeItem
+
+```typescript
 function removeItem(id: string): Promise<boolean>;
+```
+
+Removes one item in any status, pending or in flight. When no queued item has that id, it removes the dead letter with that id instead. Returns `true` when a row was removed, and emits `ITEM_REMOVED` only then.
+
+A request already sent is not cancelled. An item removed before its request was sent is never sent and gets no outcome event. One removed while its request is in flight still gets its outcome event, but never comes back, as a queue row or as a dead letter.
+
+### clearQueue
+
+```typescript
 function clearQueue(): Promise<void>;
+```
+
+Removes every item, in any status, and every dead letter. Emits one `QUEUE_CLEARED`. Dead letters keep their request headers and body, so this is the call that purges every stored request, for example on logout. The in-flight rules of `removeItem` apply to every cleared item. The sync history is not affected.
+
+### getQueueSize
+
+```typescript
 function getQueueSize(): Promise<number>;
+```
+
+Counts the `PENDING` items, cooling ones included. Items in flight and dead letters are not counted.
+
+### getPendingItems
+
+```typescript
 function getPendingItems(): Promise<SyncItem[]>;
 ```
 
-- `enqueue` persists a request and returns its native ULID. Throws INVALID_URL, or INVALID_PAYLOAD with `validationErrors`, or INVALID_PAYLOAD with no `validationErrors` when native rejects, most often because the queue is full.
-- `enqueueBatch` is atomic. On invalid input it throws one INVALID_PAYLOAD with every issue in `validationErrors`, each with `itemIndex`.
-- `removeItem` and `clearQueue` act on items in any status, FAILED rows included.
-- `getQueueSize` and `getPendingItems` cover PENDING items only, cooling ones included. Items in flight and FAILED rows are excluded. `getPendingItems` returns dispatch order.
+Returns the `PENDING` items in dispatch order, cooling ones included. Items in flight and dead letters are not returned. `attempts` and `nextRetryAt` come back verbatim: `0` is a real value for both.
+
+## Dead-Letter Functions
+
+An item becomes a dead letter whenever it fails permanently: its attempts run out, the server answers with a status that is not retried, or a 401 or 403 arrives under credentials set in the current process. The move is atomic and is followed by `ITEM_FAILED`, then `ITEM_DEAD_LETTERED`. An item removed with `removeItem()` or `clearQueue()` is never dead-lettered. The dead-letter queue is unbounded: nothing prunes it, and it counts toward no capacity cap, so discard what you do not replay. Items that failed permanently before the upgrade to v0.3 are moved there too.
+
+### listDeadLetter
+
+```typescript
+function listDeadLetter(): Promise<SyncDeadLetterItem[]>;
+```
+
+Returns every dead letter, oldest first: by `deadLetteredAt`, then by `id`. There is at most one per id: a newer dead letter replaces an older one with the same id. `useSyncSnapshot().deadLetter` keeps this list up to date for a component.
+
+### replayDeadLetter
+
+```typescript
+function replayDeadLetter(id: string): Promise<void>;
+```
+
+Puts a dead letter back into the queue in one transaction: same id, original `createdAt`, `PENDING`, `attempts: 0`, `nextRetryAt: 0` and no last error code. The dead letter is deleted. Emits `ITEM_ENQUEUED`. Does not flush.
+
+Parameters:
+- `id` (string) — From `listDeadLetter()` or an `ITEM_DEAD_LETTERED` event.
+
+An unknown id resolves with no change. If the queue already holds an item with that id, nothing changes and the dead letter stays: iOS resolves, Android rejects. The replayed item counts toward `maxQueueSize` like an enqueue: iOS counts pending items, Android pending and in-flight ones. A full queue rejects with `INVALID_PAYLOAD` and no `validationErrors`, and the dead letter stays in place.
+
+### discardDeadLetter
+
+```typescript
+function discardDeadLetter(id: string): Promise<void>;
+```
+
+Deletes a dead letter with its stored request. Emits `ITEM_REMOVED` when a row was deleted. An unknown id resolves with no change.
 
 ## Sync Functions
 
+### flush
+
 ```typescript
 function flush(): Promise<SyncResult>;
+```
+
+Runs one cycle: one batch of eligible items, up to `batchSize`. Items still cooling down are skipped. The strategy plays no part, so it also works under `MANUAL`. Per-item failures never reject: it rejects with `NETWORK_ERROR` only when the cycle itself dies, whatever the cause. With nothing eligible it resolves 0/0, records the cycle in the history and emits `SYNC_SUCCEEDED`.
+
+Before the cycle, the flush checks, in this order: the pause, the stored credentials, on iOS a cycle already running, the network-quality gate and the health check. When one fails, no cycle runs: nothing is dispatched, no item changes, no `SYNC_STARTED` is emitted and no history row is written.
+- Paused, or with stored `defaultHeaders` that cannot be read: no event at all.
+- Network quality below `minNetworkQuality`: `SYNC_FAILED` with `NETWORK_QUALITY_TOO_LOW`. On iOS, when the system has not reported the link yet, the gate first waits up to 1.5 s for it, and grades a link still unknown `OFFLINE`.
+- Health check failed, or its backoff still running: `SYNC_FAILED` with `HEALTH_CHECK_FAILED`.
+
+The counts are then 0/0. Android returns `0` for `startedAt` and `finishedAt`. iOS sets both to the time the check stopped the flush, so the result looks like an empty cycle's.
+
+Without `minNetworkQuality`, `flush()` does not check connectivity: calling it offline can spend attempts and move valid items to the dead-letter queue. Any `minNetworkQuality` other than `OFFLINE` blocks an offline flush. While a cycle is running, iOS returns the last result at once, without the gate or the health check, and Android waits, then runs its own cycle with every check.
+
+### drainUntilEmpty
+
+```typescript
 function drainUntilEmpty(options?: DrainOptions): Promise<DrainResult>;
+```
+
+A JS-side loop of flushes. It stops with `EMPTY` only when `getQueueSize() === 0 && isSyncing() === false`. It sleeps until the soonest cooldown by itself, and stops at once with `TIMEOUT` if that moment is at or past the deadline. It does not flush while `getConnectionStatus()` is `DISCONNECTED`. A flush that the quality gate or the health check skips still uses up an iteration, so on a gated link the loop ends with `MAX_ITERATIONS` or `TIMEOUT`.
+
+`timeoutMs` and `cancelDrain()` are hard stops. A native cycle already running keeps going after the drain returns. If a native call in the loop rejects, the drain re-throws that error and returns no `DrainResult`. Only one drain may run per process: a concurrent call throws `DRAIN_ALREADY_ACTIVE`, so await the previous drain, also after `cancelDrain()`.
+
+### cancelDrain
+
+```typescript
 function cancelDrain(): void;
+```
+
+Ends the running drain at once, which resolves with `stoppedReason: 'CANCELLED'`. A native cycle already running is not aborted. With no drain active it is a no-op: it never throws and makes no native call. The cancelled drain settles asynchronously, so await it before starting another.
+
+### pauseSync
+
+```typescript
 function pauseSync(): Promise<void>;
+```
+
+While paused, the queue accepts enqueues, no cycle runs, `flush()` resolves 0/0 with no event, and the retry timer is cancelled. The pause persists: workers and BGTasks stay inert while the app is dead. It lasts until `resumeSync()` or the next launch that reaches the library, including a JS reload. A launch clears it without emitting `RESUMED`.
+
+### resumeSync
+
+```typescript
 function resumeSync(): Promise<void>;
+```
+
+Unless the strategy is `MANUAL`, schedules a flush for the soonest pending item: items with no cooldown left are dispatched right away, cooling items when their cooldown ends. If offline, the flush waits for connectivity. With `minNetworkQuality` set, it also waits, without an event, until the quality reaches it. During a credential hold or a health-check backoff, it waits for that to end.
+
+### isSyncing
+
+```typescript
 function isSyncing(): Promise<boolean>;
 ```
 
-- `flush` runs one cycle. The strategy plays no part. It does not check connectivity, so calling it offline can spend attempts. Per-item failures never reject: it rejects with NETWORK_ERROR only when the cycle itself dies. With nothing eligible it resolves 0/0 and emits SYNC_SUCCEEDED. While a cycle is running, iOS returns the last result and Android waits and runs its own.
-- `drainUntilEmpty` flushes until `getQueueSize() === 0 && isSyncing() === false`. It sleeps until the soonest cooldown by itself, and stops at once with TIMEOUT if that is past the deadline. It does not flush while `getConnectionStatus()` is DISCONNECTED. `timeoutMs` and `cancelDrain()` are hard stops. A native cycle already running keeps going after the drain returns. Only one drain may run: a concurrent call throws DRAIN_ALREADY_ACTIVE, so await the previous drain, also after `cancelDrain()`.
-- `pauseSync` persists. Workers and BGTasks stay inert while the app is dead. It lasts until `resumeSync()` or the next launch that reaches the library, including a JS reload. A launch clears it without emitting RESUMED.
-- `resumeSync` dispatches pending items unless the strategy is MANUAL. If offline, the flush waits for connectivity.
+`true` while a cycle is running.
 
 ## Configuration Functions
 
+### configureSync
+
 ```typescript
 function configureSync(options: SyncOptions): Promise<void>;
+```
+
+`configureSync` replaces the whole configuration and persists it, so a worker or BGTask with no JS honors it. On Android a running cycle keeps the options it started with, except `retryOnStatusCodes`, which is read again for each response, including one to a request already in flight. iOS applies them once the call resolves, inside a running cycle too: the cycle keeps only its batch and its gate and health-check outcome, and a request in flight keeps its headers and timeout, but its response is classified under the new `retryPolicy`. Omitting `defaultHeaders` deletes the stored copy: that is the logout path. Call it whenever the token changes: the library does not refresh tokens.
+
+Every call also clears a credential hold and ends a running health-check backoff. `minNetworkQuality`, `healthCheckUrl`, `healthCheckTtlMs` and `healthCheckBackoffMs` are validated in JS, in that order and only when present, before any native call: `INVALID_URL` for `healthCheckUrl`, `INVALID_PAYLOAD` for the others, with every issue in `validationErrors`. The other fields go to native as they are.
+
+### getSyncConfig
+
+```typescript
 function getSyncConfig(): Promise<SyncOptions>;
 ```
 
-`configureSync` replaces the whole configuration and persists it, so a worker or BGTask with no JS honors it. Android applies it from the next cycle, iOS from the next item. Omitting `defaultHeaders` deletes the stored copy: that is the logout path. Call it whenever the token changes: the library does not refresh tokens.
+Returns the active configuration. `minNetworkQuality`, `healthCheckUrl`, `healthCheckTtlMs` and `healthCheckBackoffMs` are present only when they were set: their defaults are not filled in. In a process that has not called `configureSync`, it returns what an earlier process persisted. While the stored headers cannot be read, it carries none (`undefined` on Android, `{}` on iOS), so passing it back to `configureSync` deletes them: take `defaultHeaders` from the app's session.
 
 ## History Functions
 
+History is most recent first, includes 0/0 cycles, and is not trimmed automatically. A flush that ran no cycle writes no row.
+
+### getLastSyncResult
+
 ```typescript
 function getLastSyncResult(): Promise<SyncResult | undefined>;
+```
+
+The most recent persisted result, or `undefined` when no flush has run yet.
+
+### getSyncHistory
+
+```typescript
 function getSyncHistory(limit?: number): Promise<SyncResult[]>;
+```
+
+Persisted results, most recent first. With `limit` omitted, there is no limit.
+
+### clearSyncHistory
+
+```typescript
 function clearSyncHistory(): Promise<void>;
 ```
 
-History is most recent first, includes 0/0 cycles, and is not trimmed automatically.
+Drops the persisted history. The queue is not affected.
 
-## Connection
+## Connection Functions
+
+### getConnectionStatus
 
 ```typescript
 function getConnectionStatus(): Promise<ConnectionState>;
 ```
 
-## Background Sync
+The current snapshot, with the engine's `networkQuality`: always present, and `OFFLINE` exactly when `status` is `DISCONNECTED` or `UNKNOWN`. `CONNECTION_CHANGED` carries only `connectionStatus`, also when only the network quality changed, and is not emitted for the state the engine starts with: call this once at start and again on each event, or use `useConnection`.
+
+## Background Sync Functions
+
+### enableBackgroundSync
 
 ```typescript
 function enableBackgroundSync(options: BackgroundSyncOptions): Promise<void>;
+```
+
+Schedules WorkManager or BGTaskScheduler work. Throws `BACKGROUND_TASK_REGISTRATION_FAILED`, for example on an iOS simulator or with `com.gabriel-sisjr.syncprovider.background` missing from Info.plist.
+- The OS decides when a window runs. iOS does not launch a force-quit app for background work.
+- Each window runs one cycle.
+- With `foregroundOnly: true`, no OS background work is scheduled, and launch and boot recovery still run.
+
+### disableBackgroundSync
+
+```typescript
 function disableBackgroundSync(): Promise<void>;
+```
+
+Cancels the scheduled OS work, including the Android retry kick.
+
+### isBackgroundSyncEnabled
+
+```typescript
 function isBackgroundSyncEnabled(): Promise<boolean>;
 ```
 
-- `enableBackgroundSync` schedules BGTaskScheduler or WorkManager work. Throws BACKGROUND_TASK_REGISTRATION_FAILED, for example on an iOS simulator or with `com.gabriel-sisjr.syncprovider.background` missing from Info.plist.
-- The OS decides when a window runs. iOS does not launch a force-quit app for background work.
-- Each window runs one cycle.
-- `isBackgroundSyncEnabled` reports intent: it stays true with `foregroundOnly`.
+Reports intent, not OS state: it stays `true` with `foregroundOnly`.
 
-## Events
-
-```typescript
-function addSyncEventListener(callback: (event: SyncEvent) => void): Promise<string>;
-function removeSyncEventListener(subscriptionId: string): Promise<void>;
-const SYNC_EVENT_CHANNEL = 'sync-event';
-```
+## Event Listeners
 
 Events reach a running JS engine only.
 
-## Utilities
+### addSyncEventListener
 
 ```typescript
-function generateId(): string; // UUID v4, Math.random-backed
+function addSyncEventListener(callback: (event: SyncEvent) => void): Promise<string>;
+```
+
+Subscribes to the `sync-event` channel and returns a subscription id. The callback runs on the JS thread.
+
+### removeSyncEventListener
+
+```typescript
+function removeSyncEventListener(subscriptionId: string): Promise<void>;
+```
+
+Unsubscribes the listener with that id.
+
+### SYNC_EVENT_CHANNEL
+
+```typescript
+const SYNC_EVENT_CHANNEL = 'sync-event';
+```
+
+The channel name, for code that calls the Nitro `addListener(event, callback)` directly. Most code uses `addSyncEventListener`.
+
+## Utilities
+
+### generateId
+
+```typescript
+function generateId(): string;
+```
+
+A UUID v4 from `Math.random()`: not cryptographically secure, and not ordered by time. Use it for `Idempotency-Key` headers built before `enqueue`. Queue ids are native ULIDs, not these.
+
+### isNativeModuleAvailable
+
+```typescript
 function isNativeModuleAvailable(): boolean;
 ```
 
+`true` when the native module resolves. Always `false` in the web entry.
+
 ## React Hooks
 
+Every hook is safe to call before the native module loads: it returns its inert state and never throws on render. Its side-effecting actions, such as `enqueue` and `flush`, reject with `NATIVE_MODULE_UNAVAILABLE`.
+
+### useConnection
+
 ```typescript
-function useConnection(): {
-  status: ConnectionStatus;
-  type: ConnectionType;
-  isOnline: boolean;
-  isMetered: boolean;
-};
-
-function useSyncQueue(): {
-  size: number;
-  items: SyncItem[];
-  isLoading: boolean;
-  error: SyncError | null; // failed refresh only: methods reject
-  enqueue(input: SyncItemInput): Promise<string>;
-  enqueueBatch(inputs: SyncItemInput[]): Promise<string[]>;
-  removeItem(id: string): Promise<boolean>;
-  clearQueue(): Promise<void>;
-  refresh(): Promise<void>;
-};
-
-function useSyncStatus(): {
-  isSyncing: boolean;
-  isPaused: boolean;
-  progress: number | null; // SYNC_PROGRESS is iOS-only
-  lastResult: SyncResult | null;
-  error: SyncError | null;
-  flush(): Promise<SyncResult>;
-  pause(): Promise<void>;
-  resume(): Promise<void>;
-};
-
-function useOfflineQueue(): {
-  connection: UseConnectionResult;
-  size: number;
-  items: SyncItem[];
-  isSyncing: boolean;
-  isWaitingForConnection: boolean;
-  error: SyncError | null;
-  enqueue(input: SyncItemInput): Promise<string>;
-  flush(): Promise<SyncResult>;
-};
-
-function useSyncEvents(options: {
-  onEvent: (event: SyncEvent) => void;
-  types?: SyncEventType[];
-  enabled?: boolean; // default true
-}): void;
-
-function useSyncConfig(): {
-  config: SyncOptions | null;
-  isLoading: boolean;
-  error: SyncError | null;
-  setConfig(next: SyncOptions): Promise<void>; // updates the calling hook only
-  refresh(): Promise<void>;
-};
-
-function useAutoSync(options: {
-  enabled?: boolean;              // default false: the hook is inert until true
-  intervalMs?: number;            // default 60000; not positive falls back to it
-  flushOnReconnect?: boolean;     // default true
-  flushOnMetered?: boolean;       // default false; reconnect trigger only
-  flushOnAppForeground?: boolean; // default false
-  flushOnForeground?: boolean;    // reserved, ignored
-  backgroundSync?: BackgroundSyncOptions; // reserved, ignored
-}): void;
-
-function useSyncSnapshot(): UseSyncSnapshotResult;
-
-function useSyncContext(): {
-  config: SyncOptions | undefined;
-  hasProvider: boolean;
-};
+function useConnection(): UseConnectionResult;
 ```
 
-`useAutoSync`'s interval checks neither connectivity nor queue size: offline ticks can spend attempts. Gate `enabled` on `useConnection().isOnline` to stop ticking offline.
+Reads `getConnectionStatus()` on mount and again on every `CONNECTION_CHANGED`. The result object is kept when nothing visible changed, so such an event causes no re-render.
+
+Returns: `{ status, type, isOnline, isMetered, networkQuality }`. `isOnline` is `true` for `CONNECTED` and `METERED`. Before the first snapshot: `UNKNOWN`, `UNKNOWN`, `false`, `false`, `OFFLINE`.
+
+### useSyncQueue
+
+```typescript
+function useSyncQueue(): UseSyncQueueResult;
+```
+
+Returns: `{ size, items, isLoading, error, enqueue(), enqueueBatch(), removeItem(), clearQueue(), refresh() }`. `error` reports a failed refresh only: the actions reject. Refreshes on `ITEM_ENQUEUED`, `ITEM_REMOVED`, `QUEUE_CLEARED`, `SYNC_SUCCEEDED`, `SYNC_FAILED`, `ITEM_SUCCEEDED`, `ITEM_FAILED` and `ITEM_DEAD_LETTERED`.
+
+### useSyncStatus
+
+```typescript
+function useSyncStatus(): UseSyncStatusResult;
+```
+
+Returns: `{ isSyncing, isPaused, progress, lastResult, error, flush(), pause(), resume() }`. `isSyncing` and `isPaused` start `false` and follow events only, so a cycle or a pause already in force at mount is not reflected. `progress` follows `SYNC_PROGRESS`, which only iOS emits: on Android it stays `0` for the whole cycle. `error` reports a failed initial read: the actions reject.
+
+### useOfflineQueue
+
+```typescript
+function useOfflineQueue(): UseOfflineQueueResult;
+```
+
+Returns: `{ connection, size, items, isSyncing, isWaitingForConnection, error, enqueue(), flush() }`. `isWaitingForConnection` is `true` when items are pending and the device is offline. `flush()` runs whatever the strategy.
+
+### useSyncEvents
+
+```typescript
+function useSyncEvents(options: UseSyncEventsOptions): void;
+```
+
+Options: `{ onEvent, types?, enabled? }`. `enabled` defaults to `true`. `onEvent` and `types` are read through refs, so they need no memoizing: the subscription is created once per mount, and again only when `enabled` changes.
+
+### useSyncConfig
+
+```typescript
+function useSyncConfig(): UseSyncConfigResult;
+```
+
+Returns: `{ config, isLoading, error, setConfig(), refresh() }`. Under a `SyncProvider` it mirrors the Provider's config. Without one, it reads `getSyncConfig()` and reads again on `RESUMED`. `setConfig` calls `configureSync` and reads the config back, and only the calling hook updates. It replaces the whole configuration, so set `defaultHeaders` explicitly instead of copying them from `config`.
+
+### useAutoSync
+
+```typescript
+function useAutoSync(options: UseAutoSyncExtraOptions): void;
+```
+
+Options:
+- `enabled?: boolean` — Default `false`: the hook is inert until `true`.
+- `intervalMs?: number` — Default `60000`. A value that is not positive falls back to it.
+- `flushOnReconnect?: boolean` — Default `true`.
+- `flushOnMetered?: boolean` — Default `false`. Gates the reconnect trigger only.
+- `flushOnAppForeground?: boolean` — Default `false`.
+- `flushOnForeground?: boolean` — Reserved, ignored.
+- `backgroundSync?: BackgroundSyncOptions` — Reserved, ignored.
+
+The interval tick and the foreground trigger read the connection status first and do nothing while it is `DISCONNECTED`, or when the read fails. `UNKNOWN` and `METERED` still flush. Neither checks the queue size, so on an empty queue a flush records a 0/0 result. The reconnect trigger flushes only when the status changes to `CONNECTED`, or to `METERED` with `flushOnMetered`. Every flush the hook starts is a `flush()` call and runs its checks. The hook never reads the strategy, so it keeps flushing under `MANUAL`: pass `enabled: false` to stop it.
+
+### useSyncSnapshot
+
+```typescript
+function useSyncSnapshot(): UseSyncSnapshotResult;
+```
+
+Read-only, with no actions, driven by one event subscription.
+
+Returns: `{ connection, size, items, isSyncing, isPaused, progress, lastResult, isWaitingForConnection, error, networkQuality?, deadLetter? }`. `networkQuality` is read with the connection, on mount and on every `CONNECTION_CHANGED`. `deadLetter` is read with `listDeadLetter()` on mount and on `ITEM_DEAD_LETTERED`, `ITEM_REMOVED`, `ITEM_ENQUEUED` and `QUEUE_CLEARED`. Both are `undefined` until their first read succeeds. `lastResult` comes from the persisted history, so it can predate the current session.
+
+### useSyncContext
+
+```typescript
+function useSyncContext(): SyncProviderContextValue;
+```
+
+Returns: `{ config, hasProvider }`. Outside a Provider: `{ config: undefined, hasProvider: false }`. Under one, `config` is `undefined` until the Provider's first read finishes. It never throws.
 
 ## Context
+
+### SyncProvider
 
 ```tsx
 <SyncProvider options={syncOptions} backgroundSync={backgroundOptions}>
@@ -306,7 +520,18 @@ function useSyncContext(): {
 
 Optional. It calls `configureSync(options)` on mount and on every change to `options`, reads the native config even if that rejects, and calls `enableBackgroundSync` when `backgroundSync` is passed, with a matching `disableBackgroundSync` on unmount. Keep `options` stable. Every hook works without it.
 
+Props: `{ options: SyncOptions; backgroundSync?: BackgroundSyncOptions; children: React.ReactNode }`. If `configureSync` rejects, the Provider still reads the config, but skips `enableBackgroundSync` and its `RESUMED` subscription. The context's `config` is read again on `RESUMED`, and does not follow `configureSync` calls made elsewhere.
+
+### SyncProviderContext
+
+```typescript
+const SyncProviderContext: React.Context<SyncProviderContextValue>;
+// default value: { config: undefined, hasProvider: false }
+```
+
 ## Types
+
+### SyncItemInput
 
 ```typescript
 interface SyncItemInput {
@@ -318,7 +543,11 @@ interface SyncItemInput {
   priority?: SyncPriority;           // default NORMAL
   metadata?: Record<string, string>; // not sent, not echoed on events
 }
+```
 
+### SyncItem
+
+```typescript
 interface SyncItem {
   id: string;           // native ULID; not sent with the request
   method: HttpMethod;
@@ -328,69 +557,147 @@ interface SyncItem {
   contentType?: string;
   priority?: SyncPriority;
   createdAt: number;
-  attempts: number;     // 0 = never tried
-  nextRetryAt: number;  // 0 = never attempted; eligible when <= now
+  attempts: number;     // attempts recorded; 0 does not mean never tried
+  nextRetryAt: number;  // 0 = eligible now; eligible when <= now
   metadata?: Record<string, string>;
 }
+```
 
+Android records an attempt with its outcome, iOS when the dispatch starts. A credential hold spends none, so a held item can show `attempts: 0` with `nextRetryAt > 0`.
+
+### SyncDeadLetterItem
+
+```typescript
+interface SyncDeadLetterItem {
+  id: string;                        // the queued item's id; a replay keeps it
+  method: HttpMethod;
+  url: string;
+  headers?: Record<string, string>;
+  body?: string;
+  contentType?: string;
+  priority?: SyncPriority;
+  createdAt: number;                 // from the original enqueue; a replay keeps it
+  metadata?: Record<string, string>;
+  attempts: number;                  // recorded before it was dead-lettered
+  lastAttemptAt: number;             // never 0
+  lastErrorCode: SyncErrorCode;      // the real failure code; never DEAD_LETTERED
+  lastErrorMessage?: string;         // at most 1024 characters
+  deadLetteredAt: number;            // listDeadLetter() sorts by it
+}
+```
+
+After a retriable failure with no attempts left, `lastErrorCode` is `MAX_ATTEMPTS_EXCEEDED`, and so is a stored code that is empty or unknown to this version.
+
+`lastErrorMessage` never holds request or response headers or bodies, but it can hold the URL or host, so log it as carefully as the URL. After an HTTP response it reads `HTTP` and the status code: iOS adds the system's reason phrase (`HTTP 404 Not Found`), Android the server's, which HTTP/2 does not carry (`HTTP 404`). Branch on the code, not on this text. Items moved here by the upgrade have no `lastErrorMessage`.
+
+### SyncOptions
+
+```typescript
 interface SyncOptions {
   strategy: SyncStrategy;
   retryPolicy: RetryPolicy;
   batchSize?: number;                      // default 25
-  requestTimeoutMs?: number;               // default 30000
+  requestTimeoutMs?: number;               // default 30000; Android floor 1 s
   maxQueueSize?: number;                   // default 10000; below 1 means 1
   persistQueue?: boolean;                  // stored, not used
   defaultHeaders?: Record<string, string>; // encrypted at rest
+  minNetworkQuality?: NetworkQuality;      // unset: no quality gate
+  healthCheckUrl?: string;                 // unset: no health check, no measurement
+  healthCheckTtlMs?: number;               // default 60000; 0 checks before every cycle
+  healthCheckBackoffMs?: number;           // default 30000
 }
+```
 
+- `maxQueueSize`: new enqueues and `replayDeadLetter()` are rejected once it is reached. iOS counts the `PENDING` items, Android the `PENDING` and in-flight ones. Dead letters count on neither platform.
+- `minNetworkQuality`: compared with the current `networkQuality` before any cycle, after the pause and stored-credentials checks and before the health check. Below it no cycle runs, and the flush emits `SYNC_FAILED` with `NETWORK_QUALITY_TOO_LOW`. `POOR` blocks only `OFFLINE`, and `OFFLINE` lets every flush through. Without `healthCheckUrl` the level never reaches `EXCELLENT`, so `EXCELLENT` then blocks every flush. The Android retry kick and periodic worker and the iOS background tasks reach the gate inside their flush: a blocked run emits `SYNC_FAILED` and completes normally.
+- `healthCheckUrl`: before a cycle claims its first item, the engine sends one `HEAD` to it, with a 2 s timeout, unless it gave a healthy result younger than `healthCheckTtlMs`. A final `2xx`, after redirects, is healthy. Any other status, a transport error or a timeout is not. The request carries neither `defaultHeaders` nor item headers and sends `Cache-Control: no-cache`, so point it at an endpoint that answers without authentication. The same URL is the only target of the network-quality measurement, and the two share one cache: a `2xx` answer to a measurement also counts as a healthy check.
+- After a failed check the cycle is skipped with `SYNC_FAILED` and `HEALTH_CHECK_FAILED`, and a backoff of `healthCheckBackoffMs` starts, counted from the end of the failed request. Every flush during it is skipped the same way, without a request. Automatic retries never come back sooner than 1 s after a failed check, even with a backoff of `0`; a `flush()` call is not held to that floor. Every `configureSync` call ends the backoff.
+- The four network-quality and health-check options are persisted for background workers, and `getSyncConfig()` returns them only when they were set. The TTL and the backoff are ignored without `healthCheckUrl`.
+
+### RetryPolicy
+
+```typescript
 interface RetryPolicy {
-  maxAttempts: number;          // the first attempt counts as one
+  maxAttempts: number;          // the first attempt counts as one; below 1 means 1
   backoff: BackoffStrategy;
   baseDelayMs: number;
   maxDelayMs: number;
   jitter: boolean;              // factor in [0.75, 1.25)
   retryOnStatusCodes: number[]; // 401 and 403 stay permanent even if listed
 }
+```
 
+Transport failures and timeouts are retried whatever `retryOnStatusCodes` says. On Android, a call that fails with an error other than an I/O error is also reported as `NETWORK_ERROR`, but is not retried. A status that is not listed is a permanent failure. An item whose attempts already reach `maxAttempts` when a cycle takes it, for example because the limit was lowered, is dead-lettered without a request: `ITEM_FAILED` with `MAX_ATTEMPTS_EXCEEDED`, then `ITEM_DEAD_LETTERED`.
+
+### SyncResult
+
+```typescript
 interface SyncResult {
-  startedAt: number;
-  finishedAt: number;
+  startedAt: number;              // 0 on Android when flush() ran no cycle
+  finishedAt: number;             // 0 on Android when flush() ran no cycle
   successCount: number;
-  failureCount: number;           // permanent failures only
+  failureCount: number;           // permanent failures, now dead letters
   succeededIds: string[];         // always empty on iOS
   failedIds: string[];            // always empty on iOS
   errors: Record<string, string>; // "<CODE>: <detail>"; always empty on iOS
 }
+```
 
+A `flush()` that runs no cycle (paused, unreadable stored headers, the quality gate, the health check) resolves 0/0 and writes no history row. Android sets both timestamps to `0`. iOS sets both to the time the check stopped the flush, so only the missing `SYNC_STARTED` and history row tell it from an empty cycle. `failureCount` also counts an item removed or cleared while its request was in flight, which is not dead-lettered.
+
+### DrainOptions / DrainResult
+
+```typescript
 interface DrainOptions {
   maxIterations?: number;        // default 32; counts real flushes
   timeoutMs?: number;            // default 60000; hard deadline
-  delayBetweenCyclesMs?: number;
+  delayBetweenCyclesMs?: number; // minimum pause between cycles
 }
+
+type DrainStoppedReason = 'EMPTY' | 'MAX_ITERATIONS' | 'TIMEOUT' | 'CANCELLED';
 
 interface DrainResult {
   iterations: number;
   itemsDispatched: number;       // best effort; not a success count
   queueRemaining: number;
-  stoppedReason: 'EMPTY' | 'MAX_ITERATIONS' | 'TIMEOUT' | 'CANCELLED';
+  stoppedReason: DrainStoppedReason;
 }
+```
 
+A non-finite option falls back to its default. A cycle that makes no progress with nothing cooling waits at least 250 ms, so the loop cannot spin. `itemsDispatched` also counts items that were dead-lettered or removed during the drain.
+
+### BackgroundSyncOptions
+
+```typescript
 interface BackgroundSyncOptions {
-  minimumIntervalMs: number;          // Android floor 15 min; iOS soft hint
+  minimumIntervalMs: number;          // Android floor 15 min; iOS refresh task's earliest begin only, floor 60 s
   requiresCharging?: boolean;         // iOS: processing task only
   requiresUnmeteredNetwork?: boolean; // Android only
-  requiresDeviceIdle?: boolean;       // Android only
-  foregroundOnly?: boolean;           // schedule no OS background work
+  requiresDeviceIdle?: boolean;       // leave unset: true makes enableBackgroundSync() reject on Android; iOS ignores it
+  foregroundOnly?: boolean;           // schedule no OS background work; default false
   taskIdentifier?: string;            // stored, not used
 }
+```
 
+With `foregroundOnly: true`, sync progresses only while the app is alive: through `flush()`, `drainUntilEmpty()`, `useAutoSync` and the in-process retry timer. Launch and boot recovery still run. Both platforms use fixed task identifiers, whatever `taskIdentifier` says.
+
+### ConnectionState
+
+```typescript
 interface ConnectionState {
   status: ConnectionStatus;
   type: ConnectionType;
-  isInternetReachable?: boolean;
+  networkQuality: NetworkQuality; // always present; OFFLINE exactly when DISCONNECTED or UNKNOWN
+  isInternetReachable?: boolean;  // Android: NET_CAPABILITY_VALIDATED
   isExpensive?: boolean;
 }
+```
 
+On Android the snapshot follows the default network only: losing a secondary network changes nothing, and a VPN that was the default network hands over without a disconnect. On Android 11 (API 30) and later, a temporarily unmetered link reads as `CONNECTED` with `isExpensive: false`.
+
+### SyncEvent
+
+```typescript
 interface SyncEvent {
   type: SyncEventType;
   timestamp: number;
@@ -398,11 +705,17 @@ interface SyncEvent {
   progress?: number;
   errorCode?: SyncErrorCode;
   statusCode?: number;
-  attempt?: number;
+  attempt?: number;                  // 1-based
   connectionStatus?: ConnectionStatus;
-  metadata?: Record<string, string>; // iOS diagnostics, not the item's metadata
+  metadata?: Record<string, string>; // engine diagnostics, not the item's metadata
 }
+```
 
+The fields each type sets are listed under `SyncEventType`. `metadata.lastErrorCode` is set on `ITEM_DEAD_LETTERED` on both platforms. iOS also sets diagnostics on cycle-level events and on the `BACKGROUND_SYNC_*` events.
+
+### SyncError / ValidationIssue
+
+```typescript
 class SyncError extends Error {
   readonly code: SyncErrorCode;
   readonly cause?: unknown;
@@ -410,75 +723,110 @@ class SyncError extends Error {
 }
 
 type ValidationIssue = {
-  field: string;
+  field: string;      // e.g. "url", "headers.Authorization", "healthCheckUrl"
   reason: string;
-  value?: unknown; // only for method, priority and contentType
-  itemIndex?: number;
+  value?: unknown;    // only for method, priority, contentType, minNetworkQuality, healthCheckTtlMs and healthCheckBackoffMs
+  itemIndex?: number; // enqueueBatch only
 };
 ```
 
 ## Enums
 
 ### SyncStrategy
-- `AUTOMATIC` — The engine retries on its own, and dispatches pending items on `resumeSync()`.
-- `MANUAL` — The engine schedules nothing on its own: no retry timer, no Android retry kick. Background windows still run if you called `enableBackgroundSync`.
+- `AUTOMATIC` — The engine retries on its own, and dispatches pending items on `resumeSync()`. Those wakes also wait for `minNetworkQuality` and for a running health-check backoff.
+- `MANUAL` — The engine schedules nothing on its own: no retry timer, no Android retry kick. Background windows still run if you called `enableBackgroundSync`, and `useAutoSync` keeps flushing while it is enabled.
 - `OPPORTUNISTIC` — Reserved. Behaves like `AUTOMATIC`.
 
 ### SyncPriority
-`HIGH`, `NORMAL`, `LOW`.
+`HIGH`, `NORMAL`, `LOW`. Higher priority is dispatched first within a cycle. `NORMAL` is the default.
 
 ### BackoffStrategy
 - `LINEAR` — `delay = baseDelayMs * attempt`.
 - `EXPONENTIAL` — `delay = baseDelayMs * 2^(attempt-1)`.
 - `FIBONACCI` — `delay = baseDelayMs * fib(attempt)`.
 
-All capped at `maxDelayMs`.
+All capped at `maxDelayMs`. Use a positive `maxDelayMs` of at least `baseDelayMs`: iOS treats `0` or less as no cap, and Android never caps below `baseDelayMs`.
+
+### HttpMethod
+`GET`, `POST`, `PUT`, `PATCH`, `DELETE`. Android drops a body on `GET` and `DELETE`.
+
+### NetworkQuality
+- `OFFLINE` — No link, or one the OS has not reported yet: the status is `DISCONNECTED` or `UNKNOWN`. The only level `minNetworkQuality: POOR` blocks.
+- `POOR` — A median of 1000 ms or more, two or more failed probes, or an Android link without `NET_CAPABILITY_VALIDATED`.
+- `MODERATE` — A median of 500–999 ms, a metered link with no measurement, or a faster link held back by iOS Low Data Mode.
+- `GOOD` — A median of 200–499 ms, or an unmetered link with no measurement. The highest level a metered or expensive link reaches.
+- `EXCELLENT` — A median under 200 ms on a link no cap lowers. Only reported with `healthCheckUrl` set.
+
+Ordered worst to best, and `Object.values(NetworkQuality)` lists the levels in that order: compare two levels by their index in it, never as strings. Both platforms classify with the same table. Only with `healthCheckUrl` set is the link measured: three back-to-back `HEAD` requests to that URL, 2 s timeout each, a failure or a timeout counting as infinitely slow, and any HTTP status counting as a latency sample. Caps apply last, the lowest one winning: an Android link without `NET_CAPABILITY_VALIDATED` at most `POOR`, a metered (Android) or expensive (iOS) link at most `GOOD`, iOS Low Data Mode at most `MODERATE`.
+
+A measurement starts 1 s after a network change, and when the URL changes. It belongs to the network it was taken on: if the same network comes back while the measurement is less than 30 s old, it is reused. When the `minNetworkQuality` gate reads a measurement 30 s old or older, it decides on that level and starts one new measurement in the background: at once on iOS, 1 s later on Android. Without a gate, flushes and retry wakes never measure. Nothing is sent while the device is offline, and the requests carry neither `defaultHeaders` nor item headers.
 
 ### SyncEventType
-- `ITEM_ENQUEUED`, `ITEM_REMOVED` (from `removeItem` only).
-- `SYNC_STARTED`, `SYNC_PROGRESS` (iOS only).
-- `SYNC_SUCCEEDED` — No permanent failure, including 0/0 cycles.
-- `SYNC_FAILED` — A permanent failure, or the cycle died. `errorCode` is set only when it died.
-- `ITEM_SUCCEEDED`, `ITEM_FAILED`, `ITEM_RETRYING`.
-- `QUEUE_CLEARED`, `CONNECTION_CHANGED`, `PAUSED`, `RESUMED`.
-- `BACKGROUND_SYNC_STARTED`, `BACKGROUND_SYNC_COMPLETED`.
+16 types:
+- `ITEM_ENQUEUED` — An item was accepted, by `enqueue()`, `enqueueBatch()` or `replayDeadLetter()`. `itemId` is set.
+- `ITEM_REMOVED` — A row was deleted by `removeItem()`, a queued item or a dead letter, or by `discardDeadLetter()`. `itemId` is set. Not emitted when no row had that id.
+- `SYNC_STARTED` — A cycle began. A skipped cycle has none.
+- `SYNC_PROGRESS` — `progress` in `[0, 1]`. iOS only.
+- `SYNC_SUCCEEDED` — The cycle finished with no permanent failure, including a 0/0 cycle and one whose items all went back to wait for a retry.
+- `SYNC_FAILED` — The cycle finished with a permanent failure or died, or a check at the start of the flush skipped it. `errorCode` is set only when the cycle died, or to `NETWORK_QUALITY_TOO_LOW` or `HEALTH_CHECK_FAILED` for a skip.
+- `ITEM_SUCCEEDED` — `itemId`, `statusCode` and `attempt` are set.
+- `ITEM_FAILED` — A permanent failure: `itemId`, `errorCode` and `attempt`, plus `statusCode` when applicable. `ITEM_DEAD_LETTERED` follows, unless the item was removed or cleared while its request was in flight.
+- `ITEM_RETRYING` — The item went back to wait for a retry: `itemId`, `attempt` and `errorCode`, plus `statusCode` when applicable.
+- `QUEUE_CLEARED` — Once per `clearQueue()` call, dead letters included.
+- `CONNECTION_CHANGED` — A `ConnectionState` field changed, `networkQuality` alone included. `connectionStatus` is set. Never emitted for the state the engine starts with: iOS starts from `UNKNOWN`, so its first network report emits one.
+- `PAUSED` — From `pauseSync()`.
+- `RESUMED` — From `resumeSync()`. iOS also emits it at launch when recovery put interrupted items back.
+- `BACKGROUND_SYNC_STARTED` — An OS window started: a BGTask on iOS, the periodic worker on Android. The Android retry kick emits neither background event.
+- `BACKGROUND_SYNC_COMPLETED` — The same window finished. iOS emits it whether the window's flush succeeded or failed, with `metadata.ok` set to `"false"` on a failure. Android emits it only after the flush returns, so a worker whose flush throws emits none.
+- `ITEM_DEAD_LETTERED` — A permanently failed item moved to the dead-letter queue, right after its `ITEM_FAILED`. `itemId` is set, `errorCode` is `DEAD_LETTERED`, and `metadata.lastErrorCode` holds the real failure code. `statusCode` and `attempt` are not set. Android dispatches a batch concurrently, so pair it with its `ITEM_FAILED` by `itemId`.
 
 ### ConnectionStatus
-`CONNECTED`, `DISCONNECTED`, `METERED`, `UNKNOWN`.
+`CONNECTED`, `DISCONNECTED`, `METERED`, `UNKNOWN`. `useConnection().isOnline` treats `CONNECTED` and `METERED` as online.
 
 ### ConnectionType
-`WIFI`, `CELLULAR`, `ETHERNET`, `BLUETOOTH`, `VPN`, `OTHER`, `NONE`, `UNKNOWN`.
+`WIFI`, `CELLULAR`, `ETHERNET`, `BLUETOOTH`, `VPN`, `OTHER`, `NONE`, `UNKNOWN`. `BLUETOOTH` and `VPN` are Android only: iOS reports `WIFI`, `CELLULAR`, `ETHERNET`, `OTHER`, `NONE` or `UNKNOWN`.
 
 ### SyncErrorCode
-- `NETWORK_ERROR` — Transport failure, on item events. Also what `flush` rejects with when its cycle dies.
-- `SERVER_ERROR` — A response outside 2xx, other than 401/403, on item events.
-- `TIMEOUT` — `requestTimeoutMs` exceeded, on item events.
-- `UNAUTHORIZED` — 401 or 403, on item events.
-- `MAX_ATTEMPTS_EXCEEDED` — A retriable failure with no attempts left, on ITEM_FAILED.
+15 codes:
+- `NETWORK_ERROR` — Transport failure, on item events. Retried while attempts remain, except on Android for a call that fails with an error other than an I/O error. Also what `flush` rejects with when its cycle dies.
+- `SERVER_ERROR` — A response outside 2xx, other than 401/403, on item events. Retried when listed in `retryOnStatusCodes`.
+- `TIMEOUT` — A request timed out, on item events. Always retried. iOS reports `requestTimeoutMs` running out as `TIMEOUT`. Android reports it as `NETWORK_ERROR`, and `TIMEOUT` only when a socket timeout fires first: connecting takes over 10 s, or a read or write stalls 30 s.
+- `UNAUTHORIZED` — 401 or 403, on item events. The item becomes a dead letter, except in a process running on stored `defaultHeaders`.
+- `MAX_ATTEMPTS_EXCEEDED` — A retriable failure with no attempts left, on `ITEM_FAILED`. Also the `lastErrorCode` of a dead letter whose stored code is empty or unknown.
 - `INVALID_PAYLOAD` — Validation failure with `validationErrors`, or a native rejection without them in most functions.
-- `INVALID_URL` — From `enqueue`. `enqueueBatch` reports it under INVALID_PAYLOAD.
-- `QUEUE_FULL` — Raised by native, but reaches JS as INVALID_PAYLOAD for now.
+- `INVALID_URL` — From `enqueue`, and from `configureSync` for `healthCheckUrl`. `enqueueBatch` reports it under `INVALID_PAYLOAD`.
+- `QUEUE_FULL` — Raised by native, but reaches JS as `INVALID_PAYLOAD` for now, from `enqueue`, `enqueueBatch` and `replayDeadLetter`.
 - `DUPLICATE_ITEM` — Reserved. Neither platform raises it.
 - `BACKGROUND_TASK_REGISTRATION_FAILED` — From the background functions.
 - `NATIVE_MODULE_UNAVAILABLE` — Web, SSR, or the native module is not linked.
 - `DRAIN_ALREADY_ACTIVE` — A drain is already running or settling.
+- `NETWORK_QUALITY_TOO_LOW` — A cycle skipped below `minNetworkQuality`, on `SYNC_FAILED`.
+- `HEALTH_CHECK_FAILED` — A cycle skipped by a failed health check or during its backoff, on `SYNC_FAILED`.
+- `DEAD_LETTERED` — On `ITEM_DEAD_LETTERED`. Never a dead letter's `lastErrorCode`.
 
 ## Credentials in a process with no JS
 
 - `defaultHeaders` are encrypted at rest: Android Keystore AES-256-GCM, iOS Keychain (`AfterFirstUnlockThisDeviceOnly`).
-- On a 401 or 403 in a process that has not called `configureSync`, the item stays PENDING, no attempt is spent, the next try waits at least 60 seconds, and the cycle stops.
+- On a 401 or 403 to a request sent with `defaultHeaders` restored from storage, in a process that has not called `configureSync`, the item stays `PENDING`, no attempt is spent, the next try waits at least 60 seconds, and the cycle stops. The hold lives in memory, so a process restart drops it. The periodic worker and the iOS BGTasks do not wait for it, so a window that opens during one can spend one request.
+- Otherwise a 401 or 403 fails the item with `UNAUTHORIZED`, and it becomes a dead letter: once `configureSync` has run in the process, or when no `defaultHeaders` were stored.
 - If stored headers cannot be read, nothing is dispatched and items wait. `configureSync` ends the wait. While they are unreadable, `getSyncConfig()` returns none, so re-applying it deletes them.
 
 ## Platform Support
 
-| Feature               | iOS                                      | Android                                        |
-|-----------------------|------------------------------------------|------------------------------------------------|
-| Persistence           | Core Data                                | Room                                           |
-| Background sync       | BGTaskScheduler (refresh + processing)   | WorkManager (periodic + opt-in retry kick)     |
-| Dispatcher            | URLSession (foreground + background)     | OkHttp + Coroutines                            |
-| Batch dispatch        | One item at a time                       | Concurrent                                     |
-| Connectivity          | NWPathMonitor                            | ConnectivityManager + NetworkCallback          |
-| Recovery              | RecoveryManager, on every engine start   | RecoveryWorker, on JS attach, boot, app update |
-| Persisted config      | UserDefaults + Keychain                  | SharedPreferences + Android Keystore           |
-| Privacy Manifest      | Shipped (PrivacyInfo.xcprivacy)          | n/a                                            |
-| Min OS                | iOS 15                                   | Android 7.0 (API 24)                           |
+| Feature | Android | iOS |
+|---------|---------|-----|
+| Persistence | Room (SQLite), `syncprovider.db` | Core Data (SQLite), `SyncProvider.sqlite` |
+| HTTP dispatch | OkHttp, one shared client | `URLSession`: a foreground session, and a background session while the app is not active |
+| Items in one cycle | Sent concurrently, except that with `defaultHeaders` restored from disk the first item goes alone | Sent one at a time |
+| Background scheduling | WorkManager periodic work, plus an opt-in retry kick | `BGTaskScheduler` app-refresh and processing tasks |
+| Recovery of interrupted items | `RecoveryWorker`, on boot, on app update and each time a JS engine attaches | `RecoveryManager`, once per process, when the engine starts |
+| Connectivity | `ConnectivityManager` default-network callback | `NWPathMonitor` |
+| `ConnectionType` values | Every value, `BLUETOOTH` and `VPN` included | Never `BLUETOOTH` or `VPN` |
+| `SyncResult.succeededIds`, `failedIds`, `errors` | Filled | Always empty |
+| `SYNC_PROGRESS` | Never emitted | Emitted once per batch item, before that item's `ITEM_*` event |
+| Persisted configuration | SharedPreferences; `defaultHeaders` encrypted under an Android Keystore key | UserDefaults suite; `defaultHeaders` in the Keychain |
+| Host-app setup | None: the permissions and the boot receiver merge from the library manifest | Background Modes, two `Info.plist` identifiers and one `AppDelegate` call |
+| Privacy manifest | Not applicable | Shipped in the pod's `SyncProvider_Privacy` bundle |
+| Minimum OS | Android 7.0 (API 24) | iOS 15.0 |
+
+See https://gabriel-sisjr.github.io/react-native-sync-provider/docs/production/platform-comparison for every difference.

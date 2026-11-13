@@ -58,6 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documented that `removeItem` removes an item in any status, including one that failed permanently, and does not cancel a request already in flight.
 - Removed the sketched signature of the JS-side retry override. It is planned for a later release, with no committed shape.
 - Corrected earlier entries in this file: `foregroundOnly` still lets Android schedule its recovery job, the Android jitter range is `[0.75, 1.25)`, no stable 0.1.0 or 0.1.1 was published, and the `yarn test:ios` script never existed.
+- Aligned the documentation with the conventions of react-native-background-location. The README is now a landing page, and the sections it dropped live on the site. Callouts are blockquotes, and mermaid diagrams render and are validated during the docs build. New pages: a migration guide per version (v0.2.0 and v0.3.0), Platform Comparison, Crash Recovery, Battery Optimization, CI/CD Pipeline and Publishing. Troubleshooting gains an FAQ. Statements that contradicted the code were corrected.
 
 ## [0.2.0] - 2026-11-03
 
