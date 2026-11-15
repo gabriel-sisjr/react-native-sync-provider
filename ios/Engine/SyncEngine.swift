@@ -215,8 +215,12 @@ final class SyncEngine: @unchecked Sendable {
         qualityMonitor.onChange = { [weak self] state in
             self?.networkChanged(state)
         }
-        connectivity.start()
+        // The quality monitor subscribes first, so it starts from `UNKNOWN`
+        // and the system's first path report reaches it as a change: started
+        // second, a report that landed in between would be replayed as its
+        // first state, which is never reported.
         qualityMonitor.start()
+        connectivity.start()
         let startLink = qualityMonitor.current.link
         lock.withLock { lastLink = startLink }
 
