@@ -75,8 +75,9 @@ final class SyncEngine: @unchecked Sendable {
     private var options: SyncOptionsSnapshot
     private var source: ConfigSource
     /// A timer fired while the network could not take a flush: offline, or
-    /// below `minNetworkQuality`. Flushing offline would spend attempts on
-    /// items that are fine, and below the minimum the gate would refuse it.
+    /// below `minNetworkQuality`. Flushing offline would claim an item, its
+    /// attempt spent, and wait with it for the network, since both sessions
+    /// wait for connectivity; below the minimum the gate would refuse it.
     /// The wake waits here and runs once the network is online and, with a
     /// minimum set, graded at or above it.
     private var wakeAwaitingConnectivity = false
@@ -449,11 +450,12 @@ final class SyncEngine: @unchecked Sendable {
 
     /// Runs on timer expiry, where no JS caller exists to receive an error.
     ///
-    /// A wake the network cannot take is remembered, not run: offline (neither
-    /// the dispatcher nor the session checks connectivity, so a flush now
-    /// would exhaust valid items against a dead network), or below
-    /// `minNetworkQuality`. Like an offline wake, a gated one emits nothing;
-    /// it runs once the network can take it.
+    /// A wake the network cannot take is remembered, not run: offline (with
+    /// no quality gate the dispatcher does not check connectivity, and both
+    /// sessions wait for it, so a flush now would wait for the network with
+    /// its first item claimed, its attempt spent, and its cycle running), or
+    /// below `minNetworkQuality`. Like an offline wake, a gated one emits
+    /// nothing; it runs once the network can take it.
     private func retryWakeFired() async {
         guard lock.withLock({ attachedHybrids > 0 && !isShutDown }) else { return }
         guard await !dispatcher.paused() else { return }
