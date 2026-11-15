@@ -457,6 +457,26 @@ final class SyncItemDao {
         }
     }
 
+    /// Undoes ``markInFlight(id:)`` for an item whose request got no answer
+    /// because its cycle was cancelled, a BGTask expiring say: back to
+    /// `PENDING`, with the attempt count and time from before the claim, and
+    /// its cooldown untouched. A cancellation says nothing about the item, so
+    /// it must not spend the retry budget. A row that is gone, or no longer
+    /// `IN_FLIGHT`, is left alone.
+    ///
+    /// - Parameters:
+    ///   - attempts: the value from before the claim.
+    ///   - lastAttemptAt: the value from before the claim, `0` for none.
+    func releaseClaim(id: String, attempts: Int32, lastAttemptAt: Int64) async throws {
+        try await stack.performSerializedTask { context in
+            guard let entity = try Self.fetchEntity(id: id, in: context),
+                  entity.status == SyncItemStatus.inFlight.rawValue else { return }
+            entity.status = SyncItemStatus.pending.rawValue
+            entity.attempts = attempts
+            entity.lastAttemptAt = lastAttemptAt
+        }
+    }
+
     /// Reset every IN_FLIGHT item back to PENDING. Used by ``RecoveryManager``
     /// on app launch to requeue items orphaned by a crash / force-quit.
     ///

@@ -51,12 +51,12 @@ final class BackgroundTaskRegistrar: @unchecked Sendable {
 
         if permitted.contains(kBackgroundRefreshIdentifier) {
             scheduler.registerHandler(forTaskWithIdentifier: kBackgroundRefreshIdentifier) { task in
-                resolveManager().handleAppRefresh(task: task)
+                _ = resolveManager().handleAppRefresh(task: task)
             }
         }
         if permitted.contains(kBackgroundProcessingIdentifier) {
             scheduler.registerHandler(forTaskWithIdentifier: kBackgroundProcessingIdentifier) { task in
-                resolveManager().handleProcessing(task: task)
+                _ = resolveManager().handleProcessing(task: task)
             }
         }
         SyncLogger.info("Registered BGTask handlers for \(permitted.count) declared identifiers",

@@ -320,13 +320,23 @@ actor SyncDispatcher {
     /// `SYNC_STARTED` before it, no history row and no item touched. A cycle
     /// already running is joined rather than gated, so its listeners never see
     /// a `SYNC_FAILED` in the middle of it.
+    ///
+    /// A cancelled caller, a BGTask whose time expired, gets `CancellationError`.
+    /// Cancelled before its cycle starts, the flush emits nothing. Cancelled
+    /// during it, the cycle claims no further item, the request in flight is
+    /// cancelled and its item goes back to `PENDING` with the attempt its
+    /// claim spent refunded, and `SYNC_FAILED` ends the cycle without
+    /// `errorCode` or `metadata`: nothing failed, and no history row is kept.
+    /// A response that arrived before the cancellation is recorded as usual.
     func flushOutcome() async throws -> FlushOutcome {
+        try Task.checkCancellation()
         if let early = exitBeforeCycle() {
             return early
         }
         // Only suspends while the path is still unknown, and during that wait
         // a pause, a configuration or another flush can land.
         let blockingQuality = await networkQualityBlock()
+        try Task.checkCancellation()
         if let early = exitBeforeCycle() {
             return early
         }
@@ -338,6 +348,7 @@ actor SyncDispatcher {
         }
         // Suspends for the HEAD, if one is sent.
         let unhealthy = await healthCheckFails()
+        try Task.checkCancellation()
         if let early = exitBeforeCycle() {
             return early
         }
@@ -358,9 +369,14 @@ actor SyncDispatcher {
             return .ran(result)
         } catch {
             // Listeners track a cycle from SYNC_STARTED to its terminal event,
-            // so a cycle that dies must still end with one.
-            emitter.emit(.now(type: "SYNC_FAILED",
-                              errorCode: wrapAsSyncProviderError(error).code.stringValue))
+            // so a cycle that dies must still end with one. A cancelled cycle
+            // failed nothing, so its event carries no code.
+            if error is CancellationError {
+                emitter.emit(.now(type: "SYNC_FAILED"))
+            } else {
+                emitter.emit(.now(type: "SYNC_FAILED",
+                                  errorCode: wrapAsSyncProviderError(error).code.stringValue))
+            }
             await finishCycle()
             throw error
         }
@@ -450,6 +466,9 @@ actor SyncDispatcher {
         let total = pending.count
 
         dispatchLoop: for (index, item) in pending.enumerated() {
+            // A cancelled cycle claims nothing more: the BGTask it runs for
+            // has run out of time.
+            try Task.checkCancellation()
             if isPaused { break }
 
             // A budget spent before this cycle, by a `maxAttempts` lowered
@@ -480,7 +499,16 @@ actor SyncDispatcher {
             // `configureSync` can land while the request is out. Its answer is
             // about the credential it carried, not the one configured since.
             let sentWith = config
-            let outcome = await dispatchOne(item: item)
+            guard let outcome = await dispatchOne(item: item) else {
+                // Cancelled before an answer came: there is no outcome to
+                // record. The claim is undone, the attempt refunded, so the
+                // next cycle sends the item again.
+                inFlight.remove(item.id)
+                try await storage.releaseClaim(id: item.id,
+                                               attempts: item.attempts,
+                                               lastAttemptAt: item.lastAttemptAt ?? 0)
+                throw CancellationError()
+            }
             inFlight.remove(item.id)
 
             emitProgress(index: index, total: total)
@@ -704,7 +732,9 @@ actor SyncDispatcher {
 
     // MARK: - Single-item dispatch
 
-    private func dispatchOne(item: StoredSyncItem) async -> ItemDispatchOutcome {
+    /// - Returns: `nil` when the caller was cancelled before an answer came:
+    ///   the request was not sent, or it was cancelled.
+    private func dispatchOne(item: StoredSyncItem) async -> ItemDispatchOutcome? {
         guard let url = URL(string: item.url), url.scheme?.hasPrefix("http") == true else {
             return ItemDispatchOutcome(itemId: item.id,
                                        succeeded: false,
@@ -735,6 +765,7 @@ actor SyncDispatcher {
         let bodyData = (item.body ?? "").data(using: .utf8)
 
         let useBackground = await shouldUseBackgroundSession()
+        guard !Task.isCancelled else { return nil }
 
         if useBackground, let bodyData = bodyData {
             return await dispatchOnBackground(request: request, body: bodyData, item: item)
@@ -744,7 +775,7 @@ actor SyncDispatcher {
 
     private func dispatchOnForeground(request: URLRequest,
                                       body: Data?,
-                                      item: StoredSyncItem) async -> ItemDispatchOutcome {
+                                      item: StoredSyncItem) async -> ItemDispatchOutcome? {
         var requestCopy = request
         if let body = body, !body.isEmpty {
             requestCopy.httpBody = body
@@ -755,13 +786,16 @@ actor SyncDispatcher {
             let statusCode = (response as? HTTPURLResponse)?.statusCode
             return classifyResponse(itemId: item.id, statusCode: statusCode, transportError: nil)
         } catch {
+            // Cancelling the caller cancels the request: that is no answer,
+            // and must not spend an attempt as a NETWORK_ERROR.
+            if Task.isCancelled { return nil }
             return classifyResponse(itemId: item.id, statusCode: nil, transportError: error)
         }
     }
 
     private func dispatchOnBackground(request: URLRequest,
                                       body: Data,
-                                      item: StoredSyncItem) async -> ItemDispatchOutcome {
+                                      item: StoredSyncItem) async -> ItemDispatchOutcome? {
         // Background `URLSession` requires the request body to be on disk.
         let tmpURL = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("syncprovider-\(item.id).body")
@@ -773,23 +807,31 @@ actor SyncDispatcher {
 
         let task = backgroundSession.uploadTask(with: request, fromFile: tmpURL)
         task.taskDescription = item.id
+        let wait = BackgroundUploadWait()
 
-        return await withCheckedContinuation { (continuation: CheckedContinuation<ItemDispatchOutcome, Never>) in
-            backgroundDelegate.registerCompletion(itemId: item.id) { [weak self] outcome in
-                // Best-effort cleanup of the body file.
-                try? FileManager.default.removeItem(at: tmpURL)
-                let result = self?.classifyResponseSync(itemId: outcome.itemId,
-                                                        statusCode: outcome.statusCode,
-                                                        transportError: outcome.error)
-                    ?? ItemDispatchOutcome(itemId: outcome.itemId,
-                                           succeeded: false,
-                                           statusCode: outcome.statusCode,
-                                           errorCode: "NETWORK_ERROR",
-                                           errorMessage: outcome.error?.localizedDescription)
-                continuation.resume(returning: result)
+        // The wait ends once, at the session's completion or at a
+        // cancellation of the caller, whichever comes first. A cancellation
+        // also cancels the upload: its completion, when it comes, is dropped.
+        let completed = await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<BackgroundDispatchOutcome?, Never>) in
+                guard wait.install(continuation) else { return }
+                backgroundDelegate.registerCompletion(for: task) { outcome in
+                    wait.finish(outcome)
+                }
+                task.resume()
             }
-            task.resume()
+        } onCancel: {
+            wait.cancel()
+            task.cancel()
         }
+        backgroundDelegate.unregisterCompletion(for: task)
+        // Best-effort cleanup of the body file.
+        try? FileManager.default.removeItem(at: tmpURL)
+
+        guard let completed else { return nil }
+        return classifyResponseSync(itemId: completed.itemId,
+                                    statusCode: completed.statusCode,
+                                    transportError: completed.error)
     }
 
     /// `true` when an upload must survive the app leaving the foreground. A
