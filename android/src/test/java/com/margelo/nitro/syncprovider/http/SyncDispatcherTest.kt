@@ -22,6 +22,7 @@ import com.margelo.nitro.syncprovider.testutil.TestData
 import io.mockk.coEvery
 import io.mockk.mockk
 import io.mockk.spyk
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -618,6 +619,88 @@ internal class SyncDispatcherTest {
     assertThat(events.types().last()).isEqualTo(SyncEventType.SYNC_FAILED)
     assertThat(finishedCycles).hasSize(1)
     assertThat(d.isSyncing()).isFalse()
+  }
+
+  /**
+   * A cycle stopped by cancellation, a worker that `disableBackgroundSync` stopped say, did not
+   * fail: its `SYNC_FAILED` has no code, and the cancellation is no item's failure. The request
+   * already on the wire still ends with its own answer.
+   */
+  @Test
+  fun `a cycle cancelled mid-dispatch ends with SYNC_FAILED without a code and fails no item`() =
+    runTest {
+      val release = CompletableDeferred<Unit>()
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse {
+          runBlocking { withTimeout(20_000L) { release.await() } }
+          return MockResponse().setResponseCode(503)
+        }
+      }
+      val sent = enqueue("/sent")
+      val unsent = enqueue("/unsent")
+      val events = recordEvents()
+      // Restored headers send one item first: the other is claimed and still waiting.
+      val d = newDispatcher(credentials = { CredentialPolicy.PERSISTED })
+
+      val cycle = launch(Dispatchers.IO) { d.flush() }
+      assertThat(server.takeRequest(20, TimeUnit.SECONDS)!!.path).isEqualTo("/sent")
+      cycle.cancel()
+      release.complete(Unit)
+      cycle.join()
+
+      // The request on the wire got its answer, a retriable 503, and waits for its retry.
+      assertThat(row(sent).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+      assertThat(row(sent).attempts).isEqualTo(1)
+      assertThat(row(sent).lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
+      // The one never sent is back in the queue, with nothing spent.
+      assertThat(row(unsent).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+      assertThat(row(unsent).attempts).isEqualTo(0)
+      assertThat(row(unsent).lastErrorCode).isNull()
+      assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+      assertThat(server.requestCount).isEqualTo(1)
+      assertThat(events.single { it.type == SyncEventType.SYNC_FAILED }.errorCode).isNull()
+      assertThat(events.types()).doesNotContain(SyncEventType.ITEM_FAILED)
+      assertThat(events.mapNotNull { it.errorCode }).doesNotContain(SyncErrorCode.NETWORK_ERROR)
+      assertThat(finishedCycles).hasSize(1)
+    }
+
+  /** Not every cancellation comes from the cycle's job; none is an item's failure. */
+  @Test
+  fun `a cancellation raised inside a dispatch is not that item's failure`() = runTest {
+    val id = enqueue()
+    val stopping = spyk(storage)
+    coEvery { stopping.isQueued(any()) } throws CancellationException("stopped")
+    val events = recordEvents()
+
+    val thrown = runCatching { runBlocking { newDispatcher(queue = stopping).flush() } }
+
+    assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(row(id).attempts).isEqualTo(0)
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(storage.getHistory().flatMap { it.failedIds.toList() }).isEmpty()
+    assertThat(thrown.exceptionOrNull()).isInstanceOf(CancellationException::class.java)
+    assertThat(events.single { it.type == SyncEventType.SYNC_FAILED }.errorCode).isNull()
+    assertThat(events.types()).doesNotContain(SyncEventType.ITEM_FAILED)
+  }
+
+  /** An `Error` is no item's failure either: it ends the cycle, and strands no row. */
+  @Test
+  fun `an Error raised inside a dispatch ends the cycle and strands no row`() = runTest {
+    val id = enqueue()
+    val broken = spyk(storage)
+    coEvery { broken.isQueued(any()) } throws NoClassDefFoundError("a class R8 removed")
+    val events = recordEvents()
+
+    val thrown = runCatching { runBlocking { newDispatcher(queue = broken).flush() } }
+
+    assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(row(id).attempts).isEqualTo(0)
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(storage.getHistory().flatMap { it.failedIds.toList() }).isEmpty()
+    assertThat(thrown.exceptionOrNull()).isInstanceOf(NoClassDefFoundError::class.java)
+    assertThat(events.single { it.type == SyncEventType.SYNC_FAILED }.errorCode)
+      .isEqualTo(SyncErrorCode.NETWORK_ERROR)
+    assertThat(events.types()).doesNotContain(SyncEventType.ITEM_FAILED)
   }
 
   @Test

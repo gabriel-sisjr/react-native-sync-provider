@@ -233,23 +233,25 @@ internal class SyncDispatcher(
   }
 
   /**
-   * Leave no path without a terminal event and no row stranded. On cancellation the
-   * supervisor scope has already waited for its children and this cycle still holds
-   * the mutex, so any row left `IN_FLIGHT` is one that never started.
+   * Leave no path without a terminal event and no row stranded. Whatever ended the cycle, the
+   * supervisor scope has already waited for its children and this cycle still holds the
+   * mutex, so a row left `IN_FLIGHT` is one whose dispatch never started, or whose outcome
+   * could not be written: either goes back to `PENDING`, as recovery would put it.
+   *
+   * A cancelled cycle, a worker WorkManager stopped say, did not fail: its `SYNC_FAILED`
+   * carries no code. Any other cause reports its code, or `NETWORK_ERROR` when it has none.
    */
   private suspend fun abortCycle(cause: Throwable, terminalEventSent: Boolean) {
-    if (cause is CancellationException) {
-      runCatching { storage.resetInFlight() }
-        .onFailure { Log.e(TAG, "Could not release unattempted rows", it) }
-    }
+    runCatching { storage.resetInFlight() }
+      .onFailure { Log.e(TAG, "Could not release unattempted rows", it) }
     if (terminalEventSent) return
+    val code = when (cause) {
+      is CancellationException -> null
+      is SyncException -> cause.code
+      else -> SyncErrorCode.NETWORK_ERROR
+    }
     runCatching {
-      emitter.emit(
-        SyncEventEmitter.event(
-          type = SyncEventType.SYNC_FAILED,
-          errorCode = (cause as? SyncException)?.code ?: SyncErrorCode.NETWORK_ERROR,
-        ),
-      )
+      emitter.emit(SyncEventEmitter.event(type = SyncEventType.SYNC_FAILED, errorCode = code))
     }.onFailure { Log.e(TAG, "Could not emit the terminal event", it) }
   }
 
@@ -297,14 +299,22 @@ internal class SyncDispatcher(
   /**
    * Non-cancellable because the request may reach the server whatever happens to the
    * cycle. Abandoning its outcome would leave the row to be sent a second time.
+   *
+   * A cancellation or an [Error] raised in here is no outcome of this item: it is rethrown,
+   * it ends the cycle, and [abortCycle] puts the row back to `PENDING`.
    */
   private suspend fun dispatchRecordingOutcome(
     entity: SyncItemEntity,
     options: SyncOptions,
     credentials: CredentialPolicy,
   ): ItemOutcome = withContext(NonCancellable) {
-    runCatching { dispatchItem(entity, options, credentials) }
-      .getOrElse { t -> ItemOutcome.Failed(entity.id, SyncErrorCode.NETWORK_ERROR, t.message ?: "") }
+    try {
+      dispatchItem(entity, options, credentials)
+    } catch (e: CancellationException) {
+      throw e
+    } catch (e: Exception) {
+      ItemOutcome.Failed(entity.id, SyncErrorCode.NETWORK_ERROR, e.message ?: "")
+    }
   }
 
   /**
@@ -531,11 +541,14 @@ internal class SyncDispatcher(
     } catch (e: IOException) {
       val ranOutOfTime = System.nanoTime() - startedAt >= TimeUnit.MILLISECONDS.toNanos(timeoutMs)
       transportFailure(e, ranOutOfTime)
-    } catch (t: Throwable) {
+    } catch (e: CancellationException) {
+      // Not the attempt's outcome. An Error is not caught either.
+      throw e
+    } catch (e: Exception) {
       runCatching { call.cancel() }
       AttemptResult.Failure(
         code = SyncErrorCode.NETWORK_ERROR,
-        message = t.message ?: t.javaClass.simpleName,
+        message = e.message ?: e.javaClass.simpleName,
         statusCode = null,
         retryable = false,
       )
