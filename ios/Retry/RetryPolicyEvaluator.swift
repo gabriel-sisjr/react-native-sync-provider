@@ -5,7 +5,9 @@
 //  Pure-Swift implementation of the retry-backoff math. Mirrors the JS
 //  implementation in `src/utils/retryBackoff.ts` 1:1 so behavior is consistent
 //  across platforms and the JS-side `SyncOptions.retryPolicy` produces the
-//  same delay sequence it would on iOS.
+//  same delay sequence it would on iOS. iOS reads the policy's numbers after
+//  `NumericOption` converted them, so NaN, ±Infinity and 2^63 or more follow
+//  that conversion, not the JS curve.
 //
 
 import Foundation
@@ -115,7 +117,8 @@ enum RetryPolicyEvaluator {
     ///
     /// - Parameter random: a sample in `0..<1` for the jitter factor. Tests
     ///   inject it to pin the bounds of the range.
-    /// - Important: **must** match `src/utils/retryBackoff.ts`.
+    /// - Important: **must** match `src/utils/retryBackoff.ts` for the
+    ///   numbers it reads, which ``RetryPolicyValue`` has already converted.
     static func nextDelayMs(attempt: Int,
                             policy: RetryPolicyValue,
                             random: () -> Double = { Double.random(in: 0..<1) }) -> Int {
