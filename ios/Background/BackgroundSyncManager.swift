@@ -284,8 +284,9 @@ final class BackgroundSyncManager: @unchecked Sendable {
                 completion.complete(success: true)
             } catch {
                 SyncLogger.error("\(name) flush failed: \(error.localizedDescription)", category: "background")
+                // No `errorCode`: the flush never throws a `SyncProviderError`.
+                // A cycle that dies reports its code on its `SYNC_FAILED`.
                 self?.emitter.emit(.now(type: "BACKGROUND_SYNC_COMPLETED",
-                                        errorCode: (error as? SyncProviderError)?.code.stringValue,
                                         metadata: ["kind": kind, "ok": "false"]))
                 completion.complete(success: false)
             }
