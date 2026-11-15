@@ -55,14 +55,18 @@ import kotlin.random.Random
  * Concurrency model:
  * - [flushMutex] serializes cycles: a concurrent [flush] waits for the running one
  *   and then runs its own.
- * - Within a cycle, items are dispatched via [supervisorScope] so a single item's
- *   failure cannot cancel siblings.
- * - A dispatch that started always records its outcome, even if the cycle is
- *   cancelled. Rows that never started are released back to `PENDING`.
+ * - Within a cycle, items are dispatched via [supervisorScope]: an item whose attempt fails
+ *   records that outcome and leaves its siblings alone.
+ * - A dispatch that started finishes even if the cycle is cancelled, and records its outcome,
+ *   unless something raised around its attempt ends the cycle: a storage failure, a
+ *   cancellation or an [Error] (see [dispatchRecordingOutcome]). Dispatches already started
+ *   still finish then, and none starts after. The rows the cycle claimed that have no outcome,
+ *   those that never started included, go back to `PENDING` (see [abortCycle]).
  * - Each attempt is bounded by OkHttp's call timeout: `requestTimeoutMs`, raised to 1 s and
  *   capped at `Int.MAX_VALUE` ms. Running out of it reports `TIMEOUT`, and so does one of the
  *   client's fixed socket timeouts: 10 s to connect, 30 s for a stalled read or write. See
- *   [transportFailureCode].
+ *   [transportFailureCode]. The timeout cannot interrupt a DNS lookup in progress: an attempt
+ *   blocked in one can run past `requestTimeoutMs`, and then reports `TIMEOUT`.
  *
  * @param clock epoch-millis source; injectable so tests can move time.
  * @param random PRNG forwarded to [RetryPolicyEvaluator.computeDelayMs] for
