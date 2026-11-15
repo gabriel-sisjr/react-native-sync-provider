@@ -16,6 +16,9 @@ import com.margelo.nitro.syncprovider.NetworkQuality
 import com.margelo.nitro.syncprovider.SyncEvent
 import com.margelo.nitro.syncprovider.SyncEventType
 import com.margelo.nitro.syncprovider.events.SyncEventEmitter
+import io.mockk.coEvery
+import io.mockk.spyk
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -536,6 +539,46 @@ internal class ConnectivityMonitorTest {
       .inOrder()
     // Removed while the first change was being delivered: it got that one, and nothing after.
     assertThat(removedReceived).containsExactly(ConnectionStatus.METERED)
+  }
+
+  /**
+   * The one consumer outlives an emit that fails, whatever it throws: the failure loses that
+   * event, not the ones after it. Only its own cancellation, its scope's, ends it.
+   */
+  private fun assertLaterEventsSurvive(failure: Throwable) {
+    val failingEmitter = spyk(SyncEventEmitter())
+    coEvery {
+      failingEmitter.emit(match { it.connectionStatus == ConnectionStatus.METERED })
+    } throws failure
+    val unconfined = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined).also { scopes += it }
+    val received = Collections.synchronizedList(mutableListOf<ConnectionStatus?>())
+    unconfined.launch {
+      failingEmitter.events.collect {
+        if (it.type == SyncEventType.CONNECTION_CHANGED) received += it.connectionStatus
+      }
+    }
+    ConnectivityMonitor(ApplicationProvider.getApplicationContext(), failingEmitter, unconfined)
+      .also { monitors += it }
+      .start()
+    val wifi = network(WIFI_ID, NetworkCapabilities.TRANSPORT_WIFI, *INTERNET, NOT_METERED)
+    callback().onAvailable(wifi)
+
+    // Metered first, whose emit fails; then lost.
+    callback().onCapabilitiesChanged(wifi, capabilities(NetworkCapabilities.TRANSPORT_WIFI, *INTERNET))
+    callback().onLost(wifi)
+
+    assertThat(received).contains(ConnectionStatus.DISCONNECTED)
+    assertThat(received).doesNotContain(ConnectionStatus.METERED)
+  }
+
+  @Test
+  fun `an emit that throws a cancellation that is not the consumer's does not stop later events`() {
+    assertLaterEventsSurvive(CancellationException("not the consumer's"))
+  }
+
+  @Test
+  fun `an emit that throws an Error does not stop later events`() {
+    assertLaterEventsSurvive(NotImplementedError("the bridge is gone"))
   }
 
   /** The stock shadow, counting which registration call the monitor makes. */

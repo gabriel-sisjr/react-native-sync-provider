@@ -14,12 +14,12 @@ import com.margelo.nitro.syncprovider.NetworkQuality
 import com.margelo.nitro.syncprovider.SyncEventType
 import com.margelo.nitro.syncprovider.events.SyncEventEmitter
 import com.margelo.nitro.syncprovider.http.HeadResult
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -113,6 +113,10 @@ internal class ConnectivityMonitor(
    * A coroutine per change could run in either order. Started by the first change, it lives as
    * long as [scope]. It holds no lock while it emits, so a listener may cause the next change, or
    * remove a listener, without waiting for it.
+   *
+   * Nothing restarts it, so only its own cancellation, [scope]'s, may end it. An emit that fails
+   * with anything else, an [Error] or a cancellation that is not this coroutine's included, loses
+   * that one event and the next ones still go out.
    */
   private val connectionEvents: Job = scope.launch(start = CoroutineStart.LAZY) {
     for (status in pendingEvents) {
@@ -120,10 +124,9 @@ internal class ConnectivityMonitor(
         emitter.emit(
           SyncEventEmitter.event(type = SyncEventType.CONNECTION_CHANGED, connectionStatus = status),
         )
-      } catch (e: CancellationException) {
-        throw e
-      } catch (e: Exception) {
-        // One event lost, never every later one.
+      } catch (e: Throwable) {
+        // Rethrows when this coroutine is the one being cancelled.
+        ensureActive()
         Log.e(TAG, "Could not emit CONNECTION_CHANGED", e)
       }
     }
