@@ -316,7 +316,7 @@ internal class SyncDispatcher(
     credentials: CredentialPolicy,
   ): ItemOutcome {
     val timeoutMs = (options.requestTimeoutMs?.toLong() ?: DEFAULT_REQUEST_TIMEOUT_MS)
-      .coerceAtLeast(MIN_REQUEST_TIMEOUT_MS)
+      .coerceIn(MIN_REQUEST_TIMEOUT_MS, MAX_REQUEST_TIMEOUT_MS)
     val policy = options.retryPolicy
     val maxAttempts = policy.maxAttempts.toInt().coerceAtLeast(1)
 
@@ -705,6 +705,12 @@ internal class SyncDispatcher(
     private const val DEFAULT_BATCH_SIZE = 25
     private const val DEFAULT_REQUEST_TIMEOUT_MS: Long = 30_000L
     private const val MIN_REQUEST_TIMEOUT_MS: Long = 1_000L
+
+    /**
+     * The longest call timeout OkHttp takes, about 24.8 days. A longer one, `Infinity` included,
+     * makes it throw "timeout too large." before the request starts.
+     */
+    private const val MAX_REQUEST_TIMEOUT_MS: Long = Int.MAX_VALUE.toLong()
     private const val CONNECT_TIMEOUT_MS: Long = 10_000L
     private const val READ_TIMEOUT_MS: Long = 30_000L
     private const val WRITE_TIMEOUT_MS: Long = 30_000L

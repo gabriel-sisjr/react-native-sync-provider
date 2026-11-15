@@ -9,6 +9,7 @@ import com.margelo.nitro.syncprovider.NetworkQuality
 import com.margelo.nitro.syncprovider.SyncErrorCode
 import com.margelo.nitro.syncprovider.SyncEvent
 import com.margelo.nitro.syncprovider.SyncEventType
+import com.margelo.nitro.syncprovider.SyncOptions
 import com.margelo.nitro.syncprovider.SyncResult
 import com.margelo.nitro.syncprovider.database.SyncDatabase
 import com.margelo.nitro.syncprovider.database.SyncDeadLetterEntity
@@ -95,6 +96,7 @@ internal class SyncDispatcherTest {
     healthCheckBackoffMs: Double? = null,
     healthCheck: HealthCheck = this.healthCheck,
     defaultHeaders: Map<String, String>? = null,
+    tweak: (SyncOptions) -> SyncOptions = { it },
   ): SyncDispatcher {
     val options = TestData.syncOptions(
       retryPolicy = TestData.retryPolicy(
@@ -110,7 +112,7 @@ internal class SyncDispatcherTest {
       healthCheckTtlMs = healthCheckTtlMs,
       healthCheckBackoffMs = healthCheckBackoffMs,
       defaultHeaders = defaultHeaders,
-    )
+    ).let(tweak)
     return SyncDispatcher(
       storage = queue,
       emitter = emitter,
@@ -195,6 +197,33 @@ internal class SyncDispatcherTest {
     assertThat(d.isSyncing()).isFalse()
     d.flush()
     assertThat(d.isSyncing()).isFalse()
+  }
+
+  /* ---------------------------- request timeout --------------------------- */
+
+  private suspend fun inFlightRows(): List<SyncItemEntity> =
+    db.syncItemDao().findByStatusesLimit(listOf(SyncItemEntity.STATUS_IN_FLIGHT), 100)
+
+  /**
+   * OkHttp refuses a call timeout above `Int.MAX_VALUE` ms ("timeout too large."). Thrown
+   * before the request, it left the row `IN_FLIGHT` and unsent, for every later recovery to
+   * hand back to a cycle that failed it the same way.
+   */
+  @Test
+  fun `a requestTimeoutMs beyond OkHttp's limit is capped, and the request goes out`() = runTest {
+    for (timeoutMs in listOf(Double.POSITIVE_INFINITY, 1e300)) {
+      server.enqueue(MockResponse().setResponseCode(200))
+      val id = enqueue()
+
+      val result = newDispatcher(tweak = { it.copy(requestTimeoutMs = timeoutMs) }).flush()
+
+      assertWithMessage("rows left IN_FLIGHT with requestTimeoutMs = $timeoutMs")
+        .that(inFlightRows().map { it.id }).isEmpty()
+      assertWithMessage("requestTimeoutMs = $timeoutMs")
+        .that(result.succeededIds.toList()).containsExactly(id)
+      assertThat(storage.count()).isEqualTo(0)
+    }
+    assertThat(server.requestCount).isEqualTo(2)
   }
 
   /* -------------------------- cooldown and attempts ----------------------- */
