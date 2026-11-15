@@ -91,6 +91,14 @@ internal class SyncQueueStorage(
    */
   suspend fun isQueued(id: String): Boolean = withContext(Dispatchers.IO) { itemDao.exists(id) }
 
+  /**
+   * Whether row [id] is queued and still `IN_FLIGHT`: claimed by a cycle, with no outcome
+   * recorded since. Recording one moves it on, to `PENDING` or out of the queue.
+   */
+  suspend fun isInFlight(id: String): Boolean = withContext(Dispatchers.IO) {
+    itemDao.findById(id)?.status == SyncItemEntity.STATUS_IN_FLIGHT
+  }
+
   suspend fun pendingCount(): Int = withContext(Dispatchers.IO) {
     itemDao.countByStatus(SyncItemEntity.STATUS_PENDING)
   }

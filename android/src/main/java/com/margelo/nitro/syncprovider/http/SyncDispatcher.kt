@@ -301,7 +301,8 @@ internal class SyncDispatcher(
    * cycle. Abandoning its outcome would leave the row to be sent a second time.
    *
    * A cancellation or an [Error] raised in here is no outcome of this item: it is rethrown,
-   * it ends the cycle, and [abortCycle] puts the row back to `PENDING`.
+   * it ends the cycle, and [abortCycle] puts the row back to `PENDING`. Any other exception
+   * ends the item, see [failUnexpectedly].
    */
   private suspend fun dispatchRecordingOutcome(
     entity: SyncItemEntity,
@@ -313,8 +314,41 @@ internal class SyncDispatcher(
     } catch (e: CancellationException) {
       throw e
     } catch (e: Exception) {
-      ItemOutcome.Failed(entity.id, SyncErrorCode.NETWORK_ERROR, e.message ?: "")
+      failUnexpectedly(entity, e)
     }
+  }
+
+  /**
+   * An exception no attempt result accounts for, such as a failed storage read. A row still
+   * `IN_FLIGHT` has no outcome yet: it ends as a permanent `INVALID_PAYLOAD` failure, a dead
+   * letter, as iOS ends a failure it cannot classify. Left `IN_FLIGHT`, it would come back
+   * after every recovery to fail the same way, never sent and never failed. A row whose outcome
+   * was already written, or that a purge removed, is left as it is and not counted.
+   *
+   * When that cannot be written either, the row stays `IN_FLIGHT` for the next recovery.
+   */
+  private suspend fun failUnexpectedly(entity: SyncItemEntity, cause: Exception): ItemOutcome {
+    val detail = cause.message ?: cause.javaClass.simpleName
+    val failed = ItemOutcome.Failed(entity.id, SyncErrorCode.INVALID_PAYLOAD, detail)
+    val moved = try {
+      storage.isInFlight(entity.id) &&
+        deadLetter(
+          entity = entity,
+          attempts = entity.attempts,
+          lastAttemptAt = entity.lastAttemptAt?.takeIf { it > 0L } ?: clock(),
+          code = SyncErrorCode.INVALID_PAYLOAD,
+          detail = detail,
+          statusCode = null,
+          requestSent = false,
+        )
+    } catch (e: CancellationException) {
+      throw e
+    } catch (e: Exception) {
+      // Only the type: a message can carry what the request held.
+      Log.e(TAG, "Could not record the failure of ${entity.id}: ${e.javaClass.simpleName}")
+      return failed
+    }
+    return if (moved) failed else ItemOutcome.Gone(entity.id)
   }
 
   /**
@@ -545,9 +579,11 @@ internal class SyncDispatcher(
       // Not the attempt's outcome. An Error is not caught either.
       throw e
     } catch (e: Exception) {
+      // Anything but an I/O failure is permanent, as on iOS: a retry would fail the same way,
+      // and NETWORK_ERROR stays a code that is always retried.
       runCatching { call.cancel() }
       AttemptResult.Failure(
-        code = SyncErrorCode.NETWORK_ERROR,
+        code = SyncErrorCode.INVALID_PAYLOAD,
         message = e.message ?: e.javaClass.simpleName,
         statusCode = null,
         retryable = false,

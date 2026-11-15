@@ -703,6 +703,74 @@ internal class SyncDispatcherTest {
     assertThat(events.types()).doesNotContain(SyncEventType.ITEM_FAILED)
   }
 
+  /* ------------------------- failures that are not I/O --------------------- */
+
+  /**
+   * Anything but an I/O failure during an attempt is permanent, as on iOS: `INVALID_PAYLOAD`,
+   * dead-lettered. `NETWORK_ERROR` was reported for it without a retry, and a `NETWORK_ERROR`
+   * is always retried. A configuration read that throws on the per-response read stands for
+   * any such exception here.
+   */
+  @Test
+  fun `a failure that is not an I_O error is a permanent INVALID_PAYLOAD`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(503))
+    val id = enqueue()
+    val events = recordEvents()
+    val options = TestData.syncOptions(retryPolicy = TestData.retryPolicy(maxAttempts = 3))
+    var reads = 0
+    val d = SyncDispatcher(
+      storage = storage,
+      emitter = emitter,
+      // The cycle's own read succeeds; the read for the response throws.
+      getOptions = {
+        check(reads++ == 0) { "configuration unreadable" }
+        options
+      },
+      clock = clock::now,
+    )
+
+    val result = d.flush()
+
+    assertThat(server.requestCount).isEqualTo(1)
+    val dead = deadLetter(id)
+    assertThat(dead.lastErrorCode).isEqualTo(SyncErrorCode.INVALID_PAYLOAD.name)
+    assertThat(dead.lastErrorMessage).isEqualTo("configuration unreadable")
+    assertThat(dead.attempts).isEqualTo(1)
+    assertThat(result.failedIds.toList()).containsExactly(id)
+    assertThat(events.single { it.type == SyncEventType.ITEM_FAILED }.errorCode)
+      .isEqualTo(SyncErrorCode.INVALID_PAYLOAD)
+    assertThat(events.types()).doesNotContain(SyncEventType.ITEM_RETRYING)
+  }
+
+  /**
+   * An exception before anything recorded the item's outcome, here from the storage read
+   * that starts each dispatch, left the row `IN_FLIGHT`: every recovery handed it back to a
+   * cycle that failed the same way, so it was never sent and never failed.
+   */
+  @Test
+  fun `an exception before the outcome is recorded fails the item instead of stranding it`() =
+    runTest {
+      val id = enqueue()
+      val failing = spyk(storage)
+      coEvery { failing.isQueued(any()) } throws IllegalStateException("database is locked")
+      val events = recordEvents()
+
+      val result = newDispatcher(queue = failing).flush()
+
+      assertThat(inFlightRows()).isEmpty()
+      val dead = deadLetter(id)
+      assertThat(dead.lastErrorCode).isEqualTo(SyncErrorCode.INVALID_PAYLOAD.name)
+      assertThat(dead.lastErrorMessage).isEqualTo("database is locked")
+      assertThat(dead.attempts).isEqualTo(0)
+      assertThat(server.requestCount).isEqualTo(0)
+      assertThat(result.failedIds.toList()).containsExactly(id)
+      assertThat(events.filter { it.itemId == id }.types())
+        .containsExactly(SyncEventType.ITEM_FAILED, SyncEventType.ITEM_DEAD_LETTERED)
+        .inOrder()
+      assertThat(events.single { it.type == SyncEventType.ITEM_FAILED }.errorCode)
+        .isEqualTo(SyncErrorCode.INVALID_PAYLOAD)
+    }
+
   @Test
   fun `resetInFlight waits for a running cycle instead of requeueing its rows`() = runTest {
     val release = CountDownLatch(1)
