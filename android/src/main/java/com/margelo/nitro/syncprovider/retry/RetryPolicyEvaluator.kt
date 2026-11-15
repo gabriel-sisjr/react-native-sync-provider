@@ -17,12 +17,21 @@ import kotlin.random.Random
 internal object RetryPolicyEvaluator {
 
   /**
+   * The longest delay [computeDelayMs] returns: 2^53 - 1 ms, the largest integer a JS number
+   * holds exactly, and iOS's ceiling as well. That is about 285,000 years, so it only shortens a
+   * delay that would not fit in a `Long` deadline: an `Infinity` or huge `baseDelayMs`, or an
+   * uncapped curve at a huge attempt.
+   */
+  const val MAX_DELAY_MS: Long = 9_007_199_254_740_991L
+
+  /**
    * Compute the back-off delay, in milliseconds, before [attempt] should
    * be issued. `attempt` is 1-indexed: the first retry uses `attempt = 1`.
    *
    * @param attempt 1-indexed retry attempt number.
    * @param policy active retry policy.
    * @param random PRNG used for jitter; injectable for tests.
+   * @return from 0 to [MAX_DELAY_MS]. A NaN `baseDelayMs` gives 0: no delay.
    */
   fun computeDelayMs(
     attempt: Int,
@@ -48,8 +57,16 @@ internal object RetryPolicyEvaluator {
     } else {
       raw
     }
-    return min(jittered, cap).toLong()
+    // A NaN passes coerceIn unchanged, and its toLong() is 0.
+    return min(jittered, cap).coerceIn(0.0, MAX_DELAY_MS.toDouble()).toLong()
   }
+
+  /**
+   * [from] plus [delayMs], at most `Long.MAX_VALUE`. A sum that overflowed would be a deadline
+   * long past: the row it is for would be due at once.
+   */
+  fun deadline(from: Long, delayMs: Long): Long =
+    if (delayMs > 0L && from > Long.MAX_VALUE - delayMs) Long.MAX_VALUE else from + delayMs
 
   /**
    * Decide whether a request that produced [statusCode] should be retried

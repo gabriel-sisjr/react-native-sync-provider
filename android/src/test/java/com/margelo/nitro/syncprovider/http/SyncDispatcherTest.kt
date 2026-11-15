@@ -356,6 +356,50 @@ internal class SyncDispatcherTest {
     assertThat(row(id).nextRetryAt).isGreaterThan(0L)
   }
 
+  /**
+   * A delay past `Long.MAX_VALUE - now` overflowed `finishedAt + delay` into a deadline long
+   * past: the row was due at once, and the next cycle retried it without waiting.
+   */
+  @Test
+  fun `a retry delay too large to represent keeps the row waiting`() = runTest {
+    server.dispatcher = respondAfter(attemptMs = 0L, code = 503)
+    for ((index, base) in listOf(Double.POSITIVE_INFINITY, 1e300).withIndex()) {
+      val id = enqueue()
+      val d = newDispatcher(tweak = { it.copy(retryPolicy = it.retryPolicy.copy(baseDelayMs = base)) })
+
+      d.flush()
+      val cooling = row(id)
+      d.flush()
+
+      assertWithMessage("baseDelayMs = $base")
+        .that(cooling.nextRetryAt).isEqualTo(clock.now() + TestData.MAX_SAFE_DELAY_MS)
+      assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+      assertThat(row(id).attempts).isEqualTo(1)
+      assertWithMessage("requests after baseDelayMs = $base")
+        .that(server.requestCount).isEqualTo(index + 1)
+    }
+  }
+
+  /** The hold on a rejected restored credential adds the same delay, and cannot overflow either. */
+  @Test
+  fun `a credential hold too long to represent keeps the row waiting`() = runTest {
+    server.dispatcher = respondAfter(attemptMs = 10L, code = 401)
+    val id = enqueue()
+    val d = newDispatcher(
+      credentials = { CredentialPolicy.PERSISTED },
+      tweak = { it.copy(retryPolicy = it.retryPolicy.copy(baseDelayMs = Double.POSITIVE_INFINITY)) },
+    )
+
+    d.flush()
+    val held = row(id)
+    d.flush()
+
+    assertThat(held.nextRetryAt).isEqualTo(clock.now() + TestData.MAX_SAFE_DELAY_MS)
+    assertThat(finishedCycles.first()).isEqualTo(held.nextRetryAt)
+    assertThat(row(id).attempts).isEqualTo(0)
+    assertThat(server.requestCount).isEqualTo(1)
+  }
+
   @Test
   fun `attempts accumulate across cycles until the budget is exhausted`() = runTest {
     repeat(2) { server.enqueue(MockResponse().setResponseCode(500)) }

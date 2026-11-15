@@ -154,5 +154,12 @@ internal class RetryWake(
   /** No wake before the credential hold or the health-check backoff ends. */
   private fun notBeforeAny(): Long = maxOf(credentialHoldUntil.get(), healthBackoffUntil())
 
-  private fun delayUntil(deadline: Long): Long = (deadline - clock()).coerceAtLeast(0L)
+  /**
+   * The wait until [deadline]: 0 for a deadline already past, and at most
+   * [RetryPolicyEvaluator.MAX_DELAY_MS]. A longer one, for a hold with no end or a deadline an
+   * earlier version stored, is more than WorkManager can add to the clock: it would refuse the
+   * kick.
+   */
+  private fun delayUntil(deadline: Long): Long =
+    (deadline - clock()).coerceIn(0L, RetryPolicyEvaluator.MAX_DELAY_MS)
 }

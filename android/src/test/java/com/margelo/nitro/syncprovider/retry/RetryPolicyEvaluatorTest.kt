@@ -1,6 +1,7 @@
 package com.margelo.nitro.syncprovider.retry
 
 import com.google.common.truth.Truth.assertThat
+import com.google.common.truth.Truth.assertWithMessage
 import com.margelo.nitro.syncprovider.BackoffStrategy
 import com.margelo.nitro.syncprovider.testutil.TestData
 import org.junit.Test
@@ -230,6 +231,48 @@ internal class RetryPolicyEvaluatorTest {
       val policy = TestData.retryPolicy(backoff = strategy, baseDelayMs = 0L, maxDelayMs = 0L, jitter = true)
 
       assertThat(RetryPolicyEvaluator.computeDelayMs(2_000, policy, Random(7))).isEqualTo(0L)
+    }
+  }
+
+  /**
+   * As on iOS, a delay never exceeds 2^53 - 1 ms. Past it, `toLong()` gave `Long.MAX_VALUE`,
+   * and adding that to the attempt's end overflowed into a deadline long past.
+   */
+  @Test
+  fun `a delay too large to represent stops at 2^53 - 1 ms`() {
+    for (base in listOf(Double.POSITIVE_INFINITY, 1e300, Double.MAX_VALUE)) {
+      for (jitter in listOf(false, true)) {
+        val policy = TestData.retryPolicy(jitter = jitter).copy(baseDelayMs = base)
+
+        assertWithMessage("baseDelayMs = $base, jitter = $jitter")
+          .that(RetryPolicyEvaluator.computeDelayMs(1, policy, Random(7)))
+          .isEqualTo(TestData.MAX_SAFE_DELAY_MS)
+      }
+    }
+    // No cap, and a curve that grows past the ceiling.
+    val uncapped = TestData.retryPolicy(baseDelayMs = 1_000L, jitter = false)
+      .copy(maxDelayMs = Double.POSITIVE_INFINITY)
+    assertThat(RetryPolicyEvaluator.computeDelayMs(2_000, uncapped))
+      .isEqualTo(TestData.MAX_SAFE_DELAY_MS)
+  }
+
+  @Test
+  fun `a deadline that would overflow saturates instead of wrapping into the past`() {
+    assertThat(RetryPolicyEvaluator.MAX_DELAY_MS).isEqualTo(TestData.MAX_SAFE_DELAY_MS)
+    assertThat(RetryPolicyEvaluator.deadline(1_000L, 500L)).isEqualTo(1_500L)
+    assertThat(RetryPolicyEvaluator.deadline(1_000L, 0L)).isEqualTo(1_000L)
+    assertThat(RetryPolicyEvaluator.deadline(Long.MAX_VALUE - 10L, 1_000L)).isEqualTo(Long.MAX_VALUE)
+    assertThat(RetryPolicyEvaluator.deadline(1_000L, Long.MAX_VALUE)).isEqualTo(Long.MAX_VALUE)
+  }
+
+  /** The results iOS converts invalid delays to: no delay for NaN or a negative base. */
+  @Test
+  fun `a NaN or negative base means no delay`() {
+    for (base in listOf(Double.NaN, Double.NEGATIVE_INFINITY, -1.0)) {
+      val policy = TestData.retryPolicy(jitter = false).copy(baseDelayMs = base)
+
+      assertWithMessage("baseDelayMs = $base")
+        .that(RetryPolicyEvaluator.computeDelayMs(1, policy)).isEqualTo(0L)
     }
   }
 }

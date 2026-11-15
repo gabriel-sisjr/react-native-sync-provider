@@ -302,6 +302,26 @@ internal class BackgroundSyncManagerTest {
     }
   }
 
+  /**
+   * The longest delay a retry wake asks for, 2^53 - 1 ms: WorkManager takes it, and the run
+   * time it computes from it stays in the future. A delay it cannot add to the clock is refused.
+   */
+  @Test
+  fun `a kick for the furthest retry deadline is accepted and does not overflow`() {
+    manager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+
+    manager.scheduleOneTimeFlush(initialDelayMs = TestData.MAX_SAFE_DELAY_MS)
+
+    val spec = activeSpec(BackgroundSyncManager.UNIQUE_ONE_TIME)
+    assertThat(spec.initialDelay).isEqualTo(TestData.MAX_SAFE_DELAY_MS)
+    assertThat(spec.calculateNextRunTime()).isGreaterThan(System.currentTimeMillis())
+
+    manager.cancelRetryKick()
+    manager.scheduleOneTimeFlush(initialDelayMs = Long.MAX_VALUE - 1)
+
+    assertThat(activeWorkCount(BackgroundSyncManager.UNIQUE_ONE_TIME)).isEqualTo(0)
+  }
+
   @Test
   fun `the kick needs only a connection by default`() {
     manager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))

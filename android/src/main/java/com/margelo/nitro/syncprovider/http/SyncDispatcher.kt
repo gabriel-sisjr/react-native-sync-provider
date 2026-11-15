@@ -433,8 +433,10 @@ internal class SyncDispatcher(
     outcome: AttemptResult.Failure,
     options: SyncOptions,
   ): ItemOutcome {
-    val nextRetryAt = finishedAt +
-      RetryPolicyEvaluator.computeDelayMs(attempt, options.retryPolicy, random)
+    val nextRetryAt = RetryPolicyEvaluator.deadline(
+      from = finishedAt,
+      delayMs = RetryPolicyEvaluator.computeDelayMs(attempt, options.retryPolicy, random),
+    )
     storage.markRetry(entity.id, attempt, startedAt, outcome.code, nextRetryAt)
     emitRetrying(entity, attempt, outcome)
     return ItemOutcome.Rescheduled(entity.id)
@@ -455,7 +457,10 @@ internal class SyncDispatcher(
     options: SyncOptions,
   ): ItemOutcome {
     val backoffMs = RetryPolicyEvaluator.computeDelayMs(attempt, options.retryPolicy, random)
-    val nextRetryAt = finishedAt + maxOf(backoffMs, MIN_CREDENTIAL_HOLD_MS)
+    val nextRetryAt = RetryPolicyEvaluator.deadline(
+      from = finishedAt,
+      delayMs = maxOf(backoffMs, MIN_CREDENTIAL_HOLD_MS),
+    )
     storage.markRetry(entity.id, entity.attempts, startedAt, outcome.code, nextRetryAt)
     emitRetrying(entity, attempt, outcome)
     return ItemOutcome.CredentialRejected(entity.id, nextRetryAt)

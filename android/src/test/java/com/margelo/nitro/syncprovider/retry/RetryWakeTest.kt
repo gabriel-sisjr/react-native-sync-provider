@@ -97,6 +97,32 @@ internal class RetryWakeTest {
     assertThat(kicks).containsExactly(0L)
   }
 
+  /**
+   * No wake waits longer than 2^53 - 1 ms. A deadline past that, such as one a version without
+   * the delay ceiling stored just below `Long.MAX_VALUE`, asked WorkManager for an initial delay
+   * it refuses ("will cause an overflow"), so the kick was lost.
+   */
+  @Test
+  fun `no wake waits longer than the delay ceiling`() = runTest {
+    insert("far", Long.MAX_VALUE - 1)
+
+    wake.arm()
+
+    verify { timer.arm(TestData.MAX_SAFE_DELAY_MS) }
+    assertThat(kicks).containsExactly(TestData.MAX_SAFE_DELAY_MS)
+  }
+
+  /** The same for a hold with no end: a health-check backoff too long to add to the clock. */
+  @Test
+  fun `a hold with no end arms the longest wake, not one WorkManager refuses`() = runTest {
+    insert("cooling", clock.now() + 1_000L)
+    healthBackoffUntil = Long.MAX_VALUE
+
+    wake.arm()
+
+    assertThat(kicks).containsExactly(TestData.MAX_SAFE_DELAY_MS)
+  }
+
   @Test
   fun `never-attempted rows do not wake the engine`() = runTest {
     insert("left-over-from-a-full-batch", 0L)

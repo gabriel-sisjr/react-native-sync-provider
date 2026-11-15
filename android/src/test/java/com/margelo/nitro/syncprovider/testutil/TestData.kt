@@ -14,6 +14,9 @@ import com.margelo.nitro.syncprovider.work.BackgroundSyncManager
 
 internal object TestData {
 
+  /** 2^53 - 1: the largest integer a JS number holds exactly, and iOS's ceiling for a delay. */
+  const val MAX_SAFE_DELAY_MS: Long = 9_007_199_254_740_991L
+
   fun retryPolicy(
     maxAttempts: Int = 3,
     backoff: BackoffStrategy = BackoffStrategy.EXPONENTIAL,
