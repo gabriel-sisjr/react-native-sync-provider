@@ -15,6 +15,7 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequest
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
+import androidx.work.WorkRequest
 import com.margelo.nitro.syncprovider.BackgroundSyncOptions
 import com.margelo.nitro.syncprovider.SyncErrorCode
 import com.margelo.nitro.syncprovider.error.SyncException
@@ -98,7 +99,7 @@ internal class BackgroundSyncManager(context: Context) {
 
       val request = PeriodicWorkRequestBuilder<SyncWorker>(intervalMs, TimeUnit.MILLISECONDS)
         .setConstraints(constraints)
-        .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 1, TimeUnit.MINUTES)
+        .withRetryBackoff(constraints)
         .setInputData(Data.Builder().putBoolean(SyncWorker.KEY_PERIODIC, true).build())
         .build()
 
@@ -139,7 +140,8 @@ internal class BackgroundSyncManager(context: Context) {
   /**
    * Arm the opt-in retry kick: a delayed one-time flush that survives process death.
    * Does nothing unless the consumer enabled background sync and did not ask for
-   * `foregroundOnly`. It honors the same constraints as the periodic work.
+   * `foregroundOnly`. It honors the same constraints as the periodic work, an idle device
+   * included, and backs off the same way (see [withRetryBackoff]).
    *
    * [ExistingWorkPolicy.REPLACE] keeps one kick armed, for the latest decision. The caller
    * computes delays from absolute deadlines and never lets one end before an active
@@ -155,9 +157,10 @@ internal class BackgroundSyncManager(context: Context) {
   fun scheduleOneTimeFlush(initialDelayMs: Long = 0L, gateStreak: Int = 0) {
     if (!isEnabled() || isForegroundOnly()) return
     try {
+      val constraints = lastOptions()?.let(::buildConstraints) ?: defaultConstraints()
       val builder = OneTimeWorkRequestBuilder<SyncWorker>()
-        .setConstraints(lastOptions()?.let(::buildConstraints) ?: defaultConstraints())
-        .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 1, TimeUnit.MINUTES)
+        .setConstraints(constraints)
+        .withRetryBackoff(constraints)
       if (initialDelayMs > 0L) {
         builder.setInitialDelay(initialDelayMs, TimeUnit.MILLISECONDS)
       }
@@ -199,6 +202,21 @@ internal class BackgroundSyncManager(context: Context) {
       Log.e(TAG, "Failed to re-arm periodic work after recovery", it)
     }
   }
+
+  /**
+   * The backoff for a run that failed as a whole (`Result.retry()`): exponential from one
+   * minute. Not on a request that requires an idle device: WorkManager refuses backoff criteria
+   * there ("Cannot set backoff criteria on an idle mode job"). Such a request keeps WorkManager's
+   * default, exponential from 30 s and at most 5 hours, which WorkManager applies itself as the
+   * job's minimum latency: it hands JobScheduler no backoff for an idle job. The retry then
+   * waits for that delay and for the device to be idle again.
+   */
+  private fun <B : WorkRequest.Builder<B, *>> B.withRetryBackoff(constraints: Constraints): B =
+    if (constraints.requiresDeviceIdle()) {
+      this
+    } else {
+      setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 1, TimeUnit.MINUTES)
+    }
 
   private fun defaultConstraints(): Constraints =
     Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
