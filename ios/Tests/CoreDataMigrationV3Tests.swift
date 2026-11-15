@@ -9,13 +9,14 @@ import XCTest
 /// them. Tests are named after the parity scenarios the Android suite runs.
 ///
 /// The fixtures are written from one private copy of the compiled model, and
-/// the stack under test loads another. On iOS 27.2, `NSManagedObjectModel(contentsOf:)`
-/// returns the instance already in use for the same `.mom` URL, and that one is
-/// immutable: a fixture sliced from the URL the migration slices next makes the
-/// migration's `slice` raise "Can't modify an immutable model." The app never
-/// does that. It slices each version once per process, and the store on disk
-/// was written by an earlier build, so separate URLs are what a real upgrade
-/// looks like.
+/// the stack under test loads another. On iOS 27.2, once the fixture had
+/// sliced a `.mom` and written a store through it, `NSManagedObjectModel(contentsOf:)`
+/// for that same URL returned the fixture's model, already in use and so
+/// immutable, and the migration's `slice` raised "Can't modify an immutable
+/// model." What exactly makes iOS hand that model back was not isolated. The
+/// app never loads a slice twice: it slices each version once per process,
+/// and the store on disk was written by an earlier build, so separate URLs are
+/// what a real upgrade looks like.
 final class CoreDataMigrationV3Tests: XCTestCase {
     /// The compiled model in the test bundle, as `pod install` bundled it.
     private var momd: URL!
