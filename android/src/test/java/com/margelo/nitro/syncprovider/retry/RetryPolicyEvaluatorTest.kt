@@ -256,13 +256,23 @@ internal class RetryPolicyEvaluatorTest {
       .isEqualTo(TestData.MAX_SAFE_DELAY_MS)
   }
 
+  /**
+   * A deadline stops at the largest valid JavaScript Date, so `new Date(nextRetryAt)` stays
+   * valid and exact in JS, and a sum that would overflow cannot wrap into the past.
+   */
   @Test
-  fun `a deadline that would overflow saturates instead of wrapping into the past`() {
+  fun `a deadline never goes past the largest JavaScript Date`() {
+    val now = 1_800_000_000_000L
     assertThat(RetryPolicyEvaluator.MAX_DELAY_MS).isEqualTo(TestData.MAX_SAFE_DELAY_MS)
     assertThat(RetryPolicyEvaluator.deadline(1_000L, 500L)).isEqualTo(1_500L)
     assertThat(RetryPolicyEvaluator.deadline(1_000L, 0L)).isEqualTo(1_000L)
-    assertThat(RetryPolicyEvaluator.deadline(Long.MAX_VALUE - 10L, 1_000L)).isEqualTo(Long.MAX_VALUE)
-    assertThat(RetryPolicyEvaluator.deadline(1_000L, Long.MAX_VALUE)).isEqualTo(Long.MAX_VALUE)
+    assertThat(RetryPolicyEvaluator.deadline(now, RetryPolicyEvaluator.MAX_DELAY_MS))
+      .isEqualTo(TestData.MAX_JS_DATE_MS)
+    assertThat(RetryPolicyEvaluator.deadline(Long.MAX_VALUE - 10L, 1_000L))
+      .isEqualTo(TestData.MAX_JS_DATE_MS)
+    assertThat(RetryPolicyEvaluator.deadline(1_000L, Long.MAX_VALUE)).isEqualTo(TestData.MAX_JS_DATE_MS)
+    // Below 2^53, so the value is exact as a JS number.
+    assertThat(TestData.MAX_JS_DATE_MS.toDouble().toLong()).isEqualTo(TestData.MAX_JS_DATE_MS)
   }
 
   /** The results iOS converts invalid delays to: no delay for NaN or a negative base. */

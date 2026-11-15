@@ -362,7 +362,8 @@ internal class SyncDispatcherTest {
 
   /**
    * A delay past `Long.MAX_VALUE - now` overflowed `finishedAt + delay` into a deadline long
-   * past: the row was due at once, and the next cycle retried it without waiting.
+   * past: the row was due at once, and the next cycle retried it without waiting. The deadline
+   * now stops at the largest JavaScript Date, a value `getPendingItems()` hands JS exactly.
    */
   @Test
   fun `a retry delay too large to represent keeps the row waiting`() = runTest {
@@ -376,7 +377,7 @@ internal class SyncDispatcherTest {
       d.flush()
 
       assertWithMessage("baseDelayMs = $base")
-        .that(cooling.nextRetryAt).isEqualTo(clock.now() + TestData.MAX_SAFE_DELAY_MS)
+        .that(cooling.nextRetryAt).isEqualTo(TestData.MAX_JS_DATE_MS)
       assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
       assertThat(row(id).attempts).isEqualTo(1)
       assertWithMessage("requests after baseDelayMs = $base")
@@ -398,7 +399,7 @@ internal class SyncDispatcherTest {
     val held = row(id)
     d.flush()
 
-    assertThat(held.nextRetryAt).isEqualTo(clock.now() + TestData.MAX_SAFE_DELAY_MS)
+    assertThat(held.nextRetryAt).isEqualTo(TestData.MAX_JS_DATE_MS)
     assertThat(finishedCycles.first()).isEqualTo(held.nextRetryAt)
     assertThat(row(id).attempts).isEqualTo(0)
     assertThat(server.requestCount).isEqualTo(1)

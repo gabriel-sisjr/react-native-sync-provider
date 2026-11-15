@@ -156,9 +156,10 @@ internal class RetryWake(
 
   /**
    * The wait until [deadline]: 0 for a deadline already past, and at most
-   * [RetryPolicyEvaluator.MAX_DELAY_MS]. A longer one, for a hold with no end or a deadline an
-   * earlier version stored, is more than WorkManager can add to the clock: it would refuse the
-   * kick.
+   * [RetryPolicyEvaluator.MAX_DELAY_MS], a ceiling shared with iOS and far below the delays
+   * WorkManager refuses (`Long.MAX_VALUE - now` or more). Only a hold with no end, or a deadline
+   * an earlier version stored, reaches it: new deadlines stop at
+   * [RetryPolicyEvaluator.MAX_DEADLINE_MS].
    */
   private fun delayUntil(deadline: Long): Long =
     (deadline - clock()).coerceIn(0L, RetryPolicyEvaluator.MAX_DELAY_MS)

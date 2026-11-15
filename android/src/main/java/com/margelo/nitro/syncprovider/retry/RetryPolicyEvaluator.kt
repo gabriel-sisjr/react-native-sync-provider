@@ -17,12 +17,19 @@ import kotlin.random.Random
 internal object RetryPolicyEvaluator {
 
   /**
-   * The longest delay [computeDelayMs] returns: 2^53 - 1 ms, the largest integer a JS number
-   * holds exactly, and iOS's ceiling as well. That is about 285,000 years, so it only shortens a
-   * delay that would not fit in a `Long` deadline: an `Infinity` or huge `baseDelayMs`, or an
-   * uncapped curve at a huge attempt.
+   * The longest delay [computeDelayMs] returns: 2^53 - 1 ms, about 285,000 years, the largest
+   * integer a JS number holds exactly. A ceiling shared with iOS, far below the delays that
+   * overflow a `Long` deadline; it shortens only an `Infinity` or huge `baseDelayMs`, or an
+   * uncapped curve at a huge attempt. The deadline itself stops at [MAX_DEADLINE_MS].
    */
   const val MAX_DELAY_MS: Long = 9_007_199_254_740_991L
+
+  /**
+   * The latest instant a retry deadline may name: 8,640,000,000,000,000 ms after the epoch, the
+   * largest valid JavaScript Date. Being below 2^53, it is exact as a JS number, so `nextRetryAt`
+   * always makes a valid `Date` in JS. The same rule holds on iOS.
+   */
+  const val MAX_DEADLINE_MS: Long = 8_640_000_000_000_000L
 
   /**
    * Compute the back-off delay, in milliseconds, before [attempt] should
@@ -62,11 +69,13 @@ internal object RetryPolicyEvaluator {
   }
 
   /**
-   * [from] plus [delayMs], at most `Long.MAX_VALUE`. A sum that overflowed would be a deadline
-   * long past: the row it is for would be due at once.
+   * [from] plus [delayMs], at most [MAX_DEADLINE_MS]. The sum saturates rather than overflow: a
+   * wrapped sum would be a deadline long past, and the row it is for would be due at once.
    */
-  fun deadline(from: Long, delayMs: Long): Long =
-    if (delayMs > 0L && from > Long.MAX_VALUE - delayMs) Long.MAX_VALUE else from + delayMs
+  fun deadline(from: Long, delayMs: Long): Long {
+    val sum = if (delayMs > 0L && from > Long.MAX_VALUE - delayMs) Long.MAX_VALUE else from + delayMs
+    return sum.coerceAtMost(MAX_DEADLINE_MS)
+  }
 
   /**
    * Decide whether a request that produced [statusCode] should be retried
