@@ -44,6 +44,10 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import java.io.IOException
+import java.io.InterruptedIOException
+import java.net.SocketException
+import java.net.SocketTimeoutException
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -224,6 +228,68 @@ internal class SyncDispatcherTest {
       assertThat(storage.count()).isEqualTo(0)
     }
     assertThat(server.requestCount).isEqualTo(2)
+  }
+
+  /**
+   * `requestTimeoutMs` bounds the whole call through OkHttp's call timeout, and OkHttp ends a
+   * call that runs out of it with an `InterruptedIOException`, not a socket timeout: it was
+   * reported as `NETWORK_ERROR`.
+   */
+  @Test
+  fun `requestTimeoutMs running out is a TIMEOUT, and it is retried`() = runTest {
+    // Reads the request and never answers: only the 1 s call timeout can end the call, long
+    // before the client's 30 s read timeout.
+    server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+    val id = enqueue()
+    val events = recordEvents()
+
+    val result = newDispatcher(requestTimeoutMs = 1_000L, maxAttempts = 3).flush()
+
+    assertThat(row(id).lastErrorCode).isEqualTo(SyncErrorCode.TIMEOUT.name)
+    assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(row(id).attempts).isEqualTo(1)
+    assertThat(row(id).nextRetryAt).isGreaterThan(0L)
+    assertThat(events.single { it.type == SyncEventType.ITEM_RETRYING }.errorCode)
+      .isEqualTo(SyncErrorCode.TIMEOUT)
+    assertThat(result.failedIds).isEmpty()
+  }
+
+  @Test
+  fun `a connection dropped before the response is a NETWORK_ERROR, and it is retried`() = runTest {
+    server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST))
+    val id = enqueue()
+    val events = recordEvents()
+
+    val result = newDispatcher(requestTimeoutMs = 5_000L, maxAttempts = 3).flush()
+
+    assertThat(row(id).lastErrorCode).isEqualTo(SyncErrorCode.NETWORK_ERROR.name)
+    assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(row(id).attempts).isEqualTo(1)
+    assertThat(events.single { it.type == SyncEventType.ITEM_RETRYING }.errorCode)
+      .isEqualTo(SyncErrorCode.NETWORK_ERROR)
+    assertThat(result.failedIds).isEmpty()
+  }
+
+  /** The failures as OkHttp 4.12.0 raises them; a thread interrupt cannot be staged reliably. */
+  @Test
+  fun `only a socket timeout or a call that ran out of its timeout is a TIMEOUT`() {
+    fun code(failure: IOException, ranOutOfTime: Boolean): SyncErrorCode =
+      SyncDispatcher.transportFailureCode(failure, ranOutOfTime)
+    // What RealCall makes of whatever stopped a call whose timeout ran out.
+    val callTimeout = InterruptedIOException("timeout")
+      .apply { initCause(SocketException("Socket closed")) }
+
+    assertThat(code(callTimeout, ranOutOfTime = true)).isEqualTo(SyncErrorCode.TIMEOUT)
+    assertThat(code(SocketTimeoutException("timeout"), ranOutOfTime = false))
+      .isEqualTo(SyncErrorCode.TIMEOUT)
+    // Okio's answer to a thread interrupt: the same class, before the deadline.
+    assertThat(code(InterruptedIOException("interrupted"), ranOutOfTime = false))
+      .isEqualTo(SyncErrorCode.NETWORK_ERROR)
+    assertThat(code(IOException("unexpected end of stream"), ranOutOfTime = false))
+      .isEqualTo(SyncErrorCode.NETWORK_ERROR)
+    // A reset after the deadline, before the timeout fired, is still a reset.
+    assertThat(code(SocketException("Connection reset"), ranOutOfTime = true))
+      .isEqualTo(SyncErrorCode.NETWORK_ERROR)
   }
 
   /* -------------------------- cooldown and attempts ----------------------- */

@@ -24,14 +24,15 @@ import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import okhttp3.logging.HttpLoggingInterceptor
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.net.SocketTimeoutException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -57,8 +58,10 @@ import kotlin.random.Random
  *   failure cannot cancel siblings.
  * - A dispatch that started always records its outcome, even if the cycle is
  *   cancelled. Rows that never started are released back to `PENDING`.
- * - Per-attempt timeout is enforced with `withTimeoutOrNull(...)`; the underlying
- *   OkHttp call also has its own timeouts.
+ * - Each attempt is bounded by OkHttp's call timeout: `requestTimeoutMs`, raised to 1 s and
+ *   capped at `Int.MAX_VALUE` ms. Running out of it reports `TIMEOUT`, and so does one of the
+ *   client's fixed socket timeouts: 10 s to connect, 30 s for a stalled read or write. See
+ *   [transportFailureCode].
  *
  * @param clock epoch-millis source; injectable so tests can move time.
  * @param random PRNG forwarded to [RetryPolicyEvaluator.computeDelayMs] for
@@ -515,87 +518,19 @@ internal class SyncDispatcher(
       retryable = false,
     )
 
+    // The call timeout bounds the whole call: connecting, sending the request and reading the
+    // response. It is the attempt's only time limit besides the client's socket timeouts.
     val call = client.newBuilder()
       .callTimeout(timeoutMs, TimeUnit.MILLISECONDS)
       .build()
       .newCall(request)
 
-    val attemptOutcome: AttemptResult = try {
-      val response = withTimeoutOrNull(timeoutMs) {
-        runCatching { call.execute() }
-      }
-      if (response == null) {
-        runCatching { call.cancel() }
-        return@withContext AttemptResult.Failure(
-          code = SyncErrorCode.TIMEOUT,
-          message = "Request timed out (${timeoutMs}ms)",
-          statusCode = null,
-          retryable = true,
-        )
-      }
-      response.fold(
-        onSuccess = { httpResponse ->
-          httpResponse.use { resp ->
-            val code = resp.code
-            val policy = getOptions().retryPolicy
-            // The status line only: the response's headers and body stay out of it.
-            val statusLine = "HTTP $code ${resp.message}".trim()
-            when {
-              code in 200..299 -> AttemptResult.Success(code)
-              code == 401 || code == 403 -> AttemptResult.Failure(
-                code = SyncErrorCode.UNAUTHORIZED,
-                message = "HTTP $code",
-                statusCode = code,
-                retryable = false,
-                detail = statusLine,
-              )
-              RetryPolicyEvaluator.shouldRetryStatus(code, policy) -> AttemptResult.Failure(
-                code = SyncErrorCode.SERVER_ERROR,
-                message = "HTTP $code",
-                statusCode = code,
-                retryable = true,
-                detail = statusLine,
-              )
-              code in 400..499 -> AttemptResult.Failure(
-                code = SyncErrorCode.SERVER_ERROR,
-                message = "HTTP $code",
-                statusCode = code,
-                retryable = false,
-                detail = statusLine,
-              )
-              else -> AttemptResult.Failure(
-                code = SyncErrorCode.SERVER_ERROR,
-                message = "HTTP $code",
-                statusCode = code,
-                retryable = false,
-                detail = statusLine,
-              )
-            }
-          }
-        },
-        onFailure = { t ->
-          when (t) {
-            is SocketTimeoutException -> AttemptResult.Failure(
-              code = SyncErrorCode.TIMEOUT,
-              message = t.message ?: "Request timed out",
-              statusCode = null,
-              retryable = true,
-            )
-            is IOException -> AttemptResult.Failure(
-              code = SyncErrorCode.NETWORK_ERROR,
-              message = t.message ?: "Network error",
-              statusCode = null,
-              retryable = true,
-            )
-            else -> AttemptResult.Failure(
-              code = SyncErrorCode.NETWORK_ERROR,
-              message = t.message ?: t.javaClass.simpleName,
-              statusCode = null,
-              retryable = false,
-            )
-          }
-        },
-      )
+    val startedAt = System.nanoTime()
+    try {
+      call.execute().use { response -> responseOutcome(response) }
+    } catch (e: IOException) {
+      val ranOutOfTime = System.nanoTime() - startedAt >= TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+      transportFailure(e, ranOutOfTime)
     } catch (t: Throwable) {
       runCatching { call.cancel() }
       AttemptResult.Failure(
@@ -605,7 +540,58 @@ internal class SyncDispatcher(
         retryable = false,
       )
     }
-    attemptOutcome
+  }
+
+  /** The outcome of an attempt the server answered, from its status line. */
+  private fun responseOutcome(resp: Response): AttemptResult {
+    val code = resp.code
+    // Read for each response, so a configureSync made while the request was out applies to it.
+    val policy = getOptions().retryPolicy
+    // The status line only: the response's headers and body stay out of it.
+    val statusLine = "HTTP $code ${resp.message}".trim()
+    return when {
+      code in 200..299 -> AttemptResult.Success(code)
+      code == 401 || code == 403 -> AttemptResult.Failure(
+        code = SyncErrorCode.UNAUTHORIZED,
+        message = "HTTP $code",
+        statusCode = code,
+        retryable = false,
+        detail = statusLine,
+      )
+      RetryPolicyEvaluator.shouldRetryStatus(code, policy) -> AttemptResult.Failure(
+        code = SyncErrorCode.SERVER_ERROR,
+        message = "HTTP $code",
+        statusCode = code,
+        retryable = true,
+        detail = statusLine,
+      )
+      code in 400..499 -> AttemptResult.Failure(
+        code = SyncErrorCode.SERVER_ERROR,
+        message = "HTTP $code",
+        statusCode = code,
+        retryable = false,
+        detail = statusLine,
+      )
+      else -> AttemptResult.Failure(
+        code = SyncErrorCode.SERVER_ERROR,
+        message = "HTTP $code",
+        statusCode = code,
+        retryable = false,
+        detail = statusLine,
+      )
+    }
+  }
+
+  /** An attempt that failed before any response. Retried, a timeout and a network error alike. */
+  private fun transportFailure(failure: IOException, ranOutOfTime: Boolean): AttemptResult.Failure {
+    val code = transportFailureCode(failure, ranOutOfTime)
+    val fallback = if (code == SyncErrorCode.TIMEOUT) "Request timed out" else "Network error"
+    return AttemptResult.Failure(
+      code = code,
+      message = failure.message ?: fallback,
+      statusCode = null,
+      retryable = true,
+    )
   }
 
   private fun buildRequest(
@@ -720,6 +706,26 @@ internal class SyncDispatcher(
 
     /** Where `ITEM_DEAD_LETTERED` carries the real failure code. */
     const val METADATA_LAST_ERROR_CODE = "lastErrorCode"
+
+    /**
+     * The code of an attempt that failed with [failure] before any response. Both are retried.
+     * - [SyncErrorCode.TIMEOUT] when one of the client's socket timeouts fired, which OkHttp
+     *   raises as a `SocketTimeoutException`: 10 s to connect, 30 s for a stalled read or write.
+     * - [SyncErrorCode.TIMEOUT] when the call timeout, `requestTimeoutMs`, ran out. OkHttp 4.12.0
+     *   then ends the call with an `InterruptedIOException("timeout")`, whatever failure it was
+     *   in. A thread interrupt raises the same class ("interrupted"), so the class does not
+     *   decide alone: [ranOutOfTime], whether the call had run for its whole timeout, does.
+     *   OkHttp's watchdog also cancels the call, but the call can see the timeout before that
+     *   `cancel()` runs, so `isCanceled()` could miss it.
+     * - [SyncErrorCode.NETWORK_ERROR] for any other I/O failure: DNS, a refused or dropped
+     *   connection, TLS, or an interrupt before the deadline.
+     */
+    internal fun transportFailureCode(failure: IOException, ranOutOfTime: Boolean): SyncErrorCode =
+      when {
+        failure is SocketTimeoutException -> SyncErrorCode.TIMEOUT
+        failure is InterruptedIOException && ranOutOfTime -> SyncErrorCode.TIMEOUT
+        else -> SyncErrorCode.NETWORK_ERROR
+      }
 
     /**
      * The zeroed result that means "no cycle ran". `flush()` returns it to JS unchanged
