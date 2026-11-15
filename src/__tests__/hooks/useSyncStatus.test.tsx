@@ -94,6 +94,45 @@ describe('useSyncStatus', () => {
     expect(result.current.progress).toBeNull();
   });
 
+  it('ends the cycle on a SYNC_FAILED without errorCode, as a cancelled cycle sends it', async () => {
+    const mock = getMock();
+    // A cancelled cycle writes no history row: the read after it still finds
+    // the previous flush.
+    const previous = successResult();
+    mock.getLastSyncResult.mockResolvedValue(previous);
+
+    const { result } = renderHook(() => useSyncStatus());
+    await waitFor(() => expect(result.current.lastResult).toEqual(previous));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      mock.__emit({ type: SyncEventType.SYNC_STARTED, timestamp: 1 });
+      mock.__emit({
+        type: SyncEventType.SYNC_PROGRESS,
+        timestamp: 2,
+        progress: 0.5,
+      });
+    });
+    expect(result.current.isSyncing).toBe(true);
+    expect(result.current.progress).toBe(0.5);
+    expect(mock.getLastSyncResult).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      mock.__emit({ type: SyncEventType.SYNC_FAILED, timestamp: 3 });
+    });
+
+    await waitFor(() =>
+      expect(mock.getLastSyncResult).toHaveBeenCalledTimes(2)
+    );
+    expect(result.current.isSyncing).toBe(false);
+    expect(result.current.progress).toBeNull();
+    expect(result.current.lastResult).toEqual(previous);
+    expect(result.current.error).toBeNull();
+  });
+
   it('mirrors PAUSED/RESUMED events into isPaused', async () => {
     const mock = getMock();
     const { result } = renderHook(() => useSyncStatus());
