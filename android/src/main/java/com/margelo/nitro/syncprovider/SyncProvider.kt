@@ -30,6 +30,8 @@ import kotlin.coroutines.cancellation.CancellationException
  *   rejects with a `<code>: <message>` string. The JS facade does not parse it:
  *   `wrapNativeError` throws a `SyncError` with the failing call's fallback code
  *   and keeps this string as its message.
+ * - A cancellation is the exception: it is rethrown as it is, and Nitro rejects the
+ *   Promise with it. A `flush` whose cycle a cancellation stopped ends that way.
  */
 @DoNotStrip
 class SyncProvider : HybridSyncProviderSpec() {
