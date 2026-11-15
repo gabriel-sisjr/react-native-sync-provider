@@ -24,6 +24,7 @@ import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -192,11 +193,13 @@ internal class SyncDispatcher(
     syncing.set(true)
     var notBefore: Long? = null
     var terminalEventSent = false
+    var claimedIds: List<String> = emptyList()
     try {
       emitter.emit(SyncEventEmitter.event(SyncEventType.SYNC_STARTED))
 
       val batchSize = (options.batchSize?.toInt() ?: DEFAULT_BATCH_SIZE).coerceAtLeast(1)
       val claimed = storage.claimPending(batchSize, startedAt)
+      claimedIds = claimed.map { it.id }
       val outcomes = if (claimed.isEmpty()) {
         emptyList()
       } else {
@@ -221,7 +224,7 @@ internal class SyncDispatcher(
       )
       return result
     } catch (t: Throwable) {
-      withContext(NonCancellable) { abortCycle(t, terminalEventSent) }
+      withContext(NonCancellable) { abortCycle(t, terminalEventSent, claimedIds) }
       throw t
     } finally {
       syncing.set(false)
@@ -235,15 +238,22 @@ internal class SyncDispatcher(
   /**
    * Leave no path without a terminal event and no row stranded. Whatever ended the cycle, the
    * supervisor scope has already waited for its children and this cycle still holds the
-   * mutex, so a row left `IN_FLIGHT` is one whose dispatch never started, or whose outcome
-   * could not be written: either goes back to `PENDING`, as recovery would put it.
+   * mutex, so a row it claimed that is still `IN_FLIGHT` has no outcome: its dispatch never
+   * started, or failed around its attempt before the outcome was written. Those rows go back
+   * to `PENDING`, as recovery would put them; their attempt is not counted. Only the rows in
+   * [claimedIds]: a row `IN_FLIGHT` that this cycle did not claim, such as another process's
+   * claim, is left to its owner. When even that write fails, the rows wait for recovery.
    *
    * A cancelled cycle, a worker WorkManager stopped say, did not fail: its `SYNC_FAILED`
    * carries no code. Any other cause reports its code, or `NETWORK_ERROR` when it has none.
    */
-  private suspend fun abortCycle(cause: Throwable, terminalEventSent: Boolean) {
-    runCatching { storage.resetInFlight() }
-      .onFailure { Log.e(TAG, "Could not release unattempted rows", it) }
+  private suspend fun abortCycle(
+    cause: Throwable,
+    terminalEventSent: Boolean,
+    claimedIds: List<String>,
+  ) {
+    runCatching { storage.releaseClaimed(claimedIds) }
+      .onFailure { Log.e(TAG, "Could not release the cycle's rows: ${it.javaClass.simpleName}") }
     if (terminalEventSent) return
     val code = when (cause) {
       is CancellationException -> null
@@ -300,56 +310,17 @@ internal class SyncDispatcher(
    * Non-cancellable because the request may reach the server whatever happens to the
    * cycle. Abandoning its outcome would leave the row to be sent a second time.
    *
-   * A cancellation or an [Error] raised in here is no outcome of this item: it is rethrown,
-   * it ends the cycle, and [abortCycle] puts the row back to `PENDING`. Any other exception
-   * ends the item, see [failUnexpectedly].
+   * Only the attempt's own failure is an outcome of the item (see [runOnce]). Anything raised
+   * around it, a storage read or write, an event, a cancellation or an [Error], is rethrown:
+   * it ends the cycle, as a failed store write does on iOS, and [abortCycle] puts the cycle's
+   * rows that have no outcome back to `PENDING`. A failed local write is never recorded as the
+   * item's failure: after a `2xx`, the server already has the request.
    */
   private suspend fun dispatchRecordingOutcome(
     entity: SyncItemEntity,
     options: SyncOptions,
     credentials: CredentialPolicy,
-  ): ItemOutcome = withContext(NonCancellable) {
-    try {
-      dispatchItem(entity, options, credentials)
-    } catch (e: CancellationException) {
-      throw e
-    } catch (e: Exception) {
-      failUnexpectedly(entity, e)
-    }
-  }
-
-  /**
-   * An exception no attempt result accounts for, such as a failed storage read. A row still
-   * `IN_FLIGHT` has no outcome yet: it ends as a permanent `INVALID_PAYLOAD` failure, a dead
-   * letter, as iOS ends a failure it cannot classify. Left `IN_FLIGHT`, it would come back
-   * after every recovery to fail the same way, never sent and never failed. A row whose outcome
-   * was already written, or that a purge removed, is left as it is and not counted.
-   *
-   * When that cannot be written either, the row stays `IN_FLIGHT` for the next recovery.
-   */
-  private suspend fun failUnexpectedly(entity: SyncItemEntity, cause: Exception): ItemOutcome {
-    val detail = cause.message ?: cause.javaClass.simpleName
-    val failed = ItemOutcome.Failed(entity.id, SyncErrorCode.INVALID_PAYLOAD, detail)
-    val moved = try {
-      storage.isInFlight(entity.id) &&
-        deadLetter(
-          entity = entity,
-          attempts = entity.attempts,
-          lastAttemptAt = entity.lastAttemptAt?.takeIf { it > 0L } ?: clock(),
-          code = SyncErrorCode.INVALID_PAYLOAD,
-          detail = detail,
-          statusCode = null,
-          requestSent = false,
-        )
-    } catch (e: CancellationException) {
-      throw e
-    } catch (e: Exception) {
-      // Only the type: a message can carry what the request held.
-      Log.e(TAG, "Could not record the failure of ${entity.id}: ${e.javaClass.simpleName}")
-      return failed
-    }
-    return if (moved) failed else ItemOutcome.Gone(entity.id)
-  }
+  ): ItemOutcome = withContext(NonCancellable) { dispatchItem(entity, options, credentials) }
 
   /**
    * Dispatch a single attempt for [entity]. On a retriable failure with budget
@@ -567,16 +538,20 @@ internal class SyncDispatcher(
       retryable = false,
     )
 
-    // The call timeout bounds the whole call: connecting, sending the request and reading the
-    // response. It is the attempt's only time limit besides the client's socket timeouts.
-    val call = client.newBuilder()
-      .callTimeout(timeoutMs, TimeUnit.MILLISECONDS)
-      .build()
-      .newCall(request)
-
-    val startedAt = System.nanoTime()
+    var call: Call? = null
+    var startedAt = System.nanoTime()
     try {
-      call.execute().use { response -> responseOutcome(response) }
+      // Built here, so that a client that cannot be built fails the attempt, as a request that
+      // cannot be built does. The call timeout bounds the whole call: connecting, sending the
+      // request and reading the response. It is the attempt's only time limit besides the
+      // client's socket timeouts.
+      val built = client.newBuilder()
+        .callTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+        .build()
+        .newCall(request)
+      call = built
+      startedAt = System.nanoTime()
+      built.execute().use { response -> responseOutcome(response) }
     } catch (e: IOException) {
       val ranOutOfTime = System.nanoTime() - startedAt >= TimeUnit.MILLISECONDS.toNanos(timeoutMs)
       transportFailure(e, ranOutOfTime)
@@ -586,7 +561,7 @@ internal class SyncDispatcher(
     } catch (e: Exception) {
       // Anything but an I/O failure is permanent, as on iOS: a retry would fail the same way,
       // and NETWORK_ERROR stays a code that is always retried.
-      runCatching { call.cancel() }
+      call?.let { runCatching { it.cancel() } }
       AttemptResult.Failure(
         code = SyncErrorCode.INVALID_PAYLOAD,
         message = e.message ?: e.javaClass.simpleName,

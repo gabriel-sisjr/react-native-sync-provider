@@ -1,5 +1,6 @@
 package com.margelo.nitro.syncprovider.http
 
+import android.database.sqlite.SQLiteDatabaseLockedException
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.google.common.truth.Truth.assertThat
@@ -151,10 +152,10 @@ internal class SyncDispatcherTest {
     }
   }
 
-  private fun TestScope.recordEvents(): List<SyncEvent> {
+  private fun TestScope.recordEvents(source: SyncEventEmitter = emitter): List<SyncEvent> {
     val events: MutableList<SyncEvent> = Collections.synchronizedList(mutableListOf())
     backgroundScope.launch(Dispatchers.Unconfined, start = CoroutineStart.UNDISPATCHED) {
-      emitter.events.collect { events += it }
+      source.events.collect { events += it }
     }
     return events
   }
@@ -171,6 +172,9 @@ internal class SyncDispatcherTest {
     assertThat(db.syncItemDao().findById(id)).isNull()
     return checkNotNull(db.syncDeadLetterDao().findById(id))
   }
+
+  /** A transient local failure, as SQLite reports a busy database. */
+  private fun locked() = SQLiteDatabaseLockedException("database is locked")
 
   /* ---------------------------- plain dispatch ---------------------------- */
 
@@ -787,33 +791,213 @@ internal class SyncDispatcherTest {
   }
 
   /**
-   * An exception before anything recorded the item's outcome, here from the storage read
-   * that starts each dispatch, left the row `IN_FLIGHT`: every recovery handed it back to a
-   * cycle that failed the same way, so it was never sent and never failed.
+   * The call is built inside the attempt: a client that cannot be built fails the attempt, as a
+   * request that cannot be built does, and does not end the cycle.
    */
   @Test
-  fun `an exception before the outcome is recorded fails the item instead of stranding it`() =
+  fun `a client that cannot be built fails the attempt as INVALID_PAYLOAD`() = runTest {
+    val id = enqueue()
+    val events = recordEvents()
+    val d = SyncDispatcher(
+      storage = storage,
+      emitter = emitter,
+      getOptions = { TestData.syncOptions() },
+      // Read while the shared client is built.
+      verboseLogging = { throw IllegalStateException("no TLS provider") },
+      clock = clock::now,
+    )
+
+    val result = d.flush()
+
+    assertThat(server.requestCount).isEqualTo(0)
+    val dead = deadLetter(id)
+    assertThat(dead.lastErrorCode).isEqualTo(SyncErrorCode.INVALID_PAYLOAD.name)
+    assertThat(dead.lastErrorMessage).isEqualTo("no TLS provider")
+    assertThat(dead.attempts).isEqualTo(1)
+    assertThat(result.failedIds.toList()).containsExactly(id)
+    assertThat(events.single { it.type == SyncEventType.ITEM_FAILED }.attempt).isEqualTo(1.0)
+  }
+
+  /* -------------------- failures around the attempt, not in it ------------------ */
+
+  /**
+   * A local write that fails around the attempt is no outcome of the item, and after a `2xx`
+   * the server has the request. The cycle aborts, as on iOS, and the row goes back to `PENDING`
+   * instead of becoming a dead letter.
+   */
+  @Test
+  fun `a failed write after a 2xx aborts the cycle instead of failing the delivered item`() =
     runTest {
+      server.enqueue(MockResponse().setResponseCode(200))
       val id = enqueue()
       val failing = spyk(storage)
-      coEvery { failing.isQueued(any()) } throws IllegalStateException("database is locked")
+      coEvery { failing.markSucceeded(any()) } throws locked()
       val events = recordEvents()
 
-      val result = newDispatcher(queue = failing).flush()
+      val thrown = runCatching { runBlocking { newDispatcher(queue = failing).flush() } }
 
-      assertThat(inFlightRows()).isEmpty()
-      val dead = deadLetter(id)
-      assertThat(dead.lastErrorCode).isEqualTo(SyncErrorCode.INVALID_PAYLOAD.name)
-      assertThat(dead.lastErrorMessage).isEqualTo("database is locked")
-      assertThat(dead.attempts).isEqualTo(0)
-      assertThat(server.requestCount).isEqualTo(0)
-      assertThat(result.failedIds.toList()).containsExactly(id)
-      assertThat(events.filter { it.itemId == id }.types())
-        .containsExactly(SyncEventType.ITEM_FAILED, SyncEventType.ITEM_DEAD_LETTERED)
-        .inOrder()
-      assertThat(events.single { it.type == SyncEventType.ITEM_FAILED }.errorCode)
-        .isEqualTo(SyncErrorCode.INVALID_PAYLOAD)
+      assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+      assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+      assertThat(row(id).attempts).isEqualTo(0)
+      assertThat(server.requestCount).isEqualTo(1)
+      assertThat(thrown.exceptionOrNull()).isInstanceOf(SQLiteDatabaseLockedException::class.java)
+      assertThat(events.single { it.type == SyncEventType.SYNC_FAILED }.errorCode)
+        .isEqualTo(SyncErrorCode.NETWORK_ERROR)
+      assertThat(events.types())
+        .containsNoneOf(SyncEventType.ITEM_FAILED, SyncEventType.ITEM_DEAD_LETTERED)
+      assertThat(storage.getHistory()).isEmpty()
     }
+
+  @Test
+  fun `a failed write after a retryable 503 aborts the cycle and the item is retried`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(503))
+    server.enqueue(MockResponse().setResponseCode(200))
+    val id = enqueue()
+    val failing = spyk(storage)
+    coEvery { failing.markRetry(any(), any(), any(), any(), any()) } throws locked()
+    val events = recordEvents()
+
+    val thrown = runCatching { runBlocking { newDispatcher(queue = failing).flush() } }
+
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(row(id).attempts).isEqualTo(0)
+    assertThat(thrown.exceptionOrNull()).isInstanceOf(SQLiteDatabaseLockedException::class.java)
+    assertThat(events.single { it.type == SyncEventType.SYNC_FAILED }.errorCode)
+      .isEqualTo(SyncErrorCode.NETWORK_ERROR)
+    // With the storage healthy again, the next cycle sends it.
+    assertThat(newDispatcher().flush().succeededIds.toList()).containsExactly(id)
+    assertThat(server.requestCount).isEqualTo(2)
+  }
+
+  /**
+   * An exception after the outcome was written, here from the event that follows it, ends the
+   * cycle as well, but the outcome stands: the row keeps its cooldown and its attempt.
+   */
+  @Test
+  fun `an exception after the outcome is written leaves that outcome as recorded`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(503))
+    val id = enqueue()
+    val failingEvents = spyk(SyncEventEmitter())
+    coEvery { failingEvents.emit(match { it.type == SyncEventType.ITEM_RETRYING }) } throws
+      IllegalStateException("bridge down")
+    val events = recordEvents(failingEvents)
+    val d = SyncDispatcher(
+      storage = storage,
+      emitter = failingEvents,
+      getOptions = {
+        TestData.syncOptions(retryPolicy = TestData.retryPolicy(maxAttempts = 3, baseDelayMs = 1_000L))
+      },
+      clock = clock::now,
+    )
+
+    val thrown = runCatching { runBlocking { d.flush() } }
+
+    assertThat(thrown.exceptionOrNull()).isInstanceOf(IllegalStateException::class.java)
+    val cooling = row(id)
+    assertThat(cooling.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(cooling.attempts).isEqualTo(1)
+    assertThat(cooling.nextRetryAt).isEqualTo(clock.now() + 1_000L)
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(events.single { it.type == SyncEventType.SYNC_FAILED }.errorCode)
+      .isEqualTo(SyncErrorCode.NETWORK_ERROR)
+  }
+
+  /**
+   * A storage read that fails before the attempt left the row `IN_FLIGHT`, or, with Q4c, made
+   * it a dead letter. The cycle aborts instead, the row waits in the queue, and the next cycle,
+   * with the storage healthy again, sends it.
+   */
+  @Test
+  fun `a failed storage read before the attempt strands no row, and the next cycle sends it`() =
+    runTest {
+      server.enqueue(MockResponse().setResponseCode(200))
+      val id = enqueue()
+      val failing = spyk(storage)
+      coEvery { failing.isQueued(any()) } throws locked()
+      val events = recordEvents()
+
+      val thrown = runCatching { runBlocking { newDispatcher(queue = failing).flush() } }
+
+      assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+      assertThat(inFlightRows()).isEmpty()
+      assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+      assertThat(server.requestCount).isEqualTo(0)
+      assertThat(thrown.exceptionOrNull()).isInstanceOf(SQLiteDatabaseLockedException::class.java)
+      assertThat(events.single { it.type == SyncEventType.SYNC_FAILED }.errorCode)
+        .isEqualTo(SyncErrorCode.NETWORK_ERROR)
+      assertThat(newDispatcher().flush().succeededIds.toList()).containsExactly(id)
+    }
+
+  /** The one exception: when even the release fails, the row waits for recovery. */
+  @Test
+  fun `when the release fails too, the row waits in flight for recovery`() = runTest {
+    val id = enqueue()
+    val failing = spyk(storage)
+    coEvery { failing.isQueued(any()) } throws locked()
+    coEvery { failing.releaseClaimed(any()) } throws locked()
+
+    val thrown = runCatching { runBlocking { newDispatcher(queue = failing).flush() } }
+
+    assertThat(thrown.exceptionOrNull()).isInstanceOf(SQLiteDatabaseLockedException::class.java)
+    assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_IN_FLIGHT)
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    // Recovery, as an engine attach, a boot or a worker with no JS engine runs it.
+    assertThat(newDispatcher().resetInFlight()).isEqualTo(1)
+    assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+  }
+
+  /** The other items of the batch either finish with their own outcome or wait, unsent. */
+  @Test
+  fun `a failure around one attempt ends the cycle without stranding the other items`() =
+    runTest {
+      server.dispatcher = respondAfter(attemptMs = 0L, code = 200)
+      val failingId = enqueue("/failing")
+      val others = List(3) { enqueue("/other$it") }
+      val failing = spyk(storage)
+      coEvery { failing.markSucceeded(failingId) } throws locked()
+
+      val thrown = runCatching { runBlocking { newDispatcher(queue = failing).flush() } }
+
+      assertThat(thrown.exceptionOrNull()).isInstanceOf(SQLiteDatabaseLockedException::class.java)
+      assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+      assertThat(inFlightRows()).isEmpty()
+      assertThat(row(failingId).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+      // Delivered and removed, or never started and still waiting.
+      others.forEach { other ->
+        db.syncItemDao().findById(other)?.let {
+          assertThat(it.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+        }
+      }
+    }
+
+  /**
+   * An aborted cycle releases only the rows it claimed. A row `IN_FLIGHT` that it never claimed,
+   * such as another process's claim, is left to its owner, or to recovery.
+   */
+  @Test
+  fun `an aborted cycle releases only the rows it claimed`() = runTest {
+    db.syncItemDao().insert(TestData.entity(id = "elsewhere", status = SyncItemEntity.STATUS_IN_FLIGHT))
+    val release = CompletableDeferred<Unit>()
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest): MockResponse {
+        runBlocking { withTimeout(20_000L) { release.await() } }
+        return MockResponse().setResponseCode(200)
+      }
+    }
+    enqueue("/sent")
+    val unsent = enqueue("/unsent")
+    val d = newDispatcher(credentials = { CredentialPolicy.PERSISTED })
+
+    val cycle = launch(Dispatchers.IO) { d.flush() }
+    assertThat(server.takeRequest(20, TimeUnit.SECONDS)!!.path).isEqualTo("/sent")
+    cycle.cancel()
+    release.complete(Unit)
+    cycle.join()
+
+    assertThat(row(unsent).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(row("elsewhere").status).isEqualTo(SyncItemEntity.STATUS_IN_FLIGHT)
+  }
 
   @Test
   fun `resetInFlight waits for a running cycle instead of requeueing its rows`() = runTest {
