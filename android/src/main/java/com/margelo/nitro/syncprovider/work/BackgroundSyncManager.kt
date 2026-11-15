@@ -19,6 +19,7 @@ import androidx.work.WorkRequest
 import com.margelo.nitro.syncprovider.BackgroundSyncOptions
 import com.margelo.nitro.syncprovider.SyncErrorCode
 import com.margelo.nitro.syncprovider.error.SyncException
+import com.margelo.nitro.syncprovider.retry.RetryPolicyEvaluator
 import java.util.concurrent.TimeUnit
 
 /**
@@ -94,7 +95,8 @@ internal class BackgroundSyncManager(context: Context) {
         return
       }
 
-      val intervalMs = options.minimumIntervalMs.toLong().coerceAtLeast(MIN_INTERVAL_MS)
+      // NaN and -Infinity convert to 0 and Long.MIN_VALUE, so they get the floor.
+      val intervalMs = options.minimumIntervalMs.toLong().coerceIn(MIN_INTERVAL_MS, MAX_INTERVAL_MS)
       val constraints = buildConstraints(options)
 
       val request = PeriodicWorkRequestBuilder<SyncWorker>(intervalMs, TimeUnit.MILLISECONDS)
@@ -264,6 +266,14 @@ internal class BackgroundSyncManager(context: Context) {
 
     /** WorkManager refuses to register periodic work below 15 minutes. */
     const val MIN_INTERVAL_MS: Long = 15L * 60L * 1000L
+
+    /**
+     * The longest period: 2^53 - 1 ms, about 285,000 years, the ceiling retry delays use.
+     * WorkManager computes each period after the first as the last enqueue time plus the
+     * interval, and an interval that saturates a `Long` (`Infinity`, `1e300`) wraps that sum
+     * into the past, which makes every later period due at once.
+     */
+    const val MAX_INTERVAL_MS: Long = RetryPolicyEvaluator.MAX_DELAY_MS
 
     /* Unique work names. */
     const val UNIQUE_PERIODIC = "syncprovider-flush-periodic"

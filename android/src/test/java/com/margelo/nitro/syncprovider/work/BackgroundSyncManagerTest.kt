@@ -15,6 +15,7 @@ import androidx.work.testing.SynchronousExecutor
 import androidx.work.testing.TestListenableWorkerBuilder
 import androidx.work.testing.WorkManagerTestInitHelper
 import com.google.common.truth.Truth.assertThat
+import com.google.common.truth.Truth.assertWithMessage
 import com.margelo.nitro.syncprovider.SyncProviderRuntime
 import com.margelo.nitro.syncprovider.http.SyncDispatcher
 import com.margelo.nitro.syncprovider.testutil.RuntimeTestSupport
@@ -320,6 +321,45 @@ internal class BackgroundSyncManagerTest {
     manager.scheduleOneTimeFlush(initialDelayMs = Long.MAX_VALUE - 1)
 
     assertThat(activeWorkCount(BackgroundSyncManager.UNIQUE_ONE_TIME)).isEqualTo(0)
+  }
+
+  /* ------------------------------ (i) the periodic interval --------------------------- */
+
+  /**
+   * WorkManager computes each period after the first as the last enqueue time plus the interval.
+   * An interval that saturated a Long, from `Infinity` or `1e300`, wrapped that sum into the
+   * past, so every period after the first was due at once. The interval stops at 2^53 - 1 ms,
+   * the ceiling retry delays use.
+   */
+  @Test
+  fun `a huge minimumIntervalMs is capped, so the next period does not wrap`() {
+    for (interval in listOf(Double.POSITIVE_INFINITY, 1e300, Long.MAX_VALUE.toDouble())) {
+      manager.enable(
+        TestData.backgroundSyncOptions(foregroundOnly = false).copy(minimumIntervalMs = interval),
+      )
+
+      val spec = activeSpec(BackgroundSyncManager.UNIQUE_PERIODIC)
+      val now = System.currentTimeMillis()
+      // The second period, as WorkManager computes it once the first run has finished.
+      val secondPeriod = spec.copy(periodCount = 1, lastEnqueueTime = now).calculateNextRunTime()
+      assertWithMessage("second period for minimumIntervalMs = $interval")
+        .that(secondPeriod).isGreaterThan(now)
+      assertWithMessage("interval for minimumIntervalMs = $interval")
+        .that(spec.intervalDuration).isEqualTo(TestData.MAX_SAFE_DELAY_MS)
+    }
+  }
+
+  @Test
+  fun `a NaN or negative minimumIntervalMs keeps the 15-minute floor`() {
+    for (interval in listOf(Double.NaN, Double.NEGATIVE_INFINITY, -1.0, 0.0)) {
+      manager.enable(
+        TestData.backgroundSyncOptions(foregroundOnly = false).copy(minimumIntervalMs = interval),
+      )
+
+      assertWithMessage("minimumIntervalMs = $interval")
+        .that(activeSpec(BackgroundSyncManager.UNIQUE_PERIODIC).intervalDuration)
+        .isEqualTo(BackgroundSyncManager.MIN_INTERVAL_MS)
+    }
   }
 
   @Test
