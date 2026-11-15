@@ -7,8 +7,22 @@ import XCTest
 /// dead-letter store, explicitly, never by inference. The fixtures are real
 /// SQLite stores, opened with persistent history tracking as the app opens
 /// them. Tests are named after the parity scenarios the Android suite runs.
+///
+/// The fixtures are written from one private copy of the compiled model, and
+/// the stack under test loads another. On iOS 27.2, `NSManagedObjectModel(contentsOf:)`
+/// returns the instance already in use for the same `.mom` URL, and that one is
+/// immutable: a fixture sliced from the URL the migration slices next makes the
+/// migration's `slice` raise "Can't modify an immutable model." The app never
+/// does that. It slices each version once per process, and the store on disk
+/// was written by an earlier build, so separate URLs are what a real upgrade
+/// looks like.
 final class CoreDataMigrationV3Tests: XCTestCase {
+    /// The compiled model in the test bundle, as `pod install` bundled it.
     private var momd: URL!
+    /// A copy of ``momd`` the fixture stores are written from.
+    private var fixtureMomd: URL!
+    /// Another copy, loaded by the stack and the migration under test.
+    private var stackMomd: URL!
     private var directory: URL!
 
     private let storeOptions: [AnyHashable: Any] = [NSPersistentHistoryTrackingKey: true as NSNumber]
@@ -43,6 +57,10 @@ final class CoreDataMigrationV3Tests: XCTestCase {
         directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("syncprovider-v3-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        fixtureMomd = directory.appendingPathComponent("Fixture.momd", isDirectory: true)
+        try FileManager.default.copyItem(at: momd, to: fixtureMomd)
+        stackMomd = directory.appendingPathComponent("Stack.momd", isDirectory: true)
+        try FileManager.default.copyItem(at: momd, to: stackMomd)
     }
 
     override func tearDownWithError() throws {
@@ -70,11 +88,11 @@ final class CoreDataMigrationV3Tests: XCTestCase {
 
     func test_storeAlreadyAtTheCurrentModel_isLeftAlone() async throws {
         let url = try makeStore(version: "SyncProvider 2")
-        let first = CoreDataStack(storeURL: url, modelURL: momd)
+        let first = CoreDataStack(storeURL: url, modelURL: stackMomd)
         _ = first.persistentContainer
-        let currentModel = try XCTUnwrap(NSManagedObjectModel(contentsOf: momd))
+        let currentModel = try XCTUnwrap(NSManagedObjectModel(contentsOf: stackMomd))
 
-        let migratedAgain = try CoreDataMigration.migrateStoreIfNeeded(at: url, momd: momd,
+        let migratedAgain = try CoreDataMigration.migrateStoreIfNeeded(at: url, momd: stackMomd,
                                                                       currentModel: currentModel,
                                                                       storeOptions: storeOptions)
 
@@ -85,9 +103,9 @@ final class CoreDataMigrationV3Tests: XCTestCase {
 
     func test_missingStore_isLeftToTheLoad() throws {
         let url = directory.appendingPathComponent("absent.sqlite")
-        let currentModel = try XCTUnwrap(NSManagedObjectModel(contentsOf: momd))
+        let currentModel = try XCTUnwrap(NSManagedObjectModel(contentsOf: stackMomd))
 
-        let migrated = try CoreDataMigration.migrateStoreIfNeeded(at: url, momd: momd,
+        let migrated = try CoreDataMigration.migrateStoreIfNeeded(at: url, momd: stackMomd,
                                                                  currentModel: currentModel,
                                                                  storeOptions: storeOptions)
 
@@ -100,8 +118,8 @@ final class CoreDataMigrationV3Tests: XCTestCase {
     /// Inference would accept v2 to v3: the queue entity did not change. That
     /// is why the migration is explicit.
     func test_v2ToV3_wouldBeInferable_soInferenceWouldSilentlySkipTheMove() throws {
-        let v2 = try XCTUnwrap(CoreDataMigration.slice("SyncProvider 2", in: momd))
-        let v3 = try XCTUnwrap(CoreDataMigration.slice("SyncProvider 3", in: momd))
+        let v2 = try XCTUnwrap(CoreDataMigration.slice("SyncProvider 2", in: stackMomd))
+        let v3 = try XCTUnwrap(CoreDataMigration.slice("SyncProvider 3", in: stackMomd))
 
         XCTAssertEqual(v2.entityVersionHashesByName["SyncItemEntity"], v3.entityVersionHashesByName["SyncItemEntity"])
         XCTAssertNoThrow(try NSMappingModel.inferredMappingModel(forSourceModel: v2, destinationModel: v3))
@@ -149,7 +167,7 @@ final class CoreDataMigrationV3Tests: XCTestCase {
 
     private func assertMigrated(storeAt url: URL, fromV1: Bool,
                                 file: StaticString = #filePath, line: UInt = #line) async throws {
-        let stack = CoreDataStack(storeURL: url, modelURL: momd)
+        let stack = CoreDataStack(storeURL: url, modelURL: stackMomd)
         _ = stack.persistentContainer
         XCTAssertNil(stack.initializationError, file: file, line: line)
         let dao = SyncItemDao(stack: stack)
@@ -193,7 +211,7 @@ final class CoreDataMigrationV3Tests: XCTestCase {
         let metadata = try NSPersistentStoreCoordinator.metadataForPersistentStore(ofType: NSSQLiteStoreType,
                                                                                   at: url,
                                                                                   options: storeOptions)
-        let current = try XCTUnwrap(NSManagedObjectModel(contentsOf: momd))
+        let current = try XCTUnwrap(NSManagedObjectModel(contentsOf: stackMomd))
         XCTAssertTrue(current.isConfiguration(withName: nil, compatibleWithStoreMetadata: metadata),
                       "the store on disk is at the current model", file: file, line: line)
         let leftovers = try FileManager.default.contentsOfDirectory(atPath: directory.path)
@@ -203,9 +221,10 @@ final class CoreDataMigrationV3Tests: XCTestCase {
 
     // MARK: - Fixtures
 
-    /// A real SQLite store written by `version`, closed before returning.
+    /// A real SQLite store written by `version`, closed before returning. The
+    /// model comes from ``fixtureMomd``, never from a URL the stack loads.
     private func makeStore(version: String) throws -> URL {
-        let model = try XCTUnwrap(CoreDataMigration.slice(version, in: momd))
+        let model = try XCTUnwrap(CoreDataMigration.slice(version, in: fixtureMomd))
         let url = directory.appendingPathComponent("SyncProvider.sqlite")
         let coordinator = NSPersistentStoreCoordinator(managedObjectModel: model)
         let store = try coordinator.addPersistentStore(type: .sqlite, configuration: nil, at: url,
