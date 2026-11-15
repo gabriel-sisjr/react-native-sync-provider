@@ -97,3 +97,66 @@ final class ConnectivityMonitorTests: XCTestCase {
         XCTAssertNil(unknown.isExpensive)
     }
 }
+
+/// `subscribe` reads the snapshot to replay under the lock and hands it over
+/// outside it, so the system's first path update can reach the subscriber in
+/// between. A monitor of its own, with the update applied by the test at that
+/// exact point, makes the race deterministic.
+final class ConnectivityReplayOrderTests: XCTestCase {
+    private final class Received: @unchecked Sendable {
+        private let lock = NSLock()
+        private var recorded: [ConnectionSnapshot.Status] = []
+
+        var statuses: [ConnectionSnapshot.Status] {
+            lock.withLock { recorded }
+        }
+
+        func record(_ snapshot: ConnectionSnapshot) {
+            lock.withLock { recorded.append(snapshot.status) }
+        }
+    }
+
+    func test_aPathUpdateDuringTheReplay_isNotOverwrittenByTheStaleReplay() {
+        let monitor = ConnectivityMonitor()
+        monitor.setReplayHook { monitor.apply(.link()) }
+        let received = Received()
+
+        monitor.subscribe { received.record($0) }
+
+        XCTAssertEqual(received.statuses.last, .connected, "\(received.statuses)")
+        XCTAssertFalse(received.statuses.drop { $0 != .connected }.contains(.unknown),
+                       "An UNKNOWN reached the subscriber after the real path: \(received.statuses)")
+        XCTAssertEqual(monitor.current.status, .connected)
+    }
+
+    /// What the stale replay did to the engine: the quality monitor kept
+    /// `UNKNOWN`, so on a stable network `getConnectionStatus()` reported it,
+    /// retry wakes were held as offline and a gated flush was blocked.
+    func test_theQualityMonitor_keepsTheRealPath() {
+        let connectivity = ConnectivityMonitor()
+        connectivity.setReplayHook { connectivity.apply(.link()) }
+        let quality = NetworkQualityMonitor(connectivity: connectivity, probe: FakeHeadProbe(), clock: ManualClock())
+
+        quality.start()
+        defer { quality.stop() }
+
+        XCTAssertEqual(quality.current.link.status, .connected)
+        XCTAssertTrue(quality.current.link.isOnline)
+    }
+
+    /// With no race, the replay still comes first and synchronously, and the
+    /// next update follows it.
+    func test_withoutARace_theReplayComesFirst_andUpdatesFollowInOrder() {
+        let monitor = ConnectivityMonitor()
+        let received = Received()
+
+        monitor.subscribe { received.record($0) }
+        XCTAssertEqual(received.statuses, [.unknown], "Replayed before subscribe returned")
+
+        monitor.apply(.link())
+        monitor.apply(.disconnected)
+        monitor.apply(.link(.cellular, expensive: true))
+
+        XCTAssertEqual(received.statuses, [.unknown, .connected, .disconnected, .metered])
+    }
+}
