@@ -141,7 +141,7 @@ final class SyncEngine: @unchecked Sendable {
          wrapWakeSource: ((RetryWakeSource) -> RetryWakeSource)? = nil) {
         let loaded = configStore.load()
         let storage = SyncQueueStorage(dao: SyncItemDao(stack: stack, clock: clock),
-                                       capacity: max(1, Int(loaded.options.maxQueueSize)))
+                                       capacity: loaded.options.queueCapacity)
         let config = loaded.options.toDispatcherConfig(source: loaded.source,
                                                        credentialsUnavailable: loaded.credentialsUnavailable)
         let dispatcher: SyncDispatcher
@@ -317,7 +317,7 @@ final class SyncEngine: @unchecked Sendable {
         configStore.save(snapshot)
         healthCheck.clearBackoff()
         qualityMonitor.setProbeURL(Self.probeURL(snapshot))
-        await storage.updateCapacity(Int(snapshot.maxQueueSize))
+        await storage.updateCapacity(snapshot.queueCapacity)
         await dispatcher.updateConfig(snapshot.toDispatcherConfig(source: .live))
         await rearmRetryTimer()
     }

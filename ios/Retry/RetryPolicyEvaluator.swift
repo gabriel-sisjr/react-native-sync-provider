@@ -13,18 +13,82 @@ import Foundation
 /// Sendable Swift mirror of `RetryPolicy` to keep this layer free of the
 /// generated `margelo.nitro.syncprovider.RetryPolicy` C++ type. Constructed by
 /// the bridge.
+///
+/// It keeps the numbers as `configureSync` received them, NaN and ±Infinity
+/// included: that is what is persisted and what `getSyncConfig()` echoes, as
+/// on Android. They are converted where they are read, through
+/// ``NumericOption``, so no number can trap, at the call or at a later launch.
 struct RetryPolicyValue: Sendable, Equatable {
-    let maxAttempts: Int
+    /// `maxAttempts` as given. Read ``maxAttempts``.
+    let rawMaxAttempts: Double
     let backoff: Backoff
-    let baseDelayMs: Int
-    let maxDelayMs: Int
+    /// `baseDelayMs` as given. Read ``baseDelayMs``.
+    let rawBaseDelayMs: Double
+    /// `maxDelayMs` as given. Read ``maxDelayMs``.
+    let rawMaxDelayMs: Double
     let jitter: Bool
-    let retryOnStatusCodes: [Int]
+    /// `retryOnStatusCodes` as given. Read ``retryOnStatusCodes``.
+    let rawRetryOnStatusCodes: [Double]
 
     enum Backoff: String, Sendable {
         case linear = "LINEAR"
         case exponential = "EXPONENTIAL"
         case fibonacci = "FIBONACCI"
+    }
+
+    /// The policy as the bridge received it.
+    init(rawMaxAttempts: Double,
+         backoff: Backoff,
+         rawBaseDelayMs: Double,
+         rawMaxDelayMs: Double,
+         jitter: Bool,
+         rawRetryOnStatusCodes: [Double]) {
+        self.rawMaxAttempts = rawMaxAttempts
+        self.backoff = backoff
+        self.rawBaseDelayMs = rawBaseDelayMs
+        self.rawMaxDelayMs = rawMaxDelayMs
+        self.jitter = jitter
+        self.rawRetryOnStatusCodes = rawRetryOnStatusCodes
+    }
+
+    /// A policy of whole numbers, such as the default one.
+    init(maxAttempts: Int,
+         backoff: Backoff,
+         baseDelayMs: Int,
+         maxDelayMs: Int,
+         jitter: Bool,
+         retryOnStatusCodes: [Int]) {
+        self.init(rawMaxAttempts: Double(maxAttempts),
+                  backoff: backoff,
+                  rawBaseDelayMs: Double(baseDelayMs),
+                  rawMaxDelayMs: Double(maxDelayMs),
+                  jitter: jitter,
+                  rawRetryOnStatusCodes: retryOnStatusCodes.map(Double.init))
+    }
+
+    /// The attempt budget, from 1 to 2147483647. See ``NumericOption/count(_:)``.
+    var maxAttempts: Int {
+        NumericOption.count(rawMaxAttempts)
+    }
+
+    /// The base delay in whole milliseconds. See ``NumericOption/delayMs(_:)``.
+    /// With a `maxDelayMs` of NaN it reads as 0, so every delay is 0: that is
+    /// what Android computes for a NaN cap.
+    var baseDelayMs: Int {
+        rawMaxDelayMs.isNaN ? 0 : NumericOption.delayMs(rawBaseDelayMs)
+    }
+
+    /// The cap in whole milliseconds, where 0 or less means no cap. See
+    /// ``NumericOption/delayMs(_:)``: +Infinity caps at the delay ceiling,
+    /// which caps nothing either.
+    var maxDelayMs: Int {
+        NumericOption.delayMs(rawMaxDelayMs)
+    }
+
+    /// The status codes to retry, truncated, without the entries that could
+    /// match no status. See ``NumericOption/statusCodes(_:)``.
+    var retryOnStatusCodes: [Int] {
+        NumericOption.statusCodes(rawRetryOnStatusCodes)
     }
 
     /// Default policy matching the JS facade defaults.
