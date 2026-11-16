@@ -943,6 +943,26 @@ internal class SyncDispatcherTest {
     assertThat(server.requestCount).isEqualTo(1)
   }
 
+  /** An `Error` from the write after a `2xx`, a class R8 removed say, delivers the row too. */
+  @Test
+  fun `an Error from the write after a 2xx still delivers the row`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(200))
+    val id = enqueue()
+    val failing = spyk(storage)
+    coEvery { failing.markSucceeded(any()) } throws NoClassDefFoundError("a class R8 removed")
+    val events = recordEvents()
+
+    val thrown = runCatching { runBlocking { newDispatcher(queue = failing).flush() } }
+
+    assertThat(thrown.exceptionOrNull()).isInstanceOf(NoClassDefFoundError::class.java)
+    assertThat(db.syncItemDao().findById(id)).isNull()
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(events.single { it.type == SyncEventType.ITEM_SUCCEEDED }.itemId).isEqualTo(id)
+    clock.advance(3_600_000L)
+    newDispatcher().flush()
+    assertThat(server.requestCount).isEqualTo(1)
+  }
+
   /** "late": attempted twice, due now, so the next attempt is the last of 3. */
   private suspend fun insertLate() {
     db.syncItemDao().insert(
