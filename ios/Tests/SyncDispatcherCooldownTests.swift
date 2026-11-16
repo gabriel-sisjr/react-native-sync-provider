@@ -291,15 +291,15 @@ final class SyncDispatcherCooldownTests: XCTestCase {
         XCTAssertEqual(stored.status, "PENDING", "not left IN_FLIGHT", file: file, line: line)
         XCTAssertEqual(stored.attempts, 1, "the attempt counts", file: file, line: line)
         XCTAssertEqual(stored.nextRetryAt, now + 300, "the retry policy's first delay", file: file, line: line)
-        XCTAssertEqual(stored.lastErrorCode, "INVALID_PAYLOAD", file: file, line: line)
+        XCTAssertEqual(stored.lastErrorCode, "NETWORK_ERROR", file: file, line: line)
         let letters = try await storage.getDeadLetters()
         XCTAssertEqual(letters.count, 0, file: file, line: line)
         XCTAssertEqual(emitter.emittedEvents.map(\.type).filter { $0 != "SYNC_PROGRESS" },
                        ["SYNC_STARTED", "ITEM_RETRYING", "SYNC_FAILED"], file: file, line: line)
         let retrying = emitter.events(ofType: "ITEM_RETRYING").first
-        XCTAssertEqual(retrying?.errorCode, "INVALID_PAYLOAD", file: file, line: line)
+        XCTAssertEqual(retrying?.errorCode, "NETWORK_ERROR", file: file, line: line)
         XCTAssertEqual(retrying?.attempt, 1, file: file, line: line)
-        XCTAssertEqual(emitter.events(ofType: "SYNC_FAILED").first?.errorCode, "INVALID_PAYLOAD",
+        XCTAssertEqual(emitter.events(ofType: "SYNC_FAILED").first?.errorCode, "NETWORK_ERROR",
                        file: file, line: line)
 
         _ = try await dispatcher.flush()
@@ -359,7 +359,7 @@ final class SyncDispatcherCooldownTests: XCTestCase {
         let letters = try await storage.getDeadLetters()
         XCTAssertEqual(letters.count, 0)
         XCTAssertEqual(emitter.emittedEvents.map(\.type).filter { $0.hasPrefix("ITEM_") }, [])
-        XCTAssertEqual(emitter.events(ofType: "SYNC_FAILED").first?.errorCode, "INVALID_PAYLOAD")
+        XCTAssertEqual(emitter.events(ofType: "SYNC_FAILED").first?.errorCode, "NETWORK_ERROR")
     }
 
     /// When settling the row fails too, it waits IN_FLIGHT for launch recovery.
@@ -374,7 +374,7 @@ final class SyncDispatcherCooldownTests: XCTestCase {
         XCTAssertEqual(stored.status, "IN_FLIGHT")
         XCTAssertEqual(faults.failures, 2)
         XCTAssertEqual(emitter.events(ofType: "ITEM_RETRYING").count, 0)
-        XCTAssertEqual(emitter.events(ofType: "SYNC_FAILED").first?.errorCode, "INVALID_PAYLOAD")
+        XCTAssertEqual(emitter.events(ofType: "SYNC_FAILED").first?.errorCode, "NETWORK_ERROR")
         let recovered = try await storage.resetInFlightToPending()
         XCTAssertEqual(recovered, 1)
     }

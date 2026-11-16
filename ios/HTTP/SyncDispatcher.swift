@@ -346,7 +346,8 @@ actor SyncDispatcher {
     /// A response that arrived before the cancellation is recorded as usual.
     ///
     /// A cycle that dies for any other reason, a write that fails say, ends
-    /// with `SYNC_FAILED` and the cause's code, and the row whose outcome
+    /// with `SYNC_FAILED` and its code (see ``cycleFailureCode(_:)``: a cause
+    /// that is not a `SyncProviderError` is `NETWORK_ERROR`), and the row whose outcome
     /// could not be written is settled first: its attempt counted, with the
     /// retry policy's cooldown, when its request went out; as it was before
     /// its claim when the request never went out.
@@ -396,8 +397,7 @@ actor SyncDispatcher {
             if error is CancellationError {
                 emitter.emit(.now(type: "SYNC_FAILED"))
             } else {
-                emitter.emit(.now(type: "SYNC_FAILED",
-                                  errorCode: wrapAsSyncProviderError(error).code.stringValue))
+                emitter.emit(.now(type: "SYNC_FAILED", errorCode: Self.cycleFailureCode(error)))
             }
             await finishCycle(error is CancellationError ? .cancelled : .aborted)
             throw error
@@ -733,13 +733,27 @@ actor SyncDispatcher {
         return .retrying(attempt: attemptsAfter)
     }
 
+    /// The code a cycle that dies of `error` reports, on its `SYNC_FAILED`
+    /// and on the row it settles: a `SyncProviderError` keeps its own, and any
+    /// other cause, a Core Data write that fails say, is `NETWORK_ERROR`, as
+    /// on Android, the code the docs give a cycle that dies. The bridge's
+    /// fallback for a rejected call, `INVALID_PAYLOAD`, which the docs call
+    /// permanent, is not used here.
+    static func cycleFailureCode(_ error: Error) -> String {
+        guard let failure = error as? SyncProviderError else {
+            return SyncErrorCode.networkError.stringValue
+        }
+        return failure.code.stringValue
+    }
+
     /// Settles the row of an item whose outcome could not be written, before
     /// its cycle dies with `cause`. `item` is the snapshot from before the
     /// claim, which already counted the attempt.
     ///
     /// When the request went out, it may have reached the server: the row
     /// keeps that attempt and gets the retry policy's cooldown, with
-    /// `ITEM_RETRYING` carrying the cause's code, as after a retryable
+    /// `ITEM_RETRYING` carrying the cycle's code (``cycleFailureCode(_:)``),
+    /// also kept as the row's `lastErrorCode`, as after a retryable
     /// failure, or, with no budget left, moves to the dead-letter store with
     /// `MAX_ATTEMPTS_EXCEEDED`, with `ITEM_FAILED` and `ITEM_DEAD_LETTERED`.
     /// Given back at once and uncounted instead, a row whose outcome write
@@ -756,7 +770,7 @@ actor SyncDispatcher {
                 return
             }
             let failure = wrapAsSyncProviderError(cause)
-            let code = failure.code.stringValue
+            let code = Self.cycleFailureCode(cause)
             let attempt = item.attempts + 1
             guard Int(attempt) < config.retryPolicy.maxAttempts else {
                 let exhausted = "MAX_ATTEMPTS_EXCEEDED"

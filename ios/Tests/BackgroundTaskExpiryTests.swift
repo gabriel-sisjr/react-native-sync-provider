@@ -348,7 +348,8 @@ final class BackgroundTaskExpiryTests: XCTestCase {
         XCTAssertEqual(task.completedResults, [false])
         XCTAssertEqual(emitter.events(ofType: "BACKGROUND_SYNC_COMPLETED").first?.metadata,
                        ["kind": "refresh", "ok": "false"])
-        XCTAssertNotNil(emitter.events(ofType: "SYNC_FAILED").first?.errorCode, "a store failure keeps its code")
+        XCTAssertEqual(emitter.events(ofType: "SYNC_FAILED").first?.errorCode, "NETWORK_ERROR",
+                       "a cycle that dies of a cause other than a SyncProviderError")
     }
 
     // MARK: - Letting go of the task
