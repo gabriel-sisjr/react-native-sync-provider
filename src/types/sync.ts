@@ -131,6 +131,9 @@ export interface SyncItem {
    *   The native dispatcher skips the item until the device clock reaches it,
    *   and the value stays in place afterwards, so a timestamp in the past means
    *   the wait has elapsed.
+   * - It never exceeds 8,640,000,000,000,000, the largest valid JavaScript
+   *   `Date`, however long the computed delay, so `new Date(nextRetryAt)` is
+   *   always valid.
    *
    * @remarks
    * `nextRetryAt` and {@link SyncItem.attempts} do not move together. Rows
@@ -285,7 +288,8 @@ export interface SyncDeadLetterItem {
 export interface RetryPolicy {
   /**
    * Maximum number of dispatch attempts (initial attempt counts as one). A
-   * value below `1` is treated as `1`.
+   * value below `1`, NaN included, is treated as `1`, and `+Infinity` or
+   * anything of 2^31 or more as 2147483647. Fractions truncate toward zero.
    *
    * When it is lowered, a queued item whose attempts already reach the new
    * limit is moved to the dead-letter queue by the next cycle that takes it,
@@ -295,9 +299,21 @@ export interface RetryPolicy {
   maxAttempts: number;
   /** Curve used to compute the delay between attempts. */
   backoff: BackoffStrategy;
-  /** Base delay (in ms) — see {@link BackoffStrategy} for the formula. */
+  /**
+   * Base delay (in ms) — see {@link BackoffStrategy} for the formula. NaN and
+   * `-Infinity` give no delay, and `+Infinity` counts as 2^53 - 1 ms, the
+   * ceiling every computed delay stops at.
+   */
   baseDelayMs: number;
-  /** Hard cap on the per-attempt delay (in ms). */
+  /**
+   * Hard cap on the per-attempt delay (in ms). A NaN cap makes every delay
+   * `0`. Below `baseDelayMs`, Android caps at `baseDelayMs` instead. On iOS, a
+   * value of `0` or less, `-Infinity` included, means no cap.
+   *
+   * Computed delays never exceed 2^53 - 1 ms (about 285,000 years) on either
+   * platform, and the retry deadline they give never passes the largest
+   * JavaScript `Date`: see {@link SyncItem.nextRetryAt}.
+   */
   maxDelayMs: number;
   /**
    * If `true`, the computed delay is multiplied by a uniformly distributed
@@ -309,7 +325,8 @@ export interface RetryPolicy {
    * HTTP status codes that should trigger a retry. Network errors and timeouts
    * are always retried regardless of this list. Non-listed 4xx/5xx responses
    * are treated as permanent failures, and 401/403 stay permanent even when
-   * listed.
+   * listed. Entries truncate toward zero, and one that is not finite or falls
+   * outside the 32-bit range matches no status.
    */
   retryOnStatusCodes: number[];
 }
@@ -321,6 +338,10 @@ export interface RetryPolicy {
 /**
  * Library-wide configuration. Applied via `configureSync` and read back via
  * `getSyncConfig`.
+ *
+ * The numbers are stored as given and converted at each use, so
+ * `getSyncConfig` returns them as configured, NaN and `±Infinity` included.
+ * Each field says how its value converts.
  */
 export interface SyncOptions {
   /** When the queue is drained. See {@link SyncStrategy}. */
@@ -328,21 +349,35 @@ export interface SyncOptions {
   /** Retry behavior for failed items. */
   retryPolicy: RetryPolicy;
   /**
-   * Maximum number of items one flush cycle dispatches. Defaults to `25`.
-   * Android sends them concurrently, iOS one at a time.
+   * Maximum number of items one flush cycle dispatches. Defaults to `25`. A
+   * value below `1`, NaN included, is treated as `1`, and `+Infinity` or
+   * anything of 2^31 or more as 2147483647. Fractions truncate toward zero.
+   *
+   * Android sends the batch concurrently, except that the first item goes
+   * alone when `defaultHeaders` were restored from storage. iOS sends one item
+   * at a time.
    */
   batchSize?: number;
   /**
-   * Per-request HTTP timeout (in ms). Defaults to `30000`. Android enforces a
-   * floor of 1 second.
+   * Per-request HTTP timeout (in ms). Defaults to `30000`. NaN and `-Infinity`
+   * give 1 second, anything above 2147483647 ms (about 24.8 days),
+   * `+Infinity` included, is capped there, and fractions truncate toward zero.
+   *
+   * - Android bounds the whole call with it, from connecting to reading the
+   *   response, with a floor of 1 second. The HTTP client's fixed socket
+   *   timeouts apply too: 10 s to connect, and 30 s for a read or a write that
+   *   stalls.
+   * - iOS uses the value as given, with no floor.
    */
   requestTimeoutMs?: number;
   /**
    * Maximum number of items the queue may hold. Defaults to `10000` when
-   * omitted, and any value below `1` is treated as `1`, so there is no way to
-   * remove the cap. New enqueues and `replayDeadLetter()` are rejected once it
-   * is reached. iOS counts the `PENDING` items toward it, Android the `PENDING`
-   * and in-flight items. Dead letters count toward it on neither platform.
+   * omitted, and any value below `1`, NaN included, is treated as `1`, so
+   * there is no way to remove the cap. `+Infinity` or anything of 2^31 or more
+   * is treated as 2147483647, and fractions truncate toward zero. New enqueues
+   * and `replayDeadLetter()` are rejected once it is reached. iOS counts the
+   * `PENDING` items toward it, Android the `PENDING` and in-flight items. Dead
+   * letters count toward it on neither platform.
    */
   maxQueueSize?: number;
   /**
@@ -452,8 +487,9 @@ export interface SyncOptions {
    *   Android periodic worker or retry kick, or an iOS background task.
    * - The in-process retry timer does not flush during it and emits nothing.
    *   The next retry wake, the timer's and the Android kick's alike, is the
-   *   latest of the soonest item deadline, the credential hold and the end of
-   *   the backoff.
+   *   latest of the soonest item deadline, the credential hold, the end of the
+   *   backoff and the end of a running failure hold (see
+   *   {@link SyncStrategy.AUTOMATIC}).
    * - Automatic retries (the retry timer, its re-checks of a held wake, a wake
    *   that waited for the network, and the Android kick) never come back
    *   sooner than 1 s after the failed check, even with
@@ -572,11 +608,18 @@ export interface SyncResult {
  *
  * Field-by-`type` contract:
  * - `ITEM_ENQUEUED` / `ITEM_REMOVED` — `itemId` set.
- * - `SYNC_STARTED` / `SYNC_SUCCEEDED` — base fields only.
+ * - `SYNC_STARTED` — base fields only.
+ * - `SYNC_SUCCEEDED` — base fields only on Android. On iOS,
+ *   `metadata.attempted` and `metadata.succeeded` hold the cycle's counts, and
+ *   a cycle with nothing eligible also sets `metadata.failed`, all three
+ *   `"0"`.
  * - `SYNC_PROGRESS` — `progress` (0..1) set. iOS only.
- * - `SYNC_FAILED` — `errorCode` set only when the cycle itself died, or when
- *   the network-quality gate (`NETWORK_QUALITY_TOO_LOW`) or the health check
- *   (`HEALTH_CHECK_FAILED`) skipped it.
+ * - `SYNC_FAILED` — `errorCode` set only when the cycle itself died (a cycle
+ *   stopped by a cancellation ends with none), or when the network-quality
+ *   gate (`NETWORK_QUALITY_TOO_LOW`) or the health check
+ *   (`HEALTH_CHECK_FAILED`) skipped it. On iOS, a cycle that completed with a
+ *   permanent failure also sets `metadata.attempted`, `metadata.succeeded` and
+ *   `metadata.failed`.
  * - `ITEM_SUCCEEDED` — `itemId`, `statusCode`, `attempt` set.
  * - `ITEM_FAILED` — `itemId`, `errorCode`, `attempt`, `statusCode?` set.
  * - `ITEM_DEAD_LETTERED` — `itemId` set, `errorCode` is `DEAD_LETTERED`, and
@@ -590,16 +633,19 @@ export interface SyncResult {
  *   for the state the engine starts with (on iOS, the first network report
  *   replacing `UNKNOWN` is a change and emits one): read the snapshot with
  *   `getConnectionStatus()`.
- * - `PAUSED` / `RESUMED` — base fields only.
+ * - `PAUSED` / `RESUMED` — base fields only, except the `RESUMED` that iOS
+ *   emits at launch when recovery put interrupted items back in the queue:
+ *   `metadata.recovered` holds their count.
  * - `BACKGROUND_SYNC_STARTED` / `BACKGROUND_SYNC_COMPLETED` — base fields
  *   only on Android. On iOS, `metadata.kind` (`"refresh"` or `"processing"`) is
  *   set on every `BACKGROUND_SYNC_COMPLETED` and on the processing task's
  *   `BACKGROUND_SYNC_STARTED`, and `metadata.ok` is `"false"` on a
- *   `BACKGROUND_SYNC_COMPLETED` whose flush failed; a flush the network-quality
- *   gate or the health check skipped does not count as failed. `errorCode` is
- *   not set on either platform: a window whose flush fails or is skipped
- *   reports the code on that flush's `SYNC_FAILED` event. See
- *   {@link SyncEventType} for when each platform emits these events.
+ *   `BACKGROUND_SYNC_COMPLETED` whose flush threw or whose window's time ran
+ *   out; a flush the network-quality gate or the health check skipped does
+ *   not count as failed. `errorCode` is not set on either platform: a window
+ *   whose flush fails or is skipped reports the code on that flush's
+ *   `SYNC_FAILED` event. See {@link SyncEventType} for when each platform
+ *   emits these events.
  */
 export interface SyncEvent {
   /** Discriminator — see {@link SyncEventType} for per-type field semantics. */
@@ -615,6 +661,7 @@ export interface SyncEvent {
    * `DEAD_LETTERED` for `ITEM_DEAD_LETTERED`, and for `SYNC_FAILED` only when
    * the cycle itself died or was skipped by the network-quality gate
    * (`NETWORK_QUALITY_TOO_LOW`) or the health check (`HEALTH_CHECK_FAILED`).
+   * A cycle stopped by a cancellation ends with a `SYNC_FAILED` without it.
    */
   errorCode?: SyncErrorCode;
   /** HTTP status code, when applicable. */
@@ -650,10 +697,16 @@ export interface BackgroundSyncOptions {
   /**
    * Minimum interval between background sync windows, in ms.
    *
-   * Android `WorkManager` clamps this to a minimum of 15 minutes for periodic
-   * work. iOS `BGTaskScheduler` treats this as a soft hint with a floor of 60
-   * seconds — the OS schedules the task at its discretion based on system
-   * conditions.
+   * - Android: the interval of the periodic `WorkManager` work, at least 15
+   *   minutes.
+   * - iOS: only the app-refresh task's earliest begin date, at least 60
+   *   seconds after the request. `BGTaskScheduler` treats it as a soft hint:
+   *   the OS schedules the task at its discretion based on system conditions.
+   *   The processing task does not use it.
+   *
+   * On both platforms, NaN and `-Infinity` get that floor, and `+Infinity` or
+   * anything above 2^53 - 1 ms (about 285,000 years) is capped there. The
+   * value is saved as given and converted at each use.
    */
   minimumIntervalMs: number;
   /**

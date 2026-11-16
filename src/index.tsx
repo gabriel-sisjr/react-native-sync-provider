@@ -515,11 +515,16 @@ export async function discardDeadLetter(id: string): Promise<void> {
  * like an empty cycle's.
  *
  * Unless `SyncOptions.minNetworkQuality` is set, `flush()` does not check
- * connectivity first, so calling it offline can spend retry attempts and move
- * valid items to the dead-letter queue. Any `minNetworkQuality` other than
- * `OFFLINE` blocks an offline flush instead. {@link drainUntilEmpty} waits for
- * the network, and `useAutoSync` skips its interval and foreground flushes
- * while `DISCONNECTED`.
+ * connectivity first. Called offline, it differs per platform:
+ *
+ * - Android: each request fails, so the flush can spend retry attempts and
+ *   move valid items to the dead-letter queue once their attempts run out.
+ * - iOS: the flush waits for the network with its first item claimed and one
+ *   attempt spent, and dead-letters nothing.
+ *
+ * Any `minNetworkQuality` other than `OFFLINE` blocks an offline flush
+ * instead. {@link drainUntilEmpty} waits for the network, and `useAutoSync`
+ * skips its interval and foreground flushes while `DISCONNECTED`.
  *
  * While a cycle is running, iOS returns the last result at once, so the gate
  * and the health check do not run and report nothing. Android waits, then runs
@@ -705,7 +710,11 @@ export async function resumeSync(): Promise<void> {
 /**
  * Check whether a flush cycle is currently in progress.
  *
- * @returns `true` while a cycle is in flight, `false` otherwise.
+ * @returns `true` only while a cycle runs, on both platforms: from the point
+ *   where the flush has passed the pause, stored-credentials,
+ *   network-quality-gate and health-check checks until the cycle ends. `false`
+ *   otherwise, including while a flush is still running those checks and after
+ *   one of them skipped the cycle.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
  *
@@ -728,9 +737,19 @@ export async function isSyncing(): Promise<boolean> {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Replace the active sync configuration. Android applies the new options from
- * the next flush cycle. iOS applies them from the next item, even inside a
- * running cycle. A request already in flight keeps the previous config.
+ * Replace the active sync configuration. When the new options reach a cycle
+ * that is already running depends on the platform:
+ *
+ * - Android: the running cycle keeps the options it read when it started,
+ *   except `retryPolicy.retryOnStatusCodes`, which is read again for each
+ *   response, the response to a request already in flight included.
+ *   `maxQueueSize` applies from the next enqueue, and `strategy` from the
+ *   retry wake the call re-arms, which waits for a running failure hold (see
+ *   {@link SyncStrategy.AUTOMATIC}).
+ * - iOS: the options apply once the call resolves, inside a running cycle too.
+ *   The cycle keeps the batch it read and the outcome of its network-quality
+ *   gate and health check. A request already in flight keeps its headers and
+ *   timeout, and its response is classified under the new `retryPolicy`.
  *
  * @param options — new library-wide configuration.
  * @throws {SyncError} {@link SyncErrorCode.INVALID_URL} when `healthCheckUrl`
@@ -872,7 +891,10 @@ export async function getLastSyncResult(): Promise<SyncResult | undefined> {
  * Read the persisted flush history, most recent first.
  *
  * @param limit — optional maximum number of entries to return. When omitted,
- *   the facade passes `0` to the native side, which means "no limit".
+ *   the facade passes `0` to the native side, which means "no limit". Both
+ *   platforms convert it the same way: NaN, `-Infinity` and any negative value
+ *   mean "no limit", `+Infinity` and anything of 2^31 or more mean 2147483647,
+ *   and fractions truncate toward zero.
  * @returns the persisted flush results, most recent first.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
@@ -964,7 +986,11 @@ export async function getConnectionStatus(): Promise<ConnectionState> {
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
  * @throws {SyncError} {@link SyncErrorCode.BACKGROUND_TASK_REGISTRATION_FAILED}
- *   when the OS rejects the registration.
+ *   when the OS rejects the registration: on iOS, `BGTaskScheduler` refuses the
+ *   app-refresh request, for example because the task identifier is missing
+ *   from `Info.plist` or Background App Refresh is turned off; on Android,
+ *   `WorkManager` refuses the periodic work request or is not initialized.
+ *   Every native rejection of this call maps to this code.
  *
  * @example
  * await enableBackgroundSync({

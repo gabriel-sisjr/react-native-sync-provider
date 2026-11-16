@@ -95,6 +95,14 @@ export const SyncStrategy = {
    * wakes also wait for `SyncOptions.minNetworkQuality` and for a running
    * health-check backoff.
    *
+   * After a cycle that dies, for example because a storage write keeps
+   * failing, a failure hold starts: no automatic wake fires for 30 s from that
+   * cycle's end, doubling for each cycle in a row that dies, up to 15 minutes.
+   * A cycle that completes, an empty one included, ends it, and a cancelled
+   * cycle neither starts nor ends it. It lives in memory, so a new process
+   * starts at 30 s. `resumeSync()` does not wait for it, and explicit `flush()`
+   * calls, `useAutoSync` and the OS background windows are not held back.
+   *
    * Enqueueing does **not** trigger a native flush. To dispatch new items, mount
    * `useAutoSync` or call `flush()`.
    */
@@ -303,7 +311,10 @@ export const SyncEventType = {
    * died, or a check at the start of the flush skipped the cycle. Per-item
    * failures are on `ITEM_FAILED`, so `errorCode` is set only when:
    *
-   * - the cycle died, with the code of the failure;
+   * - the cycle died: the library error's own code, or `NETWORK_ERROR` for
+   *   any other cause, such as a storage write that fails. A cycle stopped by
+   *   a cancellation ends with no `errorCode`, for example an Android worker
+   *   that `WorkManager` stops, or an iOS background task whose time runs out;
    * - the network-quality gate skipped it: `NETWORK_QUALITY_TOO_LOW` (see
    *   `SyncOptions.minNetworkQuality`);
    * - the health check skipped it, or its backoff was running:
@@ -361,9 +372,12 @@ export const SyncEventType = {
    * `connectionStatus` is set, and stays the same when another field changed,
    * for example `networkQuality` alone: read `getConnectionStatus()` for the
    * new snapshot. With `SyncOptions.healthCheckUrl` set, the first measurement
-   * often changes the quality a few seconds after start, which emits one. iOS
-   * emits the event synchronously with the change, Android asynchronously, so
-   * its order relative to other events can differ between the platforms.
+   * often changes the quality a few seconds after start, which emits one.
+   *
+   * Both platforms deliver it to JS asynchronously, after the new state is
+   * stored, and in the order of the changes: when the event arrives,
+   * `getConnectionStatus()` may already return that state or a later one. Its
+   * order relative to other event types is not promised.
    */
   CONNECTION_CHANGED: 'CONNECTION_CHANGED',
   /** Sync was paused via `pauseSync()`. */
@@ -381,9 +395,11 @@ export const SyncEventType = {
   BACKGROUND_SYNC_STARTED: 'BACKGROUND_SYNC_STARTED',
   /**
    * The same window finished. iOS emits it whether the window's flush
-   * succeeded or failed, with `metadata.ok` set to `"false"` on a failure.
-   * Android emits it only after the flush returns, so a worker whose flush
-   * throws emits none. `errorCode` is not set on either platform.
+   * succeeded or not, with `metadata.ok` set to `"false"` when the flush throws
+   * or the window's time runs out; a window that expires before its cycle
+   * starts emits no cycle event before this one. Android emits it only after
+   * the flush returns, so a worker whose flush throws, a cancelled one
+   * included, emits none. `errorCode` is not set on either platform.
    *
    * A flush that the network-quality gate or the health check skipped did not
    * fail in this sense: it returns normally, the skip is reported on its
