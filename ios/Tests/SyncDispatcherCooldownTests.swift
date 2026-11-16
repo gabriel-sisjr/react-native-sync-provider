@@ -33,13 +33,17 @@ final class SyncDispatcherCooldownTests: XCTestCase {
     }
 
     private func makeDispatcher(_ policy: RetryPolicyValue) -> SyncDispatcher {
+        makeDispatcher(config: DispatcherConfig(retryPolicy: policy,
+                                                requestTimeoutMs: 30_000,
+                                                batchSize: 25,
+                                                defaultHeaders: [:]))
+    }
+
+    private func makeDispatcher(config: DispatcherConfig) -> SyncDispatcher {
         SyncDispatcher(storage: storage,
                        emitter: emitter,
                        connectivity: ConnectivityMonitor.shared,
-                       config: DispatcherConfig(retryPolicy: policy,
-                                                requestTimeoutMs: 30_000,
-                                                batchSize: 25,
-                                                defaultHeaders: [:]),
+                       config: config,
                        foregroundSession: foregroundSession,
                        backgroundSession: backgroundSession)
     }
@@ -263,23 +267,63 @@ final class SyncDispatcherCooldownTests: XCTestCase {
         } catch {}
     }
 
-    func test_aFailedWriteAfterA2xx_countsTheAttempt_andCoolsTheRow() async throws {
-        try await assertCooledAfterAFailedOutcomeWrite(status: 200)
+    private var eventTypes: [String] {
+        emitter.emittedEvents.map(\.type).filter { $0 != "SYNC_PROGRESS" }
     }
 
-    func test_aFailedWriteAfterA503_countsTheAttempt_andCoolsTheRow() async throws {
-        try await assertCooledAfterAFailedOutcomeWrite(status: 503)
+    /// The server has the item: its row is removed as delivered, on its last
+    /// attempt too, and nothing is sent again.
+    func test_aFailedRemovalAfterA2xx_onTheLastAttempt_deliversTheItem() async throws {
+        let id = try await storage.enqueue(input: .sample())
+        URLProtocolStub.setHandler(stubResponse(200))
+        let dispatcher = makeDispatcher(.exact(maxAttempts: 1, baseDelayMs: 300))
+        faults.fail(1, after: 1)
+
+        await flushExpectingItToDie(dispatcher)
+
+        let queued = try await storage.isQueued(id)
+        XCTAssertFalse(queued, "delivered")
+        let letters = try await storage.getDeadLetters()
+        XCTAssertEqual(letters.count, 0, "a delivered item is no dead letter")
+        XCTAssertEqual(eventTypes, ["SYNC_STARTED", "ITEM_SUCCEEDED", "SYNC_FAILED"])
+        let succeeded = emitter.events(ofType: "ITEM_SUCCEEDED").first
+        XCTAssertEqual(succeeded?.itemId, id)
+        XCTAssertEqual(succeeded?.statusCode, 200)
+        XCTAssertEqual(succeeded?.attempt, 1)
+        XCTAssertEqual(emitter.events(ofType: "SYNC_FAILED").first?.errorCode, "NETWORK_ERROR",
+                       "the cycle still died of the write")
+
+        _ = try await dispatcher.flush()
+        XCTAssertEqual(URLProtocolStub.capturedRequests.count, 1, "not sent again")
     }
 
-    private func assertCooledAfterAFailedOutcomeWrite(status: Int,
-                                                      file: StaticString = #filePath,
-                                                      line: UInt = #line) async throws {
+    func test_aFailedWriteAfterA503_retriesWithItsCode_andTheBackoff() async throws {
+        try await assertRetriedAfterAFailedOutcomeWrite(stubResponse(503), code: "SERVER_ERROR", statusCode: 503)
+    }
+
+    /// A failure during the send is a transport error, which the classifier
+    /// turns into an outcome: there is no request that went out without one.
+    func test_aFailedWriteAfterALostConnection_countsTheAttempt_withNetworkError() async throws {
+        try await assertRetriedAfterAFailedOutcomeWrite({ _ in throw URLError(.networkConnectionLost) },
+                                                        code: "NETWORK_ERROR", statusCode: nil)
+    }
+
+    func test_aFailedWriteAfterATimeout_keepsTimeout() async throws {
+        try await assertRetriedAfterAFailedOutcomeWrite({ _ in throw URLError(.timedOut) },
+                                                        code: "TIMEOUT", statusCode: nil)
+    }
+
+    private func assertRetriedAfterAFailedOutcomeWrite(_ answer: @escaping URLProtocolHandler,
+                                                       code: String,
+                                                       statusCode: Double?,
+                                                       file: StaticString = #filePath,
+                                                       line: UInt = #line) async throws {
         let id = try await storage.enqueue(input: .sample())
         let log = RequestLog()
         let clock = self.clock!
         URLProtocolStub.setHandler { request in
             log.record(at: clock.nowMs())
-            return try stubResponse(status)(request)
+            return try answer(request)
         }
         let dispatcher = makeDispatcher(.exact(maxAttempts: 3, baseDelayMs: 300))
         faults.fail(1, after: 1)
@@ -291,19 +335,76 @@ final class SyncDispatcherCooldownTests: XCTestCase {
         XCTAssertEqual(stored.status, "PENDING", "not left IN_FLIGHT", file: file, line: line)
         XCTAssertEqual(stored.attempts, 1, "the attempt counts", file: file, line: line)
         XCTAssertEqual(stored.nextRetryAt, now + 300, "the retry policy's first delay", file: file, line: line)
-        XCTAssertEqual(stored.lastErrorCode, "NETWORK_ERROR", file: file, line: line)
+        XCTAssertEqual(stored.lastErrorCode, code, "the outcome's own code", file: file, line: line)
         let letters = try await storage.getDeadLetters()
         XCTAssertEqual(letters.count, 0, file: file, line: line)
-        XCTAssertEqual(emitter.emittedEvents.map(\.type).filter { $0 != "SYNC_PROGRESS" },
-                       ["SYNC_STARTED", "ITEM_RETRYING", "SYNC_FAILED"], file: file, line: line)
+        XCTAssertEqual(eventTypes, ["SYNC_STARTED", "ITEM_RETRYING", "SYNC_FAILED"], file: file, line: line)
         let retrying = emitter.events(ofType: "ITEM_RETRYING").first
-        XCTAssertEqual(retrying?.errorCode, "NETWORK_ERROR", file: file, line: line)
+        XCTAssertEqual(retrying?.errorCode, code, file: file, line: line)
+        XCTAssertEqual(retrying?.statusCode, statusCode, file: file, line: line)
         XCTAssertEqual(retrying?.attempt, 1, file: file, line: line)
         XCTAssertEqual(emitter.events(ofType: "SYNC_FAILED").first?.errorCode, "NETWORK_ERROR",
-                       file: file, line: line)
+                       "the cycle died of the write", file: file, line: line)
 
         _ = try await dispatcher.flush()
         XCTAssertEqual(log.times.count, 1, "nothing is sent again before the cooldown ends", file: file, line: line)
+    }
+
+    /// A permanent answer ends in the dead-letter store with its own code.
+    func test_aFailedDeadLetterWriteAfterA404_deadLettersTheItem_withItsCode() async throws {
+        let id = try await storage.enqueue(input: .sample())
+        URLProtocolStub.setHandler(stubResponse(404))
+        faults.fail(1, after: 1)
+
+        await flushExpectingItToDie(makeDispatcher(.exact(maxAttempts: 3, baseDelayMs: 300)))
+
+        let queued = try await storage.isQueued(id)
+        XCTAssertFalse(queued)
+        let letter = try await storage.deadLetter(id)
+        XCTAssertEqual(letter?.lastErrorCode, "SERVER_ERROR")
+        XCTAssertEqual(letter?.lastErrorMessage, "HTTP 404 Not Found")
+        XCTAssertEqual(letter?.attempts, 1)
+        XCTAssertEqual(eventTypes, ["SYNC_STARTED", "ITEM_FAILED", "ITEM_DEAD_LETTERED", "SYNC_FAILED"])
+        let failed = emitter.events(ofType: "ITEM_FAILED").first
+        XCTAssertEqual(failed?.errorCode, "SERVER_ERROR")
+        XCTAssertEqual(failed?.statusCode, 404)
+        XCTAssertEqual(failed?.attempt, 1)
+        XCTAssertEqual(emitter.events(ofType: "ITEM_DEAD_LETTERED").first?.metadata?["lastErrorCode"], "SERVER_ERROR")
+        XCTAssertEqual(emitter.events(ofType: "SYNC_FAILED").first?.errorCode, "NETWORK_ERROR")
+    }
+
+    /// A 401 to default headers read back from storage holds the item as on
+    /// the normal path: its attempt refunded, the row held for at least a
+    /// minute, and the hold handed to the cycle's observer.
+    func test_aFailedWriteAfterAStaleCredentialRejection_holdsTheItem() async throws {
+        let id = try await storage.enqueue(input: .sample())
+        URLProtocolStub.setHandler(stubResponse(401))
+        var config = DispatcherConfig(retryPolicy: .exact(maxAttempts: 3, baseDelayMs: 300),
+                                      requestTimeoutMs: 30_000,
+                                      batchSize: 25,
+                                      defaultHeaders: ["Authorization": "Bearer expired"])
+        config.source = .persisted
+        config.hasDefaultHeaders = true
+        let dispatcher = makeDispatcher(config: config)
+        let ends = CycleEnds()
+        dispatcher.hooks.onCycleFinished = { notBefore, end in ends.record(end, notBefore: notBefore) }
+        faults.fail(1, after: 1)
+        let now = clock.nowMs()
+
+        await flushExpectingItToDie(dispatcher)
+
+        let stored = try await item(id)
+        XCTAssertEqual(stored.status, "PENDING")
+        XCTAssertEqual(stored.attempts, 0, "an expired token says nothing about the item")
+        XCTAssertEqual(stored.lastErrorCode, "UNAUTHORIZED")
+        XCTAssertEqual(stored.nextRetryAt, now + 60_000)
+        XCTAssertEqual(eventTypes, ["SYNC_STARTED", "ITEM_RETRYING", "SYNC_FAILED"])
+        let retrying = emitter.events(ofType: "ITEM_RETRYING").first
+        XCTAssertEqual(retrying?.errorCode, "UNAUTHORIZED")
+        XCTAssertEqual(retrying?.statusCode, 401)
+        XCTAssertEqual(retrying?.attempt, 1)
+        XCTAssertEqual(ends.all, [.aborted])
+        XCTAssertEqual(ends.holds, [now + 60_000], "the hold reaches the wake")
     }
 
     /// The outcome's write fails in every cycle. Each one counts its attempt
@@ -311,7 +412,7 @@ final class SyncDispatcherCooldownTests: XCTestCase {
     /// the last attempt ends in the dead-letter store.
     func test_anOutcomeWriteThatKeepsFailing_backsOff_andEndsInTheDeadLetter() async throws {
         let id = try await storage.enqueue(input: .sample())
-        URLProtocolStub.setHandler(stubResponse(200))
+        URLProtocolStub.setHandler(stubResponse(503))
         let dispatcher = makeDispatcher(.exact(maxAttempts: 3, baseDelayMs: 300))
         let start = clock.nowMs()
         var deadlines: [Int64] = []
@@ -335,6 +436,7 @@ final class SyncDispatcherCooldownTests: XCTestCase {
         XCTAssertEqual(letter?.lastErrorCode, "MAX_ATTEMPTS_EXCEEDED")
         XCTAssertEqual(letter?.attempts, 3)
         XCTAssertEqual(emitter.events(ofType: "ITEM_RETRYING").map(\.attempt), [1, 2])
+        XCTAssertEqual(emitter.events(ofType: "ITEM_RETRYING").map(\.errorCode), ["SERVER_ERROR", "SERVER_ERROR"])
         XCTAssertEqual(emitter.events(ofType: "ITEM_FAILED").map(\.errorCode), ["MAX_ATTEMPTS_EXCEEDED"])
         XCTAssertEqual(emitter.events(ofType: "ITEM_DEAD_LETTERED").count, 1)
         XCTAssertEqual(emitter.events(ofType: "ITEM_SUCCEEDED").count, 0)
@@ -374,22 +476,28 @@ final class SyncDispatcherCooldownTests: XCTestCase {
         XCTAssertEqual(stored.status, "IN_FLIGHT")
         XCTAssertEqual(faults.failures, 2)
         XCTAssertEqual(emitter.events(ofType: "ITEM_RETRYING").count, 0)
+        XCTAssertEqual(emitter.events(ofType: "ITEM_SUCCEEDED").count, 0)
         XCTAssertEqual(emitter.events(ofType: "SYNC_FAILED").first?.errorCode, "NETWORK_ERROR")
         let recovered = try await storage.resetInFlightToPending()
         XCTAssertEqual(recovered, 1)
     }
 }
 
-/// The ``CycleEnd`` values an observer received, in order.
+/// The ``CycleEnd`` values an observer received, in order, with the
+/// credential hold each one carried.
 private final class CycleEnds: @unchecked Sendable {
     private let lock = NSLock()
-    private var recorded: [CycleEnd] = []
+    private var recorded: [(end: CycleEnd, notBefore: Int64?)] = []
 
-    func record(_ end: CycleEnd) {
-        lock.withLock { recorded.append(end) }
+    func record(_ end: CycleEnd, notBefore: Int64? = nil) {
+        lock.withLock { recorded.append((end, notBefore)) }
     }
 
     var all: [CycleEnd] {
-        lock.withLock { recorded }
+        lock.withLock { recorded.map(\.end) }
+    }
+
+    var holds: [Int64?] {
+        lock.withLock { recorded.map(\.notBefore) }
     }
 }

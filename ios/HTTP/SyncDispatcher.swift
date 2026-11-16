@@ -348,9 +348,10 @@ actor SyncDispatcher {
     /// A cycle that dies for any other reason, a write that fails say, ends
     /// with `SYNC_FAILED` and its code (see ``cycleFailureCode(_:)``: a cause
     /// that is not a `SyncProviderError` is `NETWORK_ERROR`), and the row whose outcome
-    /// could not be written is settled first: its attempt counted, with the
-    /// retry policy's cooldown, when its request went out; as it was before
-    /// its claim when the request never went out.
+    /// could not be written is settled first: with that outcome, as the
+    /// normal path records it, when its request went out (a 2xx delivered, a
+    /// failure retried or dead-lettered with its own code, a stale credential
+    /// held); as it was before its claim when the request never went out.
     func flushOutcome() async throws -> FlushOutcome {
         try Task.checkCancellation()
         if let early = exitBeforeCycle() {
@@ -547,10 +548,7 @@ actor SyncDispatcher {
                 if outcome.succeeded {
                     succeededIds.append(item.id)
                     try await storage.remove(id: item.id)
-                    emitter.emit(.now(type: "ITEM_SUCCEEDED",
-                                      itemId: item.id,
-                                      statusCode: outcome.statusCode.map(Double.init),
-                                      attempt: Double(item.attempts + 1)))
+                    emitSucceeded(item: item, outcome: outcome)
                 } else {
                     // Decides retry vs. terminal failure, persists the retry
                     // cooldown, and emits the event.
@@ -571,7 +569,7 @@ actor SyncDispatcher {
             } catch {
                 // The outcome could not be written, and the cycle dies with
                 // `error`. Its row must not wait IN_FLIGHT for the next launch.
-                await settleUnrecorded(item: item, outcome: outcome, cause: error)
+                await settleUnrecorded(item: item, outcome: outcome, sentWith: sentWith)
                 throw error
             }
         }
@@ -599,6 +597,13 @@ actor SyncDispatcher {
         }
 
         return result
+    }
+
+    private func emitSucceeded(item: StoredSyncItem, outcome: ItemDispatchOutcome) {
+        emitter.emit(.now(type: "ITEM_SUCCEEDED",
+                          itemId: item.id,
+                          statusCode: outcome.statusCode.map(Double.init),
+                          attempt: Double(item.attempts + 1)))
     }
 
     private func emitProgress(index: Int, total: Int) {
@@ -733,8 +738,8 @@ actor SyncDispatcher {
         return .retrying(attempt: attemptsAfter)
     }
 
-    /// The code a cycle that dies of `error` reports, on its `SYNC_FAILED`
-    /// and on the row it settles: a `SyncProviderError` keeps its own, and any
+    /// The code a cycle that dies of `error` reports on its `SYNC_FAILED`: a
+    /// `SyncProviderError` keeps its own, and any
     /// other cause, a Core Data write that fails say, is `NETWORK_ERROR`, as
     /// on Android, the code the docs give a cycle that dies. The bridge's
     /// fallback for a rejected call, `INVALID_PAYLOAD`, which the docs call
@@ -747,21 +752,27 @@ actor SyncDispatcher {
     }
 
     /// Settles the row of an item whose outcome could not be written, before
-    /// its cycle dies with `cause`. `item` is the snapshot from before the
-    /// claim, which already counted the attempt.
+    /// its cycle dies. `item` is the snapshot from before the claim, which
+    /// already counted the attempt, and `sentWith` the configuration the
+    /// request went out with.
     ///
-    /// When the request went out, it may have reached the server: the row
-    /// keeps that attempt and gets the retry policy's cooldown, with
-    /// `ITEM_RETRYING` carrying the cycle's code (``cycleFailureCode(_:)``),
-    /// also kept as the row's `lastErrorCode`, as after a retryable
-    /// failure, or, with no budget left, moves to the dead-letter store with
-    /// `MAX_ATTEMPTS_EXCEEDED`, with `ITEM_FAILED` and `ITEM_DEAD_LETTERED`.
-    /// Given back at once and uncounted instead, a row whose outcome write
-    /// keeps failing would be sent again at every wake. A request that never
-    /// went out leaves the row as it was before its claim, with no event.
-    /// When this write fails too, the row waits `IN_FLIGHT` for launch
-    /// recovery.
-    private func settleUnrecorded(item: StoredSyncItem, outcome: ItemDispatchOutcome, cause: Error) async {
+    /// When the request went out, the settle applies the outcome that could
+    /// not be written, in its own transaction, as the normal path records it:
+    /// a 2xx removes the row as delivered, with `ITEM_SUCCEEDED`; a retryable
+    /// failure cools it with the retry policy's backoff and its own code, or,
+    /// with no budget left, ends as `MAX_ATTEMPTS_EXCEEDED`; a permanent one
+    /// moves it to the dead-letter store with its own code; a 401 or 403 to
+    /// default headers read back from storage refunds the attempt and holds
+    /// the row, and the hold reaches the wake armed after the cycle. Each one
+    /// comes with the normal path's events. Every request that went out has
+    /// an outcome here: a failure during the send is a transport error, which
+    /// the classifier turns into one (`NETWORK_ERROR` or `TIMEOUT`, say). A
+    /// request that never went out leaves the row as it was before its claim,
+    /// with no event. When this write fails too, the row waits `IN_FLIGHT`
+    /// for launch recovery.
+    private func settleUnrecorded(item: StoredSyncItem,
+                                  outcome: ItemDispatchOutcome,
+                                  sentWith: DispatcherConfig) async {
         do {
             guard outcome.requestSent else {
                 try await storage.releaseClaim(id: item.id,
@@ -769,32 +780,15 @@ actor SyncDispatcher {
                                                lastAttemptAt: item.lastAttemptAt ?? 0)
                 return
             }
-            let failure = wrapAsSyncProviderError(cause)
-            let code = Self.cycleFailureCode(cause)
-            let attempt = item.attempts + 1
-            guard Int(attempt) < config.retryPolicy.maxAttempts else {
-                let exhausted = "MAX_ATTEMPTS_EXCEEDED"
-                let moved = try await storage.moveToDeadLetters(id: item.id,
-                                                                errorCode: exhausted,
-                                                                errorMessage: failure.message)
-                emitter.emit(.now(type: "ITEM_FAILED",
-                                  itemId: item.id,
-                                  errorCode: exhausted,
-                                  attempt: Double(attempt)))
-                if moved {
-                    emitter.emit(.now(type: "ITEM_DEAD_LETTERED",
-                                      itemId: item.id,
-                                      errorCode: "DEAD_LETTERED",
-                                      metadata: ["lastErrorCode": exhausted]))
-                }
+            if outcome.succeeded {
+                try await storage.remove(id: item.id)
+                emitSucceeded(item: item, outcome: outcome)
                 return
             }
-            let delayMs = RetryPolicyEvaluator.nextDelayMs(attempt: Int(attempt), policy: config.retryPolicy)
-            try await storage.markPendingForRetry(id: item.id, errorCode: code, retryDelayMs: delayMs)
-            emitter.emit(.now(type: "ITEM_RETRYING",
-                              itemId: item.id,
-                              errorCode: code,
-                              attempt: Double(attempt)))
+            let disposition = try await recordFailureOutcome(item: item, outcome: outcome, sentWith: sentWith)
+            if case let .credentialRejected(heldUntil) = disposition {
+                credentialHeldUntil = heldUntil
+            }
         } catch {
             SyncLogger.error("Could not settle the row of a cycle that died; it waits for launch recovery: "
                              + error.localizedDescription,
