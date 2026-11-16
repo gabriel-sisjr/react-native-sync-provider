@@ -453,6 +453,63 @@ internal class SyncQueueStorageTest {
     assertThat(row.nextRetryAt).isEqualTo(42_000L)
   }
 
+  /**
+   * A settle applies each claim only to a row still `IN_FLIGHT`. A row whose outcome was already
+   * recorded, here `PENDING` with a cooldown, stays exactly as it is and is not reported as
+   * applied, whatever the claim. The same claims on `IN_FLIGHT` rows are applied.
+   */
+  @Test
+  fun `settleAbortedClaims applies each claim only to a row still IN_FLIGHT`() = runTest {
+    val kinds = listOf("unsent", "delivered", "retry", "exhausted")
+    for (kind in kinds) {
+      db.syncItemDao().insert(
+        TestData.entity(id = "recorded-$kind", attempts = 1, nextRetryAt = 42_000L),
+      )
+      db.syncItemDao().insert(
+        TestData.entity(id = "claimed-$kind", status = SyncItemEntity.STATUS_IN_FLIGHT),
+      )
+    }
+    fun claimsFor(prefix: String): List<AbortedClaim> = listOf(
+      AbortedClaim.Unsent("$prefix-unsent"),
+      AbortedClaim.Delivered("$prefix-delivered"),
+      AbortedClaim.Retry(
+        id = "$prefix-retry",
+        attempts = 2,
+        lastAttemptAt = 7L,
+        lastErrorCode = SyncErrorCode.SERVER_ERROR,
+        nextRetryAt = 99_000L,
+      ),
+      AbortedClaim.Exhausted(
+        entity = TestData.entity(id = "$prefix-exhausted"),
+        attempts = 2,
+        lastAttemptAt = 7L,
+        lastErrorCode = SyncErrorCode.SERVER_ERROR,
+        lastErrorMessage = "HTTP 400 Client Error",
+        deadLetteredAt = 8L,
+      ),
+    )
+    val recorded = kinds.associateWith { db.syncItemDao().findById("recorded-$it") }
+
+    val appliedToRecorded = storage.settleAbortedClaims(claimsFor("recorded"))
+    val appliedToClaimed = storage.settleAbortedClaims(claimsFor("claimed"))
+
+    assertThat(appliedToRecorded).isEmpty()
+    for (kind in kinds) {
+      assertThat(db.syncItemDao().findById("recorded-$kind")).isEqualTo(recorded[kind])
+    }
+    assertThat(db.syncDeadLetterDao().findById("recorded-exhausted")).isNull()
+    assertThat(appliedToClaimed.map { it.id })
+      .containsExactly("claimed-delivered", "claimed-retry", "claimed-exhausted")
+      .inOrder()
+    assertThat(db.syncItemDao().findById("claimed-unsent")?.status)
+      .isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(db.syncItemDao().findById("claimed-delivered")).isNull()
+    assertThat(db.syncItemDao().findById("claimed-retry")?.attempts).isEqualTo(2)
+    assertThat(db.syncItemDao().findById("claimed-exhausted")).isNull()
+    assertThat(db.syncDeadLetterDao().findById("claimed-exhausted")?.lastErrorCode)
+      .isEqualTo(SyncErrorCode.SERVER_ERROR.name)
+  }
+
   private fun sampleResult(
     successCount: Int = 1,
     failureCount: Int = 0,

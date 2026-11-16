@@ -24,6 +24,7 @@ import com.margelo.nitro.syncprovider.storage.SyncQueueStorage
 import com.margelo.nitro.syncprovider.testutil.MovingClock
 import com.margelo.nitro.syncprovider.testutil.TestData
 import io.mockk.coEvery
+import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.spyk
@@ -1249,15 +1250,14 @@ internal class SyncDispatcherTest {
 
   /**
    * An exception after the outcome was written, here from the event that follows it, ends the
-   * cycle as well, but the outcome stands: the row keeps its cooldown and its attempt.
+   * cycle as well, but the outcome stands. The settle only applies a write to a row still
+   * `IN_FLIGHT`: this one keeps its code, its cooldown and its attempt, and is not reported again.
    */
   @Test
   fun `an exception after the outcome is written leaves that outcome as recorded`() = runTest {
     server.enqueue(MockResponse().setResponseCode(503))
     val id = enqueue()
-    val failingEvents = spyk(SyncEventEmitter())
-    coEvery { failingEvents.emit(match { it.type == SyncEventType.ITEM_RETRYING }) } throws
-      IllegalStateException("bridge down")
+    val failingEvents = retryingEventFails()
     val events = recordEvents(failingEvents)
     val d = SyncDispatcher(
       storage = storage,
@@ -1274,10 +1274,53 @@ internal class SyncDispatcherTest {
     val cooling = row(id)
     assertThat(cooling.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
     assertThat(cooling.attempts).isEqualTo(1)
+    assertThat(cooling.lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
     assertThat(cooling.nextRetryAt).isEqualTo(clock.now() + 1_000L)
     assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    // Its own event, once: the settle reports no write it did not apply.
+    coVerify(exactly = 1) { failingEvents.emit(match { it.type == SyncEventType.ITEM_RETRYING }) }
     assertThat(events.single { it.type == SyncEventType.SYNC_FAILED }.errorCode)
       .isEqualTo(SyncErrorCode.NETWORK_ERROR)
+  }
+
+  /**
+   * The same after a credential hold: a rejected restored credential, its hold written, then its
+   * event fails. The hold stands, with no attempt spent, and the next wake still waits for it.
+   */
+  @Test
+  fun `an exception after a credential hold is written leaves the hold as recorded`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(401))
+    val id = enqueue()
+    val failingEvents = retryingEventFails()
+    val d = SyncDispatcher(
+      storage = storage,
+      emitter = failingEvents,
+      getOptions = {
+        TestData.syncOptions(retryPolicy = TestData.retryPolicy(maxAttempts = 3, baseDelayMs = 1_000L))
+      },
+      clock = clock::now,
+      credentialPolicy = { CredentialPolicy.PERSISTED },
+      onCycleFinished = { notBefore, _ -> finishedCycles += notBefore },
+    )
+
+    val thrown = runCatching { runBlocking { d.flush() } }
+
+    assertThat(thrown.exceptionOrNull()).isInstanceOf(IllegalStateException::class.java)
+    val held = row(id)
+    assertThat(held.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(held.attempts).isEqualTo(0)
+    assertThat(held.lastErrorCode).isEqualTo(SyncErrorCode.UNAUTHORIZED.name)
+    assertThat(held.nextRetryAt).isEqualTo(clock.now() + SyncDispatcher.MIN_CREDENTIAL_HOLD_MS)
+    coVerify(exactly = 1) { failingEvents.emit(match { it.type == SyncEventType.ITEM_RETRYING }) }
+    assertThat(finishedCycles).containsExactly(held.nextRetryAt)
+  }
+
+  /** An emitter whose `ITEM_RETRYING` always fails, as a bridge that went down would. */
+  private fun retryingEventFails(): SyncEventEmitter {
+    val failing = spyk(SyncEventEmitter())
+    coEvery { failing.emit(match { it.type == SyncEventType.ITEM_RETRYING }) } throws
+      IllegalStateException("bridge down")
+    return failing
   }
 
   /**
