@@ -254,6 +254,37 @@ final class SettleMatrixTests: XCTestCase {
         XCTAssertEqual(requestCount, 1, "not sent again")
     }
 
+    /// The removal after the 2xx throws a CancellationError that is not the
+    /// cycle's own: the settle still removes the row as delivered. The cycle
+    /// ends without a code, as a cancelled one does, and counts as one that
+    /// died for the wait after it.
+    func test_R1C1_aForeignCancellationAfterA2xx_stillDeliversTheItem() async throws {
+        let engine = await liveEngine(maxAttempts: 2)
+        let id = try await seed(engine)
+        try await seedWitness(engine)
+        await armForTheDueRow(engine)
+        answer(200)
+        faults.intercept(after: 1) { throw CancellationError() } // the removal
+        emitter.clear()
+
+        do {
+            _ = try await engine.dispatcher.flush()
+            XCTFail("the cycle was expected to die")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+
+        let stored = try await row(id, in: engine)
+        XCTAssertNil(stored, "delivered")
+        let letters = try await engine.storage.getDeadLetters()
+        XCTAssertEqual(letters.count, 0)
+        XCTAssertEqual(events, ["SYNC_STARTED", "SYNC_PROGRESS", "ITEM_SUCCEEDED", "SYNC_FAILED"])
+        XCTAssertEqual(timer.delayMs, 30_000, "the witness is due sooner")
+
+        _ = try await engine.dispatcher.flush()
+        XCTAssertEqual(requestCount, 1, "not sent again")
+    }
+
     func test_R1C2_a2xx_whoseSettleFailsToo_staysInFlight() async throws {
         let engine = await liveEngine(maxAttempts: 2)
         let id = try await seed(engine)
