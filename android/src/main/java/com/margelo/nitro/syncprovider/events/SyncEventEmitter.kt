@@ -69,6 +69,11 @@ internal class SyncEventEmitter {
    * Fan out [event] to every registered listener and to the internal
    * [SharedFlow]. Errors thrown by individual callbacks are swallowed and
    * logged so one misbehaving listener cannot break the whole pipeline.
+   *
+   * Returns once the listeners ran, so calls made one after another reach them in that order.
+   * Two concurrent calls can reach them in either order: a source whose events must stay in
+   * order emits them from one coroutine, as `ConnectivityMonitor` does. No lock is held while
+   * the listeners run, so a listener may add or remove listeners, or cause another emit.
    */
   suspend fun emit(event: SyncEvent) {
     _events.tryEmit(event)

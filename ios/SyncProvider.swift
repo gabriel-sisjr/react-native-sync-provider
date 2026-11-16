@@ -286,7 +286,7 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
         return Promise.async { [weak self] in
             guard let self = self else { return [] }
             do {
-                let safeLimit = Int(max(0, limit))
+                let safeLimit = NumericOption.historyLimit(limit)
                 let history = try await self.engine.storage.getHistory(limit: safeLimit)
                 return history.map(Self.translate(result:))
             } catch {
@@ -482,15 +482,17 @@ extension HybridSyncProvider {
                    errors: [:])
     }
 
+    /// Keeps every number as given: the engine converts them at use, through
+    /// ``NumericOption``, so none can trap here or at a later launch.
     static func translate(options: SyncOptions) -> SyncOptionsSnapshot {
         let retry = options.retryPolicy
         let policy = RetryPolicyValue(
-            maxAttempts: Int(retry.maxAttempts),
+            rawMaxAttempts: retry.maxAttempts,
             backoff: RetryPolicyValue.Backoff(rawValue: retry.backoff.stringValue) ?? .exponential,
-            baseDelayMs: Int(retry.baseDelayMs),
-            maxDelayMs: Int(retry.maxDelayMs),
+            rawBaseDelayMs: retry.baseDelayMs,
+            rawMaxDelayMs: retry.maxDelayMs,
             jitter: retry.jitter,
-            retryOnStatusCodes: retry.retryOnStatusCodes.map { Int($0) }
+            rawRetryOnStatusCodes: retry.retryOnStatusCodes
         )
         return SyncOptionsSnapshot(
             strategy: options.strategy.stringValue,
@@ -509,16 +511,18 @@ extension HybridSyncProvider {
         )
     }
 
+    /// Echoes every number as it was configured, NaN and ±Infinity included,
+    /// as Android does.
     static func translate(snapshot: SyncOptionsSnapshot) -> SyncOptions {
         let strategy = SyncStrategy(fromString: snapshot.strategy) ?? .automatic
         let backoff = BackoffStrategy(fromString: snapshot.retryPolicy.backoff.rawValue) ?? .exponential
         let retryPolicy = RetryPolicy(
-            maxAttempts: Double(snapshot.retryPolicy.maxAttempts),
+            maxAttempts: snapshot.retryPolicy.rawMaxAttempts,
             backoff: backoff,
-            baseDelayMs: Double(snapshot.retryPolicy.baseDelayMs),
-            maxDelayMs: Double(snapshot.retryPolicy.maxDelayMs),
+            baseDelayMs: snapshot.retryPolicy.rawBaseDelayMs,
+            maxDelayMs: snapshot.retryPolicy.rawMaxDelayMs,
             jitter: snapshot.retryPolicy.jitter,
-            retryOnStatusCodes: snapshot.retryPolicy.retryOnStatusCodes.map { Double($0) }
+            retryOnStatusCodes: snapshot.retryPolicy.rawRetryOnStatusCodes
         )
         return SyncOptions(strategy: strategy,
                            retryPolicy: retryPolicy,

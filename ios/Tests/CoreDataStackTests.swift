@@ -75,7 +75,9 @@ final class CoreDataStackTests: XCTestCase {
         }
 
         XCTAssertEqual(emitter.emittedEvents.map(\.type), ["SYNC_STARTED", "SYNC_FAILED"])
-        XCTAssertEqual(emitter.events(ofType: "SYNC_FAILED").first?.errorCode, "NATIVE_MODULE_UNAVAILABLE")
+        // The cycle's own event reports a dying cycle's code; the rejection
+        // above keeps the bridge's mapping.
+        XCTAssertEqual(emitter.events(ofType: "SYNC_FAILED").first?.errorCode, "NETWORK_ERROR")
         let isRunning = await dispatcher.cycleRunning()
         XCTAssertFalse(isRunning, "a dead cycle must release the guard")
     }

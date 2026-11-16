@@ -447,7 +447,7 @@ An item that went back to wait for a retry counts as neither a success nor a fai
 #### Throws
 
 - `NATIVE_MODULE_UNAVAILABLE`.
-- `NETWORK_ERROR` -- the cycle itself died, for example because the store failed. It need not be a network problem: every native rejection from `flush` maps to this code.
+- `NETWORK_ERROR` -- the cycle itself died, for example because the store failed. It need not be a network problem: every native rejection from `flush` maps to this code. The items the cycle claimed are settled before it ends: see [When a Cycle Dies](../guides/error-handling.md#when-a-cycle-dies).
 
 Per-item failures never throw, and neither does a cycle the quality gate or the health check skips.
 
@@ -470,7 +470,7 @@ The result of a skipped flush is 0/0 on both platforms and does not say why. And
 #### Behavior Worth Knowing
 
 - **Nothing eligible.** With an empty queue, or every item cooling, the cycle resolves with a 0/0 result, emits `SYNC_SUCCEEDED`, and adds a row to the sync history.
-- **Connectivity is checked only through the gate.** Without `minNetworkQuality`, calling `flush()` offline can spend retry attempts and send valid items to the dead-letter queue. On iOS the foreground session waits for connectivity, so the call may stay pending until the network returns instead. Any `minNetworkQuality` other than `OFFLINE` blocks an offline flush. Otherwise check [`getConnectionStatus`](#getconnectionstatus) first, or use [`drainUntilEmpty`](#drainuntilempty), which does not flush while `DISCONNECTED`.
+- **Connectivity is checked only through the gate.** Without `minNetworkQuality`, `flush()` does not check connectivity first. Offline, Android can spend retry attempts, until valid items reach the dead-letter queue. iOS waits for the network instead: the call stays pending until it returns, with the first item claimed and one attempt spent, and dead-letters nothing. Any `minNetworkQuality` other than `OFFLINE` blocks an offline flush. Otherwise check [`getConnectionStatus`](#getconnectionstatus) first, or use [`drainUntilEmpty`](#drainuntilempty), which does not flush while `DISCONNECTED`.
 - **While a cycle is running.** iOS returns the last finished cycle's result at once, or a 0/0 one. Android waits, then runs its own cycle.
 
 #### Usage
@@ -610,7 +610,9 @@ await pauseSync();
 
 Resume a paused engine and emit `RESUMED`. Unless the strategy is `MANUAL`, the retry timer is armed for the soonest pending item: items with no cooldown left are dispatched right away, and cooling items when their cooldown ends. If the device is offline at that moment, the flush waits until connectivity returns.
 
-During a [credential hold](../guides/background-sync.md#when-a-stored-token-expires), it waits for the hold to end before dispatching, on both platforms. The hold lives in memory, so a process restart drops it.
+During a [credential hold](../guides/background-sync.md#when-a-stored-token-expires), it waits for the hold to end before dispatching, on both platforms. The hold lives in memory, so a process restart drops it. It also waits for a running [health-check backoff](../guides/connectivity-detection.md#health-check).
+
+It does not wait for the [failure hold](../guides/retry-policy.md#the-failure-hold) that follows a cycle that died: due items go out at once, and the hold stays as it was for the other automatic wakes.
 
 **Platform:** Android and iOS
 
@@ -638,7 +640,7 @@ await resumeSync(); // emits RESUMED
 
 ### `isSyncing`
 
-Whether a cycle is running. On iOS, a flush still in its checks (the first-path wait, the health-check `HEAD`) does not count.
+Whether a cycle is running. On both platforms it is `true` only from the moment a cycle starts, after the pause, credential, quality-gate and health-check [checks](#checks-before-a-cycle), until it ends. A flush still in its checks, such as the health-check `HEAD` or, on iOS, the first-path wait, does not count.
 
 **Platform:** Android and iOS
 
@@ -678,7 +680,7 @@ Apply a full [`SyncOptions`](./types.md#syncoptions) configuration and persist i
   - **iOS** applies the new options as soon as `configureSync` resolves, even inside a running cycle, which keeps only its batch and the outcome of its quality gate and health check. A request already in flight keeps the headers and timeout it was sent with, but its response is classified under the new `retryPolicy`.
 - **Persisted.** A worker or BGTask in a fresh process honors the options, including `maxAttempts`, `batchSize` and `requestTimeoutMs`. See [Cold-start configuration](../guides/background-sync.md#cold-start-configuration).
 - **`defaultHeaders`.** Encrypted at rest. Calling `configureSync` without them deletes the stored copy, which makes it the logout path. Pass them on every other call, and call `configureSync` whenever the token changes.
-- **Retry timer.** It is re-armed from the current queue, so a strategy change takes effect at once. A wake the quality gate was holding restarts its re-check backoff.
+- **Retry timer.** It is re-armed from the current queue, so a strategy change takes effect at once. A wake the quality gate was holding restarts its re-check backoff. After a cycle that died, the re-armed wake still waits for the [failure hold](../guides/retry-policy.md#the-failure-hold).
 - **Holds and backoffs.** Every call clears a [credential hold](../guides/background-sync.md#when-a-stored-token-expires) and ends a running [health-check backoff](../guides/connectivity-detection.md#health-check), whether or not anything changed.
 - **Network quality and health check.** `minNetworkQuality` turns on the [quality gate](../guides/connectivity-detection.md#the-quality-gate), and `healthCheckUrl` the [health check](../guides/connectivity-detection.md#health-check) and the latency measurement. Both are opt-in.
 
@@ -707,7 +709,7 @@ function configureSync(options: SyncOptions): Promise<void>;
 - `INVALID_PAYLOAD` with no `validationErrors` -- native rejected the call.
 - `NATIVE_MODULE_UNAVAILABLE`.
 
-Only those four fields are validated in JS, only when present, in the order `minNetworkQuality`, `healthCheckUrl`, `healthCheckTtlMs`, `healthCheckBackoffMs`. When several are invalid, the first one sets the code, and `validationErrors` lists them all. The other fields go to native as they are, and out-of-range numbers are clamped: Android treats a `maxAttempts` below `1` as `1`.
+Only those four fields are validated in JS, only when present, in the order `minNetworkQuality`, `healthCheckUrl`, `healthCheckTtlMs`, `healthCheckBackoffMs`. When several are invalid, the first one sets the code, and `validationErrors` lists them all. The other fields go to native as they are. Out-of-range numbers, `NaN` and `Infinity` included, never fail the call: both platforms convert them, as [Out-of-Range Numbers](./types.md#out-of-range-numbers) lists.
 
 #### Usage
 
@@ -749,6 +751,8 @@ function getSyncConfig(): Promise<SyncOptions>;
 `Promise<SyncOptions>` -- the active config: the defaults until `configureSync` first runs, then the last options applied, restored from disk in a new process. After a `configureSync` that omitted `batchSize`, `requestTimeoutMs`, `maxQueueSize`, `persistQueue` or `defaultHeaders`, iOS returns them filled with their defaults, including `defaultHeaders: {}`. Android returns them as `undefined`.
 
 `minNetworkQuality`, `healthCheckUrl`, `healthCheckTtlMs` and `healthCheckBackoffMs` are not filled in: both platforms return them only when they were set.
+
+Numbers come back as they were given, `NaN` and `Infinity` included, not as the engine converted them: see [Out-of-Range Numbers](./types.md#out-of-range-numbers).
 
 #### Throws
 
@@ -807,7 +811,7 @@ if (!last) {
 
 ### `getSyncHistory`
 
-Return up to `limit` recent sync results, most recent first. History is not trimmed automatically, and every cycle adds a row, including 0/0 cycles. Call [`clearSyncHistory`](#clearsynchistory) from time to time if you flush on a timer.
+Return up to `limit` recent sync results, most recent first. History is not trimmed automatically, and every cycle that completes adds a row, including 0/0 cycles. A cancelled cycle adds none, and neither does one that dies before it records its result. Call [`clearSyncHistory`](#clearsynchistory) from time to time if you flush on a timer.
 
 **Platform:** Android and iOS
 
@@ -821,7 +825,7 @@ function getSyncHistory(limit?: number): Promise<SyncResult[]>;
 
 | Name    | Type     | Required | Default | Description                                                                                                                 |
 | ------- | -------- | -------- | ------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `limit` | `number` | No       | `0`     | Max entries to return. `0` (the JS-side default when the argument is omitted) means no limit.                               |
+| `limit` | `number` | No       | `0`     | Max entries to return, with a fraction truncated. `0` (the JS-side default when the argument is omitted) means no limit, and so do any value below `1`, `NaN` and `-Infinity`. `Infinity`, or 2147483648 or more, reads as 2147483647. |
 
 #### Return Value
 
@@ -863,7 +867,7 @@ function clearSyncHistory(): Promise<void>;
 #### Usage
 
 ```ts
-// Every cycle adds a row, so trim the history now and then.
+// Every completed cycle adds a row, so trim the history now and then.
 if ((await getSyncHistory()).length > 500) {
   await clearSyncHistory();
 }
@@ -938,8 +942,10 @@ function enableBackgroundSync(options: BackgroundSyncOptions): Promise<void>;
 
 #### Throws
 
-- `BACKGROUND_TASK_REGISTRATION_FAILED` -- iOS: the OS refused the request, because `com.gabriel-sisjr.syncprovider.background` is not in `BGTaskSchedulerPermittedIdentifiers`, because you are on a simulator, where `BGTaskScheduler` does not accept requests, or because the user turned off Background App Refresh. Android: WorkManager rejected the request, as it does when `requiresDeviceIdle` is `true`, or could not initialize, as when the app removes WorkManager's default initializer without implementing `Configuration.Provider`.
+- `BACKGROUND_TASK_REGISTRATION_FAILED` -- iOS: the OS refused the request, because `com.gabriel-sisjr.syncprovider.background` is not in `BGTaskSchedulerPermittedIdentifiers`, because you are on a simulator, where `BGTaskScheduler` does not accept requests, or because the user turned off Background App Refresh. Android: WorkManager refused the request, or could not initialize, as when the app removes WorkManager's default initializer without implementing `Configuration.Provider`.
 - `NATIVE_MODULE_UNAVAILABLE`.
+
+Out-of-range numbers never reject the call: a `minimumIntervalMs` of `NaN` or `-Infinity` gets the platform's floor, and a huge or infinite one is capped. See [`BackgroundSyncOptions`](./types.md#backgroundsyncoptions).
 
 #### Usage
 

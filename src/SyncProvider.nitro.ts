@@ -288,7 +288,11 @@ export interface SyncProvider extends HybridObject<{
   /**
    * Check whether a flush cycle is currently in progress.
    *
-   * @returns `true` while a cycle is in flight, `false` otherwise.
+   * @returns `true` only while a cycle runs, on both platforms: from the point
+   *   where the flush has passed the pause, stored-credentials,
+   *   network-quality-gate and health-check checks until the cycle ends.
+   *   `false` otherwise, including while a flush is still running those
+   *   checks and after one of them skipped the cycle.
    *
    * @example
    * if (!(await sync.isSyncing())) await sync.flush();
@@ -298,9 +302,20 @@ export interface SyncProvider extends HybridObject<{
   /* ----------------------------- Config ops ----------------------------- */
 
   /**
-   * Replace the active sync configuration. Android applies the new options
-   * from the next flush cycle. iOS applies them from the next item, even inside
-   * a running cycle. A request already in flight keeps the previous config.
+   * Replace the active sync configuration. When the new options reach a cycle
+   * that is already running depends on the platform:
+   *
+   * - Android: the running cycle keeps the options it read when it started,
+   *   except `retryPolicy.retryOnStatusCodes`, which is read again for each
+   *   response, the response to a request already in flight included.
+   *   `maxQueueSize` applies from the next enqueue, and `strategy` from the
+   *   retry wake the call re-arms, which waits for a running failure hold (see
+   *   `SyncStrategy.AUTOMATIC`).
+   * - iOS: the options apply once the call resolves, inside a running cycle
+   *   too. The cycle keeps the batch it read and the outcome of its
+   *   network-quality gate and health check. A request already in flight keeps
+   *   its headers and timeout, and its response is classified under the new
+   *   `retryPolicy`.
    *
    * The options are persisted for background workers. `defaultHeaders` are
    * encrypted at rest, and omitting them deletes the stored copy. Every call
@@ -368,6 +383,9 @@ export interface SyncProvider extends HybridObject<{
    *
    * @param limit — maximum number of entries to return. `0` means
    *   "no limit". Defaults to `0` on the native side when not supplied.
+   *   Both platforms convert it the same way: NaN, `-Infinity` and any
+   *   negative value mean "no limit", `+Infinity` and anything of 2^31 or more
+   *   mean 2147483647, and fractions truncate toward zero.
    * @returns the persisted flush results, most recent first.
    *
    * @remarks
@@ -412,10 +430,12 @@ export interface SyncProvider extends HybridObject<{
    *
    * @param options — constraints applied to the OS-scheduled task.
    * @throws SyncError with code `BACKGROUND_TASK_REGISTRATION_FAILED` when
-   *   the OS rejects the registration (missing `Info.plist` entry on iOS,
-   *   missing manifest permissions on Android, etc.).
-   * @throws SyncError with code `NATIVE_MODULE_UNAVAILABLE` when the
-   *   underlying `BGTaskScheduler` / `WorkManager` is not available.
+   *   the OS rejects the registration: on iOS, `BGTaskScheduler` refuses the
+   *   app-refresh request, for example because the task identifier is missing
+   *   from `Info.plist` or Background App Refresh is turned off; on Android,
+   *   `WorkManager` refuses the periodic work request or is not initialized.
+   *   `NATIVE_MODULE_UNAVAILABLE` comes only from the JS facade, when the
+   *   native module is missing.
    *
    * @example
    * await sync.enableBackgroundSync({

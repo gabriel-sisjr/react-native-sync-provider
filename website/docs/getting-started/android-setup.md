@@ -88,13 +88,12 @@ The library's manifest registers:
   android:exported="true">
   <intent-filter>
     <action android:name="android.intent.action.BOOT_COMPLETED" />
-    <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
     <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
   </intent-filter>
 </receiver>
 ```
 
-`LOCKED_BOOT_COMPLETED` is in the filter, but the receiver is not direct-boot aware, so a locked device does not deliver it. On `BOOT_COMPLETED`, after the first unlock, and on `MY_PACKAGE_REPLACED`, the receiver enqueues a one-time `RecoveryWorker` that:
+The receiver is exported with no `android:permission`: both actions are protected broadcasts that only the system can send, and it ignores any other action. It is not direct-boot aware, because the queue lives in credential-encrypted storage, so nothing runs before the first unlock. On `BOOT_COMPLETED`, which arrives after that unlock, and on `MY_PACKAGE_REPLACED`, after an update of your app, the receiver enqueues a one-time `RecoveryWorker` that:
 
 1. Resets items left in flight back to `PENDING`.
 2. Re-registers the periodic `WorkManager` job from the persisted `BackgroundSyncOptions`, unless `foregroundOnly` is set.
@@ -118,7 +117,7 @@ You do not need to add rules to your app. If you have custom ProGuard rules that
 
 The library uses `PeriodicWorkRequest` for OS-scheduled background sync. Android imposes a hard floor:
 
-> **Warning — 15-minute floor:** `PeriodicWorkRequest.MIN_PERIODIC_INTERVAL_MILLIS` is **15 minutes**. A smaller `minimumIntervalMs` passed to `enableBackgroundSync` is silently raised to it.
+> **Warning — 15-minute floor:** `PeriodicWorkRequest.MIN_PERIODIC_INTERVAL_MILLIS` is **15 minutes**. A smaller `minimumIntervalMs` passed to `enableBackgroundSync`, `NaN` and `-Infinity` included, is silently raised to it, and a huge or infinite one is capped at 2^53 - 1 ms.
 
 For tighter cadences while the app runs, mount `useAutoSync({ enabled: true, flushOnReconnect: true })` -- it flushes from JS on an interval and when connectivity returns, regardless of WorkManager's schedule. Failed items also come back on their own, through the [retry timer and kick](../guides/retry-policy.md#who-wakes-the-queue-and-when).
 

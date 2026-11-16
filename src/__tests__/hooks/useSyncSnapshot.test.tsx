@@ -147,6 +147,48 @@ describe('useSyncSnapshot', () => {
     expect(result.current.progress).toBeNull();
   });
 
+  it('ends the cycle and reads the queue again on a SYNC_FAILED without errorCode', async () => {
+    const mock = getMock();
+    // The shape of a cancelled cycle: its claimed row is back to PENDING
+    // before the event, and no history row is written, so the read after it
+    // still finds the previous flush.
+    const previous = successResult();
+    const row = makeItem('a');
+    mock.getLastSyncResult.mockResolvedValue(previous);
+    mock.getQueueSize.mockResolvedValue(1);
+    mock.getPendingItems.mockResolvedValue([row]);
+
+    const { result } = renderHook(() => useSyncSnapshot());
+    await waitFor(() => expect(result.current.lastResult).toEqual(previous));
+    await waitFor(() => expect(result.current.size).toBe(1));
+    await drainSubscription();
+
+    await act(async () => {
+      mock.__emit({ type: SyncEventType.SYNC_STARTED, timestamp: 1 });
+    });
+    await waitFor(() => expect(result.current.isSyncing).toBe(true));
+    expect(result.current.progress).toBe(0);
+    expect(mock.getLastSyncResult).toHaveBeenCalledTimes(1);
+    expect(mock.getQueueSize).toHaveBeenCalledTimes(1);
+    expect(mock.getPendingItems).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      mock.__emit({ type: SyncEventType.SYNC_FAILED, timestamp: 2 });
+    });
+
+    await waitFor(() =>
+      expect(mock.getLastSyncResult).toHaveBeenCalledTimes(2)
+    );
+    await waitFor(() => expect(mock.getPendingItems).toHaveBeenCalledTimes(2));
+    expect(mock.getQueueSize).toHaveBeenCalledTimes(2);
+    expect(result.current.isSyncing).toBe(false);
+    expect(result.current.progress).toBeNull();
+    expect(result.current.size).toBe(1);
+    expect(result.current.items).toEqual([row]);
+    expect(result.current.lastResult).toEqual(previous);
+    expect(result.current.error).toBeNull();
+  });
+
   it('refreshes connection on CONNECTION_CHANGED', async () => {
     const mock = getMock();
 

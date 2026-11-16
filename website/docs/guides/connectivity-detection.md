@@ -101,7 +101,7 @@ The `e.connectionStatus` field carries the coarse [`ConnectionStatus`](../api-re
 
 - **Only real changes.** The event fires when a reported field changes: `status`, `type`, `isInternetReachable`, `isExpensive` or `networkQuality`. It does not fire for a duplicate. Android never emits it for the state it starts in. iOS starts at `UNKNOWN`, so its first path report, which replaces that, emits one. Before v0.3, iOS emitted it on every path update.
 - **Quality-only changes.** A change of `networkQuality` alone emits it too, with an unchanged `connectionStatus`.
-- **Delivery.** A JS listener receives it asynchronously, on the JS thread, on both platforms, after the new state is stored. iOS emits it from the update that caused it, the emitter queues each listener call on the main queue, and Nitro then queues the JS call on the JS thread. Android emits it from a background coroutine. So `getConnectionStatus()` in the handler returns that state or a later one.
+- **Delivery.** A JS listener receives it asynchronously, on the JS thread, on both platforms, after the new state is stored. iOS emits it from the update that caused it, the emitter queues each listener call on the main queue, and Nitro then queues the JS call on the JS thread. Android queues each change and emits them one at a time from a background consumer. Both keep the order of the changes, though not their order relative to other event types. So `getConnectionStatus()` in the handler returns that state or a later one.
 
 ## Network Quality {#network-quality}
 
@@ -212,7 +212,7 @@ How a cycle uses it:
 1. **Cached result.** If a healthy result younger than `healthCheckTtlMs` exists, no request is sent. A `2xx` sample from a kept [quality measurement](#when-it-is-measured) counts as a healthy result too, for `healthCheckTtlMs`, so the endpoint is not hit twice, but it does not end a running backoff. The samples of a measurement cancelled midway, for example by an offline update, are discarded.
 2. **Probe.** Otherwise the engine sends one `HEAD`, with a 2 s timeout, no `defaultHeaders` or item headers, and `Cache-Control: no-cache`.
 3. **Failure.** The cycle is skipped like a gated one: `SYNC_FAILED` with `errorCode: 'HEALTH_CHECK_FAILED'`, no `SYNC_STARTED`, no history row, no item change. A backoff then runs until `healthCheckBackoffMs` has passed since the failed `HEAD` finished, and every cycle in it is skipped the same way without sending a request. The in-process retry timer holds silently during the backoff.
-4. **Next wake.** The next retry wake is the latest of the item's own deadline, a [credential hold](./background-sync.md#when-a-stored-token-expires), the end of the backoff and 1000 ms after the failed check. That floor holds even with `healthCheckBackoffMs: 0`, for every automatic wake: the in-process retry timer and its held-wake re-checks, the wakes after `resumeSync()` and on reconnect, and the Android retry kick. A check that keeps failing therefore cannot make them spin. It does not apply to an explicit `flush()`: with a backoff of `0`, a `flush()` right after a failure sends a new `HEAD`.
+4. **Next wake.** The next retry wake is the latest of the item's own deadline, a [credential hold](./background-sync.md#when-a-stored-token-expires), the end of the backoff with its floor of 1000 ms after the failed check, and a running [failure hold](./retry-policy.md#the-failure-hold) after a cycle that died. That floor holds even with `healthCheckBackoffMs: 0`, for every automatic wake: the in-process retry timer and its held-wake re-checks, the wakes after `resumeSync()` and on reconnect, and the Android retry kick. A check that keeps failing therefore cannot make them spin. It does not apply to an explicit `flush()`: with a backoff of `0`, a `flush()` right after a failure sends a new `HEAD`.
 5. **Recovery.** A healthy check clears the backoff, and so does every `configureSync` call, which ends it early. The backoff is kept in memory only, so a new process starts without one.
 
 > **Warning — Point it at an endpoint that answers without authentication:** The probes carry no credentials, so an endpoint that requires them answers `401` and every cycle is skipped. Prefer `https://`: a captive portal can answer a plain `http://` probe with a `2xx`. Only Android's `NET_CAPABILITY_VALIDATED` cap covers that case, and only for the quality level.
@@ -247,7 +247,7 @@ The interval tick and the foreground trigger skip while the status is `DISCONNEC
 
 ## What Acts on Connectivity
 
-Without `minNetworkQuality`, neither native dispatcher checks connectivity, so a flush while offline fails its requests and spends retry attempts. What protects you depends on who starts the flush:
+Without `minNetworkQuality`, neither native dispatcher checks connectivity, so a flush while offline spends retry attempts. On Android its requests fail, until valid items reach the dead-letter queue. On iOS it waits for the network, with its first item claimed and one attempt spent, and dead-letters nothing. What protects you depends on who starts the flush:
 
 | Flush started by | Offline behavior | Below `minNetworkQuality` |
 |---|---|---|

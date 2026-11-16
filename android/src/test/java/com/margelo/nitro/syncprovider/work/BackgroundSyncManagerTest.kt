@@ -2,17 +2,20 @@ package com.margelo.nitro.syncprovider.work
 
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
+import androidx.work.BackoffPolicy
 import androidx.work.Configuration
 import androidx.work.ListenableWorker
 import androidx.work.NetworkType
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
+import androidx.work.WorkRequest
 import androidx.work.impl.WorkManagerImpl
 import androidx.work.impl.model.WorkSpec
 import androidx.work.testing.SynchronousExecutor
 import androidx.work.testing.TestListenableWorkerBuilder
 import androidx.work.testing.WorkManagerTestInitHelper
 import com.google.common.truth.Truth.assertThat
+import com.google.common.truth.Truth.assertWithMessage
 import com.margelo.nitro.syncprovider.SyncProviderRuntime
 import com.margelo.nitro.syncprovider.http.SyncDispatcher
 import com.margelo.nitro.syncprovider.testutil.RuntimeTestSupport
@@ -254,6 +257,109 @@ internal class BackgroundSyncManagerTest {
     val constraints = activeSpec(BackgroundSyncManager.UNIQUE_ONE_TIME).constraints
     assertThat(constraints.requiredNetworkType).isEqualTo(NetworkType.UNMETERED)
     assertThat(constraints.requiresCharging()).isTrue()
+  }
+
+  /* ------------------------ (h) waiting for an idle device ---------------------------- */
+
+  /**
+   * WorkManager refuses backoff criteria on a request that requires an idle device ("Cannot
+   * set backoff criteria on an idle mode job"), so `enable` used to reject. Such a request
+   * keeps WorkManager's default backoff instead of the library's one minute.
+   */
+  @Test
+  fun `requiresDeviceIdle schedules periodic work that waits for an idle device`() {
+    manager.enable(TestData.backgroundSyncOptions(requiresDeviceIdle = true, foregroundOnly = false))
+
+    val spec = activeSpec(BackgroundSyncManager.UNIQUE_PERIODIC)
+    assertThat(spec.constraints.requiresDeviceIdle()).isTrue()
+    assertThat(spec.backoffPolicy).isEqualTo(BackoffPolicy.EXPONENTIAL)
+    assertThat(spec.backoffDelayDuration).isEqualTo(WorkRequest.DEFAULT_BACKOFF_DELAY_MILLIS)
+    assertThat(manager.isEnabled()).isTrue()
+    assertThat(manager.lastOptions()!!.requiresDeviceIdle).isTrue()
+  }
+
+  @Test
+  fun `the kick inherits the idle requirement and is scheduled too`() {
+    manager.enable(TestData.backgroundSyncOptions(requiresDeviceIdle = true, foregroundOnly = false))
+
+    manager.scheduleOneTimeFlush(initialDelayMs = 1_000L)
+
+    val spec = activeSpec(BackgroundSyncManager.UNIQUE_ONE_TIME)
+    assertThat(spec.constraints.requiresDeviceIdle()).isTrue()
+    assertThat(spec.backoffDelayDuration).isEqualTo(WorkRequest.DEFAULT_BACKOFF_DELAY_MILLIS)
+    assertThat(spec.initialDelay).isEqualTo(1_000L)
+  }
+
+  @Test
+  fun `without requiresDeviceIdle both requests keep the one-minute backoff`() {
+    manager.enable(TestData.backgroundSyncOptions(requiresDeviceIdle = false, foregroundOnly = false))
+    manager.scheduleOneTimeFlush(initialDelayMs = 1_000L)
+
+    listOf(BackgroundSyncManager.UNIQUE_PERIODIC, BackgroundSyncManager.UNIQUE_ONE_TIME).forEach {
+      val spec = activeSpec(it)
+      assertThat(spec.constraints.requiresDeviceIdle()).isFalse()
+      assertThat(spec.backoffPolicy).isEqualTo(BackoffPolicy.EXPONENTIAL)
+      assertThat(spec.backoffDelayDuration).isEqualTo(60_000L)
+    }
+  }
+
+  /**
+   * The longest delay a retry wake asks for, 2^53 - 1 ms: WorkManager takes it, and the run
+   * time it computes from it stays in the future. A delay it cannot add to the clock is refused.
+   */
+  @Test
+  fun `a kick for the furthest retry deadline is accepted and does not overflow`() {
+    manager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+
+    manager.scheduleOneTimeFlush(initialDelayMs = TestData.MAX_SAFE_DELAY_MS)
+
+    val spec = activeSpec(BackgroundSyncManager.UNIQUE_ONE_TIME)
+    assertThat(spec.initialDelay).isEqualTo(TestData.MAX_SAFE_DELAY_MS)
+    assertThat(spec.calculateNextRunTime()).isGreaterThan(System.currentTimeMillis())
+
+    manager.cancelRetryKick()
+    manager.scheduleOneTimeFlush(initialDelayMs = Long.MAX_VALUE - 1)
+
+    assertThat(activeWorkCount(BackgroundSyncManager.UNIQUE_ONE_TIME)).isEqualTo(0)
+  }
+
+  /* ------------------------------ (i) the periodic interval --------------------------- */
+
+  /**
+   * WorkManager computes each period after the first as the last enqueue time plus the interval.
+   * An interval that saturated a Long, from `Infinity` or `1e300`, wrapped that sum into the
+   * past, so every period after the first was due at once. The interval stops at 2^53 - 1 ms,
+   * the ceiling retry delays use.
+   */
+  @Test
+  fun `a huge minimumIntervalMs is capped, so the next period does not wrap`() {
+    for (interval in listOf(Double.POSITIVE_INFINITY, 1e300, Long.MAX_VALUE.toDouble())) {
+      manager.enable(
+        TestData.backgroundSyncOptions(foregroundOnly = false).copy(minimumIntervalMs = interval),
+      )
+
+      val spec = activeSpec(BackgroundSyncManager.UNIQUE_PERIODIC)
+      val now = System.currentTimeMillis()
+      // The second period, as WorkManager computes it once the first run has finished.
+      val secondPeriod = spec.copy(periodCount = 1, lastEnqueueTime = now).calculateNextRunTime()
+      assertWithMessage("second period for minimumIntervalMs = $interval")
+        .that(secondPeriod).isGreaterThan(now)
+      assertWithMessage("interval for minimumIntervalMs = $interval")
+        .that(spec.intervalDuration).isEqualTo(TestData.MAX_SAFE_DELAY_MS)
+    }
+  }
+
+  @Test
+  fun `a NaN or negative minimumIntervalMs keeps the 15-minute floor`() {
+    for (interval in listOf(Double.NaN, Double.NEGATIVE_INFINITY, -1.0, 0.0)) {
+      manager.enable(
+        TestData.backgroundSyncOptions(foregroundOnly = false).copy(minimumIntervalMs = interval),
+      )
+
+      assertWithMessage("minimumIntervalMs = $interval")
+        .that(activeSpec(BackgroundSyncManager.UNIQUE_PERIODIC).intervalDuration)
+        .isEqualTo(BackgroundSyncManager.MIN_INTERVAL_MS)
+    }
   }
 
   @Test

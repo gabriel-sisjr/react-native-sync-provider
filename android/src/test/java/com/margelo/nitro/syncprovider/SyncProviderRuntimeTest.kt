@@ -1,6 +1,7 @@
 package com.margelo.nitro.syncprovider
 
 import android.content.Context
+import android.database.sqlite.SQLiteDatabaseLockedException
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import androidx.test.core.app.ApplicationProvider
@@ -23,13 +24,16 @@ import com.margelo.nitro.syncprovider.database.SyncDeadLetterEntity
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
 import com.margelo.nitro.syncprovider.error.SyncException
 import com.margelo.nitro.syncprovider.http.SyncDispatcher
+import com.margelo.nitro.syncprovider.retry.GateRecheck
 import com.margelo.nitro.syncprovider.retry.RetryTimer
+import com.margelo.nitro.syncprovider.storage.SyncQueueStorage
 import com.margelo.nitro.syncprovider.testutil.InMemorySecretStore
 import com.margelo.nitro.syncprovider.testutil.RuntimeTestSupport
 import com.margelo.nitro.syncprovider.testutil.TestData
 import com.margelo.nitro.syncprovider.work.BackgroundSyncManager
 import com.margelo.nitro.syncprovider.work.RecoveryWorker
 import com.margelo.nitro.syncprovider.work.SyncWorker
+import io.mockk.coEvery
 import io.mockk.every
 import io.mockk.mockkConstructor
 import io.mockk.unmockkConstructor
@@ -1258,6 +1262,38 @@ internal class SyncProviderRuntimeTest {
         .getWorkSpec(oneTimeWork().single().id.toString())!!
       assertThat(spec.lastEnqueueTime + spec.initialDelay).isAtLeast(startedAt + 60_000L)
       assertThat(spec.input.getInt(SyncWorker.KEY_GATE_STREAK, 0)).isEqualTo(2)
+    }
+
+  /**
+   * A worker cycle that fails between the claim and the send leaves the due row as it was. The
+   * kick it re-arms used to fire at once, which repeated the failing cycle for as long as the
+   * failure lasted; it waits for the gate re-check schedule now.
+   */
+  @Test
+  fun `a worker cycle that fails before the send re-arms the kick 30 s, then 60 s later`() =
+    runBlocking<Unit> {
+      runtime.backgroundSyncManager.enable(TestData.backgroundSyncOptions(foregroundOnly = false))
+      insert("due", attempts = 1, nextRetryAt = 1L)
+      mockkConstructor(SyncQueueStorage::class)
+      try {
+        coEvery { anyConstructed<SyncQueueStorage>().isQueued(any()) } throws
+          SQLiteDatabaseLockedException("database is locked")
+        restartProcess() // This process's storage fails between the claim and the send.
+
+        for (step in 0..1) {
+          val startedAt = System.currentTimeMillis()
+          assertThat(runWorker()).isEqualTo(ListenableWorker.Result.retry())
+          assertThat(kickFiresAt()).isAtLeast(startedAt + GateRecheck.delayMs(step))
+        }
+
+        assertThat(server.requestCount).isEqualTo(0)
+        val due = row("due")!!
+        assertThat(due.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+        assertThat(due.attempts).isEqualTo(1)
+        assertThat(due.nextRetryAt).isEqualTo(1L)
+      } finally {
+        unmockkConstructor(SyncQueueStorage::class)
+      }
     }
 
   @Test

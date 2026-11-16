@@ -75,6 +75,10 @@ BGTaskScheduler is a **soft hint**, not a hard guarantee. Nothing promises when 
 
 iOS does not launch a force-quit app for background tasks or uploads, until the user opens it again.
 
+Each window also has a time limit. When it runs out, the library completes the task at once with `success: false` and stops the flush: the request in flight is cancelled, and its item goes back to `PENDING` with the attempt refunded. `BACKGROUND_SYNC_COMPLETED` then carries `metadata.ok: "false"`. See [When a Window Runs Out of Time](../guides/background-sync.md#when-a-window-runs-out-of-time).
+
+> **Warning — A request that never fits a window:** Each cut refunds the attempt, so the windows never spend the item's retry budget and never dead-letter it. It stays due and is the first item every window tries, which keeps the items behind it out of each window. Only a cycle that runs while the app is active, such as a `flush()` from the foreground, delivers it, so keep request bodies small enough to finish inside a window.
+
 Plan your sync UX around this: even if you request a 15-minute interval, the OS may defer the next window for hours on devices with low engagement. Use `useAutoSync` (foreground) plus `enableBackgroundSync` (background) together so the queue drains both inside and outside the app session.
 
 ## App Lifecycle and Background Sync
@@ -99,7 +103,7 @@ The library uses both task types, each with its own identifier, and you do not c
 | `BGAppRefreshTaskRequest` | `.background` | By `enableBackgroundSync`, and by its own handler. |
 | `BGProcessingTaskRequest` | `.processing` | By the refresh handler, and by its own handler. |
 
-So the first processing request exists only after a refresh window has run. Each handler re-submits before doing any work, using the options persisted by `enableBackgroundSync`, so the chain continues whether or not JS has loaded. It runs one flush cycle, which dispatches up to `batchSize` items.
+So the first processing request exists only after a refresh window has run. Each handler re-submits before doing any work, using the options persisted by `enableBackgroundSync`, so the chain continues whether or not JS has loaded. It runs one flush cycle, which dispatches up to `batchSize` items, one at a time, until the window runs out of time.
 
 `foregroundOnly: true`, `disableBackgroundSync()`, or a pause make a handler that fires complete without dispatching.
 

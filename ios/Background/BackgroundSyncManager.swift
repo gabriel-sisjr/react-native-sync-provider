@@ -188,11 +188,20 @@ final class BackgroundSyncManager: @unchecked Sendable {
 
     // MARK: - Submission
 
+    /// The wait before the next app-refresh window, in seconds, from
+    /// `minimumIntervalMs`: at least 60 s, for NaN and -Infinity too, and at
+    /// most 2^53 - 1 ms, the cap Android puts on its periodic interval, so
+    /// +Infinity and huge values still give a finite begin date.
+    static func refreshDelaySeconds(_ minimumIntervalMs: Double) -> TimeInterval {
+        let floorSeconds: TimeInterval = 60
+        guard !minimumIntervalMs.isNaN else { return floorSeconds }
+        return max(min(minimumIntervalMs, 9_007_199_254_740_991) / 1000, floorSeconds)
+    }
+
     private func scheduleAppRefresh(options: BackgroundSyncOptionsValue) throws {
         #if canImport(BackgroundTasks)
         let request = BGAppRefreshTaskRequest(identifier: kBackgroundRefreshIdentifier)
-        let intervalSeconds = max(options.minimumIntervalMs / 1000.0, 60)
-        request.earliestBeginDate = Date(timeIntervalSinceNow: intervalSeconds)
+        request.earliestBeginDate = Date(timeIntervalSinceNow: Self.refreshDelaySeconds(options.minimumIntervalMs))
         do {
             try scheduler.submit(request)
         } catch {
@@ -222,7 +231,10 @@ final class BackgroundSyncManager: @unchecked Sendable {
     // MARK: - Handlers
 
     #if canImport(BackgroundTasks)
-    func handleAppRefresh(task: BackgroundTaskHandle) {
+    /// - Returns: the window's work, which tests await; `nil` when the task
+    ///   completed inert.
+    @discardableResult
+    func handleAppRefresh(task: BackgroundTaskHandle) -> Task<Void, Never>? {
         // Re-schedule the next window before doing any work so the chain
         // continues even if we get terminated.
         let shouldRun = continueChain { options in
@@ -232,33 +244,17 @@ final class BackgroundSyncManager: @unchecked Sendable {
         guard shouldRun else {
             SyncLogger.info("BGAppRefresh fired while background sync is off; completing inert", category: "background")
             task.setTaskCompleted(success: true)
-            return
+            return nil
         }
         SyncLogger.info("BGAppRefresh task fired", category: "background")
         emitter.emit(.now(type: "BACKGROUND_SYNC_STARTED"))
-
-        let dispatchTask = Task { [weak self] in
-            await self?.waitUntilPrepared()
-            do {
-                _ = try await self?.dispatcher?.flush()
-                self?.emitter.emit(.now(type: "BACKGROUND_SYNC_COMPLETED",
-                                        metadata: ["kind": "refresh"]))
-                task.setTaskCompleted(success: true)
-            } catch {
-                SyncLogger.error("BGAppRefresh flush failed: \(error.localizedDescription)", category: "background")
-                self?.emitter.emit(.now(type: "BACKGROUND_SYNC_COMPLETED",
-                                        errorCode: (error as? SyncProviderError)?.code.stringValue,
-                                        metadata: ["kind": "refresh", "ok": "false"]))
-                task.setTaskCompleted(success: false)
-            }
-        }
-        task.expirationHandler = {
-            dispatchTask.cancel()
-            SyncLogger.error("BGAppRefresh expired", category: "background")
-        }
+        return runWindow(task: task, kind: "refresh", name: "BGAppRefresh")
     }
 
-    func handleProcessing(task: BackgroundTaskHandle) {
+    /// - Returns: the window's work, which tests await; `nil` when the task
+    ///   completed inert.
+    @discardableResult
+    func handleProcessing(task: BackgroundTaskHandle) -> Task<Void, Never>? {
         let shouldRun = continueChain { options in
             scheduleProcessing(options: options)
         }
@@ -267,31 +263,49 @@ final class BackgroundSyncManager: @unchecked Sendable {
             // processing task must become inert once background sync is off.
             SyncLogger.info("BGProcessing fired while background sync is off; completing inert", category: "background")
             task.setTaskCompleted(success: true)
-            return
+            return nil
         }
         SyncLogger.info("BGProcessing task fired", category: "background")
         emitter.emit(.now(type: "BACKGROUND_SYNC_STARTED",
                           metadata: ["kind": "processing"]))
+        return runWindow(task: task, kind: "processing", name: "BGProcessing")
+    }
 
-        let dispatchTask = Task { [weak self] in
+    /// Runs the flush of a fired task, after launch recovery, and completes
+    /// the task exactly once: with `true` when the flush returns, `false` when
+    /// it throws or the time expires first.
+    ///
+    /// iOS calls `expirationHandler` shortly before the time runs out and may
+    /// kill an app that has not completed the task by then, so expiry
+    /// completes it at once and cancels the flush: see
+    /// ``SyncDispatcher/flushOutcome()`` for what a cancelled cycle does. The
+    /// flush then throws, and `BACKGROUND_SYNC_COMPLETED` follows with
+    /// `metadata.ok: "false"`, as after any flush that throws. Expired before
+    /// its cycle started, the flush emits nothing before that event.
+    private func runWindow(task: BackgroundTaskHandle, kind: String, name: String) -> Task<Void, Never> {
+        let completion = TaskCompletion(task)
+        let work = Task { [weak self] in
             await self?.waitUntilPrepared()
             do {
                 _ = try await self?.dispatcher?.flush()
                 self?.emitter.emit(.now(type: "BACKGROUND_SYNC_COMPLETED",
-                                        metadata: ["kind": "processing"]))
-                task.setTaskCompleted(success: true)
+                                        metadata: ["kind": kind]))
+                completion.complete(success: true)
             } catch {
-                SyncLogger.error("BGProcessing flush failed: \(error.localizedDescription)", category: "background")
+                SyncLogger.error("\(name) flush failed: \(error.localizedDescription)", category: "background")
+                // No `errorCode`: the flush never throws a `SyncProviderError`.
+                // A cycle that dies reports its code on its `SYNC_FAILED`.
                 self?.emitter.emit(.now(type: "BACKGROUND_SYNC_COMPLETED",
-                                        errorCode: (error as? SyncProviderError)?.code.stringValue,
-                                        metadata: ["kind": "processing", "ok": "false"]))
-                task.setTaskCompleted(success: false)
+                                        metadata: ["kind": kind, "ok": "false"]))
+                completion.complete(success: false)
             }
         }
         task.expirationHandler = {
-            dispatchTask.cancel()
-            SyncLogger.error("BGProcessing expired", category: "background")
+            SyncLogger.error("\(name) expired", category: "background")
+            work.cancel()
+            completion.complete(success: false)
         }
+        return work
     }
 
     /// Runs `submit` unless background sync is off, and reports which.
@@ -315,3 +329,31 @@ final class BackgroundSyncManager: @unchecked Sendable {
     }
     #endif
 }
+
+#if canImport(BackgroundTasks)
+/// Completes a fired task exactly once: from whichever comes first, the end
+/// of its flush or its expiry.
+///
+/// It lets go of the task as it completes it. The task holds its expiration
+/// handler, and the handler holds this object. BackgroundTasks clears a
+/// `BGTask`'s handler when the task completes, but a handler set after the
+/// flush already completed the task stays on it, and another
+/// ``BackgroundTaskHandle`` may never clear its handler.
+private final class TaskCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    /// `nil` once the task is completed.
+    private var task: BackgroundTaskHandle?
+
+    init(_ task: BackgroundTaskHandle) {
+        self.task = task
+    }
+
+    func complete(success: Bool) {
+        let first = lock.withLock { () -> BackgroundTaskHandle? in
+            defer { task = nil }
+            return task
+        }
+        first?.setTaskCompleted(success: success)
+    }
+}
+#endif

@@ -31,6 +31,8 @@ Every queued item carries a retry budget. When a retriable dispatch fails, the i
 | `jitter`             | `boolean`         | Multiply the computed delay by a uniformly distributed equal-jitter factor in `[0.75, 1.25)` (±25%).                   |
 | `retryOnStatusCodes` | `number[]`        | HTTP status codes that should trigger a retry. Network errors and timeouts are always retried regardless of this list. |
 
+A computed delay never exceeds 2^53 - 1 ms, and a retry deadline never passes 8,640,000,000,000,000 ms, the largest valid JavaScript `Date`, so even an `Infinity` delay leaves the item waiting instead of due at once. For `NaN`, `Infinity` and other out-of-range values, see [Out-of-Range Numbers](../api-reference/types.md#out-of-range-numbers).
+
 ## Backoff Strategies
 
 ### `LINEAR`
@@ -145,14 +147,14 @@ Before v0.3, a permanently failed item stayed in the queue store, and Android co
 
 ## Retry Cooldown Across Restarts
 
-**Added in v0.2.** A retriable failure with attempts left puts the item back to `PENDING` with a persisted **`nextRetryAt`**: the clock read after the attempt finished, plus the backoff delay. The dispatcher skips the item until the device clock reaches that deadline, on both platforms and across process death and device reboot. Measuring from the end of the attempt means a slow request or a timeout does not eat into the cooldown.
+**Added in v0.2.** A retriable failure with attempts left puts the item back to `PENDING` with a persisted **`nextRetryAt`**: the clock read after the attempt finished, plus the backoff delay, capped at the largest valid JavaScript `Date`. The dispatcher skips the item until the device clock reaches that deadline, on both platforms and across process death and device reboot. Measuring from the end of the attempt means a slow request or a timeout does not eat into the cooldown.
 
 [`SyncItem.nextRetryAt`](../api-reference/types.md#syncitem) tells you where an item stands:
 
 - `0` means it is eligible now. It does not mean the item was never attempted: rows carried over from v0.1, and an iOS row whose first attempt was cut short by a process kill, can show `attempts >= 1` with `nextRetryAt: 0`.
 - A positive value means a retry cooldown or a [credential hold](./background-sync.md#when-a-stored-token-expires) is pending. It is eligible once `nextRetryAt <= now`. The value stays in place afterwards, so a timestamp in the past means the wait has elapsed.
 
-Each cycle makes at most one attempt per item, and `attempts` counts the attempts recorded across cycles, so the retry budget survives a restart. `0` means no attempt has been recorded, not that the item was never tried. Android records an attempt with its outcome, so a process kill mid-request leaves the count unchanged, while iOS counts it when the dispatch starts. A credential hold spends no attempt, so a held item can show `attempts: 0` with `nextRetryAt > 0`.
+Each cycle makes at most one attempt per item, and `attempts` counts the attempts recorded across cycles, so the retry budget survives a restart. `0` means no attempt has been recorded, not that the item was never tried. Android records an attempt with its outcome, so a process kill mid-request leaves the count unchanged, while iOS counts it when the dispatch starts, and refunds it when a [BGTask expiry](./background-sync.md#when-a-window-runs-out-of-time) cancels the request. A credential hold spends no attempt, so a held item can show `attempts: 0` with `nextRetryAt > 0`.
 
 A cooldown and a hold look the same on a `SyncItem`, which carries neither the last error code nor the last attempt time. An `ITEM_RETRYING` event with `errorCode: 'UNAUTHORIZED'` marks a hold.
 
@@ -172,19 +174,30 @@ Nothing re-dispatches an item before its `nextRetryAt`. These are the triggers t
 
 What the timer does and does not do:
 
-- **It never flushes offline.** Without `minNetworkQuality`, neither dispatcher checks connectivity, so a flush offline would spend every attempt and send valid items to the dead-letter queue. When the timer fires offline, it remembers the wake and flushes when connectivity returns. A manual `flush()` while offline keeps its behavior unless `minNetworkQuality` is set.
+- **It never flushes offline.** Without `minNetworkQuality`, neither dispatcher checks connectivity. An offline cycle can spend attempts on Android, until valid items reach the dead-letter queue. On iOS it waits for the network, with its first item claimed and one attempt spent, and dead-letters nothing. When the timer fires offline, it remembers the wake and flushes when connectivity returns. A manual `flush()` while offline keeps its behavior unless `minNetworkQuality` is set.
 - **It holds below the quality gate, and during a health-check backoff.** With [`minNetworkQuality`](./connectivity-detection.md#the-quality-gate) set, the timer checks the gate first and holds the wake silently, with no event, until the quality reaches the minimum. It re-checks at 30, 60, 120, 240 and 480 seconds, then every 15 minutes, restarting that backoff when a wake passes, the network changes or the timer is armed again, as every `configureSync` does. See [Held wakes](./connectivity-detection.md#held-wakes).
 - **It only exists in a process with JS.** A worker, a boot broadcast, or an iOS background launch where JS never reaches the library arms no timer. Android relies on the kick there.
 - **It looks at items with a deadline.** Only items with `nextRetryAt > 0`, a cooldown or a credential hold, arm it. Items with `nextRetryAt: 0` do not, so it does not replace a flush for new items, though the cycle it starts takes them too. `resumeSync` is the exception: it considers every pending item, so items with no deadline are dispatched at once. On iOS, the timer re-armed after a failed health check also considers every `PENDING` item, cooldown or not.
 - **On iOS it cannot fire while the app is suspended.** It fires on resume.
+- **It waits after a cycle that dies.** See [The Failure Hold](#the-failure-hold).
 
 That owed wake is the only native flush tied to connectivity. There is no native flush on enqueue, and none on reconnect by itself: [`useAutoSync`](../api-reference/hooks/useAutoSync.md) is the mechanism.
 
-`SyncWorker` reports `Result.success()` on any completed flush, so WorkManager's own backoff is reserved for a worker that fails as a whole and cannot race the cooldown.
+`SyncWorker` reports `Result.success()` on any completed flush, so WorkManager's own backoff is reserved for a worker that fails as a whole, a cycle that dies included, and cannot race the cooldown. That backoff is exponential from 1 minute, or, with `requiresDeviceIdle`, WorkManager's default: exponential from 30 seconds, at most 5 hours, once the device is idle again. A worker that WorkManager stops does not report `Result.retry()`, so this backoff does not apply to it.
 
 After a [rejected stored credential](./background-sync.md#when-a-stored-token-expires), the retry timer and the Android retry kick wait for the hold to end, even if other items are already due. The periodic worker and BGTasks do not wait for it, and a process restart drops it.
 
-After a failed [health check](./connectivity-detection.md#health-check), the next retry wake waits for its backoff to end too, and for at least 1000 ms after the failure, even with `healthCheckBackoffMs: 0`. The next wake is therefore the latest of the item's own deadline, the credential hold, the end of the health-check backoff and that one-second floor.
+After a failed [health check](./connectivity-detection.md#health-check), the next retry wake waits for its backoff to end too, and for at least 1000 ms after the failure, even with `healthCheckBackoffMs: 0`. The next wake is therefore the latest of the item's own deadline, the credential hold, the end of the health-check backoff with that one-second floor, and a running [failure hold](#the-failure-hold).
+
+#### The Failure Hold {#the-failure-hold}
+
+After a [cycle that dies](./error-handling.md#when-a-cycle-dies), for example because the queue's storage keeps failing, automatic wakes do not start the next cycle at once. They wait 30 seconds from the failed cycle's end, doubling for each cycle in a row that dies, up to 15 minutes:
+
+- **Held.** The retry timer and the Android retry kick, whatever arms them: the end of a cycle, `configureSync`, an engine start and its recovery, a health-check skip.
+- **Not held.** `flush()`, [`drainUntilEmpty()`](../api-reference/functions.md#drainuntilempty), [`useAutoSync`](../api-reference/hooks/useAutoSync.md), the Android periodic worker and the iOS BGTask windows. A reconnect delivers at once a wake that fell due while offline.
+- **`resumeSync()`.** It sends what is due at once, without waiting for the failure hold, and leaves the hold as it was. It still waits for a credential hold and a health-check backoff.
+- **Ended.** A cycle that completes, an empty one included, ends the hold and starts the steps over. A [cancelled cycle](./error-handling.md#cancelled-cycles) neither starts nor ends it.
+- **In memory.** The hold never creates a wake of its own, and a new process starts again at 30 seconds.
 
 ### `foregroundOnly` Interaction
 

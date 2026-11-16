@@ -161,6 +161,6 @@ example/
 ## See Also
 
 - [Quick Start](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/getting-started/quick-start)
-- [Hooks API Reference](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/category/hooks)
+- [Hooks API Reference](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/hooks/useSyncQueue)
 - [Installation Guide](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/getting-started/installation)
-- [Background Sync Advanced Guide](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/advanced/background-sync)
+- [Background Sync Guide](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/guides/background-sync)

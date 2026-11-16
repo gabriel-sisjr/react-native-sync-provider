@@ -5,6 +5,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.os.Looper
 import androidx.test.core.app.ApplicationProvider
 import com.google.common.truth.Truth.assertThat
 import com.google.common.truth.Truth.assertWithMessage
@@ -15,11 +16,16 @@ import com.margelo.nitro.syncprovider.NetworkQuality
 import com.margelo.nitro.syncprovider.SyncEvent
 import com.margelo.nitro.syncprovider.SyncEventType
 import com.margelo.nitro.syncprovider.events.SyncEventEmitter
+import io.mockk.coEvery
+import io.mockk.spyk
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Before
 import org.junit.Test
@@ -34,6 +40,7 @@ import org.robolectric.shadows.ShadowConnectivityManager
 import org.robolectric.shadows.ShadowNetwork
 import org.robolectric.shadows.ShadowNetworkCapabilities
 import java.util.Collections
+import kotlin.coroutines.CoroutineContext
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [30])
@@ -55,6 +62,8 @@ internal class ConnectivityMonitorTest {
   fun tearDown() {
     monitor.stop()
     scope.cancel()
+    monitors.forEach { it.stop() }
+    scopes.forEach { it.cancel() }
   }
 
   private fun manager(): ConnectivityManager = ApplicationProvider.getApplicationContext<Context>()
@@ -401,6 +410,177 @@ internal class ConnectivityMonitorTest {
     listOf(noNetwork, unmetered, metered, noInternet).forEach(::assertOfflineInvariant)
   }
 
+  /* ------------------------------ event delivery ----------------------------- */
+
+  /**
+   * Holds every task until the test runs them, and then runs the newest first:
+   * `Dispatchers.Default` promises no order between two coroutines, and this is an order it
+   * may pick.
+   */
+  private class NewestFirstDispatcher : CoroutineDispatcher() {
+    private val tasks = ArrayDeque<Runnable>()
+
+    override fun dispatch(context: CoroutineContext, block: Runnable) {
+      synchronized(tasks) { tasks.addLast(block) }
+    }
+
+    /** @return how many tasks ran. */
+    fun runAll(): Int {
+      var ran = 0
+      while (true) {
+        val task = synchronized(tasks) { tasks.removeLastOrNull() } ?: return ran
+        task.run()
+        ran++
+      }
+    }
+  }
+
+  /** A monitor whose coroutines run only when the test runs [dispatcher]. */
+  private fun monitorOn(dispatcher: NewestFirstDispatcher): ConnectivityMonitor {
+    val manual = CoroutineScope(SupervisorJob() + dispatcher)
+    scopes += manual
+    return ConnectivityMonitor(ApplicationProvider.getApplicationContext(), emitter, manual)
+      .also { monitors += it }
+  }
+
+  private val scopes = mutableListOf<CoroutineScope>()
+  private val monitors = mutableListOf<ConnectivityMonitor>()
+
+  /** The connection statuses a JS listener receives, in the order it receives them. */
+  private fun listen(onEvent: (SyncEvent) -> Unit = {}): MutableList<ConnectionStatus?> {
+    val received = Collections.synchronizedList(mutableListOf<ConnectionStatus?>())
+    runBlocking {
+      emitter.add(CHANNEL) {
+        if (it.type == SyncEventType.CONNECTION_CHANGED) received += it.connectionStatus
+        onEvent(it)
+      }
+    }
+    return received
+  }
+
+  /** Runs the monitor's coroutines and the main looper, where listeners run, until both rest. */
+  private fun deliver(dispatcher: NewestFirstDispatcher) {
+    val main = shadowOf(Looper.getMainLooper())
+    repeat(MAX_DELIVERY_ROUNDS) {
+      val ran = dispatcher.runAll()
+      main.idle()
+      if (ran == 0 && main.isIdle) return
+    }
+    error("Event delivery did not settle")
+  }
+
+  @Test
+  fun `two quick changes reach a listener in the order they happened`() {
+    val dispatcher = NewestFirstDispatcher()
+    val ordered = monitorOn(dispatcher)
+    ordered.start()
+    val wifi = network(WIFI_ID, NetworkCapabilities.TRANSPORT_WIFI, *INTERNET, NOT_METERED)
+    callback().onAvailable(wifi)
+    deliver(dispatcher)
+    val received = listen()
+
+    // The Wi-Fi turns out to be a metered hotspot, and is lost right after.
+    callback().onCapabilitiesChanged(wifi, capabilities(NetworkCapabilities.TRANSPORT_WIFI, *INTERNET))
+    callback().onLost(wifi)
+    deliver(dispatcher)
+
+    assertThat(received)
+      .containsExactly(ConnectionStatus.METERED, ConnectionStatus.DISCONNECTED)
+      .inOrder()
+    assertThat(ordered.state.value.status).isEqualTo(ConnectionStatus.DISCONNECTED)
+  }
+
+  @Test
+  fun `a listener that causes the next change gets both changes, in order`() {
+    val dispatcher = NewestFirstDispatcher()
+    val ordered = monitorOn(dispatcher)
+    ordered.start()
+    val wifi = network(WIFI_ID, NetworkCapabilities.TRANSPORT_WIFI, *INTERNET, NOT_METERED)
+    callback().onAvailable(wifi)
+    deliver(dispatcher)
+    var lostSent = false
+    val received = listen {
+      if (!lostSent) {
+        lostSent = true
+        callback().onLost(wifi)
+      }
+    }
+
+    callback().onCapabilitiesChanged(wifi, capabilities(NetworkCapabilities.TRANSPORT_WIFI, *INTERNET))
+    deliver(dispatcher)
+
+    assertThat(received)
+      .containsExactly(ConnectionStatus.METERED, ConnectionStatus.DISCONNECTED)
+      .inOrder()
+  }
+
+  @Test
+  fun `a listener that removes another one during delivery does not wait for the emitter`() {
+    val dispatcher = NewestFirstDispatcher()
+    val ordered = monitorOn(dispatcher)
+    ordered.start()
+    val wifi = network(WIFI_ID, NetworkCapabilities.TRANSPORT_WIFI, *INTERNET, NOT_METERED)
+    callback().onAvailable(wifi)
+    deliver(dispatcher)
+    val removedReceived = mutableListOf<ConnectionStatus?>()
+    val removedId = runBlocking { emitter.add(CHANNEL) { removedReceived += it.connectionStatus } }
+    val received = listen {
+      // On the main thread, during delivery: the emitter holds no lock here.
+      runBlocking { emitter.remove(CHANNEL, removedId) }
+    }
+
+    callback().onCapabilitiesChanged(wifi, capabilities(NetworkCapabilities.TRANSPORT_WIFI, *INTERNET))
+    deliver(dispatcher)
+    callback().onLost(wifi)
+    deliver(dispatcher)
+
+    assertThat(received)
+      .containsExactly(ConnectionStatus.METERED, ConnectionStatus.DISCONNECTED)
+      .inOrder()
+    // Removed while the first change was being delivered: it got that one, and nothing after.
+    assertThat(removedReceived).containsExactly(ConnectionStatus.METERED)
+  }
+
+  /**
+   * The one consumer outlives an emit that fails, whatever it throws: the failure loses that
+   * event, not the ones after it. Only its own cancellation, its scope's, ends it.
+   */
+  private fun assertLaterEventsSurvive(failure: Throwable) {
+    val failingEmitter = spyk(SyncEventEmitter())
+    coEvery {
+      failingEmitter.emit(match { it.connectionStatus == ConnectionStatus.METERED })
+    } throws failure
+    val unconfined = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined).also { scopes += it }
+    val received = Collections.synchronizedList(mutableListOf<ConnectionStatus?>())
+    unconfined.launch {
+      failingEmitter.events.collect {
+        if (it.type == SyncEventType.CONNECTION_CHANGED) received += it.connectionStatus
+      }
+    }
+    ConnectivityMonitor(ApplicationProvider.getApplicationContext(), failingEmitter, unconfined)
+      .also { monitors += it }
+      .start()
+    val wifi = network(WIFI_ID, NetworkCapabilities.TRANSPORT_WIFI, *INTERNET, NOT_METERED)
+    callback().onAvailable(wifi)
+
+    // Metered first, whose emit fails; then lost.
+    callback().onCapabilitiesChanged(wifi, capabilities(NetworkCapabilities.TRANSPORT_WIFI, *INTERNET))
+    callback().onLost(wifi)
+
+    assertThat(received).contains(ConnectionStatus.DISCONNECTED)
+    assertThat(received).doesNotContain(ConnectionStatus.METERED)
+  }
+
+  @Test
+  fun `an emit that throws a cancellation that is not the consumer's does not stop later events`() {
+    assertLaterEventsSurvive(CancellationException("not the consumer's"))
+  }
+
+  @Test
+  fun `an emit that throws an Error does not stop later events`() {
+    assertLaterEventsSurvive(NotImplementedError("the bridge is gone"))
+  }
+
   /** The stock shadow, counting which registration call the monitor makes. */
   @Implements(ConnectivityManager::class)
   class RecordingConnectivityManager : ShadowConnectivityManager() {
@@ -446,6 +626,10 @@ internal class ConnectivityMonitorTest {
     const val WIFI_ID = 101
     const val CELLULAR_ID = 102
     const val VPN_ID = 103
+
+    /** The emitter's one channel, the one the bridge's `addListener` uses. */
+    const val CHANNEL = "sync-event"
+    const val MAX_DELIVERY_ROUNDS = 50
 
     const val NOT_METERED = NetworkCapabilities.NET_CAPABILITY_NOT_METERED
     const val TEMPORARILY_NOT_METERED = NetworkCapabilities.NET_CAPABILITY_TEMPORARILY_NOT_METERED

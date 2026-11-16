@@ -76,15 +76,15 @@ try {
 
 | Code | Retryable? | Where you see it | Suggested action |
 |---|---|---|---|
-| `NETWORK_ERROR` | Yes | Item events. `flush()` also rejects with it when its cycle dies. | Wait for connectivity; the engine retries automatically. On Android, a `NETWORK_ERROR` from anything other than an I/O failure is not retried. |
+| `NETWORK_ERROR` | Yes | Item events. The `SYNC_FAILED` of a [cycle that dies](#when-a-cycle-dies), and `flush()` rejects with it then. | Wait for connectivity; the engine retries automatically. On a `SYNC_FAILED`, see [When a Cycle Dies](#when-a-cycle-dies). |
 | `SERVER_ERROR` | If in `retryOnStatusCodes` | Item events | The engine retries a listed status; surface only if persistent. |
-| `INVALID_PAYLOAD` | No | `enqueue`, `enqueueBatch`, `configureSync`, and most functions when native rejects | Fix the input shape. With no `validationErrors`, native rejected the call. |
+| `INVALID_PAYLOAD` | No | `enqueue`, `enqueueBatch`, `configureSync`, and most functions when native rejects. Item events and dead letters, for an attempt that failed with something other than an I/O error that the engine cannot classify | Fix the input shape. With no `validationErrors`, native rejected the call. On an item, read the dead letter's `lastErrorMessage`. |
 | `QUEUE_FULL` | No (until drained) | `enqueue`, `enqueueBatch`, `replayDeadLetter`. Reaches JS as `INVALID_PAYLOAD` for now | Flush or raise `maxQueueSize`. A rejected replay keeps the dead letter. |
 | `NATIVE_MODULE_UNAVAILABLE` | No | every facade method | Verify New Architecture; rebuild native app. |
-| `BACKGROUND_TASK_REGISTRATION_FAILED` | No | `enableBackgroundSync`. `disableBackgroundSync` and `isBackgroundSyncEnabled` reject with it only as the fallback code for a native rejection | iOS: check the `Info.plist` identifiers, that you are on a physical device, and that Background App Refresh is on. Android: leave `requiresDeviceIdle` unset, and make sure WorkManager can initialize: an app that removes its default initializer must implement `Configuration.Provider`. |
+| `BACKGROUND_TASK_REGISTRATION_FAILED` | No | `enableBackgroundSync`. `disableBackgroundSync` and `isBackgroundSyncEnabled` reject with it only as the fallback code for a native rejection | iOS: check the `Info.plist` identifiers, that you are on a physical device, and that Background App Refresh is on. Android: make sure WorkManager can initialize: an app that removes its default initializer must implement `Configuration.Provider`. |
 | `INVALID_URL` | No | `enqueue`, `configureSync` (`healthCheckUrl`) | Pass an absolute http(s) URL. |
 | `UNAUTHORIZED` | No | Item events, dead letters | Call `configureSync` with a fresh token, then replay the dead letters. |
-| `TIMEOUT` | Yes | Item events | Engine retries; raise `requestTimeoutMs` if requests legitimately take longer. On Android, that limit running out is reported as `NETWORK_ERROR`, and `TIMEOUT` means a fixed socket timeout fired first: 10 s to connect, or 30 s for a stalled read or write. Raising `requestTimeoutMs` does not lengthen those. |
+| `TIMEOUT` | Yes | Item events | Engine retries; raise `requestTimeoutMs` if requests legitimately take longer. On Android, `TIMEOUT` also covers the HTTP client's fixed socket timeouts: 10 s to connect, or 30 s for a stalled read or write. Raising `requestTimeoutMs` does not lengthen those. |
 | `MAX_ATTEMPTS_EXCEEDED` | No | `ITEM_FAILED`, dead letters | Replay once the cause is fixed. Raise `maxAttempts` or expand `retryOnStatusCodes` if it recurs. |
 | `DUPLICATE_ITEM` | No | Never: reserved | None. |
 | `DRAIN_ALREADY_ACTIVE` | No | `drainUntilEmpty` | Await the previous drain. |
@@ -156,7 +156,7 @@ useSyncEvents({
 
 - `ITEM_FAILED` is emitted when an item fails permanently, with a real `errorCode`.
 - `ITEM_DEAD_LETTERED` follows it right after, once the item is in the dead-letter queue. Its `errorCode` is always `DEAD_LETTERED`, and `metadata.lastErrorCode` repeats the real code. An item removed or cleared while its request was in flight gets `ITEM_FAILED` alone: it is never dead-lettered. See [What a Purge Stops](../api-reference/functions.md#what-a-purge-stops).
-- `SYNC_FAILED` is emitted when a cycle ends with at least one permanent failure, dies, or is skipped. Its `errorCode` is set only when the cycle died or was skipped, so read per-item codes from `ITEM_FAILED`.
+- `SYNC_FAILED` is emitted when a cycle ends with at least one permanent failure, [dies](#when-a-cycle-dies), is [cancelled](#cancelled-cycles), or is skipped. Its `errorCode` is set only when the cycle died or was skipped, so read per-item codes from `ITEM_FAILED`.
 
 ### Skipped Cycles
 
@@ -174,12 +174,38 @@ useSyncEvents({
         showBanner('Server unreachable, retrying shortly');
         break;
       default:
-        // The cycle died, or items failed: see ITEM_FAILED.
+        // The cycle died or was cancelled, or items failed: see ITEM_FAILED.
         break;
     }
   },
 });
 ```
+
+### When a Cycle Dies {#when-a-cycle-dies}
+
+A cycle dies when something around an attempt fails, rather than the attempt itself: a storage read or write, such as one that hits a locked database, or another local error. That failure is not the item's outcome. No new request starts, and on Android the requests already started finish. Then, before the cycle ends, each item it claimed and left without a recorded outcome is settled in one write, with what its attempt established, and reported with the event its own write would have given:
+
+| What the attempt established | What happens to the item |
+| --- | --- |
+| A `2xx` | Delivered: removed with `ITEM_SUCCEEDED`, never sent again. |
+| A retryable failure, `TIMEOUT` included | Back to `PENDING` behind the policy's backoff, with its own code on `ITEM_RETRYING`. On its last attempt, `ITEM_FAILED` with `MAX_ATTEMPTS_EXCEEDED`, then the dead-letter queue. |
+| A permanent failure | `ITEM_FAILED` with its own code, then the dead-letter queue. |
+| A 401 or 403 to `defaultHeaders` restored from storage | A [credential hold](./background-sync.md#when-a-stored-token-expires), as usual: no attempt spent. |
+| Android only: a request that went out, with no answer read yet | The attempt counts, with `NETWORK_ERROR` and the policy's backoff, or `MAX_ATTEMPTS_EXCEEDED` on its last attempt. |
+| No request went out | Back in the queue exactly as before the cycle, with no event. |
+
+The cycle then ends with `SYNC_FAILED`. Its `errorCode` is the library error's own code, or `NETWORK_ERROR` for any other cause, a storage error included. The `flush()` that ran it rejects with `NETWORK_ERROR`, and automatic wakes wait for the [failure hold](./retry-policy.md#the-failure-hold) before they run another cycle.
+
+Only when the settling write fails too do the items stay `IN_FLIGHT`, until the next [recovery](./crash-recovery.md) puts them back in the queue, and they are sent again. Delivery stays at least once, so keep your endpoints [idempotent](./idempotency.md).
+
+### Cancelled Cycles
+
+A cycle can be stopped by cancellation: on Android, a worker that WorkManager stops because of `disableBackgroundSync()` or because its constraints no longer hold, and on iOS, a BGTask window whose [time runs out](./background-sync.md#when-a-window-runs-out-of-time). A cancelled cycle is not a failed one:
+
+- It ends with `SYNC_FAILED` **without** an `errorCode`.
+- No item fails because of it. The items it claimed and has not sent go back to the queue unchanged.
+- A request already on the wire finishes on Android, and its answer is recorded with the attempt counted. iOS cancels it, and its item goes back to `PENDING` with the attempt refunded.
+- It neither starts nor ends the [failure hold](./retry-policy.md#the-failure-hold).
 
 ## Dead-Letter Flows
 

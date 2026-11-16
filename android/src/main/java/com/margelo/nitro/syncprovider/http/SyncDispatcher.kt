@@ -2,6 +2,7 @@ package com.margelo.nitro.syncprovider.http
 
 import android.util.Log
 import com.margelo.nitro.syncprovider.NetworkQuality
+import com.margelo.nitro.syncprovider.RetryPolicy
 import com.margelo.nitro.syncprovider.SyncErrorCode
 import com.margelo.nitro.syncprovider.SyncEventType
 import com.margelo.nitro.syncprovider.SyncOptions
@@ -11,6 +12,7 @@ import com.margelo.nitro.syncprovider.database.SyncItemEntity
 import com.margelo.nitro.syncprovider.error.SyncException
 import com.margelo.nitro.syncprovider.events.SyncEventEmitter
 import com.margelo.nitro.syncprovider.retry.RetryPolicyEvaluator
+import com.margelo.nitro.syncprovider.storage.AbortedClaim
 import com.margelo.nitro.syncprovider.storage.SyncQueueStorage
 import com.margelo.nitro.syncprovider.util.JsonMap
 import kotlinx.coroutines.CancellationException
@@ -20,19 +22,23 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import okhttp3.logging.HttpLoggingInterceptor
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.net.SocketTimeoutException
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.random.Random
@@ -48,17 +54,28 @@ import kotlin.random.Random
  * - [SyncItemEntity.attempts] is cross-cycle: it continues from whatever prior
  *   cycles persisted, so the retry budget survives process death and reboots.
  * - [onCycleFinished] fires after every cycle, whatever its outcome, so the next
- *   wake is always re-armed.
+ *   wake is always re-armed. It is told how the cycle ended ([CycleEnding]): the wake after a
+ *   cycle that failed is held back, so a failure that persists cannot run cycles back to back.
  *
  * Concurrency model:
  * - [flushMutex] serializes cycles: a concurrent [flush] waits for the running one
  *   and then runs its own.
- * - Within a cycle, items are dispatched via [supervisorScope] so a single item's
- *   failure cannot cancel siblings.
- * - A dispatch that started always records its outcome, even if the cycle is
- *   cancelled. Rows that never started are released back to `PENDING`.
- * - Per-attempt timeout is enforced with `withTimeoutOrNull(...)`; the underlying
- *   OkHttp call also has its own timeouts.
+ * - Within a cycle, items are dispatched via [supervisorScope]: an item whose attempt fails
+ *   records that outcome and leaves its siblings alone.
+ * - A dispatch that started finishes even if the cycle is cancelled, and records its outcome,
+ *   unless something raised around its attempt ends the cycle: a storage failure, a
+ *   cancellation or an [Error] (see [dispatchRecordingOutcome]). Dispatches already started
+ *   still finish then, and none starts after. Unless a cancellation ended the cycle, each row
+ *   it claimed and left without a recorded outcome is then settled with what its attempt
+ *   established (see [settlements]): an answer the server gave is applied as the attempt would
+ *   have applied it, a `2xx` included; a request that went out with no answer classified counts
+ *   the attempt, with its cooldown. A row never sent, and every row after a cancellation, comes
+ *   back as it was.
+ * - Each attempt is bounded by OkHttp's call timeout: `requestTimeoutMs`, raised to 1 s and
+ *   capped at `Int.MAX_VALUE` ms. Running out of it reports `TIMEOUT`, and so does one of the
+ *   client's fixed socket timeouts: 10 s to connect, 30 s for a stalled read or write. See
+ *   [transportFailureCode]. The timeout cannot interrupt a DNS lookup in progress: an attempt
+ *   blocked in one can run past `requestTimeoutMs`, and then reports `TIMEOUT`.
  *
  * @param clock epoch-millis source; injectable so tests can move time.
  * @param random PRNG forwarded to [RetryPolicyEvaluator.computeDelayMs] for
@@ -70,10 +87,14 @@ import kotlin.random.Random
  * @param healthCheck run before the claim while `healthCheckUrl` is set.
  * @param onHealthCheckSkipped called after every cycle the health check skipped, to arm the
  *   next wake no earlier than its backoff.
- * @param onCycleFinished called after every cycle. Its argument, when present, is
- *   the earliest instant the next wake may fire. Failures are logged and never
+ * @param onCycleFinished called after every cycle, with how it ended. Its first argument, when
+ *   present, is the earliest instant the next wake may fire. Failures are logged and never
  *   reject a cycle that already completed.
+ * @param httpClient the one OkHttp client, built once, on the first cycle with items to send,
+ *   before any attempt: a client that cannot be built fails that cycle, not its items. Each
+ *   attempt derives its own call from it, with that cycle's `requestTimeoutMs`.
  */
+@Suppress("LongParameterList")
 internal class SyncDispatcher(
   private val storage: SyncQueueStorage,
   private val emitter: SyncEventEmitter,
@@ -86,18 +107,19 @@ internal class SyncDispatcher(
   private val networkQuality: () -> NetworkQuality = { NetworkQuality.GOOD },
   private val healthCheck: HealthCheck = HealthCheck(HeadProbe()),
   private val onHealthCheckSkipped: suspend () -> Unit = {},
-  private val onCycleFinished: suspend (notBefore: Long?) -> Unit = {},
+  private val onCycleFinished: suspend (notBefore: Long?, ending: CycleEnding) -> Unit =
+    { _, _ -> },
+  private val httpClient: Lazy<OkHttpClient> = lazy { newClient(verboseLogging()) },
 ) {
   private val flushMutex = Mutex()
   private val syncing = AtomicBoolean(false)
 
   /**
-   * OkHttp is intentionally instantiated once. Per-cycle option changes
-   * (timeouts) are honored by reading [SyncOptions.requestTimeoutMs] inside
-   * [flush] and applying it via `newCall(...)` builder when needed; here we
-   * pick conservative defaults.
+   * The rows whose request the running cycle sent, each with what its attempt established (see
+   * [SentRequest]). Its dispatches write it and [abortCycle] reads it. One cycle runs at a time,
+   * under [flushMutex], and each starts by clearing it.
    */
-  private val client: OkHttpClient by lazy { buildClient() }
+  private val requestsSent = ConcurrentHashMap<String, SentRequest>()
 
   fun isSyncing(): Boolean = syncing.get()
 
@@ -188,15 +210,23 @@ internal class SyncDispatcher(
     val startedAt = clock()
     syncing.set(true)
     var notBefore: Long? = null
+    var ending = CycleEnding.COMPLETED
     var terminalEventSent = false
+    var claimed: List<SyncItemEntity> = emptyList()
+    requestsSent.clear()
     try {
       emitter.emit(SyncEventEmitter.event(SyncEventType.SYNC_STARTED))
 
       val batchSize = (options.batchSize?.toInt() ?: DEFAULT_BATCH_SIZE).coerceAtLeast(1)
-      val claimed = storage.claimPending(batchSize, startedAt)
+      // Not cancellable: a cancellation that lands once the claim has committed would discard
+      // the rows it took, and only recovery would release them. It surfaces right after, at the
+      // first check, and the rows are then the settle's to give back.
+      claimed = withContext(NonCancellable) { storage.claimPending(batchSize, startedAt) }
       val outcomes = if (claimed.isEmpty()) {
         emptyList()
       } else {
+        // Before any attempt: a client that cannot be built aborts the cycle, item-free.
+        httpClient.value
         dispatchClaimed(claimed, options, credentials)
       }
       notBefore = outcomes
@@ -218,36 +248,173 @@ internal class SyncDispatcher(
       )
       return result
     } catch (t: Throwable) {
-      withContext(NonCancellable) { abortCycle(t, terminalEventSent) }
+      // From the cycle's own job, read here: inside the block below it is always active.
+      ending = if (t is CancellationException && !currentCoroutineContext().isActive) {
+        CycleEnding.CANCELLED
+      } else {
+        CycleEnding.FAILED
+      }
+      val held = withContext(NonCancellable) {
+        abortCycle(t, terminalEventSent, claimed, options.retryPolicy)
+      }
+      notBefore = listOfNotNull(notBefore, held).maxOrNull()
       throw t
     } finally {
       syncing.set(false)
       withContext(NonCancellable) {
-        runCatching { onCycleFinished(notBefore) }
+        runCatching { onCycleFinished(notBefore, ending) }
           .onFailure { Log.w(TAG, "Could not arm the next retry wake", it) }
       }
     }
   }
 
   /**
-   * Leave no path without a terminal event and no row stranded. On cancellation the
-   * supervisor scope has already waited for its children and this cycle still holds
-   * the mutex, so any row left `IN_FLIGHT` is one that never started.
+   * Leave no path without a terminal event and no row stranded. Whatever ended the cycle, the
+   * supervisor scope has already waited for its children and this cycle still holds the
+   * mutex, so a row it [claimed] that is still `IN_FLIGHT` has no outcome recorded: its dispatch
+   * never started, or failed around its attempt before its outcome was written. Each such row is
+   * settled in one transaction (see [settlements]) and then reported as its own write would have
+   * reported it, before the cycle's `SYNC_FAILED`. A row `IN_FLIGHT` that this cycle did not
+   * claim, such as another process's claim, is left to its owner. When even that write fails,
+   * the rows wait for recovery.
+   *
+   * A cancelled cycle, a worker WorkManager stopped say, did not fail: its `SYNC_FAILED`
+   * carries no code. Any other cause reports its code, or `NETWORK_ERROR` when it has none.
+   *
+   * @return the latest credential hold the cycle's answers set, whether their own write or the
+   *   settle recorded it, for the next wake to wait for; null after a cancellation.
    */
-  private suspend fun abortCycle(cause: Throwable, terminalEventSent: Boolean) {
-    if (cause is CancellationException) {
-      runCatching { storage.resetInFlight() }
-        .onFailure { Log.e(TAG, "Could not release unattempted rows", it) }
+  private suspend fun abortCycle(
+    cause: Throwable,
+    terminalEventSent: Boolean,
+    claimed: List<SyncItemEntity>,
+    policy: RetryPolicy,
+  ): Long? {
+    val code = when (cause) {
+      is CancellationException -> null
+      is SyncException -> cause.code
+      else -> SyncErrorCode.NETWORK_ERROR
     }
-    if (terminalEventSent) return
-    runCatching {
-      emitter.emit(
+    val settlements = settlements(claimed, cause, code, policy)
+    val applied = runCatching {
+      storage.settleAbortedClaims(settlements.map { it.claim }).mapTo(HashSet()) { it.id }
+    }.onFailure { Log.e(TAG, "Could not release the cycle's rows: ${it.javaClass.simpleName}") }
+      .getOrDefault(emptySet())
+    // The events each write gives, after the writes are in.
+    settlements.filter { it.claim.id in applied }.forEach { settlement ->
+      runCatching { emitSettled(settlement) }
+        .onFailure { Log.e(TAG, "Could not report a released row: ${it.javaClass.simpleName}") }
+    }
+    if (!terminalEventSent) {
+      runCatching {
+        emitter.emit(SyncEventEmitter.event(type = SyncEventType.SYNC_FAILED, errorCode = code))
+      }.onFailure { Log.e(TAG, "Could not emit the terminal event", it) }
+    }
+    return settlements.mapNotNull { it.heldUntil }.maxOrNull()
+  }
+
+  /**
+   * What each row [claimed] by an aborted cycle becomes. A cancellation is no outcome: every row
+   * comes back as it was. After any other cause:
+   * - a row whose answer was classified gets what its dispatch decided for that answer, exactly
+   *   as its own write would have written it (see [SentRequest.outcome]): removed as delivered
+   *   after a `2xx`; back to `PENDING` with its cooldown and real code after a retryable answer;
+   *   held, without spending the attempt, after a rejected restored credential; a dead letter
+   *   with its real code after a permanent answer, or with `MAX_ATTEMPTS_EXCEEDED` once a
+   *   retryable one spent the budget;
+   * - a row whose request went out with no answer classified, an [Error] raised during the send
+   *   say, counts that attempt as a retryable failure would, with [code]: back to `PENDING` with
+   *   the retry policy's cooldown, or a dead letter with `MAX_ATTEMPTS_EXCEEDED` once the budget
+   *   is spent. Released at once and uncounted instead, a row whose send kept failing that way
+   *   would be sent again on every wake;
+   * - a row whose request never went out comes back as it was.
+   */
+  private fun settlements(
+    claimed: List<SyncItemEntity>,
+    cause: Throwable,
+    code: SyncErrorCode?,
+    policy: RetryPolicy,
+  ): List<Settlement> {
+    val now = clock()
+    return claimed.map { entity ->
+      val sent = requestsSent[entity.id]
+      if (code == null || sent == null) return@map Settlement(AbortedClaim.Unsent(entity.id))
+      sent.outcome?.let { return@map it }
+      val attempt = entity.attempts + 1
+      val claim = if (RetryPolicyEvaluator.hasBudget(attempt, policy)) {
+        AbortedClaim.Retry(
+          id = entity.id,
+          attempts = attempt,
+          lastAttemptAt = sent.startedAt,
+          lastErrorCode = code,
+          nextRetryAt = RetryPolicyEvaluator.deadline(
+            from = now,
+            delayMs = RetryPolicyEvaluator.computeDelayMs(attempt, policy, random),
+          ),
+        )
+      } else {
+        AbortedClaim.Exhausted(
+          entity = entity,
+          attempts = attempt,
+          lastAttemptAt = sent.startedAt,
+          lastErrorCode = SyncErrorCode.MAX_ATTEMPTS_EXCEEDED,
+          lastErrorMessage = cause.message ?: cause.javaClass.simpleName,
+          deadLetteredAt = now,
+        )
+      }
+      Settlement(claim, attempt = attempt)
+    }
+  }
+
+  /** The item events of a write [abortCycle] applied: the ones its own write would have given. */
+  private suspend fun emitSettled(settlement: Settlement) {
+    when (val claim = settlement.claim) {
+      is AbortedClaim.Delivered -> emitter.emit(
         SyncEventEmitter.event(
-          type = SyncEventType.SYNC_FAILED,
-          errorCode = (cause as? SyncException)?.code ?: SyncErrorCode.NETWORK_ERROR,
+          type = SyncEventType.ITEM_SUCCEEDED,
+          itemId = claim.id,
+          statusCode = settlement.statusCode,
+          attempt = settlement.attempt,
         ),
       )
-    }.onFailure { Log.e(TAG, "Could not emit the terminal event", it) }
+      is AbortedClaim.Retry -> emitter.emit(
+        SyncEventEmitter.event(
+          type = SyncEventType.ITEM_RETRYING,
+          itemId = claim.id,
+          errorCode = claim.lastErrorCode,
+          statusCode = settlement.statusCode,
+          attempt = settlement.attempt,
+        ),
+      )
+      is AbortedClaim.Exhausted -> {
+        emitter.emit(
+          SyncEventEmitter.event(
+            type = SyncEventType.ITEM_FAILED,
+            itemId = claim.id,
+            errorCode = claim.lastErrorCode,
+            statusCode = settlement.statusCode,
+            attempt = settlement.attempt,
+          ),
+        )
+        emitter.emit(
+          SyncEventEmitter.event(
+            type = SyncEventType.ITEM_DEAD_LETTERED,
+            itemId = claim.id,
+            errorCode = SyncErrorCode.DEAD_LETTERED,
+            metadata = mapOf(METADATA_LAST_ERROR_CODE to claim.lastErrorCode.name),
+          ),
+        )
+      }
+      is AbortedClaim.Unsent -> Unit
+    }
+  }
+
+  /**
+   * Remember what [settlement] writes for [id]'s answer, before that write: if it fails, the
+   * cycle's settle applies it instead. A row whose request never went out has nothing to remember.
+   */
+  private fun remember(id: String, settlement: Settlement) {
+    requestsSent.computeIfPresent(id) { _, sent -> sent.copy(outcome = settlement) }
   }
 
   /**
@@ -271,7 +438,8 @@ internal class SyncDispatcher(
       val outcome = dispatchRecordingOutcome(entity, options, credentials)
       leading += outcome
       if (outcome is ItemOutcome.CredentialRejected) {
-        storage.resetInFlight()
+        // Through the settle, so that only this cycle's claims are released.
+        storage.settleAbortedClaims(claimed.drop(leading.size).map { AbortedClaim.Unsent(it.id) })
         return leading
       }
       if (outcome !is ItemOutcome.Gone) break
@@ -294,15 +462,19 @@ internal class SyncDispatcher(
   /**
    * Non-cancellable because the request may reach the server whatever happens to the
    * cycle. Abandoning its outcome would leave the row to be sent a second time.
+   *
+   * Only the attempt's own failure is an outcome of the item (see [runOnce]). Anything raised
+   * around it, a storage read or write, an event, a cancellation or an [Error], is rethrown:
+   * it ends the cycle, as a failed store write does on iOS, and [abortCycle] settles the cycle's
+   * rows that have no recorded outcome. A failed local write is never the item's failure: an
+   * answer the server gave is applied as this dispatch would have applied it, so after a `2xx`
+   * the row is delivered.
    */
   private suspend fun dispatchRecordingOutcome(
     entity: SyncItemEntity,
     options: SyncOptions,
     credentials: CredentialPolicy,
-  ): ItemOutcome = withContext(NonCancellable) {
-    runCatching { dispatchItem(entity, options, credentials) }
-      .getOrElse { t -> ItemOutcome.Failed(entity.id, SyncErrorCode.NETWORK_ERROR, t.message ?: "") }
-  }
+  ): ItemOutcome = withContext(NonCancellable) { dispatchItem(entity, options, credentials) }
 
   /**
    * Dispatch a single attempt for [entity]. On a retriable failure with budget
@@ -316,7 +488,7 @@ internal class SyncDispatcher(
     credentials: CredentialPolicy,
   ): ItemOutcome {
     val timeoutMs = (options.requestTimeoutMs?.toLong() ?: DEFAULT_REQUEST_TIMEOUT_MS)
-      .coerceAtLeast(MIN_REQUEST_TIMEOUT_MS)
+      .coerceIn(MIN_REQUEST_TIMEOUT_MS, MAX_REQUEST_TIMEOUT_MS)
     val policy = options.retryPolicy
     val maxAttempts = policy.maxAttempts.toInt().coerceAtLeast(1)
 
@@ -348,8 +520,12 @@ internal class SyncDispatcher(
       return ItemOutcome.Failed(entity.id, SyncErrorCode.MAX_ATTEMPTS_EXCEEDED, message)
     }
 
-    return when (val outcome = runOnce(entity, timeoutMs, options.defaultHeaders)) {
+    return when (val outcome = runOnce(entity, timeoutMs, options.defaultHeaders, startedAt)) {
       is AttemptResult.Success -> {
+        remember(
+          entity.id,
+          Settlement(AbortedClaim.Delivered(entity.id), attempt, outcome.statusCode),
+        )
         storage.markSucceeded(entity.id)
         emitter.emit(
           SyncEventEmitter.event(
@@ -386,8 +562,12 @@ internal class SyncDispatcher(
     outcome: AttemptResult.Failure,
     options: SyncOptions,
   ): ItemOutcome {
-    val nextRetryAt = finishedAt +
-      RetryPolicyEvaluator.computeDelayMs(attempt, options.retryPolicy, random)
+    val nextRetryAt = RetryPolicyEvaluator.deadline(
+      from = finishedAt,
+      delayMs = RetryPolicyEvaluator.computeDelayMs(attempt, options.retryPolicy, random),
+    )
+    val retry = AbortedClaim.Retry(entity.id, attempt, startedAt, outcome.code, nextRetryAt)
+    remember(entity.id, Settlement(retry, attempt, outcome.statusCode))
     storage.markRetry(entity.id, attempt, startedAt, outcome.code, nextRetryAt)
     emitRetrying(entity, attempt, outcome)
     return ItemOutcome.Rescheduled(entity.id)
@@ -408,7 +588,12 @@ internal class SyncDispatcher(
     options: SyncOptions,
   ): ItemOutcome {
     val backoffMs = RetryPolicyEvaluator.computeDelayMs(attempt, options.retryPolicy, random)
-    val nextRetryAt = finishedAt + maxOf(backoffMs, MIN_CREDENTIAL_HOLD_MS)
+    val nextRetryAt = RetryPolicyEvaluator.deadline(
+      from = finishedAt,
+      delayMs = maxOf(backoffMs, MIN_CREDENTIAL_HOLD_MS),
+    )
+    val hold = AbortedClaim.Retry(entity.id, entity.attempts, startedAt, outcome.code, nextRetryAt)
+    remember(entity.id, Settlement(hold, attempt, outcome.statusCode, heldUntil = nextRetryAt))
     storage.markRetry(entity.id, entity.attempts, startedAt, outcome.code, nextRetryAt)
     emitRetrying(entity, attempt, outcome)
     return ItemOutcome.CredentialRejected(entity.id, nextRetryAt)
@@ -457,13 +642,17 @@ internal class SyncDispatcher(
     statusCode: Int?,
     requestSent: Boolean,
   ): Boolean {
+    val deadLetteredAt = clock()
+    val exhausted =
+      AbortedClaim.Exhausted(entity, attempts, lastAttemptAt, code, detail, deadLetteredAt)
+    remember(entity.id, Settlement(exhausted, attempts, statusCode))
     val moved = storage.moveToDeadLetters(
       entity = entity,
       attempts = attempts,
       lastAttemptAt = lastAttemptAt,
       lastErrorCode = code,
       lastErrorMessage = detail,
-      deadLetteredAt = clock(),
+      deadLetteredAt = deadLetteredAt,
     )
     if (!moved && !requestSent) return false
     emitter.emit(
@@ -503,10 +692,12 @@ internal class SyncDispatcher(
     )
   }
 
+  /** @param attemptStartedAt epoch ms; recorded in [requestsSent] when the request goes out. */
   private suspend fun runOnce(
     entity: SyncItemEntity,
     timeoutMs: Long,
     defaultHeaders: Map<String, String>?,
+    attemptStartedAt: Long,
   ): AttemptResult = withContext(Dispatchers.IO) {
     val request = buildRequest(entity, defaultHeaders) ?: return@withContext AttemptResult.Failure(
       code = SyncErrorCode.INVALID_PAYLOAD,
@@ -515,97 +706,93 @@ internal class SyncDispatcher(
       retryable = false,
     )
 
-    val call = client.newBuilder()
-      .callTimeout(timeoutMs, TimeUnit.MILLISECONDS)
-      .build()
-      .newCall(request)
-
-    val attemptOutcome: AttemptResult = try {
-      val response = withTimeoutOrNull(timeoutMs) {
-        runCatching { call.execute() }
-      }
-      if (response == null) {
-        runCatching { call.cancel() }
-        return@withContext AttemptResult.Failure(
-          code = SyncErrorCode.TIMEOUT,
-          message = "Request timed out (${timeoutMs}ms)",
-          statusCode = null,
-          retryable = true,
-        )
-      }
-      response.fold(
-        onSuccess = { httpResponse ->
-          httpResponse.use { resp ->
-            val code = resp.code
-            val policy = getOptions().retryPolicy
-            // The status line only: the response's headers and body stay out of it.
-            val statusLine = "HTTP $code ${resp.message}".trim()
-            when {
-              code in 200..299 -> AttemptResult.Success(code)
-              code == 401 || code == 403 -> AttemptResult.Failure(
-                code = SyncErrorCode.UNAUTHORIZED,
-                message = "HTTP $code",
-                statusCode = code,
-                retryable = false,
-                detail = statusLine,
-              )
-              RetryPolicyEvaluator.shouldRetryStatus(code, policy) -> AttemptResult.Failure(
-                code = SyncErrorCode.SERVER_ERROR,
-                message = "HTTP $code",
-                statusCode = code,
-                retryable = true,
-                detail = statusLine,
-              )
-              code in 400..499 -> AttemptResult.Failure(
-                code = SyncErrorCode.SERVER_ERROR,
-                message = "HTTP $code",
-                statusCode = code,
-                retryable = false,
-                detail = statusLine,
-              )
-              else -> AttemptResult.Failure(
-                code = SyncErrorCode.SERVER_ERROR,
-                message = "HTTP $code",
-                statusCode = code,
-                retryable = false,
-                detail = statusLine,
-              )
-            }
-          }
-        },
-        onFailure = { t ->
-          when (t) {
-            is SocketTimeoutException -> AttemptResult.Failure(
-              code = SyncErrorCode.TIMEOUT,
-              message = t.message ?: "Request timed out",
-              statusCode = null,
-              retryable = true,
-            )
-            is IOException -> AttemptResult.Failure(
-              code = SyncErrorCode.NETWORK_ERROR,
-              message = t.message ?: "Network error",
-              statusCode = null,
-              retryable = true,
-            )
-            else -> AttemptResult.Failure(
-              code = SyncErrorCode.NETWORK_ERROR,
-              message = t.message ?: t.javaClass.simpleName,
-              statusCode = null,
-              retryable = false,
-            )
-          }
-        },
-      )
-    } catch (t: Throwable) {
-      runCatching { call.cancel() }
+    // Built by the cycle before any attempt, so reading it here cannot fail an item.
+    val shared = httpClient.value
+    var call: Call? = null
+    var startedAt = System.nanoTime()
+    try {
+      // The call is derived here, so that one that cannot be built fails the attempt, as a
+      // request that cannot be built does. The call timeout bounds the whole call: connecting,
+      // sending the request and reading the response. It is the attempt's only time limit
+      // besides the client's socket timeouts.
+      val built = shared.newBuilder()
+        .callTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+        .build()
+        .newCall(request)
+      call = built
+      startedAt = System.nanoTime()
+      // From here the server may get the request: an abort counts this attempt.
+      requestsSent[entity.id] = SentRequest(attemptStartedAt)
+      built.execute().use { response -> responseOutcome(response) }
+    } catch (e: IOException) {
+      val ranOutOfTime = System.nanoTime() - startedAt >= TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+      transportFailure(e, ranOutOfTime)
+    } catch (e: CancellationException) {
+      // Not the attempt's outcome. An Error is not caught either.
+      throw e
+    } catch (e: Exception) {
+      // Anything but an I/O failure is permanent, as on iOS: a retry would fail the same way,
+      // and NETWORK_ERROR stays a code that is always retried.
+      call?.let { runCatching { it.cancel() } }
       AttemptResult.Failure(
-        code = SyncErrorCode.NETWORK_ERROR,
-        message = t.message ?: t.javaClass.simpleName,
+        code = SyncErrorCode.INVALID_PAYLOAD,
+        message = e.message ?: e.javaClass.simpleName,
         statusCode = null,
         retryable = false,
       )
     }
-    attemptOutcome
+  }
+
+  /** The outcome of an attempt the server answered, from its status line. */
+  private fun responseOutcome(resp: Response): AttemptResult {
+    val code = resp.code
+    // Read for each response, so a configureSync made while the request was out applies to it.
+    val policy = getOptions().retryPolicy
+    // The status line only: the response's headers and body stay out of it.
+    val statusLine = "HTTP $code ${resp.message}".trim()
+    return when {
+      code in 200..299 -> AttemptResult.Success(code)
+      code == 401 || code == 403 -> AttemptResult.Failure(
+        code = SyncErrorCode.UNAUTHORIZED,
+        message = "HTTP $code",
+        statusCode = code,
+        retryable = false,
+        detail = statusLine,
+      )
+      RetryPolicyEvaluator.shouldRetryStatus(code, policy) -> AttemptResult.Failure(
+        code = SyncErrorCode.SERVER_ERROR,
+        message = "HTTP $code",
+        statusCode = code,
+        retryable = true,
+        detail = statusLine,
+      )
+      code in 400..499 -> AttemptResult.Failure(
+        code = SyncErrorCode.SERVER_ERROR,
+        message = "HTTP $code",
+        statusCode = code,
+        retryable = false,
+        detail = statusLine,
+      )
+      else -> AttemptResult.Failure(
+        code = SyncErrorCode.SERVER_ERROR,
+        message = "HTTP $code",
+        statusCode = code,
+        retryable = false,
+        detail = statusLine,
+      )
+    }
+  }
+
+  /** An attempt that failed before any response. Retried, a timeout and a network error alike. */
+  private fun transportFailure(failure: IOException, ranOutOfTime: Boolean): AttemptResult.Failure {
+    val code = transportFailureCode(failure, ranOutOfTime)
+    val fallback = if (code == SyncErrorCode.TIMEOUT) "Request timed out" else "Network error"
+    return AttemptResult.Failure(
+      code = code,
+      message = failure.message ?: fallback,
+      statusCode = null,
+      retryable = true,
+    )
   }
 
   private fun buildRequest(
@@ -629,22 +816,6 @@ internal class SyncDispatcher(
     // Only the type: OkHttp puts header values in these messages.
     Log.e(TAG, "Failed to build OkHttp request for ${entity.id}: ${it.javaClass.simpleName}")
     null
-  }
-
-  private fun buildClient(): OkHttpClient {
-    val builder = OkHttpClient.Builder()
-      .connectTimeout(CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-      .readTimeout(READ_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-      .writeTimeout(WRITE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-      .retryOnConnectionFailure(false)
-
-    if (verboseLogging()) {
-      val logging = HttpLoggingInterceptor { msg -> Log.d(TAG, msg) }
-      // BASIC, because every level above it logs header values.
-      logging.level = HttpLoggingInterceptor.Level.BASIC
-      builder.addInterceptor(logging)
-    }
-    return builder.build()
   }
 
   /**
@@ -681,6 +852,31 @@ internal class SyncDispatcher(
     ) : AttemptResult
   }
 
+  /**
+   * A request the running cycle sent.
+   *
+   * @property startedAt epoch ms its attempt started.
+   * @property outcome what the dispatch decided to write for the row once its answer was
+   *   classified, set before that write: [abortCycle] applies it if the write fails. Null while
+   *   the request is out, and for good when the send raised what no outcome classifies, an
+   *   [Error] say.
+   */
+  private data class SentRequest(val startedAt: Long, val outcome: Settlement? = null)
+
+  /**
+   * One row's write in a settle, with what its item event reports.
+   *
+   * @property attempt the attempt the event reports; a credential hold reports it without
+   *   spending it.
+   * @property heldUntil the end of a credential hold, which the next wake waits for.
+   */
+  private data class Settlement(
+    val claim: AbortedClaim,
+    val attempt: Int = 0,
+    val statusCode: Int? = null,
+    val heldUntil: Long? = null,
+  )
+
   private sealed interface ItemOutcome {
     val itemId: String
     data class Succeeded(override val itemId: String, val statusCode: Int) : ItemOutcome
@@ -705,6 +901,12 @@ internal class SyncDispatcher(
     private const val DEFAULT_BATCH_SIZE = 25
     private const val DEFAULT_REQUEST_TIMEOUT_MS: Long = 30_000L
     private const val MIN_REQUEST_TIMEOUT_MS: Long = 1_000L
+
+    /**
+     * The longest call timeout OkHttp takes, about 24.8 days. A longer one, `Infinity` included,
+     * makes it throw "timeout too large." before the request starts.
+     */
+    private const val MAX_REQUEST_TIMEOUT_MS: Long = Int.MAX_VALUE.toLong()
     private const val CONNECT_TIMEOUT_MS: Long = 10_000L
     private const val READ_TIMEOUT_MS: Long = 30_000L
     private const val WRITE_TIMEOUT_MS: Long = 30_000L
@@ -714,6 +916,43 @@ internal class SyncDispatcher(
 
     /** Where `ITEM_DEAD_LETTERED` carries the real failure code. */
     const val METADATA_LAST_ERROR_CODE = "lastErrorCode"
+
+    /** The shared client: the fixed socket timeouts, and no retry of OkHttp's own. */
+    private fun newClient(verboseLogging: Boolean): OkHttpClient {
+      val builder = OkHttpClient.Builder()
+        .connectTimeout(CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        .readTimeout(READ_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        .writeTimeout(WRITE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        .retryOnConnectionFailure(false)
+
+      if (verboseLogging) {
+        val logging = HttpLoggingInterceptor { msg -> Log.d(TAG, msg) }
+        // BASIC, because every level above it logs header values.
+        logging.level = HttpLoggingInterceptor.Level.BASIC
+        builder.addInterceptor(logging)
+      }
+      return builder.build()
+    }
+
+    /**
+     * The code of an attempt that failed with [failure] before any response. Both are retried.
+     * - [SyncErrorCode.TIMEOUT] when one of the client's socket timeouts fired, which OkHttp
+     *   raises as a `SocketTimeoutException`: 10 s to connect, 30 s for a stalled read or write.
+     * - [SyncErrorCode.TIMEOUT] when the call timeout, `requestTimeoutMs`, ran out. OkHttp 4.12.0
+     *   then ends the call with an `InterruptedIOException("timeout")`, whatever failure it was
+     *   in. A thread interrupt raises the same class ("interrupted"), so the class does not
+     *   decide alone: [ranOutOfTime], whether the call had run for its whole timeout, does.
+     *   OkHttp's watchdog also cancels the call, but the call can see the timeout before that
+     *   `cancel()` runs, so `isCanceled()` could miss it.
+     * - [SyncErrorCode.NETWORK_ERROR] for any other I/O failure: DNS, a refused or dropped
+     *   connection, TLS, or an interrupt before the deadline.
+     */
+    internal fun transportFailureCode(failure: IOException, ranOutOfTime: Boolean): SyncErrorCode =
+      when {
+        failure is SocketTimeoutException -> SyncErrorCode.TIMEOUT
+        failure is InterruptedIOException && ranOutOfTime -> SyncErrorCode.TIMEOUT
+        else -> SyncErrorCode.NETWORK_ERROR
+      }
 
     /**
      * The zeroed result that means "no cycle ran". `flush()` returns it to JS unchanged

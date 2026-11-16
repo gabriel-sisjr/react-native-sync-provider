@@ -45,13 +45,13 @@ One-paragraph overview: what changed, why, and the blast radius (compile-time on
 
 Use the table at the bottom of each entry to enumerate every renamed, removed, or reshaped public symbol so consumers can grep for what they import.
 
-## [Unreleased] - Required network quality, a dead-letter queue for failed items, connection events on real changes only
+## [v0.3.0] - 2026-11-16 - Required network quality, a dead-letter queue for failed items, connection events on real changes only
 
 > **Upgrade path:** v0.2.z --> v0.3.0
 >
 > **Full migration guide:** [`docs/migration/v0-3-0`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/migration/v0-3-0)
 >
-> **Changelog:** see the [`[Unreleased]` entries in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+> **Changelog:** see the [`[0.3.0]` entries in `CHANGELOG.md`](./CHANGELOG.md#030---2026-11-16).
 
 No function, hook or error code was removed, and the quality gate and the health check are opt-in. The blast radius is a raised `react-native-nitro-modules` floor, one compile-time change for hand-built connection values, one persisted-data migration that moves permanently failed items to a new dead-letter queue, and two connectivity behavior changes. The upgrade is roll-forward only.
 
@@ -59,7 +59,7 @@ No function, hook or error code was removed, and the quality gate and the health
 
 > **Category:** dependency-requirement change (**not** a JS/TS API break). Pre-1.0.
 >
-> **Changelog:** see the [`[Unreleased]` Changed entry in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+> **Changelog:** see the [`[0.3.0]` Changed entry in `CHANGELOG.md`](./CHANGELOG.md#030---2026-11-16).
 
 The `react-native-nitro-modules` peer range is raised from `^0.35.6` to `^0.35.8`: 0.35.8 or later, and still below 0.36, as before. Apps on 0.35.6 or 0.35.7 must upgrade, and package managers that check peer ranges warn about or reject those versions. Apps already on 0.35.8 or a later 0.35.x release have nothing to do.
 
@@ -84,7 +84,7 @@ No JS/TS code changes are required.
 
 > **Category:** compile-time change. Pre-1.0.
 >
-> **Changelog:** see the [`[Unreleased]` Changed entry in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+> **Changelog:** see the [`[0.3.0]` Changed entry in `CHANGELOG.md`](./CHANGELOG.md#030---2026-11-16).
 
 `ConnectionState.networkQuality` and `UseConnectionResult.networkQuality` are required. Runtime code that only reads these types is unaffected. Hand-built values, usually test fixtures and mocks of `getConnectionStatus`, stop compiling.
 
@@ -124,7 +124,7 @@ const connection: ConnectionState = {
 
 > **Category:** observable behavior change and persisted-data migration (**not** a JS/TS API removal). Pre-1.0.
 >
-> **Changelog:** see the [`[Unreleased]` Added and Changed entries in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+> **Changelog:** see the [`[0.3.0]` Added and Changed entries in `CHANGELOG.md`](./CHANGELOG.md#030---2026-11-16).
 
 An item that fails permanently used to stay in the queue store as a `FAILED` row that JS could not list. It now moves, in one transaction, to a separate dead-letter store, and `ITEM_FAILED` is followed by `ITEM_DEAD_LETTERED`. That covers attempts exhausted, responses that are not retried, and a 401 or 403 under a configuration set in the current process. JS can list, replay and discard dead letters. They count toward no capacity cap, and nothing prunes them.
 
@@ -187,7 +187,7 @@ for (const item of await listDeadLetter()) {
 
 > **Category:** observable behavior change, on iOS (**not** a JS/TS API break). Pre-1.0.
 >
-> **Changelog:** see the [`[Unreleased]` Changed entry in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+> **Changelog:** see the [`[0.3.0]` Changed entry in `CHANGELOG.md`](./CHANGELOG.md#030---2026-11-16).
 
 iOS emitted `CONNECTION_CHANGED` on every path update, including the first one and repeats of the same state. Both platforms now emit it only when `status`, `type`, `isInternetReachable`, `isExpensive` or `networkQuality` changes, never for a duplicate. Android already behaved this way, and never emits it for the state it starts in. iOS starts at `UNKNOWN`, so its first path report, which replaces that, still emits one. The event is also emitted when only `networkQuality` changed, with an unchanged `connectionStatus`. Both platforms deliver it to JS asynchronously, after the new state is stored.
 
@@ -207,7 +207,7 @@ iOS emitted `CONNECTION_CHANGED` on every path update, including the first one a
 
 > **Category:** observable behavior change, on Android (**not** a JS/TS API break). Pre-1.0.
 >
-> **Changelog:** see the [`[Unreleased]` Changed entries in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+> **Changelog:** see the [`[0.3.0]` Changed entries in `CHANGELOG.md`](./CHANGELOG.md#030---2026-11-16).
 
 Android now tracks only the default network, the one the app's traffic uses. Losing a secondary network, such as cellular alongside Wi-Fi or a VPN that does not apply to the app, no longer reports `DISCONNECTED`, and a VPN that was the default network hands over without a false disconnect.
 
@@ -303,7 +303,7 @@ The iOS minimum deployment target declared in `SyncProvider.podspec` is raised f
 
 #### Migration steps
 
-1. In your app's `ios/Podfile`, ensure the platform line is at least `platform :ios, '15.0'`.
+1. In your app's `ios/Podfile`, make sure the platform line resolves to iOS 15.0 or later. A React Native 0.85 Podfile keeps `platform :ios, min_ios_version_supported`, which is `15.1`, so leave it as it is. A Podfile that names a version needs at least `platform :ios, '15.0'`. The library's own floor stays `15.0`.
 2. If you set `IPHONEOS_DEPLOYMENT_TARGET` anywhere (Podfile `post_install`, Xcode build settings), make sure it is `>= 15.0`.
 3. Run `cd ios && bundle exec pod install`.
 

@@ -197,13 +197,19 @@ enum CoreDataMigration {
         return entity
     }
 
-    /// One version of the compiled model, loaded fresh and with every entity
-    /// backed by `NSManagedObject`. A v1 row as a `SyncItemEntity` would carry
-    /// a `nextRetryAt` its model lacks; class names do not enter the version
-    /// hashes, so the migrated store still matches the app's model. Fresh, so
-    /// the model the app loads is never touched.
+    /// One version of the compiled model, as an editable copy with every
+    /// entity backed by `NSManagedObject`. A v1 row as a `SyncItemEntity` would
+    /// carry a `nextRetryAt` its model lacks; class names do not enter the
+    /// version hashes, so the migrated store still matches the app's model.
+    ///
+    /// A copy, because `NSManagedObjectModel(contentsOf:)` can return a model
+    /// already in use, which cannot be edited: on iOS 27.2 it did for a URL
+    /// another slice had written a store with in the same process, and setting
+    /// a class name on it raises an Objective-C exception that traps. The
+    /// model the app loads is never touched.
     static func slice(_ version: String, in momd: URL) -> NSManagedObjectModel? {
-        guard let model = NSManagedObjectModel(contentsOf: momd.appendingPathComponent("\(version).mom")) else {
+        guard let loaded = NSManagedObjectModel(contentsOf: momd.appendingPathComponent("\(version).mom")),
+              let model = loaded.copy() as? NSManagedObjectModel else {
             return nil
         }
         for entity in model.entities {

@@ -10,15 +10,19 @@
  * native rejection to one fallback code per function. Codes a per-item failure
  * reports arrive on `ITEM_FAILED` and `ITEM_RETRYING` events and are kept as a
  * dead letter's `lastErrorCode`. Codes for a cycle skipped at the start of a
- * flush arrive on `SYNC_FAILED`.
+ * flush, or for a cycle that died, arrive on `SYNC_FAILED`.
  */
 export const SyncErrorCode = {
   /**
    * Generic transport failure: DNS lookup failed, TCP connection refused,
    * TLS handshake failed, etc. Always retried (subject to `RetryPolicy`).
    *
-   * Reported on item events. Also the code `flush` rejects with when its cycle
-   * dies, whatever the cause.
+   * Reported on item events. Also the code of a cycle that dies of a cause
+   * other than one of the library's own errors, such as a storage write that
+   * fails: that cycle's `SYNC_FAILED` carries it, and on Android so does the
+   * `ITEM_RETRYING` of a request the cycle had sent without classifying its
+   * answer. And the code `flush` rejects with when its cycle dies, whatever
+   * the cause: the facade maps every native rejection of `flush` to it.
    */
   NETWORK_ERROR: 'NETWORK_ERROR',
   /**
@@ -38,6 +42,12 @@ export const SyncErrorCode = {
    * Thrown by: `enqueue`, `enqueueBatch`, `configureSync` (for
    * `minNetworkQuality`, `healthCheckTtlMs` and `healthCheckBackoffMs`), and as
    * that fallback.
+   *
+   * Also reported on item events, for an attempt that fails on its own with an
+   * error the engine cannot classify, neither an I/O failure nor an HTTP
+   * answer, such as an Android request that OkHttp cannot build: on
+   * `ITEM_FAILED`, as the dead letter's `lastErrorCode`, and on Android in
+   * `SyncResult.errors`. Permanent: the item is dead-lettered.
    */
   INVALID_PAYLOAD: 'INVALID_PAYLOAD',
   /**
@@ -57,11 +67,15 @@ export const SyncErrorCode = {
    */
   NATIVE_MODULE_UNAVAILABLE: 'NATIVE_MODULE_UNAVAILABLE',
   /**
-   * The OS rejected the background task registration — typically because the
-   * iOS `Info.plist` is missing the task identifier or the Android manifest
-   * is missing required permissions.
+   * The OS rejected the background task registration. On iOS,
+   * `BGTaskScheduler` refused the app-refresh request, for example because the
+   * task identifier is missing from `Info.plist` or Background App Refresh is
+   * turned off. On Android, `WorkManager` refused the periodic work request or
+   * is not initialized.
    *
-   * Thrown by: `enableBackgroundSync`.
+   * Thrown by: `enableBackgroundSync`. Also the code every native rejection
+   * of `enableBackgroundSync`, `disableBackgroundSync` and
+   * `isBackgroundSyncEnabled` maps to.
    */
   BACKGROUND_TASK_REGISTRATION_FAILED: 'BACKGROUND_TASK_REGISTRATION_FAILED',
   /**
@@ -84,8 +98,10 @@ export const SyncErrorCode = {
   UNAUTHORIZED: 'UNAUTHORIZED',
   /**
    * The request exceeded `SyncOptions.requestTimeoutMs`. Always retried
-   * (subject to `RetryPolicy`). Android can report this expiry as
-   * `NETWORK_ERROR`, which is retried the same way.
+   * (subject to `RetryPolicy`). On Android, the HTTP client's fixed socket
+   * timeouts also report it: 10 s to connect, and 30 s for a read or a write
+   * that stalls. A `requestTimeoutMs` above 2147483647 ms (about 24.8 days),
+   * `Infinity` included, is capped there on both platforms.
    *
    * Reported on item events.
    */

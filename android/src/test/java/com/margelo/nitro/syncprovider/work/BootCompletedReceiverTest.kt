@@ -28,6 +28,9 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.w3c.dom.Element
+import java.io.File
+import javax.xml.parsers.DocumentBuilderFactory
 
 /** The boot path end to end: broadcast, real [RecoveryWorker], real runtime. */
 @RunWith(RobolectricTestRunner::class)
@@ -137,5 +140,72 @@ internal class BootCompletedReceiverTest {
     receive(null)
 
     assertThat(infos(BackgroundSyncManager.UNIQUE_RECOVERY)).isEmpty()
+  }
+
+  /**
+   * The receiver is not direct-boot aware, so a locked device never delivers
+   * `LOCKED_BOOT_COMPLETED` to it. The library's manifest as it ships, before any merge.
+   */
+  @Test
+  fun `the shipped manifest declares only the broadcasts the receiver can get`() {
+    val receiver = shippedReceiver()
+
+    assertThat(receiver.actions)
+      .containsExactly(Intent.ACTION_BOOT_COMPLETED, Intent.ACTION_MY_PACKAGE_REPLACED)
+    assertThat(receiver.exported).isEqualTo("true")
+    assertThat(receiver.directBootAware).isEmpty()
+  }
+
+  /** The same, as the package manager resolves the merged manifest. */
+  @Test
+  fun `a locked-boot broadcast resolves to no receiver of the library`() {
+    fun receiversOf(action: String): List<String> = context.packageManager
+      .queryBroadcastReceivers(Intent(action).setPackage(context.packageName), 0)
+      .map { it.activityInfo.name }
+
+    assertThat(receiversOf(Intent.ACTION_BOOT_COMPLETED))
+      .contains(BootCompletedReceiver::class.java.name)
+    assertThat(receiversOf(Intent.ACTION_LOCKED_BOOT_COMPLETED))
+      .doesNotContain(BootCompletedReceiver::class.java.name)
+  }
+
+  @Test
+  fun `a locked-boot broadcast is ignored`() {
+    receive(Intent.ACTION_LOCKED_BOOT_COMPLETED)
+
+    assertThat(infos(BackgroundSyncManager.UNIQUE_RECOVERY)).isEmpty()
+  }
+
+  private class DeclaredReceiver(
+    val actions: List<String>,
+    val exported: String,
+    val directBootAware: String,
+  )
+
+  /** [BootCompletedReceiver] as `android/src/main/AndroidManifest.xml` declares it. */
+  private fun shippedReceiver(): DeclaredReceiver {
+    // Gradle runs unit tests from the module directory, android/.
+    val manifest = File("src/main/AndroidManifest.xml")
+    check(manifest.isFile) { "No library manifest at ${manifest.absolutePath}" }
+    val document = DocumentBuilderFactory.newInstance()
+      .apply { isNamespaceAware = true }
+      .newDocumentBuilder()
+      .parse(manifest)
+    val receivers = document.getElementsByTagName("receiver")
+    val receiver = (0 until receivers.length)
+      .map { receivers.item(it) as Element }
+      .single { it.getAttributeNS(ANDROID_NS, "name") == BootCompletedReceiver::class.java.name }
+    val actions = receiver.getElementsByTagName("action")
+    return DeclaredReceiver(
+      actions = (0 until actions.length).map {
+        (actions.item(it) as Element).getAttributeNS(ANDROID_NS, "name")
+      },
+      exported = receiver.getAttributeNS(ANDROID_NS, "exported"),
+      directBootAware = receiver.getAttributeNS(ANDROID_NS, "directBootAware"),
+    )
+  }
+
+  private companion object {
+    const val ANDROID_NS = "http://schemas.android.com/apk/res/android"
   }
 }

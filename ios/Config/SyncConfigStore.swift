@@ -24,14 +24,20 @@ struct LoadedSyncConfig: Sendable {
 /// The network-health fields are optional and absent while unset, so a record
 /// written before they existed still decodes, and an older build reading a
 /// newer record ignores them.
+///
+/// Every number is kept as the app passed it, converted only at use, as
+/// Android stores them. JSON has no NaN or ±Infinity, so the coders write and
+/// read those as strings (see ``SyncConfigStore``). Older records hold the
+/// `retryPolicy` numbers as whole numbers, which decode unchanged. An older
+/// build that cannot read a number written here falls back to its defaults.
 private struct PersistedSyncRecord: Codable {
     var strategy: String
-    var maxAttempts: Int
+    var maxAttempts: Double
     var backoff: String
-    var baseDelayMs: Int
-    var maxDelayMs: Int
+    var baseDelayMs: Double
+    var maxDelayMs: Double
     var jitter: Bool
-    var retryOnStatusCodes: [Int]
+    var retryOnStatusCodes: [Double]
     var batchSize: Double
     var requestTimeoutMs: Double
     var maxQueueSize: Double
@@ -44,12 +50,12 @@ private struct PersistedSyncRecord: Codable {
 
     init(_ options: SyncOptionsSnapshot) {
         strategy = options.strategy
-        maxAttempts = options.retryPolicy.maxAttempts
+        maxAttempts = options.retryPolicy.rawMaxAttempts
         backoff = options.retryPolicy.backoff.rawValue
-        baseDelayMs = options.retryPolicy.baseDelayMs
-        maxDelayMs = options.retryPolicy.maxDelayMs
+        baseDelayMs = options.retryPolicy.rawBaseDelayMs
+        maxDelayMs = options.retryPolicy.rawMaxDelayMs
         jitter = options.retryPolicy.jitter
-        retryOnStatusCodes = options.retryPolicy.retryOnStatusCodes
+        retryOnStatusCodes = options.retryPolicy.rawRetryOnStatusCodes
         batchSize = options.batchSize
         requestTimeoutMs = options.requestTimeoutMs
         maxQueueSize = options.maxQueueSize
@@ -69,12 +75,12 @@ private struct PersistedSyncRecord: Codable {
         return SyncOptionsSnapshot(
             strategy: strategy,
             retryPolicy: RetryPolicyValue(
-                maxAttempts: maxAttempts,
+                rawMaxAttempts: maxAttempts,
                 backoff: RetryPolicyValue.Backoff(rawValue: backoff) ?? .exponential,
-                baseDelayMs: baseDelayMs,
-                maxDelayMs: maxDelayMs,
+                rawBaseDelayMs: baseDelayMs,
+                rawMaxDelayMs: maxDelayMs,
                 jitter: jitter,
-                retryOnStatusCodes: retryOnStatusCodes
+                rawRetryOnStatusCodes: retryOnStatusCodes
             ),
             batchSize: batchSize,
             requestTimeoutMs: requestTimeoutMs,
@@ -100,6 +106,29 @@ final class SyncConfigStore: @unchecked Sendable {
     private let defaults: UserDefaults
     private let secrets: SecretStore
 
+    /// How NaN and ±Infinity are written in the record, where JSON has no
+    /// number for them. Without it the encoder refused such a configuration,
+    /// the save was skipped, and a later launch read the record before it.
+    private static let positiveInfinity = "Infinity"
+    private static let negativeInfinity = "-Infinity"
+    private static let notANumber = "NaN"
+
+    private static func makeEncoder() -> JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.nonConformingFloatEncodingStrategy = .convertToString(positiveInfinity: positiveInfinity,
+                                                                      negativeInfinity: negativeInfinity,
+                                                                      nan: notANumber)
+        return encoder
+    }
+
+    private static func makeDecoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.nonConformingFloatDecodingStrategy = .convertFromString(positiveInfinity: positiveInfinity,
+                                                                        negativeInfinity: negativeInfinity,
+                                                                        nan: notANumber)
+        return decoder
+    }
+
     init(defaults: UserDefaults = .syncProvider, secrets: SecretStore = KeychainSecretStore()) {
         self.defaults = defaults
         self.secrets = secrets
@@ -117,7 +146,7 @@ final class SyncConfigStore: @unchecked Sendable {
                                     paused: paused)
         }
 
-        guard let record = try? JSONDecoder().decode(PersistedSyncRecord.self, from: data) else {
+        guard let record = try? Self.makeDecoder().decode(PersistedSyncRecord.self, from: data) else {
             SyncLogger.error("Stored configuration is unreadable; using defaults", category: "general")
             return LoadedSyncConfig(options: .default,
                                     source: .defaults,
@@ -162,7 +191,7 @@ final class SyncConfigStore: @unchecked Sendable {
         }
 
         do {
-            let data = try JSONEncoder().encode(PersistedSyncRecord(options))
+            let data = try Self.makeEncoder().encode(PersistedSyncRecord(options))
             defaults.set(data, forKey: Key.record)
         } catch {
             SyncLogger.error("Could not persist the configuration: \(error.localizedDescription)",

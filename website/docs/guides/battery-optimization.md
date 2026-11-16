@@ -53,8 +53,8 @@ The periodic worker and the retry kick share one set of constraints:
 | Not set | `NetworkType.CONNECTED` |
 | `requiresUnmeteredNetwork: true` | `NetworkType.UNMETERED` |
 | `requiresCharging: true` | `setRequiresCharging(true)` |
-| `requiresDeviceIdle: true` | `enableBackgroundSync()` rejects with `BACKGROUND_TASK_REGISTRATION_FAILED`: WorkManager refuses the backoff policy the library sets on an idle-constrained request. Leave it unset |
-| `minimumIntervalMs` | The period of the periodic worker, raised to 15 minutes when lower |
+| `requiresDeviceIdle: true` | `setRequiresDeviceIdle(true)`, on the periodic worker and the retry kick. A run that fails as a whole keeps WorkManager's default backoff, exponential from 30 seconds and at most 5 hours, and waits for an idle device again |
+| `minimumIntervalMs` | The period of the periodic worker, raised to 15 minutes when lower, and capped at 2^53 - 1 ms |
 
 ### BGTask Requests (iOS)
 
@@ -115,7 +115,8 @@ A `2xx` measurement of the same URL also counts as a passed check for `healthChe
 - **One request per wake for an expired stored token.** With `defaultHeaders` restored from disk, a `401` or `403` stops the cycle, and the item waits at least 60 seconds.
 - **No health-check request during its backoff.** Automatic wakes also wait at least 1 000 ms after a failed check.
 - **Backoff on gated wakes.** A wake held below `minNetworkQuality` is re-checked after 30 s, then at doubling intervals up to 15 minutes.
-- **No WorkManager retries for failed items.** `SyncWorker` returns `Result.success()` on every completed flush. `Result.retry()`, with exponential backoff from 1 minute, is kept for a worker that fails as a whole.
+- **No back-to-back failing cycles.** After a [cycle that dies](./error-handling.md#when-a-cycle-dies), for example on a storage error that persists, automatic wakes wait 30 s, doubling for each dead cycle in a row up to 15 minutes. See [The Failure Hold](./retry-policy.md#the-failure-hold).
+- **No WorkManager retries for failed items.** `SyncWorker` returns `Result.success()` on every completed flush. `Result.retry()`, with exponential backoff from 1 minute, or WorkManager's default under `requiresDeviceIdle`, is kept for a worker that fails as a whole.
 - **No offline ticks.** The `useAutoSync` interval and foreground triggers do nothing while the status is `DISCONNECTED`.
 
 ## Recommended Settings

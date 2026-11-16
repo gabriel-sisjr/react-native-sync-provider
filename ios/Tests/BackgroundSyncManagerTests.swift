@@ -245,6 +245,66 @@ final class BackgroundSyncManagerTests: XCTestCase {
         XCTAssertEqual(emitter.events(ofType: "BACKGROUND_SYNC_COMPLETED").count, 2)
     }
 
+    // MARK: - minimumIntervalMs
+
+    private func makeOptions(interval: Double, foregroundOnly: Bool) -> BackgroundSyncOptionsValue {
+        BackgroundSyncOptionsValue(minimumIntervalMs: interval,
+                                   requiresCharging: nil,
+                                   requiresUnmeteredNetwork: nil,
+                                   requiresDeviceIdle: nil,
+                                   foregroundOnly: foregroundOnly,
+                                   taskIdentifier: nil)
+    }
+
+    /// The refresh request's begin date is always a finite one: NaN and
+    /// -Infinity get the 60 s floor, +Infinity and huge values the cap
+    /// Android puts on its interval, 2^53 - 1 ms.
+    func test_anyInterval_givesTheRefreshRequestAFiniteBeginDate() throws {
+        let cap: TimeInterval = 9_007_199_254_740.991
+        let cases: [(interval: Double, seconds: TimeInterval)] = [
+            (.nan, 60), (-.infinity, 60), (-1, 60), (0, 60), (90_000, 90), (.infinity, cap), (1e300, cap)
+        ]
+        for (interval, seconds) in cases {
+            scheduler.reset()
+            let before = Date()
+
+            try manager.enable(options: makeOptions(interval: interval, foregroundOnly: false))
+
+            let begin = scheduler.submittedBeginDates.first { $0.identifier == kBackgroundRefreshIdentifier }?.date
+            let wait = try XCTUnwrap(begin, "\(interval)").timeIntervalSince(before)
+            XCTAssertTrue(wait.isFinite, "\(interval)")
+            XCTAssertEqual(wait, seconds, accuracy: 5, "\(interval)")
+        }
+    }
+
+    func test_refreshDelaySeconds_staysBetweenTheFloorAndTheCap() {
+        XCTAssertEqual(BackgroundSyncManager.refreshDelaySeconds(.nan), 60)
+        XCTAssertEqual(BackgroundSyncManager.refreshDelaySeconds(-.infinity), 60)
+        XCTAssertEqual(BackgroundSyncManager.refreshDelaySeconds(59_999), 60)
+        XCTAssertEqual(BackgroundSyncManager.refreshDelaySeconds(900_000), 900)
+        XCTAssertEqual(BackgroundSyncManager.refreshDelaySeconds(.infinity), 9_007_199_254_740.991)
+        XCTAssertEqual(BackgroundSyncManager.refreshDelaySeconds(Double.greatestFiniteMagnitude), 9_007_199_254_740.991)
+    }
+
+    /// The options of the last call are what a cold BGTask launch reads, an
+    /// interval JSON has no number for included, so its opt-out holds.
+    func test_aNonFiniteInterval_isSaved_soAColdLaunchReadsTheLastCall() throws {
+        for interval in [Double.nan, .infinity, -.infinity] {
+            try manager.enable(options: makeOptions(interval: 900_000, foregroundOnly: false))
+            try manager.enable(options: makeOptions(interval: interval, foregroundOnly: true))
+
+            let cold = BackgroundSyncOptionsStore(defaults: defaults).load()
+            XCTAssertTrue(cold.enabled, "\(interval)")
+            XCTAssertEqual(cold.options?.foregroundOnly, true, "\(interval)")
+            let stored = try XCTUnwrap(cold.options?.minimumIntervalMs, "\(interval)")
+            XCTAssertEqual(stored.isNaN, interval.isNaN, "\(interval)")
+            if !interval.isNaN {
+                XCTAssertEqual(stored, interval, "\(interval)")
+            }
+            XCTAssertTrue(makeManager().isForegroundOnly, "a cold launch honors the opt-out: \(interval)")
+        }
+    }
+
     // MARK: - Background uploads
 
     private func makeDispatcher(isAppActive: @escaping @Sendable () async -> Bool) -> SyncDispatcher {

@@ -82,29 +82,30 @@ CI runs the same command on `ubuntu-latest` with JDK 17 (Zulu) and uploads the H
 
 | Suite                                  | Cases | What it exercises                                                                       |
 | -------------------------------------- | ----- | --------------------------------------------------------------------------------------- |
-| `SyncProviderRuntimeTest`              | 81    | Configuration, pause, retry wake, credential holds and cold workers against a fresh runtime. |
+| `SyncProviderRuntimeTest`              | 82    | Configuration, pause, retry wake, credential holds and cold workers against a fresh runtime. |
 | `database/SyncItemDaoTest`             | 16    | Room in-memory + Robolectric SDK 30. Insert/batch/count/delete, ordering, status flips. |
 | `database/SyncResultDaoTest`           | 5     | History persistence, ordering DESC.                                                     |
 | `database/SyncDatabaseMigrationTest`   | 6     | Room v1→v2→v3 migrations against the exported schemas, and the destructive downgrade.  |
-| `storage/SyncQueueStorageTest`         | 34    | enqueue + INVALID_URL + QUEUE_FULL + claim atomicity + cooldowns + dead-letter moves + roundtrip. |
+| `storage/SyncQueueStorageTest`         | 35    | enqueue + INVALID_URL + QUEUE_FULL + claim atomicity + cooldowns + dead-letter moves + roundtrip. |
 | `storage/DeadLetterReplayRaceTest`     | 3     | A replay holds one write transaction, so a purge, a discard or a second replay waits for it. |
-| `http/SyncDispatcherTest`              | 57    | MockWebServer 4.12.0 — success, retry, terminal codes, credential hold, cancellation, the quality gate, the health check, dead letters. |
+| `http/SyncDispatcherTest`              | 95    | MockWebServer 4.12.0 — success, retry, terminal codes, timeouts, credential hold, cancellation, a cycle that dies and its settle, the quality gate, the health check, dead letters. |
+| `http/SettleMatrixTest`                | 24    | Each cell of the abort and settle matrix: what a cycle that dies or is cancelled leaves of each claimed row, the events in order, and the next wake. |
 | `http/HeadProbeTest`                   | 14    | The `HEAD` client that the health check and the latency probe share.                   |
 | `http/HealthCheckTest`                 | 6     | The healthy-result cache per URL and its clocks, and the backoff after a failure.      |
-| `retry/RetryPolicyEvaluatorTest`       | 18    | Linear/exp/fib + cap + equal jitter `[0.75, 1.25)` with seeded `Random`.                |
+| `retry/RetryPolicyEvaluatorTest`       | 21    | Linear/exp/fib + cap + equal jitter `[0.75, 1.25)` with seeded `Random`, the delay clamp and the deadline ceiling. |
 | `retry/RetryTimerTest`                 | 25    | Single-shot arming, cancel, a wake owed to the network, wakes the quality gate or a health-check backoff holds. |
-| `retry/RetryWakeTest`                  | 30    | When the timer and the kick arm, what suppresses them, the credential hold and the health-check backoff. |
+| `retry/RetryWakeTest`                  | 40    | When the timer and the kick arm, what suppresses them, the credential hold, the health-check backoff and the failure hold. |
 | `retry/OfflineRetryTest`               | 4     | No attempt is spent while offline.                                                      |
 | `config/SyncConfigStoreTest`           | 19    | Round trip of every option, damaged values, and the secret lifecycle.                   |
 | `config/SyncOptionsValidatorTest`      | 5     | The checks `configureSync` runs on the network-quality and health-check options.        |
 | `config/KeystoreSecretStoreTest`       | 4     | Encryption behind the `SecretStore` seam.                                               |
-| `connectivity/ConnectivityMonitorTest` | 20 (22 runs: two cases run on SDK 30 and 31) | Lifecycle, idempotency, the initial StateFlow value, the default network and the offline invariant. |
+| `connectivity/ConnectivityMonitorTest` | 25 (27 runs: two cases run on SDK 30 and 31) | Lifecycle, idempotency, the initial StateFlow value, the default network, the offline invariant and the order of `CONNECTION_CHANGED`. |
 | `connectivity/ConnectivityMonitorQualityTest` | 23 | The latency measurement behind `networkQuality`: when it is taken, how long it is reused, what it reports. |
 | `connectivity/LatencyProbeTest`        | 2     | The three back-to-back `HEAD`s of a measurement.                                        |
 | `connectivity/NetworkQualityClassifierTest` | 23 | The shared threshold table, one parameterized case per scenario.                     |
-| `work/BackgroundSyncManagerTest`       | 24    | Periodic work, the retry kick, `foregroundOnly`.                                        |
-| `work/BootCompletedReceiverTest`       | 5     | Boot and package-replaced actions.                                                      |
-| `work/SyncWorkerTest`                  | 11    | `TestListenableWorkerBuilder` + `mockkObject(SyncProviderRuntime.Companion)`. Results, inert runs, and runs the quality gate holds. |
+| `work/BackgroundSyncManagerTest`       | 30    | Periodic work, the retry kick, `foregroundOnly`, `requiresDeviceIdle` and the interval's floor and cap. |
+| `work/BootCompletedReceiverTest`       | 8     | Boot and package-replaced actions, the shipped manifest's filter, and every other action ignored. |
+| `work/SyncWorkerTest`                  | 12    | `TestListenableWorkerBuilder` + `mockkObject(SyncProviderRuntime.Companion)`. Results, inert runs, stopped runs, and runs the quality gate holds. |
 | `work/RecoveryWorkerTest`              | 5     | Reset-in-flight + reschedule + failure → retry.                                         |
 
 ### Robolectric SDK 30
@@ -173,22 +174,22 @@ These `internal init(...)` overloads exist solely for tests (they do not appear 
 
 | Suite                            | Cases | Notes                                                                                              |
 | -------------------------------- | ----- | -------------------------------------------------------------------------------------------------- |
-| `SyncEngineRetryTimerTests`      | 37    | When the timer arms, offline wakes, credential holds, hybrid attach and detach.                    |
+| `SyncEngineRetryTimerTests`      | 44    | When the timer arms, offline wakes, credential holds, hybrid attach and detach, and the failure hold after a cycle that dies. |
 | `SyncEngineConfigTests`          | 35    | Configuration across engine restarts, pause lifetime, stale credentials.                           |
 | `SyncQueueStorageTests`          | 14    | enqueue / batch / QUEUE_FULL / sort / status transitions / history.                                |
 | `SyncDispatcherTests`            | 19    | URLProtocolStub-driven; 200/500/408/429/400/401 paths + transport errors + paused skip + items purged before their dispatch + response classification. |
-| `SyncDispatcherCooldownTests`    | 10    | Cooldown written from the end of the attempt, and skipped items.                                   |
-| `SyncRetryCooldownTests`         | 14    | Cooldowns in storage, recovery, and the predicate.                                                 |
-| `RetryPolicyEvaluatorTests`      | 15    | linear/exp/fib + cap + jitter `[3000, 5000)` over 200 samples + perf measure baseline.             |
+| `SyncDispatcherCooldownTests`    | 25    | Cooldown written from the end of the attempt, skipped items, the deadline ceiling, and the settle after an outcome write that fails. |
+| `SyncRetryCooldownTests`         | 16    | Cooldowns in storage, recovery, the predicate, and deadlines that stop at the largest JavaScript `Date`. |
+| `RetryPolicyEvaluatorTests`      | 16    | linear/exp/fib + cap + jitter `[3000, 5000)` over 200 samples + perf measure baseline + the deadline ceiling. |
 | `RetryWakeTimerTests`            | 8     | Single-shot arming and cancel.                                                                     |
-| `HeldWakeTests`                  | 18    | Retry wakes the quality gate holds back: silent, re-checked with backoff, re-measured when stale.  |
+| `HeldWakeTests`                  | 20    | Retry wakes the quality gate holds back: silent, re-checked with backoff, re-measured when stale.  |
 | `SyncConfigStoreTests`           | 11    | Persistence, logout, orphaned secrets.                                                             |
 | `NetworkHealthOptionsTests`      | 15    | The network-health options: checked before `configureSync` applies anything, kept as set, persisted, clamped. |
-| `BackgroundSyncManagerTests`     | 17    | Scheduling decisions and handlers, with a fake scheduler.                                          |
+| `BackgroundSyncManagerTests`     | 20    | Scheduling decisions and handlers, with a fake scheduler, and the refresh begin date for any `minimumIntervalMs`. |
 | `BackgroundSyncPersistenceTests` | 7     | Options and enabled state across relaunches.                                                       |
 | `BackgroundTaskRegistrarTests`   | 6     | Registration, and identifiers missing from `Info.plist`.                                           |
 | `CoreDataMigrationV1ToV2Tests`   | 5     | Model v1→v2 migration.                                                                             |
-| `CoreDataMigrationV3Tests`       | 8     | v1 and v2 stores opened through the production load: failed items move to the dead-letter store.  |
+| `CoreDataMigrationV3Tests`       | 9     | v1 and v2 stores opened through the production load: failed items move to the dead-letter store, and a migration never edits a model in use. |
 | `CoreDataStackTests`             | 5     | Store loading and failure.                                                                         |
 | `DeadLetterStoreTests`           | 19    | A permanent failure moves the item, with its request and its failure, to the dead-letter store in one transaction. |
 | `DeadLetterBridgeTests`          | 12    | Listing, replaying and discarding dead letters through the bridge.                                 |
@@ -200,6 +201,14 @@ These `internal init(...)` overloads exist solely for tests (they do not appear 
 | `NetworkQualityGateTests`        | 15    | The gate before every flush, the wakes it holds, and what `CONNECTION_CHANGED` and `getConnectionStatus()` report. |
 | `HeadProbeTests`                 | 18    | One `HEAD` request, timed from the task metrics, redirects included.                               |
 | `HealthCheckTests`               | 16    | The `HEAD` to `healthCheckUrl` before a cycle: when it is sent, its cache, and the backoff after a failure. |
+| `BackgroundTaskExpiryTests`      | 12    | A BGTask window that runs out of time: the task completes once, the request is cancelled, the item comes back with its attempt refunded. |
+| `BackgroundURLSessionDelegateRoutingTests` | 2 | A background upload's completion reaches only the call that started that upload. |
+| `BackgroundUploadWaitTests`      | 4     | The wait for a background upload ends once, at its completion or at the cancellation. |
+| `ConnectivityReplayOrderTests`   | 3     | Path snapshots reach each subscriber in order, and never an older one after a newer one.           |
+| `NumericOptionTests`             | 10    | How every number from JS converts: counts, timeouts, delays, status codes, the history limit.     |
+| `NumericOptionEngineTests`       | 7     | `NaN`, `Infinity` and out-of-range numbers through `configureSync`, an engine restart and `getSyncConfig`. |
+| `SyncConfigStoreNumbersTests`    | 4     | Numbers saved as given, and records that earlier builds wrote or read.                             |
+| `SettleMatrixTests`              | 22    | Each cell of the abort and settle matrix: what a cycle that dies or is cancelled leaves of each claimed row, the events in order, and the next wake. |
 
 `URLSessionConfiguration.background` and a real `BGTaskScheduler` launch are not exercised in unit tests: they are OS-driven and cannot be run from a test host. That coverage needs a physical device: see [iOS Setup](../getting-started/ios-setup.md#7-test-the-background-handler).
 
@@ -207,4 +216,9 @@ These `internal init(...)` overloads exist solely for tests (they do not appear 
 
 ## Local Validation Gotcha
 
-The maintainer's Mac currently reports `iOS 26.4 not installed` for the `Any iOS Device` placeholder, which disables every simulator destination locally. CI on `macos-latest` with `XCODE_VERSION: 'latest-stable'` is the source of truth for iOS test runs. Same story for Android: a clean Linux + JDK 17 toolchain is more reliable than the local mac for `testDebugUnitTest` end-to-end.
+Both native suites run locally from a checkout on a local disk: the iOS tests on a simulator, and the Android tests through `testDebugUnitTest`. Two setups get in the way:
+
+- **A checkout on an SMB-mounted volume.** File locks (`fcntl`) fail there, and the runs need them, for example for the SQLite database inside the `.xcresult` bundle. Clone onto a local disk instead.
+- **`OS=latest` with a newer local Xcode.** The command above then runs on that Xcode's newest runtime, such as iOS 27.2, which CI may not test: CI's `latest-stable` Xcode can be older. To reproduce a CI run, pick a simulator of CI's runtime from `xcrun simctl list devices available` and pass it by UDID: `-destination 'platform=iOS Simulator,id=<udid>'`.
+
+CI stays the source of truth for both platforms.

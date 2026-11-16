@@ -20,11 +20,18 @@ enum ConfigSource: String, Sendable {
 }
 
 /// Sendable mirror of `SyncOptions`.
+///
+/// The numbers stay as the app passed them, NaN and ±Infinity included: that
+/// is what is persisted and what `getSyncConfig()` echoes, as on Android.
+/// They are converted where they are used, through ``NumericOption``.
 struct SyncOptionsSnapshot: Sendable, Equatable {
     var strategy: String
     var retryPolicy: RetryPolicyValue
+    /// As given. Converted by ``toDispatcherConfig(source:credentialsUnavailable:)``.
     var batchSize: Double
+    /// As given. Converted by ``toDispatcherConfig(source:credentialsUnavailable:)``.
     var requestTimeoutMs: Double
+    /// As given. Read ``queueCapacity`` to use it.
     var maxQueueSize: Double
     var persistQueue: Bool
     var defaultHeaders: [String: String]
@@ -56,11 +63,17 @@ struct SyncOptionsSnapshot: Sendable, Equatable {
         strategy == "MANUAL"
     }
 
+    /// `maxQueueSize` as the queue cap, from 1 to 2147483647. See
+    /// ``NumericOption/count(_:)``.
+    var queueCapacity: Int {
+        NumericOption.count(maxQueueSize)
+    }
+
     func toDispatcherConfig(source: ConfigSource = .live,
                             credentialsUnavailable: Bool = false) -> DispatcherConfig {
         DispatcherConfig(retryPolicy: retryPolicy,
-                         requestTimeoutMs: Int(requestTimeoutMs),
-                         batchSize: Int(batchSize),
+                         requestTimeoutMs: NumericOption.timeoutMs(requestTimeoutMs),
+                         batchSize: NumericOption.count(batchSize),
                          defaultHeaders: defaultHeaders,
                          source: source,
                          hasDefaultHeaders: !defaultHeaders.isEmpty || credentialsUnavailable,

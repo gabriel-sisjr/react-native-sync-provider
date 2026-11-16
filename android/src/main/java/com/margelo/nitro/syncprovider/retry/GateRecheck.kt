@@ -11,13 +11,17 @@ internal sealed interface WakeHold {
 
 /**
  * The delays between checks of a wake the network-quality gate holds back: 30 s, doubled
- * for each consecutive check the gate turns back too, at most 15 min.
+ * for each consecutive check the gate turns back too, at most 15 min. The wakes after cycles
+ * that failed in a row wait on the same schedule, one step per failed cycle (see [RetryWake]).
  */
 internal object GateRecheck {
   const val FIRST_DELAY_MS: Long = 30_000L
   const val MAX_DELAY_MS: Long = 15L * 60L * 1_000L
 
-  /** The delay before the next check, after [streak] consecutive checks the gate turned back. */
+  /**
+   * The delay before the next check, after [streak] consecutive checks the gate turned back, or
+   * after [streak] cycles that failed before the one that just failed.
+   */
   fun delayMs(streak: Int): Long {
     val doublings = streak.coerceIn(0, MAX_DOUBLINGS)
     return (FIRST_DELAY_MS shl doublings).coerceAtMost(MAX_DELAY_MS)

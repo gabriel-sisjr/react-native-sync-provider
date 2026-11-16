@@ -250,8 +250,10 @@ export async function runDrain(
       }
 
       // Unless `minNetworkQuality` is set, neither dispatcher checks
-      // connectivity. Flushing offline would burn the retry budget and
-      // dead-letter valid items, so wait for the network.
+      // connectivity. Flushing offline would spend attempts: Android can burn
+      // the retry budget and dead-letter valid items, and iOS waits for the
+      // network with its first item claimed and one attempt spent. So wait for
+      // the network here.
       const connection = await guarded(native.getConnectionStatus);
       if (connection.status === ConnectionStatus.DISCONNECTED) {
         await wait(idleWaitMs);

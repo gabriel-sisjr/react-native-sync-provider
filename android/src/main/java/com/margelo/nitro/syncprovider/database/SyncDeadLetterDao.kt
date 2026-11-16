@@ -99,7 +99,95 @@ internal interface SyncDeadLetterDao {
     deleteById(id)
     return ReplayOutcome.REPLAYED
   }
+
+  /**
+   * Settle, in one transaction, the rows a cycle claimed and leaves `IN_FLIGHT`: an aborted
+   * cycle's, or the rest of a batch that a rejected credential stopped. Each change applies only
+   * to a row still `IN_FLIGHT`: one whose outcome was written meanwhile, or that a purge removed,
+   * is left as it is.
+   * - [unsent]: back to `PENDING` unchanged;
+   * - [delivered]: rows whose request was answered with a `2xx`, removed;
+   * - [retries]: back to `PENDING` with these values: a retry, which counts its attempt, or a
+   *   credential hold, which does not;
+   * - [exhausted]: rows that become dead letters, moved here.
+   *
+   * @return the ids of [delivered], [retries] and [exhausted] that were applied.
+   */
+  @Transaction
+  suspend fun settleAbortedClaims(
+    unsent: List<String>,
+    delivered: List<String>,
+    retries: List<ScheduledRetry>,
+    exhausted: List<SyncDeadLetterEntity>,
+  ): Set<String> {
+    unsent.chunked(MAX_IDS_PER_STATEMENT).forEach { releaseQueuedInFlight(it) }
+    val applied = mutableSetOf<String>()
+    for (id in delivered) {
+      if (deleteQueuedInFlight(id) > 0) applied += id
+    }
+    for (retry in retries) {
+      val changed = retryQueuedInFlight(
+        id = retry.id,
+        attempts = retry.attempts,
+        lastAttemptAt = retry.lastAttemptAt,
+        lastErrorCode = retry.lastErrorCode,
+        nextRetryAt = retry.nextRetryAt,
+      )
+      if (changed > 0) applied += retry.id
+    }
+    for (row in exhausted) {
+      if (deleteQueuedInFlight(row.id) == 0) continue
+      insert(row)
+      applied += row.id
+    }
+    return applied
+  }
+
+  @Query(
+    """
+      UPDATE sync_items
+      SET status = '${SyncItemEntity.STATUS_PENDING}'
+      WHERE status = '${SyncItemEntity.STATUS_IN_FLIGHT}' AND id IN (:ids)
+    """,
+  )
+  suspend fun releaseQueuedInFlight(ids: List<String>): Int
+
+  @Query(
+    """
+      UPDATE sync_items
+      SET status = '${SyncItemEntity.STATUS_PENDING}',
+          attempts = :attempts,
+          lastAttemptAt = :lastAttemptAt,
+          lastErrorCode = :lastErrorCode,
+          nextRetryAt = :nextRetryAt
+      WHERE id = :id AND status = '${SyncItemEntity.STATUS_IN_FLIGHT}'
+    """,
+  )
+  suspend fun retryQueuedInFlight(
+    id: String,
+    attempts: Int,
+    lastAttemptAt: Long,
+    lastErrorCode: String,
+    nextRetryAt: Long,
+  ): Int
+
+  @Query("DELETE FROM sync_items WHERE id = :id AND status = '${SyncItemEntity.STATUS_IN_FLIGHT}'")
+  suspend fun deleteQueuedInFlight(id: String): Int
+
+  private companion object {
+    /** Below the 999 bind parameters older SQLite versions allow per statement. */
+    const val MAX_IDS_PER_STATEMENT = 500
+  }
 }
+
+/** A retry [SyncDeadLetterDao.settleAbortedClaims] writes: the attempt counted, and its cooldown. */
+internal data class ScheduledRetry(
+  val id: String,
+  val attempts: Int,
+  val lastAttemptAt: Long,
+  val lastErrorCode: String,
+  val nextRetryAt: Long,
+)
 
 /** What [SyncDeadLetterDao.replay] did. */
 internal enum class ReplayOutcome {

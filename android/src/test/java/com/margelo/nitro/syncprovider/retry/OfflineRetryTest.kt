@@ -60,7 +60,7 @@ internal class OfflineRetryTest {
       storage = storage,
       emitter = SyncEventEmitter(),
       getOptions = { options },
-      onCycleFinished = { wake.arm(it) },
+      onCycleFinished = { notBefore, ending -> wake.arm(notBefore, ending) },
     )
     timer = RetryTimer(scope, isOffline = { offline }, flush = { dispatcher.flush() })
     wake = RetryWake(

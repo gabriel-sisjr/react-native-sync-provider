@@ -171,6 +171,18 @@ actor SyncQueueStorage {
                                              attempts: attempts)
     }
 
+    /// Give a claimed row back with the attempt count from before the claim.
+    /// See ``SyncItemDao/releaseClaim(id:attempts:lastAttemptAt:)``.
+    func releaseClaim(id: String, attempts: Int32, lastAttemptAt: Int64?) async throws {
+        try await dao.releaseClaim(id: id, attempts: attempts, lastAttemptAt: lastAttemptAt)
+    }
+
+    /// Write the outcome of a claimed row whose own write failed, only while
+    /// the row is still in flight. See ``SyncItemDao/settleClaim(id:_:)``.
+    func settleClaim(id: String, _ settlement: ClaimSettlement) async throws -> SettledClaim {
+        try await dao.settleClaim(id: id, settlement)
+    }
+
     @discardableResult
     func resetInFlightToPending() async throws -> Int {
         try await dao.resetInFlightToPending()

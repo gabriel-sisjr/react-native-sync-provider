@@ -64,6 +64,11 @@ final class CoreDataStack: @unchecked Sendable {
     /// Runs the transactions of ``performSerializedTask(_:)``, one at a time.
     private let serializedQueue = DispatchQueue(label: "com.syncprovider.coredata.serialized", qos: .utility)
 
+    /// Test seam: runs before each save, after the transaction's block. A
+    /// throw fails that save the way a failed `save()` does: nothing is
+    /// written, and the transaction throws. `nil` outside tests.
+    private let beforeSave: (@Sendable () throws -> Void)?
+
     /// The loaded container. The first caller loads the store while holding
     /// the lock, so concurrent callers wait for it instead of opening their
     /// own coordinator on the same file.
@@ -92,12 +97,14 @@ final class CoreDataStack: @unchecked Sendable {
 
     private init() {
         self.makeContainer = { $0.loadBundledContainer() }
+        self.beforeSave = nil
     }
 
     /// Test-only initializer. Runs the production load, migration included,
     /// against a store and a compiled model of the caller's choosing.
     internal init(storeURL: URL, modelURL: URL) {
         self.makeContainer = { $0.loadBundledContainer(modelURL: modelURL, storeURL: storeURL) }
+        self.beforeSave = nil
     }
 
     /// Test-only initializer. Accepts a pre-loaded `NSPersistentContainer`
@@ -106,14 +113,18 @@ final class CoreDataStack: @unchecked Sendable {
     ///
     /// - Important: callers are responsible for invoking
     ///   `loadPersistentStores` on the container before passing it in.
-    internal init(container: NSPersistentContainer) {
+    /// - Parameter beforeSave: runs before each save; a throw fails that
+    ///   save, as a store that cannot write does.
+    internal init(container: NSPersistentContainer, beforeSave: (@Sendable () throws -> Void)? = nil) {
         self.makeContainer = { _ in (container, nil) }
+        self.beforeSave = beforeSave
     }
 
     /// Test-only initializer. Injects the one-time load itself, so tests can
     /// count how many loads run and simulate a store that fails to open.
     internal init(load: @escaping () -> (NSPersistentContainer, Error?)) {
         self.makeContainer = { _ in load() }
+        self.beforeSave = nil
     }
 
     /// The options the store is opened with, and migrated with.
@@ -197,9 +208,10 @@ final class CoreDataStack: @unchecked Sendable {
         if let loadError = initializationError {
             throw loadError
         }
+        let beforeSave = self.beforeSave
         return try await withCheckedThrowingContinuation { continuation in
             container.performBackgroundTask { context in
-                continuation.resume(with: Self.run(block, in: context))
+                continuation.resume(with: Self.run(block, in: context, beforeSave: beforeSave))
             }
         }
     }
@@ -223,11 +235,12 @@ final class CoreDataStack: @unchecked Sendable {
         if let loadError = initializationError {
             throw loadError
         }
+        let beforeSave = self.beforeSave
         return try await withCheckedThrowingContinuation { continuation in
             serializedQueue.async {
                 let context = container.newBackgroundContext()
                 context.performAndWait {
-                    continuation.resume(with: Self.run(block, in: context))
+                    continuation.resume(with: Self.run(block, in: context, beforeSave: beforeSave))
                 }
             }
         }
@@ -235,11 +248,13 @@ final class CoreDataStack: @unchecked Sendable {
 
     /// Runs `block` on `context` and saves what it changed, if it did not throw.
     private static func run<T>(_ block: (NSManagedObjectContext) throws -> T,
-                               in context: NSManagedObjectContext) -> Result<T, Error> {
+                               in context: NSManagedObjectContext,
+                               beforeSave: (@Sendable () throws -> Void)?) -> Result<T, Error> {
         context.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
         return Result {
             let value = try block(context)
             if context.hasChanges {
+                try beforeSave?()
                 try context.save()
             }
             return value

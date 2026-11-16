@@ -594,6 +594,226 @@ final class SyncEngineRetryTimerTests: XCTestCase {
         XCTAssertFalse(timer.isArmed)
     }
 
+    // MARK: - After a cycle that dies
+
+    /// Every save fails, the claim's included: each wake runs a cycle that
+    /// dies before its request, and the row stays due at once. The automatic
+    /// wake after it waits 30 s, then 60 s, then 120 s, and a cycle that
+    /// completes starts that schedule again.
+    func test_cyclesThatDieBeforeTheSend_spaceTheWakes_untilOneCompletes() async throws {
+        let engine = await fixture.makeEngine()
+        await engine.configure(.sample(retryPolicy: .exact(maxAttempts: 5, baseDelayMs: 100)))
+        _ = try await enqueueCooling(in: engine, delayMs: 100)
+        URLProtocolStub.setHandler(stubResponse(200))
+        await engine.rearmRetryTimer()
+        XCTAssertEqual(timer.delayMs, 100)
+
+        fixture.saveFaults.fail(.max)
+        var delays: [Int64?] = []
+        for _ in 0..<3 {
+            await fireWhenDue()
+            delays.append(timer.delayMs)
+        }
+        XCTAssertEqual(delays, [30_000, 60_000, 120_000], "never a wake at once")
+        XCTAssertEqual(requestCount, 0, "nothing was sent")
+
+        fixture.saveFaults.fail(0)
+        await fireWhenDue()
+        XCTAssertEqual(requestCount, 1, "the cycle completed")
+
+        _ = try await enqueueCooling(in: engine, delayMs: 100)
+        await engine.rearmRetryTimer()
+        XCTAssertEqual(timer.delayMs, 100, "a completed cycle ends the wait")
+        fixture.saveFaults.fail(.max)
+        await fireWhenDue()
+        XCTAssertEqual(timer.delayMs, 30_000, "the schedule starts again")
+    }
+
+    /// A due row whose next claim fails: the cycle dies, and the wait after it
+    /// runs for 30 s.
+    private func startTheWaitAfterADeadCycle(in engine: SyncEngine) async throws {
+        await engine.configure(.sample(retryPolicy: .exact(maxAttempts: 5, baseDelayMs: 100)))
+        _ = try await enqueueCooling(in: engine, delayMs: 100)
+        clock.advance(ms: 100)
+        fixture.saveFaults.fail(1)
+        _ = try? await engine.dispatcher.flush()
+        XCTAssertEqual(timer.delayMs, 30_000)
+    }
+
+    /// Runs a cycle that is cancelled as its request goes out. The request
+    /// then fails, with the cancellation already seen, so no answer can be
+    /// recorded first: the claim is refunded and the cycle ends as cancelled.
+    private func runACancelledCycle(in engine: SyncEngine,
+                                    file: StaticString = #filePath, line: UInt = #line) async {
+        let flush = CancelledOnRequest()
+        URLProtocolStub.setHandler { _ in
+            flush.cancel()
+            throw URLError(.cancelled)
+        }
+        var open: AsyncStream<Void>.Continuation?
+        let gate = AsyncStream<Void> { open = $0 }
+        let cycle = Task {
+            for await _ in gate { break }
+            _ = try? await engine.dispatcher.flush()
+        }
+        flush.set(cycle)
+        open?.yield(())
+        await cycle.value
+        XCTAssertEqual(requestCount, 1, "the cancelled cycle's request went out", file: file, line: line)
+    }
+
+    /// A cancelled cycle neither starts the wait nor ends it, nor adds to its
+    /// streak: the wake after it waits for what is left, and the next cycle
+    /// that dies doubles from where the streak was.
+    func test_aCancelledCycle_neitherStartsNorEndsTheWaitAfterADeadOne() async throws {
+        let engine = await fixture.makeEngine()
+        await engine.configure(.sample(retryPolicy: .exact(maxAttempts: 5, baseDelayMs: 100)))
+        _ = try await enqueueCooling(in: engine, delayMs: 100)
+        clock.advance(ms: 100)
+
+        await runACancelledCycle(in: engine)
+        XCTAssertEqual(timer.delayMs, 0, "a cancelled cycle starts no wait: the refunded row is due")
+
+        fixture.saveFaults.fail(1)
+        _ = try? await engine.dispatcher.flush()
+        XCTAssertEqual(timer.delayMs, 30_000, "the streak starts at 30 s")
+
+        clock.advance(ms: 10_000)
+        await runACancelledCycle(in: engine)
+        XCTAssertEqual(timer.delayMs, 20_000, "what is left of the wait")
+
+        clock.advance(ms: 20_000)
+        fixture.saveFaults.fail(1)
+        _ = try? await engine.dispatcher.flush()
+        XCTAssertEqual(timer.delayMs, 60_000, "the streak goes on from where it was")
+    }
+
+    /// resumeSync() sends what is due at once, during the wait after a cycle
+    /// that died too, and leaves the wait's streak where it was.
+    func test_resumeSync_dispatchesAtOnce_duringTheWaitAfterADeadCycle() async throws {
+        let engine = await fixture.makeEngine()
+        try await startTheWaitAfterADeadCycle(in: engine)
+
+        await engine.pause()
+        await engine.resume()
+        XCTAssertEqual(timer.delayMs, 0, "what is due goes out at once")
+
+        fixture.saveFaults.fail(1)
+        await timer.fire()
+        XCTAssertEqual(timer.delayMs, 60_000, "the streak is where it was")
+    }
+
+    /// A cancellation that lands while the claim is being written, a BGTask
+    /// expiring say: the claim still commits and the cycle knows it, so the
+    /// row comes back with the claim's attempt refunded, nothing is sent, and
+    /// the cycle ends as cancelled.
+    func test_aCancellationDuringTheClaimsWrite_givesTheRowBack() async throws {
+        let engine = await fixture.makeEngine()
+        await engine.configure(.sample(retryPolicy: .exact(maxAttempts: 5, baseDelayMs: 100)))
+        let id = try await enqueueCooling(in: engine, delayMs: 100)
+        clock.advance(ms: 100)
+        URLProtocolStub.setHandler(stubResponse(200))
+        let flush = CancelledOnRequest()
+        let cancels = RequestLog()
+        fixture.saveFaults.intercept { // the claim's save, which still commits
+            flush.cancel()
+            cancels.record()
+        }
+        var open: AsyncStream<Void>.Continuation?
+        let gate = AsyncStream<Void> { open = $0 }
+        let cycle = Task {
+            for await _ in gate { break }
+            _ = try? await engine.dispatcher.flush()
+        }
+        flush.set(cycle)
+        open?.yield(())
+        await cycle.value
+
+        XCTAssertEqual(cancels.times.count, 1, "cancelled during the claim's write")
+        let stored = try await engine.storage.getAll().first { $0.id == id }
+        XCTAssertEqual(stored?.status, "PENDING", "not left IN_FLIGHT")
+        XCTAssertEqual(stored?.attempts, 1, "the claim's attempt is refunded")
+        XCTAssertEqual(requestCount, 0, "nothing was sent")
+        XCTAssertEqual(timer.delayMs, 0, "a cancelled cycle starts no wait: the row is due")
+    }
+
+    /// A CancellationError that is not the cycle's own, thrown by a write
+    /// while the cycle's task runs on, is a failure like any other: the wait
+    /// after a cycle that died starts. Its SYNC_FAILED still has no code, as
+    /// on Android.
+    func test_aCancellationErrorThatIsNotTheCyclesOwn_startsTheWait() async throws {
+        let emitter = MockSyncEventEmitter()
+        let engine = await fixture.makeEngine(emitter: emitter)
+        await engine.configure(.sample(retryPolicy: .exact(maxAttempts: 5, baseDelayMs: 100)))
+        _ = try await enqueueCooling(in: engine, delayMs: 100)
+        clock.advance(ms: 100)
+        fixture.saveFaults.intercept { throw CancellationError() } // the claim
+
+        do {
+            _ = try await engine.dispatcher.flush()
+            XCTFail("the cycle was expected to die")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+
+        XCTAssertEqual(timer.delayMs, 30_000, "0 if it counted as a cancellation")
+        let failed = emitter.events(ofType: "SYNC_FAILED")
+        XCTAssertEqual(failed.count, 1)
+        XCTAssertNil(failed.first?.errorCode)
+    }
+
+    /// A cycle that completes during the wait after a dead one, an explicit
+    /// flush say, ends that wait: a row cooling for 100 ms then arms at
+    /// 100 ms, not at what is left of the wait.
+    func test_aCompletedCycleDuringTheWait_endsIt() async throws {
+        let engine = await fixture.makeEngine()
+        await engine.configure(.sample(retryPolicy: .exact(maxAttempts: 5, baseDelayMs: 100)))
+        _ = try await enqueueCooling(in: engine, delayMs: 100)
+        clock.advance(ms: 100)
+        fixture.saveFaults.fail(1) // the claim
+        _ = try? await engine.dispatcher.flush()
+        XCTAssertEqual(timer.delayMs, 30_000)
+
+        clock.advance(ms: 10_000)
+        URLProtocolStub.setHandler(stubResponse(200))
+        _ = try await engine.dispatcher.flush()
+        XCTAssertEqual(requestCount, 1, "the explicit flush completed")
+        _ = try await enqueueCooling(in: engine, delayMs: 100)
+        await engine.rearmRetryTimer()
+        XCTAssertEqual(timer.delayMs, 100, "the wait ended with the completed cycle (20 000 if it had not)")
+    }
+
+    /// A cycle's end is noted when the cycle ends, before another one can
+    /// start, not when its follow-up runs: the late follow-up of a cycle that
+    /// died cannot overwrite the end of a later cycle that completed.
+    func test_aLateFollowUpOfADeadCycle_doesNotOverwriteALaterCompletedOne() async throws {
+        let engine = await fixture.makeEngine()
+        await engine.configure(.sample(retryPolicy: .exact(maxAttempts: 5, baseDelayMs: 100)))
+        _ = try await enqueueCooling(in: engine, delayMs: 100)
+        clock.advance(ms: 100)
+        let parked = ParkedFollowUp()
+        let followUp = engine.dispatcher.hooks.onCycleFinished
+        engine.dispatcher.hooks.onCycleFinished = { notBefore, end in
+            if end == .aborted {
+                await parked.park()
+            }
+            await followUp?(notBefore, end)
+        }
+        fixture.saveFaults.fail(1) // the first cycle's claim
+        let dead = Task { _ = try? await engine.dispatcher.flush() }
+        await parked.waitUntilParked()
+
+        URLProtocolStub.setHandler(stubResponse(200))
+        _ = try await engine.dispatcher.flush()
+        XCTAssertEqual(requestCount, 1, "a second cycle completed while the first one's follow-up waited")
+        parked.release()
+        await dead.value
+
+        _ = try await enqueueCooling(in: engine, delayMs: 100)
+        await engine.rearmRetryTimer()
+        XCTAssertEqual(timer.delayMs, 100, "30 000 if the dead cycle's late end overwrote the completed one")
+    }
+
     // MARK: - Failure handling
 
     /// No JS caller exists on a timer path. A store that failed to open must
@@ -688,5 +908,69 @@ private final class GatedWakeSource: RetryWakeSource, @unchecked Sendable {
                 continuation.resume()
             }
         }
+    }
+}
+
+/// Holds a cycle's follow-up until released, and tells the test once it holds
+/// one.
+private final class ParkedFollowUp: @unchecked Sendable {
+    private let lock = NSLock()
+    private var held: CheckedContinuation<Void, Never>?
+    private var parkedWaiter: CheckedContinuation<Void, Never>?
+    private var isParked = false
+    private var isReleased = false
+
+    func park() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let (goOn, waiter) = lock.withLock { () -> (Bool, CheckedContinuation<Void, Never>?) in
+                isParked = true
+                defer { parkedWaiter = nil }
+                if isReleased {
+                    return (true, parkedWaiter)
+                }
+                held = continuation
+                return (false, parkedWaiter)
+            }
+            waiter?.resume()
+            if goOn {
+                continuation.resume()
+            }
+        }
+    }
+
+    func waitUntilParked() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let already = lock.withLock { () -> Bool in
+                if isParked { return true }
+                parkedWaiter = continuation
+                return false
+            }
+            if already {
+                continuation.resume()
+            }
+        }
+    }
+
+    func release() {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            isReleased = true
+            defer { held = nil }
+            return held
+        }
+        continuation?.resume()
+    }
+}
+
+/// The flush a stub cancels when its request starts.
+private final class CancelledOnRequest: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: Task<Void, Never>?
+
+    func set(_ task: Task<Void, Never>) {
+        lock.withLock { self.task = task }
+    }
+
+    func cancel() {
+        lock.withLock { task }?.cancel()
     }
 }

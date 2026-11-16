@@ -290,6 +290,30 @@ final class HeldWakeTests: XCTestCase {
         XCTAssertTrue(emitter.events(ofType: "CONNECTION_CHANGED").isEmpty)
     }
 
+    /// iOS starts from `UNKNOWN`, so the system's first path report is a
+    /// change, even when it lands while the engine starts its monitors and no
+    /// `healthCheckUrl` was saved.
+    func test_connection_firstReport_landingAsTheEngineStarts_isReported() async {
+        fixture.connectivity.reportOnStart(.link())
+
+        let engine = await fixture.makeEngine(emitter: emitter)
+
+        XCTAssertEqual(emitter.events(ofType: "CONNECTION_CHANGED").map(\.connectionStatus), ["CONNECTED"])
+        XCTAssertEqual(engine.currentNetwork().link.status, .connected)
+    }
+
+    /// The common order: the report comes after the engine started.
+    func test_connection_firstReport_afterTheEngineStarted_isReportedOnce() async {
+        fixture.connectivity.set(.unknown)
+        let engine = await fixture.makeEngine(emitter: emitter)
+        XCTAssertTrue(emitter.events(ofType: "CONNECTION_CHANGED").isEmpty, "UNKNOWN is where it starts")
+
+        fixture.connectivity.set(snapshot: .link())
+
+        XCTAssertEqual(emitter.events(ofType: "CONNECTION_CHANGED").map(\.connectionStatus), ["CONNECTED"])
+        XCTAssertEqual(engine.currentNetwork().link.status, .connected)
+    }
+
     /// While the first measurement is pending, the gate compares the
     /// link-signal grade: no forced pass, no forced block.
     func test_gate_firstProbePending_comparesTheLinkGrade() async throws {

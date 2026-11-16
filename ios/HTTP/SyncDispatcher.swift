@@ -70,6 +70,11 @@ struct ItemDispatchOutcome: Sendable {
     let statusCode: Int?
     let errorCode: String?
     let errorMessage: String?
+    /// `false` when the request never reached `URLSession`: its URL is not
+    /// http(s), or its body could not be written for a background upload. A
+    /// cycle that dies before such an outcome is written gives the row back
+    /// as it was before its claim.
+    var requestSent = true
 }
 
 /// What ``SyncDispatcher/recordFailureOutcome(item:outcome:sentWith:)`` decided to do
@@ -84,6 +89,17 @@ enum FailureDisposition: Sendable {
     /// `PENDING` with its attempt refunded; the cycle must stop claiming items,
     /// and no wake may come before `heldUntil`.
     case credentialRejected(heldUntil: Int64)
+}
+
+/// How a flush cycle ended, for the wake armed after it.
+enum CycleEnd: Sendable, Equatable {
+    /// It ran to its end, whatever its items' outcomes.
+    case completed
+    /// It died: a write that failed, say. Its `SYNC_FAILED` carries the code.
+    case aborted
+    /// Its own task was cancelled, a BGTask that expired say. Nothing failed.
+    /// A `CancellationError` that its task did not get ends it as `aborted`.
+    case cancelled
 }
 
 /// Why a flush started no cycle.
@@ -116,7 +132,8 @@ final class DispatcherHooks: @unchecked Sendable {
     private let lock = NSLock()
     private var foregroundOnlyValue = false
     private var pausedValue = false
-    private var cycleFinished: (@Sendable (Int64?) async -> Void)?
+    private var cycleEnded: (@Sendable (CycleEnd) -> Void)?
+    private var cycleFinished: (@Sendable (Int64?, CycleEnd) async -> Void)?
     private var credentialRecovery: (@Sendable () -> [String: String]?)?
     private var qualitySource: (@Sendable () -> NetworkQualityLevel)?
     private var qualityRefresh: (@Sendable () -> Void)?
@@ -136,10 +153,19 @@ final class DispatcherHooks: @unchecked Sendable {
         set { lock.withLock { pausedValue = newValue } }
     }
 
+    /// Called when a flush cycle ends, with how it ended, on the actor and
+    /// before another cycle can start, so cycle ends reach it in the order the
+    /// cycles ran. It must not block.
+    var onCycleEnded: (@Sendable (CycleEnd) -> Void)? {
+        get { lock.withLock { cycleEnded } }
+        set { lock.withLock { cycleEnded = newValue } }
+    }
+
     /// Awaited when a flush cycle ends, whatever its outcome, so whoever awaits
     /// `flush()` sees its effects. Receives the moment a credential hold ends
-    /// when the cycle was stopped by one.
-    var onCycleFinished: (@Sendable (Int64?) async -> Void)? {
+    /// when the cycle was stopped by one, and how the cycle ended. Another
+    /// cycle can start while it runs: see ``onCycleEnded``.
+    var onCycleFinished: (@Sendable (Int64?, CycleEnd) async -> Void)? {
         get { lock.withLock { cycleFinished } }
         set { lock.withLock { cycleFinished = newValue } }
     }
@@ -200,7 +226,6 @@ actor SyncDispatcher {
     // MARK: - State
 
     private var config: DispatcherConfig
-    private var inFlight: Set<String> = []
     private var isCycleRunning = false
     private var credentialHeldUntil: Int64?
     private(set) var lastResult: StoredSyncResult?
@@ -320,13 +345,36 @@ actor SyncDispatcher {
     /// `SYNC_STARTED` before it, no history row and no item touched. A cycle
     /// already running is joined rather than gated, so its listeners never see
     /// a `SYNC_FAILED` in the middle of it.
+    ///
+    /// A cancelled caller, a BGTask whose time expired, gets `CancellationError`.
+    /// Cancelled before its cycle starts, the flush emits nothing. Cancelled
+    /// during it, the cycle claims no further item, the request in flight is
+    /// cancelled and its item goes back to `PENDING` with the attempt its
+    /// claim spent refunded, and `lastAttemptAt` as the claim set it when
+    /// `URLSession` had the request (it may have reached the server) or as it
+    /// was before the claim when it never did, and `SYNC_FAILED` ends the cycle without
+    /// `errorCode` or `metadata`: nothing failed, and no history row is kept.
+    /// A response that arrived before the cancellation is recorded as usual.
+    /// A `CancellationError` thrown while the caller's task is not cancelled,
+    /// by a callee say, also ends the cycle with `SYNC_FAILED` without a code,
+    /// but counts as a cycle that died for the wait after it.
+    ///
+    /// A cycle that dies for any other reason, a write that fails say, ends
+    /// with `SYNC_FAILED` and its code (see ``cycleFailureCode(_:)``: a cause
+    /// that is not a `SyncProviderError` is `NETWORK_ERROR`), and the row whose outcome
+    /// could not be written is settled first: with that outcome, as the
+    /// normal path records it, when its request went out (a 2xx delivered, a
+    /// failure retried or dead-lettered with its own code, a stale credential
+    /// held); as it was before its claim when the request never went out.
     func flushOutcome() async throws -> FlushOutcome {
+        try Task.checkCancellation()
         if let early = exitBeforeCycle() {
             return early
         }
         // Only suspends while the path is still unknown, and during that wait
         // a pause, a configuration or another flush can land.
         let blockingQuality = await networkQualityBlock()
+        try Task.checkCancellation()
         if let early = exitBeforeCycle() {
             return early
         }
@@ -338,6 +386,7 @@ actor SyncDispatcher {
         }
         // Suspends for the HEAD, if one is sent.
         let unhealthy = await healthCheckFails()
+        try Task.checkCancellation()
         if let early = exitBeforeCycle() {
             return early
         }
@@ -354,23 +403,35 @@ actor SyncDispatcher {
 
         do {
             let result = try await runCycle(startedAt: startedAt)
-            await finishCycle()
+            await finishCycle(.completed)
             return .ran(result)
         } catch {
             // Listeners track a cycle from SYNC_STARTED to its terminal event,
-            // so a cycle that dies must still end with one.
-            emitter.emit(.now(type: "SYNC_FAILED",
-                              errorCode: wrapAsSyncProviderError(error).code.stringValue))
-            await finishCycle()
+            // so a cycle that dies must still end with one. A cancelled cycle
+            // failed nothing, so its event carries no code.
+            if error is CancellationError {
+                emitter.emit(.now(type: "SYNC_FAILED"))
+            } else {
+                emitter.emit(.now(type: "SYNC_FAILED", errorCode: Self.cycleFailureCode(error)))
+            }
+            // Only a cancellation of the cycle's own task ends it as
+            // cancelled. A CancellationError thrown while that task runs on,
+            // by a callee say, is a failure, and the wait after a cycle that
+            // died applies to it, as on Android.
+            let cancelled = error is CancellationError && Task.isCancelled
+            await finishCycle(cancelled ? .cancelled : .aborted)
             throw error
         }
     }
 
-    private func finishCycle() async {
+    private func finishCycle(_ end: CycleEnd) async {
+        // Before the next cycle can start: the follow-up below suspends, and
+        // a whole cycle could run before it does.
+        hooks.onCycleEnded?(end)
         isCycleRunning = false
         let notBefore = credentialHeldUntil
         credentialHeldUntil = nil
-        await hooks.onCycleFinished?(notBefore)
+        await hooks.onCycleFinished?(notBefore, end)
     }
 
     /// The outcome of a flush that must not start a cycle, or `nil` when one
@@ -450,6 +511,9 @@ actor SyncDispatcher {
         let total = pending.count
 
         dispatchLoop: for (index, item) in pending.enumerated() {
+            // A cancelled cycle claims nothing more: the BGTask it runs for
+            // has run out of time.
+            try Task.checkCancellation()
             if isPaused { break }
 
             // A budget spent before this cycle, by a `maxAttempts` lowered
@@ -467,11 +531,9 @@ actor SyncDispatcher {
                 continue
             }
 
-            inFlight.insert(item.id)
             // A purge since the batch was read, a logout say, leaves this item
             // nothing to send: no request and no event of its own.
             guard try await storage.markInFlight(id: item.id) else {
-                inFlight.remove(item.id)
                 emitProgress(index: index, total: total)
                 continue
             }
@@ -480,34 +542,58 @@ actor SyncDispatcher {
             // `configureSync` can land while the request is out. Its answer is
             // about the credential it carried, not the one configured since.
             let sentWith = config
-            let outcome = await dispatchOne(item: item)
-            inFlight.remove(item.id)
+            let outcome: ItemDispatchOutcome
+            switch await dispatchOne(item: item) {
+            case let .answered(answered):
+                outcome = answered
+            case let .cancelled(requestSent):
+                // Cancelled before an answer came: there is no outcome to
+                // record. The attempt is refunded, so the next cycle sends the
+                // item again. The claim's time stays when URLSession had the
+                // request, which may have reached the server; otherwise the
+                // row keeps the time it had before its claim.
+                do {
+                    try await storage.releaseClaim(id: item.id,
+                                                   attempts: item.attempts,
+                                                   lastAttemptAt: requestSent ? nil : (item.lastAttemptAt ?? 0))
+                } catch {
+                    // Still a cancellation, which failed nothing: the row
+                    // waits IN_FLIGHT for launch recovery.
+                    SyncLogger.error("Could not give a cancelled request's row back: \(error.localizedDescription)",
+                                     category: "dispatcher")
+                }
+                throw CancellationError()
+            }
 
             emitProgress(index: index, total: total)
 
-            if outcome.succeeded {
-                succeededIds.append(item.id)
-                try await storage.remove(id: item.id)
-                emitter.emit(.now(type: "ITEM_SUCCEEDED",
-                                  itemId: item.id,
-                                  statusCode: outcome.statusCode.map(Double.init),
-                                  attempt: Double(item.attempts + 1)))
-            } else {
-                // Decides retry vs. terminal failure, persists the retry
-                // cooldown, and emits the event.
-                switch try await recordFailureOutcome(item: item, outcome: outcome, sentWith: sentWith) {
-                case .retrying:
-                    break // kept PENDING with a cooldown; not counted as failed
-                case let .failed(_, message):
-                    failedIds.append(item.id)
-                    if firstError == nil {
-                        firstError = message
+            do {
+                if outcome.succeeded {
+                    succeededIds.append(item.id)
+                    try await storage.remove(id: item.id)
+                    emitSucceeded(item: item, outcome: outcome)
+                } else {
+                    // Decides retry vs. terminal failure, persists the retry
+                    // cooldown, and emits the event.
+                    switch try await recordFailureOutcome(item: item, outcome: outcome, sentWith: sentWith) {
+                    case .retrying:
+                        break // kept PENDING with a cooldown; not counted as failed
+                    case let .failed(_, message):
+                        failedIds.append(item.id)
+                        if firstError == nil {
+                            firstError = message
+                        }
+                    case let .credentialRejected(heldUntil):
+                        // The next item would carry the same rejected credential.
+                        credentialHeldUntil = heldUntil
+                        break dispatchLoop
                     }
-                case let .credentialRejected(heldUntil):
-                    // The next item would carry the same rejected credential.
-                    credentialHeldUntil = heldUntil
-                    break dispatchLoop
                 }
+            } catch {
+                // The outcome could not be written, and the cycle dies with
+                // `error`. Its row must not wait IN_FLIGHT for the next launch.
+                await settleUnrecorded(item: item, outcome: outcome, sentWith: sentWith)
+                throw error
             }
         }
 
@@ -534,6 +620,13 @@ actor SyncDispatcher {
         }
 
         return result
+    }
+
+    private func emitSucceeded(item: StoredSyncItem, outcome: ItemDispatchOutcome) {
+        emitter.emit(.now(type: "ITEM_SUCCEEDED",
+                          itemId: item.id,
+                          statusCode: outcome.statusCode.map(Double.init),
+                          attempt: Double(item.attempts + 1)))
     }
 
     private func emitProgress(index: Int, total: Int) {
@@ -609,63 +702,172 @@ actor SyncDispatcher {
     func recordFailureOutcome(item: StoredSyncItem,
                               outcome: ItemDispatchOutcome,
                               sentWith: DispatcherConfig) async throws -> FailureDisposition {
-        let attemptsAfter = item.attempts + 1
+        switch failureDecision(item: item, outcome: outcome, sentWith: sentWith) {
+        case let .credentialHold(holdMs):
+            let heldUntil = try await storage.markCredentialRejected(id: item.id,
+                                                                     errorCode: outcome.errorCode,
+                                                                     retryDelayMs: holdMs,
+                                                                     attempts: item.attempts)
+            emitRetrying(item: item, outcome: outcome)
+            return .credentialRejected(heldUntil: heldUntil)
+        case let .deadLetter(errorCode, message):
+            let moved = try await storage.moveToDeadLetters(id: item.id,
+                                                            errorCode: errorCode,
+                                                            errorMessage: Self.deadLetterMessage(for: outcome,
+                                                                                                 fallback: message))
+            // A row removed while its request was out has nothing to move.
+            emitFailed(item: item, outcome: outcome, errorCode: errorCode, deadLettered: moved)
+            return .failed(errorCode: errorCode, message: message)
+        case let .retry(delayMs):
+            // Park the item behind a backoff cooldown so it is not
+            // re-dispatched until `now + delay`.
+            try await storage.markPendingForRetry(id: item.id,
+                                                  errorCode: outcome.errorCode,
+                                                  retryDelayMs: delayMs)
+            emitRetrying(item: item, outcome: outcome)
+            return .retrying(attempt: item.attempts + 1)
+        }
+    }
 
+    /// What a failed attempt does to its row. Decided here for the normal
+    /// path and for the settle of a cycle that dies before writing it, so the
+    /// two cannot differ.
+    private enum FailureDecision {
+        /// A 401/403 to default headers read back from storage: the attempt is
+        /// refunded, and the row waits `holdMs`.
+        case credentialHold(holdMs: Int)
+        /// Retryable, with attempts left: the row cools for `delayMs`.
+        case retry(delayMs: Int)
+        /// Permanent, or retryable with no attempt left.
+        case deadLetter(errorCode: String, message: String)
+    }
+
+    private func failureDecision(item: StoredSyncItem,
+                                 outcome: ItemDispatchOutcome,
+                                 sentWith: DispatcherConfig) -> FailureDecision {
+        let attemptsAfter = item.attempts + 1
         if isStaleCredentialRejection(outcome, sentWith: sentWith) {
             let delayMs = RetryPolicyEvaluator.nextDelayMs(attempt: Int(attemptsAfter),
                                                            policy: config.retryPolicy)
-            let heldUntil = try await storage.markCredentialRejected(id: item.id,
-                                                                     errorCode: outcome.errorCode,
-                                                                     retryDelayMs: max(delayMs, kMinCredentialHoldMs),
-                                                                     attempts: item.attempts)
-            emitter.emit(.now(type: "ITEM_RETRYING",
-                              itemId: item.id,
-                              errorCode: outcome.errorCode,
-                              statusCode: outcome.statusCode.map(Double.init),
-                              attempt: Double(attemptsAfter)))
-            return .credentialRejected(heldUntil: heldUntil)
+            return .credentialHold(holdMs: max(delayMs, kMinCredentialHoldMs))
         }
-
         let isRetryable = decideRetry(outcome: outcome, statusCode: outcome.statusCode)
         let exhausted = Int(attemptsAfter) >= config.retryPolicy.maxAttempts
-
         guard isRetryable && !exhausted else {
             let finalErrorCode = isRetryable
                 ? "MAX_ATTEMPTS_EXCEEDED"
                 : (outcome.errorCode ?? "NETWORK_ERROR")
-            let message = outcome.errorMessage ?? finalErrorCode
-            let moved = try await storage.moveToDeadLetters(id: item.id,
-                                                            errorCode: finalErrorCode,
-                                                            errorMessage: Self.deadLetterMessage(for: outcome,
-                                                                                                 fallback: message))
-            emitter.emit(.now(type: "ITEM_FAILED",
-                              itemId: item.id,
-                              errorCode: finalErrorCode,
-                              statusCode: outcome.statusCode.map(Double.init),
-                              attempt: Double(attemptsAfter)))
-            // A row removed while its request was out has nothing to move.
-            if moved {
-                emitter.emit(.now(type: "ITEM_DEAD_LETTERED",
-                                  itemId: item.id,
-                                  errorCode: "DEAD_LETTERED",
-                                  metadata: ["lastErrorCode": finalErrorCode]))
-            }
-            return .failed(errorCode: finalErrorCode, message: message)
+            return .deadLetter(errorCode: finalErrorCode, message: outcome.errorMessage ?? finalErrorCode)
         }
+        return .retry(delayMs: RetryPolicyEvaluator.nextDelayMs(attempt: Int(attemptsAfter),
+                                                                policy: config.retryPolicy))
+    }
 
-        // Retryable and attempts remain: park the item behind a backoff
-        // cooldown so it is not re-dispatched until `now + delay`.
-        let delayMs = RetryPolicyEvaluator.nextDelayMs(attempt: Int(attemptsAfter),
-                                                       policy: config.retryPolicy)
-        try await storage.markPendingForRetry(id: item.id,
-                                              errorCode: outcome.errorCode,
-                                              retryDelayMs: delayMs)
+    private func emitRetrying(item: StoredSyncItem, outcome: ItemDispatchOutcome) {
         emitter.emit(.now(type: "ITEM_RETRYING",
                           itemId: item.id,
                           errorCode: outcome.errorCode,
                           statusCode: outcome.statusCode.map(Double.init),
-                          attempt: Double(attemptsAfter)))
-        return .retrying(attempt: attemptsAfter)
+                          attempt: Double(item.attempts + 1)))
+    }
+
+    private func emitFailed(item: StoredSyncItem,
+                            outcome: ItemDispatchOutcome,
+                            errorCode: String,
+                            deadLettered: Bool) {
+        emitter.emit(.now(type: "ITEM_FAILED",
+                          itemId: item.id,
+                          errorCode: errorCode,
+                          statusCode: outcome.statusCode.map(Double.init),
+                          attempt: Double(item.attempts + 1)))
+        if deadLettered {
+            emitter.emit(.now(type: "ITEM_DEAD_LETTERED",
+                              itemId: item.id,
+                              errorCode: "DEAD_LETTERED",
+                              metadata: ["lastErrorCode": errorCode]))
+        }
+    }
+
+    /// The code a cycle that dies of `error` reports on its `SYNC_FAILED`: a
+    /// `SyncProviderError` keeps its own, and any
+    /// other cause, a Core Data write that fails say, is `NETWORK_ERROR`, as
+    /// on Android, the code the docs give a cycle that dies. The bridge's
+    /// fallback for a rejected call, `INVALID_PAYLOAD`, which the docs call
+    /// permanent, is not used here.
+    static func cycleFailureCode(_ error: Error) -> String {
+        guard let failure = error as? SyncProviderError else {
+            return SyncErrorCode.networkError.stringValue
+        }
+        return failure.code.stringValue
+    }
+
+    /// Settles the row of an item whose outcome could not be written, before
+    /// its cycle dies. `item` is the snapshot from before the claim, which
+    /// already counted the attempt, and `sentWith` the configuration the
+    /// request went out with.
+    ///
+    /// When the request went out, the settle applies the outcome that could
+    /// not be written, in its own transaction, as the normal path records it:
+    /// a 2xx removes the row as delivered, with `ITEM_SUCCEEDED`; a retryable
+    /// failure cools it with the retry policy's backoff and its own code, or,
+    /// with no budget left, ends as `MAX_ATTEMPTS_EXCEEDED`; a permanent one
+    /// moves it to the dead-letter store with its own code; a 401 or 403 to
+    /// default headers read back from storage refunds the attempt and holds
+    /// the row, and the hold reaches the wake armed after the cycle. Each one
+    /// comes with the normal path's events. Every request that went out has
+    /// an outcome here: a failure during the send is a transport error, which
+    /// the classifier turns into one (`NETWORK_ERROR` or `TIMEOUT`, say). A
+    /// request that never went out leaves the row as it was before its claim,
+    /// with no event. When this write fails too, the row waits `IN_FLIGHT`
+    /// for launch recovery.
+    ///
+    /// Only a row still `IN_FLIGHT` is settled, as on Android: a row purged
+    /// since, a logout say, stays gone and gets no event. The credential
+    /// hold applies either way.
+    private func settleUnrecorded(item: StoredSyncItem,
+                                  outcome: ItemDispatchOutcome,
+                                  sentWith: DispatcherConfig) async {
+        do {
+            guard outcome.requestSent else {
+                try await storage.releaseClaim(id: item.id,
+                                               attempts: item.attempts,
+                                               lastAttemptAt: item.lastAttemptAt ?? 0)
+                return
+            }
+            if outcome.succeeded {
+                let settled = try await storage.settleClaim(id: item.id, .delivered)
+                if settled.applied {
+                    emitSucceeded(item: item, outcome: outcome)
+                }
+                return
+            }
+            let decision = failureDecision(item: item, outcome: outcome, sentWith: sentWith)
+            let settlement: ClaimSettlement
+            switch decision {
+            case let .credentialHold(holdMs):
+                settlement = .credentialHold(errorCode: outcome.errorCode, holdMs: holdMs, attempts: item.attempts)
+            case let .retry(delayMs):
+                settlement = .retry(errorCode: outcome.errorCode, delayMs: delayMs)
+            case let .deadLetter(errorCode, message):
+                settlement = .deadLetter(errorCode: errorCode,
+                                         errorMessage: Self.deadLetterMessage(for: outcome, fallback: message))
+            }
+            let settled = try await storage.settleClaim(id: item.id, settlement)
+            if let heldUntil = settled.heldUntil {
+                credentialHeldUntil = heldUntil
+            }
+            guard settled.applied else { return }
+            switch decision {
+            case .credentialHold, .retry:
+                emitRetrying(item: item, outcome: outcome)
+            case let .deadLetter(errorCode, _):
+                emitFailed(item: item, outcome: outcome, errorCode: errorCode, deadLettered: true)
+            }
+        } catch {
+            SyncLogger.error("Could not settle the row of a cycle that died; it waits for launch recovery: "
+                             + error.localizedDescription,
+                             category: "dispatcher")
+        }
     }
 
     /// What a dead letter says about the failure that ended it: for an HTTP
@@ -704,13 +906,24 @@ actor SyncDispatcher {
 
     // MARK: - Single-item dispatch
 
-    private func dispatchOne(item: StoredSyncItem) async -> ItemDispatchOutcome {
+    /// What one ``dispatchOne(item:)`` came to.
+    private enum DispatchResult {
+        /// The outcome to record: an answer, a transport error, or a request
+        /// that could not be sent (see ``ItemDispatchOutcome/requestSent``).
+        case answered(ItemDispatchOutcome)
+        /// The caller was cancelled before an answer came. `requestSent` is
+        /// `false` when the request was never handed to `URLSession`.
+        case cancelled(requestSent: Bool)
+    }
+
+    private func dispatchOne(item: StoredSyncItem) async -> DispatchResult {
         guard let url = URL(string: item.url), url.scheme?.hasPrefix("http") == true else {
-            return ItemDispatchOutcome(itemId: item.id,
-                                       succeeded: false,
-                                       statusCode: nil,
-                                       errorCode: "INVALID_URL",
-                                       errorMessage: "Invalid URL: \(item.url)")
+            return .answered(ItemDispatchOutcome(itemId: item.id,
+                                                 succeeded: false,
+                                                 statusCode: nil,
+                                                 errorCode: "INVALID_URL",
+                                                 errorMessage: "Invalid URL: \(item.url)",
+                                                 requestSent: false))
         }
 
         var request = URLRequest(url: url)
@@ -735,6 +948,7 @@ actor SyncDispatcher {
         let bodyData = (item.body ?? "").data(using: .utf8)
 
         let useBackground = await shouldUseBackgroundSession()
+        guard !Task.isCancelled else { return .cancelled(requestSent: false) }
 
         if useBackground, let bodyData = bodyData {
             return await dispatchOnBackground(request: request, body: bodyData, item: item)
@@ -744,7 +958,7 @@ actor SyncDispatcher {
 
     private func dispatchOnForeground(request: URLRequest,
                                       body: Data?,
-                                      item: StoredSyncItem) async -> ItemDispatchOutcome {
+                                      item: StoredSyncItem) async -> DispatchResult {
         var requestCopy = request
         if let body = body, !body.isEmpty {
             requestCopy.httpBody = body
@@ -753,43 +967,58 @@ actor SyncDispatcher {
         do {
             let (_, response) = try await foregroundSession.data(for: requestCopy)
             let statusCode = (response as? HTTPURLResponse)?.statusCode
-            return classifyResponse(itemId: item.id, statusCode: statusCode, transportError: nil)
+            return .answered(classifyResponse(itemId: item.id, statusCode: statusCode, transportError: nil))
         } catch {
-            return classifyResponse(itemId: item.id, statusCode: nil, transportError: error)
+            // Cancelling the caller cancels the request: that is no answer,
+            // and must not spend an attempt as a NETWORK_ERROR. URLSession had
+            // the request, which may have reached the server.
+            if Task.isCancelled { return .cancelled(requestSent: true) }
+            return .answered(classifyResponse(itemId: item.id, statusCode: nil, transportError: error))
         }
     }
 
     private func dispatchOnBackground(request: URLRequest,
                                       body: Data,
-                                      item: StoredSyncItem) async -> ItemDispatchOutcome {
+                                      item: StoredSyncItem) async -> DispatchResult {
         // Background `URLSession` requires the request body to be on disk.
         let tmpURL = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("syncprovider-\(item.id).body")
         do {
             try body.write(to: tmpURL, options: .atomic)
         } catch {
-            return classifyResponse(itemId: item.id, statusCode: nil, transportError: error)
+            var outcome = classifyResponse(itemId: item.id, statusCode: nil, transportError: error)
+            outcome.requestSent = false
+            return .answered(outcome)
         }
 
         let task = backgroundSession.uploadTask(with: request, fromFile: tmpURL)
         task.taskDescription = item.id
+        let wait = BackgroundUploadWait()
 
-        return await withCheckedContinuation { (continuation: CheckedContinuation<ItemDispatchOutcome, Never>) in
-            backgroundDelegate.registerCompletion(itemId: item.id) { [weak self] outcome in
-                // Best-effort cleanup of the body file.
-                try? FileManager.default.removeItem(at: tmpURL)
-                let result = self?.classifyResponseSync(itemId: outcome.itemId,
-                                                        statusCode: outcome.statusCode,
-                                                        transportError: outcome.error)
-                    ?? ItemDispatchOutcome(itemId: outcome.itemId,
-                                           succeeded: false,
-                                           statusCode: outcome.statusCode,
-                                           errorCode: "NETWORK_ERROR",
-                                           errorMessage: outcome.error?.localizedDescription)
-                continuation.resume(returning: result)
+        // The wait ends once, at the session's completion or at a
+        // cancellation of the caller, whichever comes first. A cancellation
+        // also cancels the upload: its completion, when it comes, is dropped.
+        let completed = await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<BackgroundDispatchOutcome?, Never>) in
+                guard wait.install(continuation) else { return }
+                backgroundDelegate.registerCompletion(for: task) { outcome in
+                    wait.finish(outcome)
+                }
+                task.resume()
             }
-            task.resume()
+        } onCancel: {
+            wait.cancel()
+            task.cancel()
         }
+        backgroundDelegate.unregisterCompletion(for: task)
+        // Best-effort cleanup of the body file.
+        try? FileManager.default.removeItem(at: tmpURL)
+
+        // A wait the cancellation ended first never started its upload.
+        guard let completed else { return .cancelled(requestSent: wait.started) }
+        return .answered(classifyResponseSync(itemId: completed.itemId,
+                                              statusCode: completed.statusCode,
+                                              transportError: completed.error))
     }
 
     /// `true` when an upload must survive the app leaving the foreground. A

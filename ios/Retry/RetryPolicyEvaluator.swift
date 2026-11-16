@@ -3,9 +3,15 @@
 //  SyncProvider
 //
 //  Pure-Swift implementation of the retry-backoff math. Mirrors the JS
-//  implementation in `src/utils/retryBackoff.ts` 1:1 so behavior is consistent
-//  across platforms and the JS-side `SyncOptions.retryPolicy` produces the
-//  same delay sequence it would on iOS.
+//  implementation in `src/utils/retryBackoff.ts`, so the JS-side
+//  `SyncOptions.retryPolicy` produces the same delay sequence on iOS for the
+//  numbers both read alike. iOS reads the policy's numbers after
+//  `NumericOption` converted them, and leaves the JS curve where that
+//  conversion changes a number: NaN, ±Infinity and 2^63 or more follow the
+//  conversion, and a fractional `baseDelayMs` or `maxDelayMs` is truncated to
+//  whole milliseconds before the curve, where JS keeps the fraction and
+//  rounds the result. A base of 1000.5 ms gives a first delay of 1000 ms on
+//  iOS and 1001 ms in JS, and a `maxDelayMs` between 0 and 1 is no cap here.
 //
 
 import Foundation
@@ -13,18 +19,82 @@ import Foundation
 /// Sendable Swift mirror of `RetryPolicy` to keep this layer free of the
 /// generated `margelo.nitro.syncprovider.RetryPolicy` C++ type. Constructed by
 /// the bridge.
+///
+/// It keeps the numbers as `configureSync` received them, NaN and ±Infinity
+/// included: that is what is persisted and what `getSyncConfig()` echoes, as
+/// on Android. They are converted where they are read, through
+/// ``NumericOption``, so no number can trap, at the call or at a later launch.
 struct RetryPolicyValue: Sendable, Equatable {
-    let maxAttempts: Int
+    /// `maxAttempts` as given. Read ``maxAttempts``.
+    let rawMaxAttempts: Double
     let backoff: Backoff
-    let baseDelayMs: Int
-    let maxDelayMs: Int
+    /// `baseDelayMs` as given. Read ``baseDelayMs``.
+    let rawBaseDelayMs: Double
+    /// `maxDelayMs` as given. Read ``maxDelayMs``.
+    let rawMaxDelayMs: Double
     let jitter: Bool
-    let retryOnStatusCodes: [Int]
+    /// `retryOnStatusCodes` as given. Read ``retryOnStatusCodes``.
+    let rawRetryOnStatusCodes: [Double]
 
     enum Backoff: String, Sendable {
         case linear = "LINEAR"
         case exponential = "EXPONENTIAL"
         case fibonacci = "FIBONACCI"
+    }
+
+    /// The policy as the bridge received it.
+    init(rawMaxAttempts: Double,
+         backoff: Backoff,
+         rawBaseDelayMs: Double,
+         rawMaxDelayMs: Double,
+         jitter: Bool,
+         rawRetryOnStatusCodes: [Double]) {
+        self.rawMaxAttempts = rawMaxAttempts
+        self.backoff = backoff
+        self.rawBaseDelayMs = rawBaseDelayMs
+        self.rawMaxDelayMs = rawMaxDelayMs
+        self.jitter = jitter
+        self.rawRetryOnStatusCodes = rawRetryOnStatusCodes
+    }
+
+    /// A policy of whole numbers, such as the default one.
+    init(maxAttempts: Int,
+         backoff: Backoff,
+         baseDelayMs: Int,
+         maxDelayMs: Int,
+         jitter: Bool,
+         retryOnStatusCodes: [Int]) {
+        self.init(rawMaxAttempts: Double(maxAttempts),
+                  backoff: backoff,
+                  rawBaseDelayMs: Double(baseDelayMs),
+                  rawMaxDelayMs: Double(maxDelayMs),
+                  jitter: jitter,
+                  rawRetryOnStatusCodes: retryOnStatusCodes.map(Double.init))
+    }
+
+    /// The attempt budget, from 1 to 2147483647. See ``NumericOption/count(_:)``.
+    var maxAttempts: Int {
+        NumericOption.count(rawMaxAttempts)
+    }
+
+    /// The base delay in whole milliseconds. See ``NumericOption/delayMs(_:)``.
+    /// With a `maxDelayMs` of NaN it reads as 0, so every delay is 0: that is
+    /// what Android computes for a NaN cap.
+    var baseDelayMs: Int {
+        rawMaxDelayMs.isNaN ? 0 : NumericOption.delayMs(rawBaseDelayMs)
+    }
+
+    /// The cap in whole milliseconds, where 0 or less means no cap. See
+    /// ``NumericOption/delayMs(_:)``: +Infinity caps at the delay ceiling,
+    /// which caps nothing either.
+    var maxDelayMs: Int {
+        NumericOption.delayMs(rawMaxDelayMs)
+    }
+
+    /// The status codes to retry, truncated, without the entries that could
+    /// match no status. See ``NumericOption/statusCodes(_:)``.
+    var retryOnStatusCodes: [Int] {
+        NumericOption.statusCodes(rawRetryOnStatusCodes)
     }
 
     /// Default policy matching the JS facade defaults.
@@ -51,7 +121,8 @@ enum RetryPolicyEvaluator {
     ///
     /// - Parameter random: a sample in `0..<1` for the jitter factor. Tests
     ///   inject it to pin the bounds of the range.
-    /// - Important: **must** match `src/utils/retryBackoff.ts`.
+    /// - Important: **must** match `src/utils/retryBackoff.ts` for the
+    ///   numbers it reads, which ``RetryPolicyValue`` has already converted.
     static func nextDelayMs(attempt: Int,
                             policy: RetryPolicyValue,
                             random: () -> Double = { Double.random(in: 0..<1) }) -> Int {
@@ -81,6 +152,21 @@ enum RetryPolicyEvaluator {
         let cap = policy.maxDelayMs > 0 ? Double(policy.maxDelayMs) : raw
         let clamped = min(max(0, raw), cap, maxRepresentableDelayMs)
         return Int(clamped.rounded())
+    }
+
+    /// The latest retry deadline, in epoch ms: the largest valid JavaScript
+    /// `Date`. It is below 2^53, so a JS number holds it exactly. Android
+    /// stops its deadlines at the same value.
+    static let maxDeadlineMs: Int64 = 8_640_000_000_000_000
+
+    /// The deadline `delayMs` after `fromMs`, never past ``maxDeadlineMs``:
+    /// a delay at the ceiling of ``nextDelayMs(attempt:policy:random:)``,
+    /// 2^53 - 1 ms, would otherwise land after any date JS can represent. The
+    /// sum saturates instead of overflowing, and a negative delay counts as 0.
+    /// The retry cooldown and the credential hold are both computed here.
+    static func deadline(fromMs: Int64, delayMs: Int) -> Int64 {
+        let (sum, overflowed) = fromMs.addingReportingOverflow(Int64(max(0, delayMs)))
+        return overflowed ? maxDeadlineMs : min(sum, maxDeadlineMs)
     }
 
     /// Decide whether an HTTP response should be retried.

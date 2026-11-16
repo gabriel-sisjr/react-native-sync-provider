@@ -48,7 +48,7 @@ function useAutoSync(options: UseAutoSyncExtraOptions): void
 | `flushOnForeground` | `boolean` | No | -- | **Reserved.** The hook ignores it. Use `flushOnAppForeground`. |
 | `backgroundSync` | [`BackgroundSyncOptions`](../types.md#backgroundsyncoptions) | No | -- | **Reserved.** The hook ignores it. Call [`enableBackgroundSync`](../functions.md#enablebackgroundsync), or pass `backgroundSync` to [`<SyncProvider>`](../context.md). |
 
-> **Note — Flushes are skipped while offline:** The interval and the foreground trigger read the connection status first and do nothing while it is `DISCONNECTED`, because a flush while offline can spend retry attempts and send valid items to the dead-letter queue. `UNKNOWN` and `METERED` still flush. See [Skip flushes while offline](#skip-the-interval-while-offline).
+> **Note — Flushes are skipped while offline:** The interval and the foreground trigger read the connection status first and do nothing while it is `DISCONNECTED`, because a flush while offline can spend retry attempts: on Android until valid items reach the dead-letter queue, and on iOS one, while the flush waits for the network. `UNKNOWN` and `METERED` still flush. See [Skip flushes while offline](#skip-the-interval-while-offline).
 >
 > With [`minNetworkQuality`](../types.md#syncoptions) set, the native gate also checks every flush the hook starts: below the minimum, that flush runs no cycle and emits `SYNC_FAILED` with `NETWORK_QUALITY_TOO_LOW`.
 >

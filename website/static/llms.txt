@@ -27,10 +27,10 @@ A cross-platform React Native library for offline-first HTTP sync built on Nitro
 ## Facts that are easy to get wrong
 
 - `enqueue` stores an item. It does not dispatch it, under any strategy. A flush does, from `useAutoSync`, `flush()`, `drainUntilEmpty()` or an OS background window. After `resumeSync()`, and on iOS also after a failed health check, the retry timer flushes items with no cooldown too, unless the strategy is `MANUAL`. `replayDeadLetter()` does not flush either.
-- `AUTOMATIC` means the engine retries failed items on its own: an in-process timer, plus the Android retry kick while background sync is enabled. Enqueueing does not trigger a native flush, and a reconnect alone does not either: only a retry wake the timer held while offline runs then.
+- `AUTOMATIC` means the engine retries failed items on its own: an in-process timer, plus the Android retry kick while background sync is enabled. Enqueueing does not trigger a native flush, and a reconnect alone does not either: only a retry wake the timer held while offline runs then. After a cycle that dies, automatic wakes wait a failure hold: 30 s from its end, doubling for each cycle in a row that dies, up to 15 min. `resumeSync()`, `flush()`, `useAutoSync` and the OS background windows do not wait for it.
 - `MANUAL` stops the engine from scheduling flushes, not `useAutoSync`: the hook never reads the strategy. Pass `enabled: false` for a manual flow.
 - Each cycle dispatches one batch of eligible items, up to `batchSize` (default 25). Use `drainUntilEmpty()` to loop.
-- `flush()` checks connectivity only through `minNetworkQuality`. Unset, a flush while offline can spend retry attempts and move valid items to the dead-letter queue. `minNetworkQuality: 'POOR'` blocks only `OFFLINE`. `useAutoSync`'s interval and foreground flushes, the native retry timer and `drainUntilEmpty()` do not flush while `DISCONNECTED`.
+- `flush()` checks connectivity only through `minNetworkQuality`. Unset, a flush while offline costs attempts: on Android it can spend retry attempts and move valid items to the dead-letter queue, and on iOS it waits for the network with its first item claimed and one attempt spent. `minNetworkQuality: 'POOR'` blocks only `OFFLINE`. `useAutoSync`'s interval and foreground flushes, the native retry timer and `drainUntilEmpty()` do not flush while `DISCONNECTED`.
 - Per-item failures never reject. Read them from `ITEM_FAILED` events. A permanent failure moves the item to the dead-letter queue: `ITEM_FAILED`, then `ITEM_DEAD_LETTERED`. Nothing prunes that queue: replay or discard each dead letter.
 - A cycle the quality gate or the health check skips runs nothing: `SYNC_FAILED` with `NETWORK_QUALITY_TOO_LOW` or `HEALTH_CHECK_FAILED`, no `SYNC_STARTED`, no item change, no history row, and a 0/0 result.
 - Without `healthCheckUrl`, `networkQuality` never reaches `EXCELLENT`, so `minNetworkQuality: 'EXCELLENT'` blocks every flush. Compare levels by their index in `Object.values(NetworkQuality)`, never as strings.
@@ -63,15 +63,15 @@ A cross-platform React Native library for offline-first HTTP sync built on Nitro
 - `cancelDrain()` — Hard stop for a running drain. A no-op when none runs.
 - `pauseSync()` — Pause until `resumeSync()` or the next launch. Persisted, so background workers stay inert.
 - `resumeSync()` — Resume. Dispatches pending items unless the strategy is `MANUAL`.
-- `isSyncing()` — `true` while a cycle is running.
+- `isSyncing()` — `true` only while a cycle runs, once a flush has passed its pause, credentials, quality-gate and health-check checks.
 
 ### Configuration Functions
 - `configureSync(options)` — Replace and persist the active `SyncOptions`. Validates `minNetworkQuality`, `healthCheckUrl`, `healthCheckTtlMs` and `healthCheckBackoffMs` in JS.
-- `getSyncConfig()` — Read the active `SyncOptions`. Those four options appear only when they were set.
+- `getSyncConfig()` — Read the active `SyncOptions`. Those four options appear only when they were set. Numbers come back as configured, NaN and `±Infinity` included.
 
 ### History Functions
 - `getLastSyncResult()` — Most recent persisted `SyncResult`, or `undefined`.
-- `getSyncHistory(limit?)` — Persisted results, most recent first. No limit when omitted.
+- `getSyncHistory(limit?)` — Persisted results, most recent first. No limit when omitted, `0`, negative, NaN or `-Infinity`. `+Infinity` and 2^31 or more mean 2147483647, and fractions truncate.
 - `clearSyncHistory()` — Drop persisted history. The queue is untouched.
 
 ### Connection Functions

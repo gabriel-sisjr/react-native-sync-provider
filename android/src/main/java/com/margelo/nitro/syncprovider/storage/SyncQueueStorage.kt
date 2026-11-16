@@ -14,6 +14,7 @@ import com.margelo.nitro.syncprovider.database.SyncItemDao
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
 import com.margelo.nitro.syncprovider.database.SyncResultDao
 import com.margelo.nitro.syncprovider.database.ReplayOutcome
+import com.margelo.nitro.syncprovider.database.ScheduledRetry
 import com.margelo.nitro.syncprovider.database.SyncResultEntity
 import com.margelo.nitro.syncprovider.error.SyncException
 import com.margelo.nitro.syncprovider.util.JsonMap
@@ -25,6 +26,41 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import java.util.UUID
+
+/** What a cycle writes for one row it claimed and leaves without a recorded outcome. */
+internal sealed interface AbortedClaim {
+  val id: String
+
+  /** Back to `PENDING` as it was: its request never went out, or a cancellation ended the cycle. */
+  data class Unsent(override val id: String) : AbortedClaim
+
+  /** Its request was answered with a `2xx`: the row is removed, as delivered. */
+  data class Delivered(override val id: String) : AbortedClaim
+
+  /**
+   * Back to `PENDING` with these values: a retry, which counts its attempt, or a credential hold,
+   * which does not. The row waits for [nextRetryAt].
+   */
+  data class Retry(
+    override val id: String,
+    val attempts: Int,
+    val lastAttemptAt: Long,
+    val lastErrorCode: SyncErrorCode,
+    val nextRetryAt: Long,
+  ) : AbortedClaim
+
+  /** The row becomes a dead letter with these values: a permanent failure, or a spent budget. */
+  data class Exhausted(
+    val entity: SyncItemEntity,
+    val attempts: Int,
+    val lastAttemptAt: Long,
+    val lastErrorCode: SyncErrorCode,
+    val lastErrorMessage: String,
+    val deadLetteredAt: Long,
+  ) : AbortedClaim {
+    override val id: String get() = entity.id
+  }
+}
 
 /**
  * High-level persistence facade.
@@ -90,6 +126,43 @@ internal class SyncQueueStorage(
    * (`clearQueue()`, `removeItem(id)`) deletes it, or when its outcome is recorded.
    */
   suspend fun isQueued(id: String): Boolean = withContext(Dispatchers.IO) { itemDao.exists(id) }
+
+  /**
+   * Settle, in one transaction, rows a cycle claimed and leaves without an outcome: an aborted
+   * cycle's, or the rest of a batch that a rejected credential stopped. Each claim applies only
+   * to a row still `IN_FLIGHT`: a recorded or purged row, and a row that another claim holds, is
+   * untouched.
+   *
+   * @return the claims other than [AbortedClaim.Unsent] that were applied.
+   */
+  suspend fun settleAbortedClaims(claims: List<AbortedClaim>): List<AbortedClaim> =
+    withContext(Dispatchers.IO) {
+      if (claims.isEmpty()) return@withContext emptyList()
+      val applied = deadLetterDao.settleAbortedClaims(
+        unsent = claims.filterIsInstance<AbortedClaim.Unsent>().map { it.id },
+        delivered = claims.filterIsInstance<AbortedClaim.Delivered>().map { it.id },
+        retries = claims.filterIsInstance<AbortedClaim.Retry>().map {
+          ScheduledRetry(
+            id = it.id,
+            attempts = it.attempts,
+            lastAttemptAt = it.lastAttemptAt,
+            lastErrorCode = it.lastErrorCode.name,
+            nextRetryAt = it.nextRetryAt,
+          )
+        },
+        exhausted = claims.filterIsInstance<AbortedClaim.Exhausted>().map {
+          deadLetterOf(
+            entity = it.entity,
+            attempts = it.attempts,
+            lastAttemptAt = it.lastAttemptAt,
+            lastErrorCode = it.lastErrorCode,
+            lastErrorMessage = it.lastErrorMessage,
+            deadLetteredAt = it.deadLetteredAt,
+          )
+        },
+      )
+      claims.filter { it !is AbortedClaim.Unsent && it.id in applied }
+    }
 
   suspend fun pendingCount(): Int = withContext(Dispatchers.IO) {
     itemDao.countByStatus(SyncItemEntity.STATUS_PENDING)
@@ -184,25 +257,36 @@ internal class SyncQueueStorage(
     deadLetteredAt: Long,
   ): Boolean = withContext(Dispatchers.IO) {
     deadLetterDao.moveFromQueue(
-      SyncDeadLetterEntity(
-        id = entity.id,
-        method = entity.method,
-        url = entity.url,
-        headers = entity.headers,
-        body = entity.body,
-        contentType = entity.contentType,
-        priority = entity.priority,
-        priorityWeight = entity.priorityWeight,
-        createdAt = entity.createdAt,
-        metadata = entity.metadata,
-        attempts = attempts,
-        lastAttemptAt = lastAttemptAt,
-        lastErrorCode = lastErrorCode.name,
-        lastErrorMessage = lastErrorMessage?.take(SyncDeadLetterEntity.MAX_ERROR_MESSAGE_LENGTH),
-        deadLetteredAt = deadLetteredAt,
-      ),
+      deadLetterOf(entity, attempts, lastAttemptAt, lastErrorCode, lastErrorMessage, deadLetteredAt),
     )
   }
+
+  /** The dead letter [entity] becomes; [lastErrorMessage] cut to its maximum length. */
+  @Suppress("LongParameterList")
+  private fun deadLetterOf(
+    entity: SyncItemEntity,
+    attempts: Int,
+    lastAttemptAt: Long,
+    lastErrorCode: SyncErrorCode,
+    lastErrorMessage: String?,
+    deadLetteredAt: Long,
+  ): SyncDeadLetterEntity = SyncDeadLetterEntity(
+    id = entity.id,
+    method = entity.method,
+    url = entity.url,
+    headers = entity.headers,
+    body = entity.body,
+    contentType = entity.contentType,
+    priority = entity.priority,
+    priorityWeight = entity.priorityWeight,
+    createdAt = entity.createdAt,
+    metadata = entity.metadata,
+    attempts = attempts,
+    lastAttemptAt = lastAttemptAt,
+    lastErrorCode = lastErrorCode.name,
+    lastErrorMessage = lastErrorMessage?.take(SyncDeadLetterEntity.MAX_ERROR_MESSAGE_LENGTH),
+    deadLetteredAt = deadLetteredAt,
+  )
 
   suspend fun resetInFlight(): Int = withContext(Dispatchers.IO) {
     itemDao.resetInFlight()

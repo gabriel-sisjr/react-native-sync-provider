@@ -92,8 +92,11 @@ internal class SyncProviderRuntime private constructor(
   private val configStore = SyncConfigStore(appContext, secretStore)
 
   /**
-   * The active configuration. [SyncDispatcher] reads through it, so configuration
-   * changes apply on the next attempt.
+   * The active configuration, replaced at once by every [configure]. A flush cycle that is
+   * already running keeps the options it read when it started: [SyncDispatcher] reads them once
+   * per cycle, and reads only `retryOnStatusCodes` again, for each response, the response to a
+   * request already in flight included. Outside the dispatcher the new options apply at once:
+   * `maxQueueSize` from the next enqueue, and `strategy` from the retry wake [configure] re-arms.
    */
   private val configRef: AtomicReference<EngineConfig> = AtomicReference(
     configStore.load() ?: EngineConfig(defaultOptions(), ConfigSource.DEFAULTS),
@@ -121,7 +124,7 @@ internal class SyncProviderRuntime private constructor(
     networkQuality = { connectivityMonitor.qualityForGate() },
     healthCheck = healthCheck,
     onHealthCheckSkipped = { retryWake.arm() },
-    onCycleFinished = { notBefore -> retryWake.arm(notBefore) },
+    onCycleFinished = { notBefore, ending -> retryWake.arm(notBefore, ending) },
   )
 
   private val retryTimer = RetryTimer(
@@ -208,7 +211,7 @@ internal class SyncProviderRuntime private constructor(
     retryWake.armForResume()
   }
 
-  /** Arm the next retry wake from the current queue, no earlier than a credential hold. */
+  /** Arm the next retry wake from the current queue, no earlier than the holds [RetryWake] keeps. */
   suspend fun armRetryWake() {
     retryWake.arm()
   }

@@ -17,7 +17,9 @@ import com.margelo.nitro.syncprovider.http.HeadResult
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -98,6 +100,37 @@ internal class ConnectivityMonitor(
   /** Guarded by [probeLock]. */
   private var measurement: Measurement? = null
   private var probe: RunningProbe? = null
+
+  /**
+   * The statuses [set] published, in the order it published them, until [connectionEvents]
+   * emits them. Unbounded: changes are few, and none may be dropped.
+   */
+  private val pendingEvents = Channel<ConnectionStatus>(Channel.UNLIMITED)
+
+  /**
+   * The one coroutine that emits `CONNECTION_CHANGED`, a change at a time: an emit returns once
+   * the listeners have the event, so two quick changes reach them in the order they happened.
+   * A coroutine per change could run in either order. Started by the first change, it lives as
+   * long as [scope]. It holds no lock while it emits, so a listener may cause the next change, or
+   * remove a listener, without waiting for it.
+   *
+   * Nothing restarts it, so only its own cancellation, [scope]'s, may end it. An emit that fails
+   * with anything else, an [Error] or a cancellation that is not this coroutine's included, loses
+   * that one event and the next ones still go out.
+   */
+  private val connectionEvents: Job = scope.launch(start = CoroutineStart.LAZY) {
+    for (status in pendingEvents) {
+      try {
+        emitter.emit(
+          SyncEventEmitter.event(type = SyncEventType.CONNECTION_CHANGED, connectionStatus = status),
+        )
+      } catch (e: Throwable) {
+        // Rethrows when this coroutine is the one being cancelled.
+        ensureActive()
+        Log.e(TAG, "Could not emit CONNECTION_CHANGED", e)
+      }
+    }
+  }
 
   fun start() {
     if (callback != null || cm == null) return
@@ -351,22 +384,18 @@ internal class ConnectivityMonitor(
 
   /**
    * Publish [next] when it differs from the reported state in any field; the seed of [start]
-   * passes `emit = false`. The `CONNECTION_CHANGED` event is launched on [scope], after
-   * [state] already holds the new value, so it reaches listeners asynchronously; iOS delivers
-   * its event synchronously. Caller holds [stateLock].
+   * passes `emit = false`. The `CONNECTION_CHANGED` event is queued after [state] already holds
+   * the new value, under [stateLock], so the queue keeps the order of the changes, and
+   * [connectionEvents] emits it from [scope]: listeners receive it asynchronously, and
+   * `getConnectionStatus()` may already return this state, or a later one, when it arrives.
+   * Caller holds [stateLock].
    */
   private fun set(next: ConnectionState, emit: Boolean) {
     if (_state.value == next) return
     _state.value = next
     if (!emit) return
-    scope.launch {
-      emitter.emit(
-        SyncEventEmitter.event(
-          type = SyncEventType.CONNECTION_CHANGED,
-          connectionStatus = next.status,
-        ),
-      )
-    }
+    pendingEvents.trySend(next.status)
+    connectionEvents.start()
   }
 
   private data class MeasurementKey(val network: Network?, val validated: Boolean, val url: String)

@@ -9,6 +9,7 @@ final class FakeConnectivity: ConnectivityProviding, @unchecked Sendable {
     private var listeners: [UUID: @Sendable (ConnectionSnapshot) -> Void] = [:]
     private var knownWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     private var waits: [Int] = []
+    private var startReport: ConnectionSnapshot?
 
     init(status: ConnectionSnapshot.Status = .connected) {
         snapshot = Self.snapshot(status)
@@ -23,7 +24,26 @@ final class FakeConnectivity: ConnectivityProviding, @unchecked Sendable {
         lock.withLock { waits }
     }
 
-    func start() {}
+    /// Delivers the report set by ``reportOnStart(_:)``, if any.
+    func start() {
+        let report = lock.withLock { () -> ConnectionSnapshot? in
+            defer { startReport = nil }
+            return startReport
+        }
+        if let report {
+            set(snapshot: report)
+        }
+    }
+
+    /// Makes the status unknown until `start()`, which then reports `snapshot`
+    /// at once: the system's first path report, landing as the engine starts
+    /// its monitors.
+    func reportOnStart(_ snapshot: ConnectionSnapshot) {
+        lock.withLock {
+            self.snapshot = .unknown
+            startReport = snapshot
+        }
+    }
 
     @discardableResult
     func subscribe(_ listener: @escaping @Sendable (ConnectionSnapshot) -> Void) -> UUID {

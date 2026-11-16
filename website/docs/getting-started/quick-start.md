@@ -31,7 +31,6 @@ Before starting, make sure you have:
 A screen that enqueues a POST when the user taps a button, shows the queue size, and reflects connectivity in real time:
 
 ```tsx
-import React from 'react';
 import { View, Text, Button, StyleSheet } from 'react-native';
 import {
   useConnection,
@@ -115,6 +114,7 @@ import {
   BackoffStrategy,
   useAutoSync,
 } from '@gabriel-sisjr/react-native-sync-provider';
+import { Root } from './Root'; // your app's screens
 
 const BACKGROUND_OPTIONS = {
   minimumIntervalMs: 15 * 60 * 1000,

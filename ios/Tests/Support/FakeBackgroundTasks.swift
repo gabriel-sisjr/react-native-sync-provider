@@ -10,6 +10,7 @@ final class FakeBackgroundTaskScheduler: BackgroundTaskScheduling, @unchecked Se
     private var registered: [String: (BackgroundTaskHandle) -> Void] = [:]
     private var registrationCount = 0
     private var submitted: [String] = []
+    private var beginDates: [(identifier: String, date: Date?)] = []
     private var cancelled: [String] = []
 
     /// When set, `submit(_:)` throws it. Exercises the error-mapping path.
@@ -21,6 +22,8 @@ final class FakeBackgroundTaskScheduler: BackgroundTaskScheduling, @unchecked Se
     var registeredIdentifiers: [String] { lock.withLock { Array(registered.keys).sorted() } }
     var registrationCalls: Int { lock.withLock { registrationCount } }
     var submittedIdentifiers: [String] { lock.withLock { submitted } }
+    /// The `earliestBeginDate` of every submitted request, in order.
+    var submittedBeginDates: [(identifier: String, date: Date?)] { lock.withLock { beginDates } }
     var cancelledIdentifiers: [String] { lock.withLock { cancelled } }
 
     @discardableResult
@@ -35,7 +38,10 @@ final class FakeBackgroundTaskScheduler: BackgroundTaskScheduling, @unchecked Se
 
     func submit(_ taskRequest: BGTaskRequest) throws {
         if let submitError { throw submitError }
-        lock.withLock { submitted.append(taskRequest.identifier) }
+        lock.withLock {
+            submitted.append(taskRequest.identifier)
+            beginDates.append((taskRequest.identifier, taskRequest.earliestBeginDate))
+        }
     }
 
     func cancel(taskRequestWithIdentifier identifier: String) {
@@ -51,6 +57,7 @@ final class FakeBackgroundTaskScheduler: BackgroundTaskScheduling, @unchecked Se
     func reset() {
         lock.withLock {
             submitted.removeAll()
+            beginDates.removeAll()
             cancelled.removeAll()
         }
     }

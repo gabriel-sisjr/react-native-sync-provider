@@ -280,4 +280,35 @@ final class SyncRetryCooldownTests: XCTestCase {
 
         XCTAssertEqual(heldUntil, clock.nowMs() + 5_000)
     }
+
+    // MARK: - The largest JavaScript Date
+
+    /// The ceiling of a computed delay, 2^53 - 1 ms: added to any present
+    /// time, it lands past 8_640_000_000_000_000 ms, the largest valid
+    /// JavaScript `Date`.
+    private let longestDelayMs = 9_007_199_254_740_991
+
+    func test_aRetryDeadline_stopsAtTheLargestJavaScriptDate() async throws {
+        let id = try await storage.enqueue(input: makeInput())
+        try await storage.markInFlight(id: id)
+
+        try await storage.markPendingForRetry(id: id, errorCode: "SERVER_ERROR", retryDelayMs: longestDelayMs)
+
+        let stored = try await item(id)
+        XCTAssertEqual(stored.nextRetryAt, 8_640_000_000_000_000)
+    }
+
+    func test_aCredentialHold_stopsAtTheLargestJavaScriptDate() async throws {
+        let id = try await storage.enqueue(input: makeInput())
+        try await storage.markInFlight(id: id)
+
+        let heldUntil = try await storage.markCredentialRejected(id: id,
+                                                                 errorCode: "UNAUTHORIZED",
+                                                                 retryDelayMs: longestDelayMs,
+                                                                 attempts: 0)
+
+        XCTAssertEqual(heldUntil, 8_640_000_000_000_000)
+        let stored = try await item(id)
+        XCTAssertEqual(stored.nextRetryAt, 8_640_000_000_000_000)
+    }
 }

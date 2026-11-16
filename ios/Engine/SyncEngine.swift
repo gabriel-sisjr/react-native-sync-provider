@@ -75,13 +75,18 @@ final class SyncEngine: @unchecked Sendable {
     private var options: SyncOptionsSnapshot
     private var source: ConfigSource
     /// A timer fired while the network could not take a flush: offline, or
-    /// below `minNetworkQuality`. Flushing offline would spend attempts on
-    /// items that are fine, and below the minimum the gate would refuse it.
+    /// below `minNetworkQuality`. Flushing offline would claim an item, its
+    /// attempt spent, and wait with it for the network, since both sessions
+    /// wait for connectivity; below the minimum the gate would refuse it.
     /// The wake waits here and runs once the network is online and, with a
     /// minimum set, graded at or above it.
     private var wakeAwaitingConnectivity = false
     /// The wait before the next re-check of a wake held below the minimum.
     private var heldWakeRecheckMs = kHeldWakeRecheckInitialMs
+    /// The wait an automatic wake keeps after the next cycle that dies, and
+    /// the end of the current one: see ``noteCycleEnd(_:)``.
+    private var abortBackoffMs = kHeldWakeRecheckInitialMs
+    private var abortBackoffUntil: Int64 = 0
     /// The link of the last reported change, to tell a new path from a new
     /// grade on the same one.
     private var lastLink: ConnectionSnapshot?
@@ -141,7 +146,7 @@ final class SyncEngine: @unchecked Sendable {
          wrapWakeSource: ((RetryWakeSource) -> RetryWakeSource)? = nil) {
         let loaded = configStore.load()
         let storage = SyncQueueStorage(dao: SyncItemDao(stack: stack, clock: clock),
-                                       capacity: max(1, Int(loaded.options.maxQueueSize)))
+                                       capacity: loaded.options.queueCapacity)
         let config = loaded.options.toDispatcherConfig(source: loaded.source,
                                                        credentialsUnavailable: loaded.credentialsUnavailable)
         let dispatcher: SyncDispatcher
@@ -186,7 +191,12 @@ final class SyncEngine: @unchecked Sendable {
         self.healthCheck = healthCheck
         self.probe = probe
 
-        dispatcher.hooks.onCycleFinished = { [weak self] notBefore in
+        // Noted when the cycle ends, before the next one can start, so a late
+        // re-arm cannot put an older end over a newer one.
+        dispatcher.hooks.onCycleEnded = { [weak self] end in
+            self?.noteCycleEnd(end)
+        }
+        dispatcher.hooks.onCycleFinished = { [weak self] notBefore, _ in
             await self?.rearmRetryTimer(notBefore: notBefore)
         }
         dispatcher.hooks.recoverCredentials = { [weak self] in
@@ -215,8 +225,12 @@ final class SyncEngine: @unchecked Sendable {
         qualityMonitor.onChange = { [weak self] state in
             self?.networkChanged(state)
         }
-        connectivity.start()
+        // The quality monitor subscribes first, so it starts from `UNKNOWN`
+        // and the system's first path report reaches it as a change: started
+        // second, a report that landed in between would be replayed as its
+        // first state, which is never reported.
         qualityMonitor.start()
+        connectivity.start()
         let startLink = qualityMonitor.current.link
         lock.withLock { lastLink = startLink }
 
@@ -317,7 +331,7 @@ final class SyncEngine: @unchecked Sendable {
         configStore.save(snapshot)
         healthCheck.clearBackoff()
         qualityMonitor.setProbeURL(Self.probeURL(snapshot))
-        await storage.updateCapacity(Int(snapshot.maxQueueSize))
+        await storage.updateCapacity(snapshot.queueCapacity)
         await dispatcher.updateConfig(snapshot.toDispatcherConfig(source: .live))
         await rearmRetryTimer()
     }
@@ -339,7 +353,7 @@ final class SyncEngine: @unchecked Sendable {
     func resume() async {
         configStore.setPaused(false)
         await dispatcher.setPaused(false)
-        await rearmRetryTimer(scope: .allPending)
+        await rearmRetryTimer(scope: .allPending, waitsAfterAbort: false)
     }
 
     // MARK: - Retry timer
@@ -360,16 +374,23 @@ final class SyncEngine: @unchecked Sendable {
     /// configuration changes, and after the health check stopped a flush.
     ///
     /// The wake comes no earlier than the latest of the row's deadline, the
-    /// credential hold and the end of a running health-check backoff, which
-    /// lasts at least ``kMinHealthCheckRetryBackoffMs`` here.
+    /// credential hold, the end of a running health-check backoff, which
+    /// lasts at least ``kMinHealthCheckRetryBackoffMs`` here, and the wait
+    /// after a cycle that died (see ``noteCycleEnd(_:)``).
     ///
-    /// - Parameter notBefore: when the hold on a rejected credential ends. It
-    ///   outlives this call, so a later re-arm cannot wake earlier.
-    func rearmRetryTimer(scope: RetryWakeScope = .attempted, notBefore: Int64? = nil) async {
-        let (ticket, canArm, holdUntil) = lock.withLock { () -> (UInt64, Bool, Int64) in
+    /// - Parameters:
+    ///   - notBefore: when the hold on a rejected credential ends. It outlives
+    ///     this call, so a later re-arm cannot wake earlier.
+    ///   - waitsAfterAbort: `false` for `resumeSync()`, which sends what is
+    ///     due at once: this arm ignores the wait after a cycle that died, and
+    ///     leaves that wait and its streak as they were.
+    func rearmRetryTimer(scope: RetryWakeScope = .attempted, notBefore: Int64? = nil,
+                         waitsAfterAbort: Bool = true) async {
+        let (ticket, canArm, holdUntil, abortUntil) = lock.withLock { () -> (UInt64, Bool, Int64, Int64) in
             rearmTicket &+= 1
             credentialHoldUntil = max(credentialHoldUntil, notBefore ?? 0)
-            return (rearmTicket, attachedHybrids > 0 && !options.isManual, credentialHoldUntil)
+            return (rearmTicket, attachedHybrids > 0 && !options.isManual, credentialHoldUntil,
+                    waitsAfterAbort ? abortBackoffUntil : 0)
         }
         let isPaused = await dispatcher.paused()
 
@@ -402,8 +423,35 @@ final class SyncEngine: @unchecked Sendable {
             // takes over, and a wake it finds still held starts again at 30 s.
             heldWakeTimer.cancel()
             heldWakeRecheckMs = kHeldWakeRecheckInitialMs
-            retryTimer.arm(afterMs: max(0, max(wakeAt, holdUntil, backoffUntil) - nowMs)) { [weak self] in
+            retryTimer.arm(afterMs: max(0, max(wakeAt, holdUntil, backoffUntil, abortUntil) - nowMs)) { [weak self] in
                 await self?.retryWakeFired()
+            }
+        }
+    }
+
+    /// Keeps automatic wakes from running a cycle again right after one that
+    /// died. A dying cycle can give its row back due at once, and with a
+    /// store that keeps failing every wake would then run the next cycle at
+    /// once. After a cycle that died, the wake waits at least 30 s, doubling
+    /// to 15 min while cycles keep dying: the schedule a held wake re-checks
+    /// on. A cycle that completes, an empty one included, ends the wait; a
+    /// cancelled one, or a flush that ran no cycle, changes nothing. It never
+    /// arms a wake on its own, and it lives in memory, so a new process
+    /// starts at 30 s. An explicit `flush()`, `useAutoSync`, the BGTask
+    /// windows and a reconnect never wait for it, and `resumeSync()` sends
+    /// what is due at once.
+    private func noteCycleEnd(_ end: CycleEnd) {
+        let nowMs = clock.nowMs()
+        lock.withLock {
+            switch end {
+            case .completed:
+                abortBackoffMs = kHeldWakeRecheckInitialMs
+                abortBackoffUntil = 0
+            case .aborted:
+                abortBackoffUntil = nowMs + abortBackoffMs
+                abortBackoffMs = min(abortBackoffMs * 2, kHeldWakeRecheckMaxMs)
+            case .cancelled:
+                break
             }
         }
     }
@@ -445,11 +493,12 @@ final class SyncEngine: @unchecked Sendable {
 
     /// Runs on timer expiry, where no JS caller exists to receive an error.
     ///
-    /// A wake the network cannot take is remembered, not run: offline (neither
-    /// the dispatcher nor the session checks connectivity, so a flush now
-    /// would exhaust valid items against a dead network), or below
-    /// `minNetworkQuality`. Like an offline wake, a gated one emits nothing;
-    /// it runs once the network can take it.
+    /// A wake the network cannot take is remembered, not run: offline (with
+    /// no quality gate the dispatcher does not check connectivity, and both
+    /// sessions wait for it, so a flush now would wait for the network with
+    /// its first item claimed, its attempt spent, and its cycle running), or
+    /// below `minNetworkQuality`. Like an offline wake, a gated one emits
+    /// nothing; it runs once the network can take it.
     private func retryWakeFired() async {
         guard lock.withLock({ attachedHybrids > 0 && !isShutDown }) else { return }
         guard await !dispatcher.paused() else { return }

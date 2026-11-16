@@ -5,6 +5,7 @@ import androidx.test.core.app.ApplicationProvider
 import com.google.common.truth.Truth.assertThat
 import com.margelo.nitro.syncprovider.database.SyncDatabase
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
+import com.margelo.nitro.syncprovider.http.CycleEnding
 import com.margelo.nitro.syncprovider.storage.SyncQueueStorage
 import com.margelo.nitro.syncprovider.testutil.MovingClock
 import com.margelo.nitro.syncprovider.testutil.TestData
@@ -95,6 +96,32 @@ internal class RetryWakeTest {
 
     verify { timer.arm(0L) }
     assertThat(kicks).containsExactly(0L)
+  }
+
+  /**
+   * No wake waits longer than 2^53 - 1 ms. A deadline past that, such as one a version without
+   * the delay ceiling stored just below `Long.MAX_VALUE`, asked WorkManager for an initial delay
+   * it refuses ("will cause an overflow"), so the kick was lost.
+   */
+  @Test
+  fun `no wake waits longer than the delay ceiling`() = runTest {
+    insert("far", Long.MAX_VALUE - 1)
+
+    wake.arm()
+
+    verify { timer.arm(TestData.MAX_SAFE_DELAY_MS) }
+    assertThat(kicks).containsExactly(TestData.MAX_SAFE_DELAY_MS)
+  }
+
+  /** The same for a hold with no end: a health-check backoff too long to add to the clock. */
+  @Test
+  fun `a hold with no end arms the longest wake, not one WorkManager refuses`() = runTest {
+    insert("cooling", clock.now() + 1_000L)
+    healthBackoffUntil = Long.MAX_VALUE
+
+    wake.arm()
+
+    assertThat(kicks).containsExactly(TestData.MAX_SAFE_DELAY_MS)
   }
 
   @Test
@@ -410,6 +437,124 @@ internal class RetryWakeTest {
     wake.arm(notBefore = clock.now() + HOLD_MS)
 
     assertThat(armed).containsExactly(HOLD_MS)
+  }
+
+  /* --------------------------- after a failed cycle --------------------------- */
+
+  @Test
+  fun `a failed cycle holds the next wake back 30 s, doubling to 15 min while failures go on`() =
+    runTest {
+      insert("due", clock.now() - 500L)
+
+      repeat(7) { wake.arm(ending = CycleEnding.FAILED) }
+
+      val steps = listOf(30_000L, 60_000L, 120_000L, 240_000L, 480_000L, 900_000L, 900_000L)
+      assertThat(armed).containsExactlyElementsIn(steps).inOrder()
+      assertThat(kicks).containsExactlyElementsIn(steps).inOrder()
+    }
+
+  @Test
+  fun `a completed cycle lifts the failure hold and starts its steps over`() = runTest {
+    insert("due", clock.now() - 500L)
+
+    wake.arm(ending = CycleEnding.FAILED)
+    wake.arm(ending = CycleEnding.FAILED)
+    wake.arm(ending = CycleEnding.COMPLETED)
+    wake.arm(ending = CycleEnding.FAILED)
+
+    assertThat(armed).containsExactly(30_000L, 60_000L, 0L, 30_000L).inOrder()
+    assertThat(kicks).containsExactly(30_000L, 60_000L, 0L, 30_000L).inOrder()
+  }
+
+  @Test
+  fun `a cancelled cycle neither starts the failure hold nor resets it`() = runTest {
+    insert("due", clock.now() - 500L)
+
+    wake.arm(ending = CycleEnding.CANCELLED)
+    wake.arm(ending = CycleEnding.FAILED)
+    clock.advance(10_000L)
+    wake.arm(ending = CycleEnding.CANCELLED)
+    wake.arm(ending = CycleEnding.FAILED)
+
+    // At once, the first step, what is left of it, then the second step.
+    assertThat(armed).containsExactly(0L, 30_000L, 20_000L, 60_000L).inOrder()
+    assertThat(kicks).containsExactly(0L, 30_000L, 20_000L, 60_000L).inOrder()
+  }
+
+  @Test
+  fun `every arm path but resume waits for the failure hold`() = runTest {
+    insert("due", clock.now() - 500L)
+    repeat(2) { wake.arm(ending = CycleEnding.FAILED) } // The second step: 60 s.
+    clock.advance(5_000L)
+    armed.clear()
+    kicks.clear()
+
+    wake.arm() // configureSync, recovery and a health-check skip arm this way.
+    wake.armAfterGate(gateStreak = 0)
+
+    assertThat(armed).containsExactly(55_000L)
+    assertThat(kicks).containsExactly(55_000L)
+    assertThat(gatedKicks).containsExactly(55_000L to 1)
+  }
+
+  /**
+   * `resumeSync` is documented to dispatch the items with no cooldown left right away, waiting
+   * only for a credential hold or a health-check backoff. It leaves the failure hold in place.
+   */
+  @Test
+  fun `resume dispatches at once during a failure hold, which still holds the next arm`() =
+    runTest {
+      insert("due", clock.now() - 500L)
+      insert("fresh", nextRetryAt = 0L)
+      wake.arm(ending = CycleEnding.FAILED) // The first step: 30 s.
+      clock.advance(5_000L)
+      armed.clear()
+      kicks.clear()
+
+      wake.armForResume()
+      wake.arm()
+      wake.arm(ending = CycleEnding.FAILED)
+
+      // At once, then what is left of the hold, then the second step: the streak survived.
+      assertThat(armed).containsExactly(0L, 25_000L, 60_000L).inOrder()
+      assertThat(kicks).containsExactly(0L, 25_000L, 60_000L).inOrder()
+    }
+
+  @Test
+  fun `a cooldown later than the failure hold keeps its own deadline`() = runTest {
+    insert("late", clock.now() + 300_000L)
+
+    wake.arm(ending = CycleEnding.FAILED)
+
+    assertThat(armed).containsExactly(300_000L)
+    assertThat(kicks).containsExactly(300_000L)
+  }
+
+  @Test
+  fun `after a completed cycle a fresh row arms nothing and a cooldown its own time`() = runTest {
+    insert("fresh", nextRetryAt = 0L)
+    wake.arm(ending = CycleEnding.FAILED)
+    wake.arm(ending = CycleEnding.COMPLETED)
+    insert("cooling", clock.now() + 1_500L)
+
+    wake.arm()
+
+    // Neither cycle armed anything for the fresh row, and no hold is left for the cooldown.
+    assertThat(armed).containsExactly(1_500L)
+    assertThat(kicks).containsExactly(1_500L)
+  }
+
+  @Test
+  fun `a failure reported while halted still holds back the wake that follows`() = runTest {
+    insert("due", clock.now() - 500L)
+    halted = true
+    wake.arm(ending = CycleEnding.FAILED)
+    halted = false
+
+    wake.arm()
+
+    assertThat(armed).containsExactly(30_000L)
+    assertThat(kicks).containsExactly(30_000L)
   }
 
   private companion object {

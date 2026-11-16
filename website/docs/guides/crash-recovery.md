@@ -46,7 +46,7 @@ Events are not stored either. On both platforms, an event emitted while no liste
 `RecoveryWorker` is a one-time WorkManager job, enqueued as the unique work `syncprovider-recovery`. A request made while one has not finished is dropped. It is enqueued when:
 
 - **A JS engine attaches.** The first native call from a JS engine attaches it to the native runtime, which enqueues recovery. A JS reload starts a new engine, so recovery runs again.
-- **The device boots.** `BootCompletedReceiver` handles `BOOT_COMPLETED`, which arrives after the first unlock. `LOCKED_BOOT_COMPLETED` is in its filter, but the receiver is not direct-boot aware, so it does not receive that broadcast while the device is still locked.
+- **The device boots.** `BootCompletedReceiver` handles `BOOT_COMPLETED`, which arrives after the first unlock. Nothing runs before that unlock: the receiver is not direct-boot aware, because the queue, the configuration and WorkManager's own database live in credential-encrypted storage.
 - **The app is updated.** The same receiver handles `MY_PACKAGE_REPLACED`.
 
 The worker then:
@@ -65,7 +65,7 @@ Unlike `RecoveryWorker`, it can be skipped: a worker blocked by a persisted paus
 
 ### Cancelled Cycles
 
-A cycle that is cancelled while the process lives on leaves nothing in flight. Each request already sent finishes and records its outcome, and the items whose request never started go back to `PENDING`.
+A cycle that is cancelled while the process lives on, such as a worker that WorkManager stops, leaves nothing in flight. Each request already sent finishes and records its outcome, the items whose request never started go back to `PENDING` unchanged, and the cycle ends with `SYNC_FAILED` without an `errorCode`. See [Cancelled Cycles](./error-handling.md#cancelled-cycles).
 
 ## iOS Recovery
 
@@ -89,6 +89,10 @@ While the app is not active and `foregroundOnly` is off, uploads go through a ba
 
 The handlers that record each upload's outcome live in memory. When an upload completes in a later process, its outcome is dropped. The row stays `IN_FLIGHT` until recovery puts it back to `PENDING`, with its attempt spent and no new cooldown. The next flush sends it again, although the server may have accepted it.
 
+### Windows That Run Out of Time
+
+A BGTask window whose time runs out leaves nothing in flight either. Its request is cancelled, and the item goes back to `PENDING` at once, with the attempt refunded and its cooldown untouched, so it needs no recovery. An item whose request never fits a window is retried first in every window and is never dead-lettered by them: a foreground `flush()` delivers it. See [When a Window Runs Out of Time](./background-sync.md#when-a-window-runs-out-of-time).
+
 ### No Boot Hook
 
 The library has no boot hook on iOS. After a reboot, recovery runs at the next engine start: when the user opens the app and JS uses the library, or when a BGTask fires.
@@ -104,6 +108,7 @@ The library has no boot hook on iOS. After a reboot, recovery runs at the next e
 | Stopped by a pause or `foregroundOnly` | `RecoveryWorker`: never. The `SyncWorker` reset: yes | Never |
 | Items in flight per cycle | The whole claimed batch, up to `batchSize` | One |
 | Kill mid-request | Spends no attempt | Spends the attempt |
+| Cycle cancelled mid-request | The request finishes and its attempt counts | The request is cancelled and its attempt refunded |
 | `nextRetryAt` after the reset | Kept | Kept |
 | Re-arms | The periodic job, if enabled, then the next retry wake | The retry timer, once a JS-facing object is attached |
 | Event | None. The count is logged | `RESUMED` with `metadata.recovered`, to listeners registered at that moment |
@@ -118,6 +123,8 @@ What a dead process leaves behind depends on how far each item had got:
 | Claimed, request not started | `IN_FLIGHT`: a claim marks the whole batch. Recovery returns it to `PENDING`, unchanged. | Items the cycle has not reached are still `PENDING`: a cycle claims each item only when its dispatch starts, so there is nothing to recover. An item claimed but not yet sent (between the claim and the request, across a main-thread hop) is `IN_FLIGHT` with its attempt spent. |
 | Request sent, outcome not recorded | `IN_FLIGHT`. An attempt is recorded only with its outcome, so `attempts` is unchanged. | `IN_FLIGHT`. The claim already counted the attempt, so it is spent. |
 | Background upload that completes after a relaunch | Does not apply. | The outcome is dropped. Recovery returns the item to `PENDING`, with its attempt spent. |
+
+A process that lives on leaves nothing in flight. A [cancelled cycle](./error-handling.md#cancelled-cycles) gives its unsent items back unchanged, and a [cycle that dies](./error-handling.md#when-a-cycle-dies) settles each item it claimed, with what its attempt established, before it ends. Only when that settling write fails too do items stay `IN_FLIGHT`, and recovery then treats them as after a kill: Android puts them back exactly as before the claim, and iOS puts them back to `PENDING` with the claim's attempt counted.
 
 After recovery, on both platforms:
 
