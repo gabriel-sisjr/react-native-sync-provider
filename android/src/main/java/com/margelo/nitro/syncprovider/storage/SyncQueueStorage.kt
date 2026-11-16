@@ -27,14 +27,20 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import java.util.UUID
 
-/** What an aborted cycle does with one row it claimed and left without an outcome. */
+/** What a cycle writes for one row it claimed and leaves without a recorded outcome. */
 internal sealed interface AbortedClaim {
   val id: String
 
-  /** Its request never went out: back to `PENDING` as it was. */
+  /** Back to `PENDING` as it was: its request never went out, or a cancellation ended the cycle. */
   data class Unsent(override val id: String) : AbortedClaim
 
-  /** Its request went out: the attempt counts, and the row waits for its cooldown. */
+  /** Its request was answered with a `2xx`: the row is removed, as delivered. */
+  data class Delivered(override val id: String) : AbortedClaim
+
+  /**
+   * Back to `PENDING` with these values: a retry, which counts its attempt, or a credential hold,
+   * which does not. The row waits for [nextRetryAt].
+   */
   data class Retry(
     override val id: String,
     val attempts: Int,
@@ -43,7 +49,7 @@ internal sealed interface AbortedClaim {
     val nextRetryAt: Long,
   ) : AbortedClaim
 
-  /** Its request spent the last attempt: the row becomes a dead letter. */
+  /** The row becomes a dead letter with these values: a permanent failure, or a spent budget. */
   data class Exhausted(
     val entity: SyncItemEntity,
     val attempts: Int,
@@ -127,13 +133,14 @@ internal class SyncQueueStorage(
    * to a row still `IN_FLIGHT`: a recorded or purged row, and a row that another claim holds, is
    * untouched.
    *
-   * @return the [AbortedClaim.Retry] and [AbortedClaim.Exhausted] claims that were applied.
+   * @return the claims other than [AbortedClaim.Unsent] that were applied.
    */
   suspend fun settleAbortedClaims(claims: List<AbortedClaim>): List<AbortedClaim> =
     withContext(Dispatchers.IO) {
       if (claims.isEmpty()) return@withContext emptyList()
       val applied = deadLetterDao.settleAbortedClaims(
         unsent = claims.filterIsInstance<AbortedClaim.Unsent>().map { it.id },
+        delivered = claims.filterIsInstance<AbortedClaim.Delivered>().map { it.id },
         retries = claims.filterIsInstance<AbortedClaim.Retry>().map {
           ScheduledRetry(
             id = it.id,

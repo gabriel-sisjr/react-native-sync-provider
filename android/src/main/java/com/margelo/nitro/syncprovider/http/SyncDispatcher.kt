@@ -64,10 +64,12 @@ import kotlin.random.Random
  * - A dispatch that started finishes even if the cycle is cancelled, and records its outcome,
  *   unless something raised around its attempt ends the cycle: a storage failure, a
  *   cancellation or an [Error] (see [dispatchRecordingOutcome]). Dispatches already started
- *   still finish then, and none starts after. Of the rows the cycle claimed that have no
- *   outcome, one whose request went out counts that attempt, with its cooldown, unless a
- *   cancellation ended the cycle; one never sent goes back to `PENDING` as it was (see
- *   [abortedClaims]).
+ *   still finish then, and none starts after. Unless a cancellation ended the cycle, each row
+ *   it claimed and left without a recorded outcome is then settled with what its attempt
+ *   established (see [settlements]): an answer the server gave is applied as the attempt would
+ *   have applied it, a `2xx` included; a request that went out with no answer classified counts
+ *   the attempt, with its cooldown. A row never sent, and every row after a cancellation, comes
+ *   back as it was.
  * - Each attempt is bounded by OkHttp's call timeout: `requestTimeoutMs`, raised to 1 s and
  *   capped at `Int.MAX_VALUE` ms. Running out of it reports `TIMEOUT`, and so does one of the
  *   client's fixed socket timeouts: 10 s to connect, 30 s for a stalled read or write. See
@@ -112,11 +114,11 @@ internal class SyncDispatcher(
   private val syncing = AtomicBoolean(false)
 
   /**
-   * The rows whose request the running cycle sent, with the epoch ms each attempt started. Its
-   * dispatches write it and [abortCycle] reads it. One cycle runs at a time, under [flushMutex],
-   * and each starts by clearing it.
+   * The rows whose request the running cycle sent, each with what its attempt established (see
+   * [SentRequest]). Its dispatches write it and [abortCycle] reads it. One cycle runs at a time,
+   * under [flushMutex], and each starts by clearing it.
    */
-  private val requestsSent = ConcurrentHashMap<String, Long>()
+  private val requestsSent = ConcurrentHashMap<String, SentRequest>()
 
   fun isSyncing(): Boolean = syncing.get()
 
@@ -246,7 +248,10 @@ internal class SyncDispatcher(
       return result
     } catch (t: Throwable) {
       ending = if (t is CancellationException) CycleEnding.CANCELLED else CycleEnding.FAILED
-      withContext(NonCancellable) { abortCycle(t, terminalEventSent, claimed, options.retryPolicy) }
+      val held = withContext(NonCancellable) {
+        abortCycle(t, terminalEventSent, claimed, options.retryPolicy)
+      }
+      notBefore = listOfNotNull(notBefore, held).maxOrNull()
       throw t
     } finally {
       syncing.set(false)
@@ -260,65 +265,81 @@ internal class SyncDispatcher(
   /**
    * Leave no path without a terminal event and no row stranded. Whatever ended the cycle, the
    * supervisor scope has already waited for its children and this cycle still holds the
-   * mutex, so a row it [claimed] that is still `IN_FLIGHT` has no outcome: its dispatch never
-   * started, or failed around its attempt before the outcome was written. Each such row is
-   * settled in one transaction (see [abortedClaims]); a row `IN_FLIGHT` that this cycle did
-   * not claim, such as another process's claim, is left to its owner. When even that write
-   * fails, the rows wait for recovery.
+   * mutex, so a row it [claimed] that is still `IN_FLIGHT` has no outcome recorded: its dispatch
+   * never started, or failed around its attempt before its outcome was written. Each such row is
+   * settled in one transaction (see [settlements]) and then reported as its own write would have
+   * reported it, before the cycle's `SYNC_FAILED`. A row `IN_FLIGHT` that this cycle did not
+   * claim, such as another process's claim, is left to its owner. When even that write fails,
+   * the rows wait for recovery.
    *
    * A cancelled cycle, a worker WorkManager stopped say, did not fail: its `SYNC_FAILED`
    * carries no code. Any other cause reports its code, or `NETWORK_ERROR` when it has none.
+   *
+   * @return the latest credential hold the cycle's answers set, whether their own write or the
+   *   settle recorded it, for the next wake to wait for; null after a cancellation.
    */
   private suspend fun abortCycle(
     cause: Throwable,
     terminalEventSent: Boolean,
     claimed: List<SyncItemEntity>,
     policy: RetryPolicy,
-  ) {
+  ): Long? {
     val code = when (cause) {
       is CancellationException -> null
       is SyncException -> cause.code
       else -> SyncErrorCode.NETWORK_ERROR
     }
-    val settled = runCatching {
-      storage.settleAbortedClaims(abortedClaims(claimed, cause, code, policy))
+    val settlements = settlements(claimed, cause, code, policy)
+    val applied = runCatching {
+      storage.settleAbortedClaims(settlements.map { it.claim }).mapTo(HashSet()) { it.id }
     }.onFailure { Log.e(TAG, "Could not release the cycle's rows: ${it.javaClass.simpleName}") }
-      .getOrDefault(emptyList())
-    // The events a retryable failure gives, after the writes are in.
-    settled.forEach { claim ->
-      runCatching { emitSettled(claim) }
+      .getOrDefault(emptySet())
+    // The events each write gives, after the writes are in.
+    settlements.filter { it.claim.id in applied }.forEach { settlement ->
+      runCatching { emitSettled(settlement) }
         .onFailure { Log.e(TAG, "Could not report a released row: ${it.javaClass.simpleName}") }
     }
-    if (terminalEventSent) return
-    runCatching {
-      emitter.emit(SyncEventEmitter.event(type = SyncEventType.SYNC_FAILED, errorCode = code))
-    }.onFailure { Log.e(TAG, "Could not emit the terminal event", it) }
+    if (!terminalEventSent) {
+      runCatching {
+        emitter.emit(SyncEventEmitter.event(type = SyncEventType.SYNC_FAILED, errorCode = code))
+      }.onFailure { Log.e(TAG, "Could not emit the terminal event", it) }
+    }
+    return settlements.mapNotNull { it.heldUntil }.maxOrNull()
   }
 
   /**
    * What each row [claimed] by an aborted cycle becomes. A cancellation is no outcome: every row
-   * comes back as it was. After any other cause, a row whose request went out counts that
-   * attempt, exactly as a retryable failure would: back to `PENDING` with the retry policy's
-   * cooldown, or a dead letter with `MAX_ATTEMPTS_EXCEEDED` once the budget is spent. Released at
-   * once and uncounted instead, a row whose outcome write keeps failing would be sent again on
-   * every wake. A row whose request never went out comes back as it was.
+   * comes back as it was. After any other cause:
+   * - a row whose answer was classified gets what its dispatch decided for that answer, exactly
+   *   as its own write would have written it (see [SentRequest.outcome]): removed as delivered
+   *   after a `2xx`; back to `PENDING` with its cooldown and real code after a retryable answer;
+   *   held, without spending the attempt, after a rejected restored credential; a dead letter
+   *   with its real code after a permanent answer, or with `MAX_ATTEMPTS_EXCEEDED` once a
+   *   retryable one spent the budget;
+   * - a row whose request went out with no answer classified, an [Error] raised during the send
+   *   say, counts that attempt as a retryable failure would, with [code]: back to `PENDING` with
+   *   the retry policy's cooldown, or a dead letter with `MAX_ATTEMPTS_EXCEEDED` once the budget
+   *   is spent. Released at once and uncounted instead, a row whose send kept failing that way
+   *   would be sent again on every wake;
+   * - a row whose request never went out comes back as it was.
    */
-  private fun abortedClaims(
+  private fun settlements(
     claimed: List<SyncItemEntity>,
     cause: Throwable,
     code: SyncErrorCode?,
     policy: RetryPolicy,
-  ): List<AbortedClaim> {
+  ): List<Settlement> {
     val now = clock()
     return claimed.map { entity ->
-      val attemptStartedAt = requestsSent[entity.id]
-      if (code == null || attemptStartedAt == null) return@map AbortedClaim.Unsent(entity.id)
+      val sent = requestsSent[entity.id]
+      if (code == null || sent == null) return@map Settlement(AbortedClaim.Unsent(entity.id))
+      sent.outcome?.let { return@map it }
       val attempt = entity.attempts + 1
-      if (RetryPolicyEvaluator.hasBudget(attempt, policy)) {
+      val claim = if (RetryPolicyEvaluator.hasBudget(attempt, policy)) {
         AbortedClaim.Retry(
           id = entity.id,
           attempts = attempt,
-          lastAttemptAt = attemptStartedAt,
+          lastAttemptAt = sent.startedAt,
           lastErrorCode = code,
           nextRetryAt = RetryPolicyEvaluator.deadline(
             from = now,
@@ -329,24 +350,34 @@ internal class SyncDispatcher(
         AbortedClaim.Exhausted(
           entity = entity,
           attempts = attempt,
-          lastAttemptAt = attemptStartedAt,
+          lastAttemptAt = sent.startedAt,
           lastErrorCode = SyncErrorCode.MAX_ATTEMPTS_EXCEEDED,
           lastErrorMessage = cause.message ?: cause.javaClass.simpleName,
           deadLetteredAt = now,
         )
       }
+      Settlement(claim, attempt = attempt)
     }
   }
 
-  /** `ITEM_RETRYING`, or `ITEM_FAILED` then `ITEM_DEAD_LETTERED`, for a row [abortCycle] settled. */
-  private suspend fun emitSettled(claim: AbortedClaim) {
-    when (claim) {
+  /** The item events of a write [abortCycle] applied: the ones its own write would have given. */
+  private suspend fun emitSettled(settlement: Settlement) {
+    when (val claim = settlement.claim) {
+      is AbortedClaim.Delivered -> emitter.emit(
+        SyncEventEmitter.event(
+          type = SyncEventType.ITEM_SUCCEEDED,
+          itemId = claim.id,
+          statusCode = settlement.statusCode,
+          attempt = settlement.attempt,
+        ),
+      )
       is AbortedClaim.Retry -> emitter.emit(
         SyncEventEmitter.event(
           type = SyncEventType.ITEM_RETRYING,
           itemId = claim.id,
           errorCode = claim.lastErrorCode,
-          attempt = claim.attempts,
+          statusCode = settlement.statusCode,
+          attempt = settlement.attempt,
         ),
       )
       is AbortedClaim.Exhausted -> {
@@ -355,7 +386,8 @@ internal class SyncDispatcher(
             type = SyncEventType.ITEM_FAILED,
             itemId = claim.id,
             errorCode = claim.lastErrorCode,
-            attempt = claim.attempts,
+            statusCode = settlement.statusCode,
+            attempt = settlement.attempt,
           ),
         )
         emitter.emit(
@@ -369,6 +401,14 @@ internal class SyncDispatcher(
       }
       is AbortedClaim.Unsent -> Unit
     }
+  }
+
+  /**
+   * Remember what [settlement] writes for [id]'s answer, before that write: if it fails, the
+   * cycle's settle applies it instead. A row whose request never went out has nothing to remember.
+   */
+  private fun remember(id: String, settlement: Settlement) {
+    requestsSent.computeIfPresent(id) { _, sent -> sent.copy(outcome = settlement) }
   }
 
   /**
@@ -419,9 +459,10 @@ internal class SyncDispatcher(
    *
    * Only the attempt's own failure is an outcome of the item (see [runOnce]). Anything raised
    * around it, a storage read or write, an event, a cancellation or an [Error], is rethrown:
-   * it ends the cycle, as a failed store write does on iOS, and [abortCycle] puts the cycle's
-   * rows that have no outcome back to `PENDING`. A failed local write is never recorded as the
-   * item's failure: after a `2xx`, the server already has the request.
+   * it ends the cycle, as a failed store write does on iOS, and [abortCycle] settles the cycle's
+   * rows that have no recorded outcome. A failed local write is never the item's failure: an
+   * answer the server gave is applied as this dispatch would have applied it, so after a `2xx`
+   * the row is delivered.
    */
   private suspend fun dispatchRecordingOutcome(
     entity: SyncItemEntity,
@@ -475,6 +516,10 @@ internal class SyncDispatcher(
 
     return when (val outcome = runOnce(entity, timeoutMs, options.defaultHeaders, startedAt)) {
       is AttemptResult.Success -> {
+        remember(
+          entity.id,
+          Settlement(AbortedClaim.Delivered(entity.id), attempt, outcome.statusCode),
+        )
         storage.markSucceeded(entity.id)
         emitter.emit(
           SyncEventEmitter.event(
@@ -515,6 +560,8 @@ internal class SyncDispatcher(
       from = finishedAt,
       delayMs = RetryPolicyEvaluator.computeDelayMs(attempt, options.retryPolicy, random),
     )
+    val retry = AbortedClaim.Retry(entity.id, attempt, startedAt, outcome.code, nextRetryAt)
+    remember(entity.id, Settlement(retry, attempt, outcome.statusCode))
     storage.markRetry(entity.id, attempt, startedAt, outcome.code, nextRetryAt)
     emitRetrying(entity, attempt, outcome)
     return ItemOutcome.Rescheduled(entity.id)
@@ -539,6 +586,8 @@ internal class SyncDispatcher(
       from = finishedAt,
       delayMs = maxOf(backoffMs, MIN_CREDENTIAL_HOLD_MS),
     )
+    val hold = AbortedClaim.Retry(entity.id, entity.attempts, startedAt, outcome.code, nextRetryAt)
+    remember(entity.id, Settlement(hold, attempt, outcome.statusCode, heldUntil = nextRetryAt))
     storage.markRetry(entity.id, entity.attempts, startedAt, outcome.code, nextRetryAt)
     emitRetrying(entity, attempt, outcome)
     return ItemOutcome.CredentialRejected(entity.id, nextRetryAt)
@@ -587,13 +636,17 @@ internal class SyncDispatcher(
     statusCode: Int?,
     requestSent: Boolean,
   ): Boolean {
+    val deadLetteredAt = clock()
+    val exhausted =
+      AbortedClaim.Exhausted(entity, attempts, lastAttemptAt, code, detail, deadLetteredAt)
+    remember(entity.id, Settlement(exhausted, attempts, statusCode))
     val moved = storage.moveToDeadLetters(
       entity = entity,
       attempts = attempts,
       lastAttemptAt = lastAttemptAt,
       lastErrorCode = code,
       lastErrorMessage = detail,
-      deadLetteredAt = clock(),
+      deadLetteredAt = deadLetteredAt,
     )
     if (!moved && !requestSent) return false
     emitter.emit(
@@ -663,7 +716,7 @@ internal class SyncDispatcher(
       call = built
       startedAt = System.nanoTime()
       // From here the server may get the request: an abort counts this attempt.
-      requestsSent[entity.id] = attemptStartedAt
+      requestsSent[entity.id] = SentRequest(attemptStartedAt)
       built.execute().use { response -> responseOutcome(response) }
     } catch (e: IOException) {
       val ranOutOfTime = System.nanoTime() - startedAt >= TimeUnit.MILLISECONDS.toNanos(timeoutMs)
@@ -792,6 +845,31 @@ internal class SyncDispatcher(
       val detail: String = message,
     ) : AttemptResult
   }
+
+  /**
+   * A request the running cycle sent.
+   *
+   * @property startedAt epoch ms its attempt started.
+   * @property outcome what the dispatch decided to write for the row once its answer was
+   *   classified, set before that write: [abortCycle] applies it if the write fails. Null while
+   *   the request is out, and for good when the send raised what no outcome classifies, an
+   *   [Error] say.
+   */
+  private data class SentRequest(val startedAt: Long, val outcome: Settlement? = null)
+
+  /**
+   * One row's write in a settle, with what its item event reports.
+   *
+   * @property attempt the attempt the event reports; a credential hold reports it without
+   *   spending it.
+   * @property heldUntil the end of a credential hold, which the next wake waits for.
+   */
+  private data class Settlement(
+    val claim: AbortedClaim,
+    val attempt: Int = 0,
+    val statusCode: Int? = null,
+    val heldUntil: Long? = null,
+  )
 
   private sealed interface ItemOutcome {
     val itemId: String

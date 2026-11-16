@@ -105,21 +105,26 @@ internal interface SyncDeadLetterDao {
    * cycle's, or the rest of a batch that a rejected credential stopped. Each change applies only
    * to a row still `IN_FLIGHT`: one whose outcome was written meanwhile, or that a purge removed,
    * is left as it is.
-   * - [unsent]: rows whose request never went out, back to `PENDING` unchanged;
-   * - [retries]: rows whose request went out, back to `PENDING` with that attempt counted and
-   *   its cooldown;
-   * - [exhausted]: rows whose request spent the last attempt, moved here.
+   * - [unsent]: back to `PENDING` unchanged;
+   * - [delivered]: rows whose request was answered with a `2xx`, removed;
+   * - [retries]: back to `PENDING` with these values: a retry, which counts its attempt, or a
+   *   credential hold, which does not;
+   * - [exhausted]: rows that become dead letters, moved here.
    *
-   * @return the ids of [retries] and [exhausted] that were applied.
+   * @return the ids of [delivered], [retries] and [exhausted] that were applied.
    */
   @Transaction
   suspend fun settleAbortedClaims(
     unsent: List<String>,
+    delivered: List<String>,
     retries: List<ScheduledRetry>,
     exhausted: List<SyncDeadLetterEntity>,
   ): Set<String> {
     unsent.chunked(MAX_IDS_PER_STATEMENT).forEach { releaseQueuedInFlight(it) }
     val applied = mutableSetOf<String>()
+    for (id in delivered) {
+      if (deleteQueuedInFlight(id) > 0) applied += id
+    }
     for (retry in retries) {
       val changed = retryQueuedInFlight(
         id = retry.id,
