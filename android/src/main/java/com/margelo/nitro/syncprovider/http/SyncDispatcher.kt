@@ -392,7 +392,8 @@ internal class SyncDispatcher(
       val outcome = dispatchRecordingOutcome(entity, options, credentials)
       leading += outcome
       if (outcome is ItemOutcome.CredentialRejected) {
-        storage.resetInFlight()
+        // Through the settle, so that only this cycle's claims are released.
+        storage.settleAbortedClaims(claimed.drop(leading.size).map { AbortedClaim.Unsent(it.id) })
         return leading
       }
       if (outcome !is ItemOutcome.Gone) break

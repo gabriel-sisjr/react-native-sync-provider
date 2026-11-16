@@ -1439,6 +1439,27 @@ internal class SyncDispatcherTest {
     }
   }
 
+  /**
+   * The rest of the batch goes back through the settle, so only rows this cycle claimed are
+   * released. A row `IN_FLIGHT` that it never claimed, such as another process's claim, is left
+   * to its owner, or to recovery, as an aborted cycle leaves it.
+   */
+  @Test
+  fun `a rejected credential releases only the rows its cycle claimed`() = runTest {
+    db.syncItemDao().insert(TestData.entity(id = "elsewhere", status = SyncItemEntity.STATUS_IN_FLIGHT))
+    server.dispatcher = respondAfter(attemptMs = 10L, code = 401)
+    val first = enqueue("/1")
+    val second = enqueue("/2")
+
+    persistedCredentials().flush()
+
+    assertThat(server.requestCount).isEqualTo(1)
+    assertThat(row(first).lastErrorCode).isEqualTo(SyncErrorCode.UNAUTHORIZED.name)
+    assertThat(row(second).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(row(second).attempts).isEqualTo(0)
+    assertThat(row("elsewhere").status).isEqualTo(SyncItemEntity.STATUS_IN_FLIGHT)
+  }
+
   @Test
   fun `the next wake waits for the hold even when released rows are due at once`() = runTest {
     server.dispatcher = respondAfter(attemptMs = 10L, code = 401)

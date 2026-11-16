@@ -101,9 +101,10 @@ internal interface SyncDeadLetterDao {
   }
 
   /**
-   * Settle, in one transaction, the rows an aborted cycle claimed and left `IN_FLIGHT`. Each
-   * change applies only to a row still `IN_FLIGHT`: one whose outcome was written meanwhile, or
-   * that a purge removed, is left as it is.
+   * Settle, in one transaction, the rows a cycle claimed and leaves `IN_FLIGHT`: an aborted
+   * cycle's, or the rest of a batch that a rejected credential stopped. Each change applies only
+   * to a row still `IN_FLIGHT`: one whose outcome was written meanwhile, or that a purge removed,
+   * is left as it is.
    * - [unsent]: rows whose request never went out, back to `PENDING` unchanged;
    * - [retries]: rows whose request went out, back to `PENDING` with that attempt counted and
    *   its cooldown;

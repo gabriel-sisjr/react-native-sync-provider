@@ -122,9 +122,10 @@ internal class SyncQueueStorage(
   suspend fun isQueued(id: String): Boolean = withContext(Dispatchers.IO) { itemDao.exists(id) }
 
   /**
-   * Settle what an aborted cycle claimed and left without an outcome, in one transaction. Each
-   * claim applies only to a row still `IN_FLIGHT`: a recorded or purged row, and a row that
-   * another claim holds, is untouched.
+   * Settle, in one transaction, rows a cycle claimed and leaves without an outcome: an aborted
+   * cycle's, or the rest of a batch that a rejected credential stopped. Each claim applies only
+   * to a row still `IN_FLIGHT`: a recorded or purged row, and a row that another claim holds, is
+   * untouched.
    *
    * @return the [AbortedClaim.Retry] and [AbortedClaim.Exhausted] claims that were applied.
    */
