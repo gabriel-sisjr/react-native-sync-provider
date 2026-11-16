@@ -762,6 +762,27 @@ final class SyncEngineRetryTimerTests: XCTestCase {
         XCTAssertNil(failed.first?.errorCode)
     }
 
+    /// A cycle that completes during the wait after a dead one, an explicit
+    /// flush say, ends that wait: a row cooling for 100 ms then arms at
+    /// 100 ms, not at what is left of the wait.
+    func test_aCompletedCycleDuringTheWait_endsIt() async throws {
+        let engine = await fixture.makeEngine()
+        await engine.configure(.sample(retryPolicy: .exact(maxAttempts: 5, baseDelayMs: 100)))
+        _ = try await enqueueCooling(in: engine, delayMs: 100)
+        clock.advance(ms: 100)
+        fixture.saveFaults.fail(1) // the claim
+        _ = try? await engine.dispatcher.flush()
+        XCTAssertEqual(timer.delayMs, 30_000)
+
+        clock.advance(ms: 10_000)
+        URLProtocolStub.setHandler(stubResponse(200))
+        _ = try await engine.dispatcher.flush()
+        XCTAssertEqual(requestCount, 1, "the explicit flush completed")
+        _ = try await enqueueCooling(in: engine, delayMs: 100)
+        await engine.rearmRetryTimer()
+        XCTAssertEqual(timer.delayMs, 100, "the wait ended with the completed cycle (20 000 if it had not)")
+    }
+
     // MARK: - Failure handling
 
     /// No JS caller exists on a timer path. A store that failed to open must
