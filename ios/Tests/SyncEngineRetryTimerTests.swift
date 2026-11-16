@@ -594,6 +594,41 @@ final class SyncEngineRetryTimerTests: XCTestCase {
         XCTAssertFalse(timer.isArmed)
     }
 
+    // MARK: - After a cycle that dies
+
+    /// Every save fails, the claim's included: each wake runs a cycle that
+    /// dies before its request, and the row stays due at once. The automatic
+    /// wake after it waits 30 s, then 60 s, then 120 s, and a cycle that
+    /// completes starts that schedule again.
+    func test_cyclesThatDieBeforeTheSend_spaceTheWakes_untilOneCompletes() async throws {
+        let engine = await fixture.makeEngine()
+        await engine.configure(.sample(retryPolicy: .exact(maxAttempts: 5, baseDelayMs: 100)))
+        _ = try await enqueueCooling(in: engine, delayMs: 100)
+        URLProtocolStub.setHandler(stubResponse(200))
+        await engine.rearmRetryTimer()
+        XCTAssertEqual(timer.delayMs, 100)
+
+        fixture.saveFaults.fail(.max)
+        var delays: [Int64?] = []
+        for _ in 0..<3 {
+            await fireWhenDue()
+            delays.append(timer.delayMs)
+        }
+        XCTAssertEqual(delays, [30_000, 60_000, 120_000], "never a wake at once")
+        XCTAssertEqual(requestCount, 0, "nothing was sent")
+
+        fixture.saveFaults.fail(0)
+        await fireWhenDue()
+        XCTAssertEqual(requestCount, 1, "the cycle completed")
+
+        _ = try await enqueueCooling(in: engine, delayMs: 100)
+        await engine.rearmRetryTimer()
+        XCTAssertEqual(timer.delayMs, 100, "a completed cycle ends the wait")
+        fixture.saveFaults.fail(.max)
+        await fireWhenDue()
+        XCTAssertEqual(timer.delayMs, 30_000, "the schedule starts again")
+    }
+
     // MARK: - Failure handling
 
     /// No JS caller exists on a timer path. A store that failed to open must

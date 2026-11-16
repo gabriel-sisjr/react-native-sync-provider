@@ -6,7 +6,9 @@ import Foundation
 /// app launch does, `makeColdEngine()` the way a BGTask launch does. Time is
 /// manual: nothing happens until a test moves `clock` and fires `timer`.
 final class EngineFixture {
-    let stack = InMemoryCoreDataStack.make()
+    /// Makes the stack's saves fail on demand.
+    let saveFaults: SaveFaults
+    let stack: CoreDataStack
     let secrets = InMemorySecretStore()
     let connectivity = FakeConnectivity()
     /// Every measurement and health check goes through it, with no debounce.
@@ -27,6 +29,9 @@ final class EngineFixture {
     private var engines: [SyncEngine] = []
 
     init() {
+        let faults = SaveFaults()
+        saveFaults = faults
+        stack = InMemoryCoreDataStack.make(saveFaults: faults)
         (defaults, suite) = UserDefaults.ephemeral()
     }
 

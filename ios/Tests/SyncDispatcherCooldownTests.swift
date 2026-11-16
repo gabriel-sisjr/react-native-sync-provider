@@ -212,27 +212,32 @@ final class SyncDispatcherCooldownTests: XCTestCase {
     }
 
     func test_cycleEnd_notifiesTheObserver_onEveryOutcome_beforeFlushReturns() async throws {
-        let cycles = RequestLog()
+        let ends = CycleEnds()
         let dispatcher = makeDispatcher(.exact(maxAttempts: 5, baseDelayMs: 60_000))
-        dispatcher.hooks.onCycleFinished = { _ in cycles.record() }
+        dispatcher.hooks.onCycleFinished = { _, end in ends.record(end) }
 
         _ = try await dispatcher.flush() // empty
-        XCTAssertEqual(cycles.times.count, 1)
+        XCTAssertEqual(ends.all, [.completed])
 
         _ = try await storage.enqueue(input: .sample())
         URLProtocolStub.setHandler(stubResponse(503))
         _ = try await dispatcher.flush() // failed
-        XCTAssertEqual(cycles.times.count, 2)
+        XCTAssertEqual(ends.all, [.completed, .completed], "an item that failed is a cycle that completed")
+
+        _ = try await storage.enqueue(input: .sample())
+        faults.fail(1) // its claim
+        await flushExpectingItToDie(dispatcher)
+        XCTAssertEqual(ends.all, [.completed, .completed, .aborted])
 
         await dispatcher.setPaused(true)
         _ = try await dispatcher.flush() // no cycle ran
-        XCTAssertEqual(cycles.times.count, 2, "a paused flush is not a cycle")
+        XCTAssertEqual(ends.all.count, 3, "a paused flush is not a cycle")
     }
 
     func test_cycleStaysMarkedRunning_untilItEnds_andNotDuringTheObserver() async throws {
         let dispatcher = makeDispatcher(.default)
         let runningDuringObserver = RequestLog()
-        dispatcher.hooks.onCycleFinished = { [weak dispatcher] _ in
+        dispatcher.hooks.onCycleFinished = { [weak dispatcher] _, _ in
             if await dispatcher?.cycleRunning() == true {
                 runningDuringObserver.record()
             }
@@ -372,5 +377,19 @@ final class SyncDispatcherCooldownTests: XCTestCase {
         XCTAssertEqual(emitter.events(ofType: "SYNC_FAILED").first?.errorCode, "INVALID_PAYLOAD")
         let recovered = try await storage.resetInFlightToPending()
         XCTAssertEqual(recovered, 1)
+    }
+}
+
+/// The ``CycleEnd`` values an observer received, in order.
+private final class CycleEnds: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [CycleEnd] = []
+
+    func record(_ end: CycleEnd) {
+        lock.withLock { recorded.append(end) }
+    }
+
+    var all: [CycleEnd] {
+        lock.withLock { recorded }
     }
 }

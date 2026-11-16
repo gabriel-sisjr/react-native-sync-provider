@@ -83,6 +83,10 @@ final class SyncEngine: @unchecked Sendable {
     private var wakeAwaitingConnectivity = false
     /// The wait before the next re-check of a wake held below the minimum.
     private var heldWakeRecheckMs = kHeldWakeRecheckInitialMs
+    /// The wait an automatic wake keeps after the next cycle that dies, and
+    /// the end of the current one: see ``noteCycleEnd(_:)``.
+    private var abortBackoffMs = kHeldWakeRecheckInitialMs
+    private var abortBackoffUntil: Int64 = 0
     /// The link of the last reported change, to tell a new path from a new
     /// grade on the same one.
     private var lastLink: ConnectionSnapshot?
@@ -187,7 +191,8 @@ final class SyncEngine: @unchecked Sendable {
         self.healthCheck = healthCheck
         self.probe = probe
 
-        dispatcher.hooks.onCycleFinished = { [weak self] notBefore in
+        dispatcher.hooks.onCycleFinished = { [weak self] notBefore, end in
+            self?.noteCycleEnd(end)
             await self?.rearmRetryTimer(notBefore: notBefore)
         }
         dispatcher.hooks.recoverCredentials = { [weak self] in
@@ -365,16 +370,17 @@ final class SyncEngine: @unchecked Sendable {
     /// configuration changes, and after the health check stopped a flush.
     ///
     /// The wake comes no earlier than the latest of the row's deadline, the
-    /// credential hold and the end of a running health-check backoff, which
-    /// lasts at least ``kMinHealthCheckRetryBackoffMs`` here.
+    /// credential hold, the end of a running health-check backoff, which
+    /// lasts at least ``kMinHealthCheckRetryBackoffMs`` here, and the wait
+    /// after a cycle that died (see ``noteCycleEnd(_:)``).
     ///
     /// - Parameter notBefore: when the hold on a rejected credential ends. It
     ///   outlives this call, so a later re-arm cannot wake earlier.
     func rearmRetryTimer(scope: RetryWakeScope = .attempted, notBefore: Int64? = nil) async {
-        let (ticket, canArm, holdUntil) = lock.withLock { () -> (UInt64, Bool, Int64) in
+        let (ticket, canArm, holdUntil, abortUntil) = lock.withLock { () -> (UInt64, Bool, Int64, Int64) in
             rearmTicket &+= 1
             credentialHoldUntil = max(credentialHoldUntil, notBefore ?? 0)
-            return (rearmTicket, attachedHybrids > 0 && !options.isManual, credentialHoldUntil)
+            return (rearmTicket, attachedHybrids > 0 && !options.isManual, credentialHoldUntil, abortBackoffUntil)
         }
         let isPaused = await dispatcher.paused()
 
@@ -407,8 +413,31 @@ final class SyncEngine: @unchecked Sendable {
             // takes over, and a wake it finds still held starts again at 30 s.
             heldWakeTimer.cancel()
             heldWakeRecheckMs = kHeldWakeRecheckInitialMs
-            retryTimer.arm(afterMs: max(0, max(wakeAt, holdUntil, backoffUntil) - nowMs)) { [weak self] in
+            retryTimer.arm(afterMs: max(0, max(wakeAt, holdUntil, backoffUntil, abortUntil) - nowMs)) { [weak self] in
                 await self?.retryWakeFired()
+            }
+        }
+    }
+
+    /// Keeps automatic wakes from running a cycle again right after one that
+    /// died. A dying cycle can give its row back due at once, and with a
+    /// store that keeps failing every wake would then run the next cycle at
+    /// once. After a cycle that died, the wake waits at least 30 s, doubling
+    /// to 15 min while cycles keep dying: the schedule a held wake re-checks
+    /// on. A cycle that completes ends the wait, and a cancelled one changes
+    /// nothing. An explicit `flush()` never waits for it.
+    private func noteCycleEnd(_ end: CycleEnd) {
+        let nowMs = clock.nowMs()
+        lock.withLock {
+            switch end {
+            case .completed:
+                abortBackoffMs = kHeldWakeRecheckInitialMs
+                abortBackoffUntil = 0
+            case .aborted:
+                abortBackoffUntil = nowMs + abortBackoffMs
+                abortBackoffMs = min(abortBackoffMs * 2, kHeldWakeRecheckMaxMs)
+            case .cancelled:
+                break
             }
         }
     }

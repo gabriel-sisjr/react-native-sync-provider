@@ -91,6 +91,16 @@ enum FailureDisposition: Sendable {
     case credentialRejected(heldUntil: Int64)
 }
 
+/// How a flush cycle ended, for the wake armed after it.
+enum CycleEnd: Sendable, Equatable {
+    /// It ran to its end, whatever its items' outcomes.
+    case completed
+    /// It died: a write that failed, say. Its `SYNC_FAILED` carries the code.
+    case aborted
+    /// It was cancelled, a BGTask that expired say. Nothing failed.
+    case cancelled
+}
+
 /// Why a flush started no cycle.
 enum FlushSkipReason: Sendable, Equatable {
     case paused
@@ -121,7 +131,7 @@ final class DispatcherHooks: @unchecked Sendable {
     private let lock = NSLock()
     private var foregroundOnlyValue = false
     private var pausedValue = false
-    private var cycleFinished: (@Sendable (Int64?) async -> Void)?
+    private var cycleFinished: (@Sendable (Int64?, CycleEnd) async -> Void)?
     private var credentialRecovery: (@Sendable () -> [String: String]?)?
     private var qualitySource: (@Sendable () -> NetworkQualityLevel)?
     private var qualityRefresh: (@Sendable () -> Void)?
@@ -143,8 +153,8 @@ final class DispatcherHooks: @unchecked Sendable {
 
     /// Awaited when a flush cycle ends, whatever its outcome, so whoever awaits
     /// `flush()` sees its effects. Receives the moment a credential hold ends
-    /// when the cycle was stopped by one.
-    var onCycleFinished: (@Sendable (Int64?) async -> Void)? {
+    /// when the cycle was stopped by one, and how the cycle ended.
+    var onCycleFinished: (@Sendable (Int64?, CycleEnd) async -> Void)? {
         get { lock.withLock { cycleFinished } }
         set { lock.withLock { cycleFinished = newValue } }
     }
@@ -377,7 +387,7 @@ actor SyncDispatcher {
 
         do {
             let result = try await runCycle(startedAt: startedAt)
-            await finishCycle()
+            await finishCycle(.completed)
             return .ran(result)
         } catch {
             // Listeners track a cycle from SYNC_STARTED to its terminal event,
@@ -389,16 +399,16 @@ actor SyncDispatcher {
                 emitter.emit(.now(type: "SYNC_FAILED",
                                   errorCode: wrapAsSyncProviderError(error).code.stringValue))
             }
-            await finishCycle()
+            await finishCycle(error is CancellationError ? .cancelled : .aborted)
             throw error
         }
     }
 
-    private func finishCycle() async {
+    private func finishCycle(_ end: CycleEnd) async {
         isCycleRunning = false
         let notBefore = credentialHeldUntil
         credentialHeldUntil = nil
-        await hooks.onCycleFinished?(notBefore)
+        await hooks.onCycleFinished?(notBefore, end)
     }
 
     /// The outcome of a flush that must not start a cycle, or `nil` when one
