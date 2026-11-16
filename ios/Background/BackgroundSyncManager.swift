@@ -324,23 +324,27 @@ final class BackgroundSyncManager: @unchecked Sendable {
 #if canImport(BackgroundTasks)
 /// Completes a fired task exactly once: from whichever comes first, the end
 /// of its flush or its expiry.
+///
+/// It lets go of the task as it completes it. The task holds its expiration
+/// handler, and the handler holds this object. BackgroundTasks clears a
+/// `BGTask`'s handler when the task completes, but a handler set after the
+/// flush already completed the task stays on it, and another
+/// ``BackgroundTaskHandle`` may never clear its handler.
 private final class TaskCompletion: @unchecked Sendable {
-    private let task: BackgroundTaskHandle
     private let lock = NSLock()
-    private var isDone = false
+    /// `nil` once the task is completed.
+    private var task: BackgroundTaskHandle?
 
     init(_ task: BackgroundTaskHandle) {
         self.task = task
     }
 
     func complete(success: Bool) {
-        let isFirst = lock.withLock { () -> Bool in
-            defer { isDone = true }
-            return !isDone
+        let first = lock.withLock { () -> BackgroundTaskHandle? in
+            defer { task = nil }
+            return task
         }
-        if isFirst {
-            task.setTaskCompleted(success: success)
-        }
+        first?.setTaskCompleted(success: success)
     }
 }
 #endif

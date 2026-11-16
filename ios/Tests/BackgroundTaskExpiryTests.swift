@@ -276,6 +276,55 @@ final class BackgroundTaskExpiryTests: XCTestCase {
         XCTAssertNotNil(emitter.events(ofType: "SYNC_FAILED").first?.errorCode, "a store failure keeps its code")
     }
 
+    // MARK: - Letting go of the task
+
+    /// A task holds its expiration handler, and the handler holds what
+    /// completes the task. A `BGTask` drops its handler when it completes;
+    /// this fake never does, as a `BGTask` never drops a handler set on it
+    /// after it completed.
+    func test_aWindowThatCompleted_letsGoOfItsTask() async throws {
+        let manager = try makeManager(appActive: true)
+        weak var released: FakeBackgroundTask?
+        do {
+            let task = FakeBackgroundTask()
+            released = task
+            let work = try XCTUnwrap(manager.handleProcessing(task: task))
+            await work.value
+            XCTAssertEqual(task.completedResults, [true])
+            XCTAssertNotNil(task.expirationHandler, "the fake keeps its handler")
+        }
+        await assertFreed { released }
+    }
+
+    func test_aWindowThatExpired_letsGoOfItsTask() async throws {
+        let manager = try makeManager(appActive: true)
+        let gate = Gate()
+        manager.setPrepare { await gate.wait() }
+        weak var released: FakeBackgroundTask?
+        do {
+            let task = FakeBackgroundTask()
+            released = task
+            let work = try XCTUnwrap(manager.handleProcessing(task: task))
+            task.expirationHandler?()
+            gate.open()
+            await work.value
+            XCTAssertEqual(task.completedResults, [false])
+        }
+        await assertFreed { released }
+    }
+
+    /// Waits up to 2 s for `object()` to be `nil`: a finished `Task` frees
+    /// what its closure captured shortly after `value` returns.
+    private func assertFreed(_ object: () -> AnyObject?,
+                             file: StaticString = #filePath, line: UInt = #line) async {
+        var waits = 0
+        while object() != nil, waits < 200 {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+            waits += 1
+        }
+        XCTAssertNil(object(), "the window's task is still held after it completed", file: file, line: line)
+    }
+
     // MARK: - Routing
 
     /// A task identifier is unique only within one session: a task restored
