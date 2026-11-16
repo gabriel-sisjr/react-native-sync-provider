@@ -21,6 +21,7 @@ import com.margelo.nitro.syncprovider.storage.SyncQueueStorage
 import com.margelo.nitro.syncprovider.testutil.MovingClock
 import com.margelo.nitro.syncprovider.testutil.TestData
 import io.mockk.coEvery
+import io.mockk.every
 import io.mockk.mockk
 import io.mockk.spyk
 import kotlinx.coroutines.CancellationException
@@ -34,6 +35,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withTimeout
+import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -792,20 +794,49 @@ internal class SyncDispatcherTest {
   }
 
   /**
-   * The call is built inside the attempt: a client that cannot be built fails the attempt, as a
-   * request that cannot be built does, and does not end the cycle.
+   * The shared client is built before any attempt. Failing to build it is no item's fault:
+   * while it lasted, it would have dead-lettered every claimed item, batch after batch. The
+   * cycle aborts instead, and its rows wait in the queue, unsent and unchanged.
    */
   @Test
-  fun `a client that cannot be built fails the attempt as INVALID_PAYLOAD`() = runTest {
+  fun `a shared client that cannot be built aborts the cycle and dead-letters nothing`() =
+    runTest {
+      val id = enqueue()
+      val events = recordEvents()
+      val d = SyncDispatcher(
+        storage = storage,
+        emitter = emitter,
+        getOptions = { TestData.syncOptions() },
+        // Read while the shared client is built.
+        verboseLogging = { throw IllegalStateException("no TLS provider") },
+        clock = clock::now,
+      )
+
+      val thrown = runCatching { runBlocking { d.flush() } }
+
+      assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+      assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+      assertThat(row(id).attempts).isEqualTo(0)
+      assertThat(server.requestCount).isEqualTo(0)
+      assertThat(thrown.exceptionOrNull()).isInstanceOf(IllegalStateException::class.java)
+      assertThat(events.single { it.type == SyncEventType.SYNC_FAILED }.errorCode)
+        .isEqualTo(SyncErrorCode.NETWORK_ERROR)
+      assertThat(events.types()).doesNotContain(SyncEventType.ITEM_FAILED)
+    }
+
+  /** Each call is derived inside its attempt: a call that cannot be built fails that attempt. */
+  @Test
+  fun `a call that cannot be built fails the attempt as INVALID_PAYLOAD`() = runTest {
     val id = enqueue()
     val events = recordEvents()
+    val client = mockk<OkHttpClient>()
+    every { client.newBuilder() } throws IllegalStateException("no call can be made")
     val d = SyncDispatcher(
       storage = storage,
       emitter = emitter,
       getOptions = { TestData.syncOptions() },
-      // Read while the shared client is built.
-      verboseLogging = { throw IllegalStateException("no TLS provider") },
       clock = clock::now,
+      httpClient = lazyOf(client),
     )
 
     val result = d.flush()
@@ -813,7 +844,7 @@ internal class SyncDispatcherTest {
     assertThat(server.requestCount).isEqualTo(0)
     val dead = deadLetter(id)
     assertThat(dead.lastErrorCode).isEqualTo(SyncErrorCode.INVALID_PAYLOAD.name)
-    assertThat(dead.lastErrorMessage).isEqualTo("no TLS provider")
+    assertThat(dead.lastErrorMessage).isEqualTo("no call can be made")
     assertThat(dead.attempts).isEqualTo(1)
     assertThat(result.failedIds.toList()).containsExactly(id)
     assertThat(events.single { it.type == SyncEventType.ITEM_FAILED }.attempt).isEqualTo(1.0)

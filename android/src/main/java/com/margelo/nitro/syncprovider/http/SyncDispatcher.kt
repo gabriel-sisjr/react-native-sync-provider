@@ -81,7 +81,11 @@ import kotlin.random.Random
  * @param onCycleFinished called after every cycle. Its argument, when present, is
  *   the earliest instant the next wake may fire. Failures are logged and never
  *   reject a cycle that already completed.
+ * @param httpClient the one OkHttp client, built once, on the first cycle with items to send,
+ *   before any attempt: a client that cannot be built fails that cycle, not its items. Each
+ *   attempt derives its own call from it, with that cycle's `requestTimeoutMs`.
  */
+@Suppress("LongParameterList")
 internal class SyncDispatcher(
   private val storage: SyncQueueStorage,
   private val emitter: SyncEventEmitter,
@@ -95,17 +99,10 @@ internal class SyncDispatcher(
   private val healthCheck: HealthCheck = HealthCheck(HeadProbe()),
   private val onHealthCheckSkipped: suspend () -> Unit = {},
   private val onCycleFinished: suspend (notBefore: Long?) -> Unit = {},
+  private val httpClient: Lazy<OkHttpClient> = lazy { newClient(verboseLogging()) },
 ) {
   private val flushMutex = Mutex()
   private val syncing = AtomicBoolean(false)
-
-  /**
-   * OkHttp is intentionally instantiated once. Per-cycle option changes
-   * (timeouts) are honored by reading [SyncOptions.requestTimeoutMs] inside
-   * [flush] and applying it via `newCall(...)` builder when needed; here we
-   * pick conservative defaults.
-   */
-  private val client: OkHttpClient by lazy { buildClient() }
 
   fun isSyncing(): Boolean = syncing.get()
 
@@ -207,6 +204,8 @@ internal class SyncDispatcher(
       val outcomes = if (claimed.isEmpty()) {
         emptyList()
       } else {
+        // Before any attempt: a client that cannot be built aborts the cycle, item-free.
+        httpClient.value
         dispatchClaimed(claimed, options, credentials)
       }
       notBefore = outcomes
@@ -542,14 +541,16 @@ internal class SyncDispatcher(
       retryable = false,
     )
 
+    // Built by the cycle before any attempt, so reading it here cannot fail an item.
+    val shared = httpClient.value
     var call: Call? = null
     var startedAt = System.nanoTime()
     try {
-      // Built here, so that a client that cannot be built fails the attempt, as a request that
-      // cannot be built does. The call timeout bounds the whole call: connecting, sending the
-      // request and reading the response. It is the attempt's only time limit besides the
-      // client's socket timeouts.
-      val built = client.newBuilder()
+      // The call is derived here, so that one that cannot be built fails the attempt, as a
+      // request that cannot be built does. The call timeout bounds the whole call: connecting,
+      // sending the request and reading the response. It is the attempt's only time limit
+      // besides the client's socket timeouts.
+      val built = shared.newBuilder()
         .callTimeout(timeoutMs, TimeUnit.MILLISECONDS)
         .build()
         .newCall(request)
@@ -650,22 +651,6 @@ internal class SyncDispatcher(
     null
   }
 
-  private fun buildClient(): OkHttpClient {
-    val builder = OkHttpClient.Builder()
-      .connectTimeout(CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-      .readTimeout(READ_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-      .writeTimeout(WRITE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-      .retryOnConnectionFailure(false)
-
-    if (verboseLogging()) {
-      val logging = HttpLoggingInterceptor { msg -> Log.d(TAG, msg) }
-      // BASIC, because every level above it logs header values.
-      logging.level = HttpLoggingInterceptor.Level.BASIC
-      builder.addInterceptor(logging)
-    }
-    return builder.build()
-  }
-
   /**
    * Rescheduled and held items count as neither success nor failure: they are still
    * queued, and their outcome belongs to a later cycle. Nor do items purged before their
@@ -739,6 +724,23 @@ internal class SyncDispatcher(
 
     /** Where `ITEM_DEAD_LETTERED` carries the real failure code. */
     const val METADATA_LAST_ERROR_CODE = "lastErrorCode"
+
+    /** The shared client: the fixed socket timeouts, and no retry of OkHttp's own. */
+    private fun newClient(verboseLogging: Boolean): OkHttpClient {
+      val builder = OkHttpClient.Builder()
+        .connectTimeout(CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        .readTimeout(READ_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        .writeTimeout(WRITE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        .retryOnConnectionFailure(false)
+
+      if (verboseLogging) {
+        val logging = HttpLoggingInterceptor { msg -> Log.d(TAG, msg) }
+        // BASIC, because every level above it logs header values.
+        logging.level = HttpLoggingInterceptor.Level.BASIC
+        builder.addInterceptor(logging)
+      }
+      return builder.build()
+    }
 
     /**
      * The code of an attempt that failed with [failure] before any response. Both are retried.
