@@ -102,6 +102,22 @@ final class CoreDataMigrationV3Tests: XCTestCase {
         XCTAssertEqual(letters.count, 3)
     }
 
+    /// A slice of a URL whose model is already in use: on iOS 27.2 the load
+    /// can hand back that model, which cannot be edited. The fixture's own
+    /// sequence makes it so. `slice` edits a copy, and the stack migrates a
+    /// store whose source version is in use the same way.
+    func test_slice_ofAModelAlreadyInUse_isAnEditableCopy_andTheStoreMigrates() async throws {
+        let url = try makeStore(version: "SyncProvider 2")
+
+        let again = try XCTUnwrap(CoreDataMigration.slice("SyncProvider 2", in: fixtureMomd))
+
+        XCTAssertEqual(again.entitiesByName["SyncItemEntity"]?.managedObjectClassName,
+                       NSStringFromClass(NSManagedObject.self))
+        let loaded = try XCTUnwrap(NSManagedObjectModel(contentsOf: fixtureMomd.appendingPathComponent("SyncProvider 2.mom")))
+        XCTAssertEqual(again.entityVersionHashesByName, loaded.entityVersionHashesByName)
+        try await assertMigrated(storeAt: url, fromV1: false, modelURL: fixtureMomd)
+    }
+
     func test_missingStore_isLeftToTheLoad() throws {
         let url = directory.appendingPathComponent("absent.sqlite")
         let currentModel = try XCTUnwrap(NSManagedObjectModel(contentsOf: stackMomd))
@@ -166,9 +182,9 @@ final class CoreDataMigrationV3Tests: XCTestCase {
 
     // MARK: - Assertions
 
-    private func assertMigrated(storeAt url: URL, fromV1: Bool,
+    private func assertMigrated(storeAt url: URL, fromV1: Bool, modelURL: URL? = nil,
                                 file: StaticString = #filePath, line: UInt = #line) async throws {
-        let stack = CoreDataStack(storeURL: url, modelURL: stackMomd)
+        let stack = CoreDataStack(storeURL: url, modelURL: modelURL ?? stackMomd)
         _ = stack.persistentContainer
         XCTAssertNil(stack.initializationError, file: file, line: line)
         let dao = SyncItemDao(stack: stack)
