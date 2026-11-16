@@ -105,6 +105,35 @@ enum DeadLetterReplay: Sendable, Equatable {
     case queueFull
 }
 
+/// What ``SyncItemDao/settleClaim(id:_:)`` writes for an attempt whose
+/// outcome could not be written: what the normal path's write would have.
+enum ClaimSettlement: Sendable, Equatable {
+    /// A 2xx: the row is deleted.
+    case delivered
+    /// Back to `PENDING` behind a cooldown of `delayMs`, as
+    /// ``SyncItemDao/markPendingForRetry(id:errorCode:retryDelayMs:)`` writes it.
+    case retry(errorCode: String?, delayMs: Int)
+    /// Back to `PENDING` with `attempts`, from before the claim, held for
+    /// `holdMs`, as
+    /// ``SyncItemDao/markCredentialRejected(id:errorCode:retryDelayMs:attempts:)``
+    /// writes it.
+    case credentialHold(errorCode: String?, holdMs: Int, attempts: Int32)
+    /// Moved to the dead-letter store, as
+    /// ``SyncItemDao/moveToDeadLetters(id:errorCode:errorMessage:)`` moves it.
+    case deadLetter(errorCode: String, errorMessage: String?)
+}
+
+/// What ``SyncItemDao/settleClaim(id:_:)`` did.
+struct SettledClaim: Sendable, Equatable {
+    /// `false` when no queue row with the id was `IN_FLIGHT` any more: nothing
+    /// was written.
+    let applied: Bool
+    /// When a ``ClaimSettlement/credentialHold(errorCode:holdMs:attempts:)``
+    /// ends, even with the row gone: the credential was rejected either way.
+    /// `nil` for the other settlements.
+    let heldUntil: Int64?
+}
+
 /// Asynchronous CRUD wrapper around `SyncItemEntity`, `SyncDeadLetterEntity`
 /// and `SyncResultEntity`.
 final class SyncItemDao {
@@ -316,28 +345,39 @@ final class SyncItemDao {
     func moveToDeadLetters(id: String, errorCode: String, errorMessage: String?) async throws -> Bool {
         try await stack.performSerializedTask { [clock] context in
             guard let entity = try Self.fetchEntity(id: id, in: context) else { return false }
-            if let older = try Self.fetchDeadLetter(id: id, in: context) {
-                context.delete(older)
-            }
-            let nowMs = clock.nowMs()
-            let letter = SyncDeadLetterEntity(context: context)
-            letter.id = entity.id
-            letter.method = entity.method
-            letter.url = entity.url
-            letter.headersJSON = entity.headersJSON
-            letter.body = entity.body
-            letter.contentType = entity.contentType
-            letter.priority = entity.priority
-            letter.createdAt = entity.createdAt
-            letter.metadataJSON = entity.metadataJSON
-            letter.attempts = entity.attempts
-            letter.lastAttemptAt = entity.lastAttemptAt > 0 ? entity.lastAttemptAt : nowMs
-            letter.lastErrorCode = errorCode
-            letter.lastErrorMessage = errorMessage.map { String($0.prefix(kDeadLetterMessageMaxLength)) }
-            letter.deadLetteredAt = nowMs
-            context.delete(entity)
+            try Self.moveToDeadLetters(entity, id: id, errorCode: errorCode, errorMessage: errorMessage,
+                                       nowMs: clock.nowMs(), in: context)
             return true
         }
+    }
+
+    /// The writes of ``moveToDeadLetters(id:errorCode:errorMessage:)`` for its
+    /// row, once found.
+    private static func moveToDeadLetters(_ entity: SyncItemEntity,
+                                          id: String,
+                                          errorCode: String,
+                                          errorMessage: String?,
+                                          nowMs: Int64,
+                                          in context: NSManagedObjectContext) throws {
+        if let older = try fetchDeadLetter(id: id, in: context) {
+            context.delete(older)
+        }
+        let letter = SyncDeadLetterEntity(context: context)
+        letter.id = entity.id
+        letter.method = entity.method
+        letter.url = entity.url
+        letter.headersJSON = entity.headersJSON
+        letter.body = entity.body
+        letter.contentType = entity.contentType
+        letter.priority = entity.priority
+        letter.createdAt = entity.createdAt
+        letter.metadataJSON = entity.metadataJSON
+        letter.attempts = entity.attempts
+        letter.lastAttemptAt = entity.lastAttemptAt > 0 ? entity.lastAttemptAt : nowMs
+        letter.lastErrorCode = errorCode
+        letter.lastErrorMessage = errorMessage.map { String($0.prefix(kDeadLetterMessageMaxLength)) }
+        letter.deadLetteredAt = nowMs
+        context.delete(entity)
     }
 
     /// Puts the dead letter `id` back in the queue, in one transaction: a
@@ -487,6 +527,47 @@ final class SyncItemDao {
             if let lastAttemptAt {
                 entity.lastAttemptAt = lastAttemptAt
             }
+        }
+    }
+
+    /// Writes the outcome of an attempt whose own write failed, for the
+    /// settle of the cycle that died of it: `settlement`, in one transaction,
+    /// only while the row is still `IN_FLIGHT`. A row purged since, a logout
+    /// say, or no longer in flight, is left alone.
+    ///
+    /// Runs one at a time with the purges (see
+    /// ``CoreDataStack/performSerializedTask(_:)``), so a row found here is
+    /// still there when the transaction saves.
+    func settleClaim(id: String, _ settlement: ClaimSettlement) async throws -> SettledClaim {
+        try await stack.performSerializedTask { [clock] context in
+            let nowMs = clock.nowMs()
+            var heldUntil: Int64?
+            if case let .credentialHold(_, holdMs, _) = settlement {
+                heldUntil = RetryPolicyEvaluator.deadline(fromMs: nowMs, delayMs: holdMs)
+            }
+            guard let entity = try Self.fetchEntity(id: id, in: context),
+                  entity.status == SyncItemStatus.inFlight.rawValue else {
+                return SettledClaim(applied: false, heldUntil: heldUntil)
+            }
+            switch settlement {
+            case .delivered:
+                context.delete(entity)
+            case let .retry(errorCode, delayMs):
+                entity.status = SyncItemStatus.pending.rawValue
+                entity.lastErrorCode = errorCode
+                entity.lastAttemptAt = nowMs
+                entity.nextRetryAt = RetryPolicyEvaluator.deadline(fromMs: nowMs, delayMs: delayMs)
+            case let .credentialHold(errorCode, holdMs, attempts):
+                entity.status = SyncItemStatus.pending.rawValue
+                entity.attempts = attempts
+                entity.lastErrorCode = errorCode
+                entity.lastAttemptAt = nowMs
+                entity.nextRetryAt = RetryPolicyEvaluator.deadline(fromMs: nowMs, delayMs: holdMs)
+            case let .deadLetter(errorCode, errorMessage):
+                try Self.moveToDeadLetters(entity, id: id, errorCode: errorCode, errorMessage: errorMessage,
+                                           nowMs: nowMs, in: context)
+            }
+            return SettledClaim(applied: true, heldUntil: heldUntil)
         }
     }
 

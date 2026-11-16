@@ -1,3 +1,4 @@
+import CoreData
 import XCTest
 @testable import SyncProvider
 
@@ -480,6 +481,46 @@ final class SyncDispatcherCooldownTests: XCTestCase {
         XCTAssertEqual(emitter.events(ofType: "SYNC_FAILED").first?.errorCode, "NETWORK_ERROR")
         let recovered = try await storage.resetInFlightToPending()
         XCTAssertEqual(recovered, 1)
+    }
+
+    /// A purge between the failed outcome write and the settle, a logout say:
+    /// the settle changes only a row still IN_FLIGHT, so the purged item stays
+    /// gone and gets no event of its own, whatever its answer was.
+    func test_aRowPurgedBeforeTheSettle_isLeftAlone_withNoEvent() async throws {
+        let container = stack.persistentContainer
+        for status in [200, 503, 404] {
+            let id = try await storage.enqueue(input: .sample())
+            URLProtocolStub.setHandler(stubResponse(status))
+            emitter.clear()
+            faults.intercept(after: 1) { // the outcome's write
+                Self.purge(id, in: container)
+                throw NSError(domain: NSCocoaErrorDomain,
+                              code: NSPersistentStoreSaveError,
+                              userInfo: [NSLocalizedDescriptionKey: "Purged, then failed"])
+            }
+
+            await flushExpectingItToDie(makeDispatcher(.exact(maxAttempts: 3, baseDelayMs: 300)))
+
+            let queued = try await storage.isQueued(id)
+            XCTAssertFalse(queued, "HTTP \(status): the purge stands")
+            let letter = try await storage.deadLetter(id)
+            XCTAssertNil(letter, "HTTP \(status): nothing is resurrected")
+            XCTAssertEqual(eventTypes, ["SYNC_STARTED", "SYNC_FAILED"], "HTTP \(status)")
+        }
+    }
+
+    /// Deletes the queue row `id` through a context of its own, as a purge by
+    /// another caller would.
+    private static func purge(_ id: String, in container: NSPersistentContainer) {
+        let context = container.newBackgroundContext()
+        context.performAndWait {
+            let request = NSFetchRequest<NSManagedObject>(entityName: "SyncItemEntity")
+            request.predicate = NSPredicate(format: "id == %@", id)
+            if let row = try? context.fetch(request).first {
+                context.delete(row)
+                try? context.save()
+            }
+        }
     }
 }
 

@@ -679,63 +679,90 @@ actor SyncDispatcher {
     func recordFailureOutcome(item: StoredSyncItem,
                               outcome: ItemDispatchOutcome,
                               sentWith: DispatcherConfig) async throws -> FailureDisposition {
-        let attemptsAfter = item.attempts + 1
+        switch failureDecision(item: item, outcome: outcome, sentWith: sentWith) {
+        case let .credentialHold(holdMs):
+            let heldUntil = try await storage.markCredentialRejected(id: item.id,
+                                                                     errorCode: outcome.errorCode,
+                                                                     retryDelayMs: holdMs,
+                                                                     attempts: item.attempts)
+            emitRetrying(item: item, outcome: outcome)
+            return .credentialRejected(heldUntil: heldUntil)
+        case let .deadLetter(errorCode, message):
+            let moved = try await storage.moveToDeadLetters(id: item.id,
+                                                            errorCode: errorCode,
+                                                            errorMessage: Self.deadLetterMessage(for: outcome,
+                                                                                                 fallback: message))
+            // A row removed while its request was out has nothing to move.
+            emitFailed(item: item, outcome: outcome, errorCode: errorCode, deadLettered: moved)
+            return .failed(errorCode: errorCode, message: message)
+        case let .retry(delayMs):
+            // Park the item behind a backoff cooldown so it is not
+            // re-dispatched until `now + delay`.
+            try await storage.markPendingForRetry(id: item.id,
+                                                  errorCode: outcome.errorCode,
+                                                  retryDelayMs: delayMs)
+            emitRetrying(item: item, outcome: outcome)
+            return .retrying(attempt: item.attempts + 1)
+        }
+    }
 
+    /// What a failed attempt does to its row. Decided here for the normal
+    /// path and for the settle of a cycle that dies before writing it, so the
+    /// two cannot differ.
+    private enum FailureDecision {
+        /// A 401/403 to default headers read back from storage: the attempt is
+        /// refunded, and the row waits `holdMs`.
+        case credentialHold(holdMs: Int)
+        /// Retryable, with attempts left: the row cools for `delayMs`.
+        case retry(delayMs: Int)
+        /// Permanent, or retryable with no attempt left.
+        case deadLetter(errorCode: String, message: String)
+    }
+
+    private func failureDecision(item: StoredSyncItem,
+                                 outcome: ItemDispatchOutcome,
+                                 sentWith: DispatcherConfig) -> FailureDecision {
+        let attemptsAfter = item.attempts + 1
         if isStaleCredentialRejection(outcome, sentWith: sentWith) {
             let delayMs = RetryPolicyEvaluator.nextDelayMs(attempt: Int(attemptsAfter),
                                                            policy: config.retryPolicy)
-            let heldUntil = try await storage.markCredentialRejected(id: item.id,
-                                                                     errorCode: outcome.errorCode,
-                                                                     retryDelayMs: max(delayMs, kMinCredentialHoldMs),
-                                                                     attempts: item.attempts)
-            emitter.emit(.now(type: "ITEM_RETRYING",
-                              itemId: item.id,
-                              errorCode: outcome.errorCode,
-                              statusCode: outcome.statusCode.map(Double.init),
-                              attempt: Double(attemptsAfter)))
-            return .credentialRejected(heldUntil: heldUntil)
+            return .credentialHold(holdMs: max(delayMs, kMinCredentialHoldMs))
         }
-
         let isRetryable = decideRetry(outcome: outcome, statusCode: outcome.statusCode)
         let exhausted = Int(attemptsAfter) >= config.retryPolicy.maxAttempts
-
         guard isRetryable && !exhausted else {
             let finalErrorCode = isRetryable
                 ? "MAX_ATTEMPTS_EXCEEDED"
                 : (outcome.errorCode ?? "NETWORK_ERROR")
-            let message = outcome.errorMessage ?? finalErrorCode
-            let moved = try await storage.moveToDeadLetters(id: item.id,
-                                                            errorCode: finalErrorCode,
-                                                            errorMessage: Self.deadLetterMessage(for: outcome,
-                                                                                                 fallback: message))
-            emitter.emit(.now(type: "ITEM_FAILED",
-                              itemId: item.id,
-                              errorCode: finalErrorCode,
-                              statusCode: outcome.statusCode.map(Double.init),
-                              attempt: Double(attemptsAfter)))
-            // A row removed while its request was out has nothing to move.
-            if moved {
-                emitter.emit(.now(type: "ITEM_DEAD_LETTERED",
-                                  itemId: item.id,
-                                  errorCode: "DEAD_LETTERED",
-                                  metadata: ["lastErrorCode": finalErrorCode]))
-            }
-            return .failed(errorCode: finalErrorCode, message: message)
+            return .deadLetter(errorCode: finalErrorCode, message: outcome.errorMessage ?? finalErrorCode)
         }
+        return .retry(delayMs: RetryPolicyEvaluator.nextDelayMs(attempt: Int(attemptsAfter),
+                                                                policy: config.retryPolicy))
+    }
 
-        // Retryable and attempts remain: park the item behind a backoff
-        // cooldown so it is not re-dispatched until `now + delay`.
-        let delayMs = RetryPolicyEvaluator.nextDelayMs(attempt: Int(attemptsAfter),
-                                                       policy: config.retryPolicy)
-        try await storage.markPendingForRetry(id: item.id,
-                                              errorCode: outcome.errorCode,
-                                              retryDelayMs: delayMs)
+    private func emitRetrying(item: StoredSyncItem, outcome: ItemDispatchOutcome) {
         emitter.emit(.now(type: "ITEM_RETRYING",
                           itemId: item.id,
                           errorCode: outcome.errorCode,
                           statusCode: outcome.statusCode.map(Double.init),
-                          attempt: Double(attemptsAfter)))
-        return .retrying(attempt: attemptsAfter)
+                          attempt: Double(item.attempts + 1)))
+    }
+
+    private func emitFailed(item: StoredSyncItem,
+                            outcome: ItemDispatchOutcome,
+                            errorCode: String,
+                            deadLettered: Bool) {
+        emitter.emit(.now(type: "ITEM_FAILED",
+                          itemId: item.id,
+                          errorCode: errorCode,
+                          statusCode: outcome.statusCode.map(Double.init),
+                          attempt: Double(item.attempts + 1)))
+        if deadLettered {
+            emitter.emit(.now(type: "ITEM_DEAD_LETTERED",
+                              itemId: item.id,
+                              errorCode: "DEAD_LETTERED",
+                              metadata: ["lastErrorCode": errorCode]))
+        }
     }
 
     /// The code a cycle that dies of `error` reports on its `SYNC_FAILED`: a
@@ -770,6 +797,10 @@ actor SyncDispatcher {
     /// request that never went out leaves the row as it was before its claim,
     /// with no event. When this write fails too, the row waits `IN_FLIGHT`
     /// for launch recovery.
+    ///
+    /// Only a row still `IN_FLIGHT` is settled, as on Android: a row purged
+    /// since, a logout say, stays gone and gets no event. The credential
+    /// hold applies either way.
     private func settleUnrecorded(item: StoredSyncItem,
                                   outcome: ItemDispatchOutcome,
                                   sentWith: DispatcherConfig) async {
@@ -781,13 +812,33 @@ actor SyncDispatcher {
                 return
             }
             if outcome.succeeded {
-                try await storage.remove(id: item.id)
-                emitSucceeded(item: item, outcome: outcome)
+                let settled = try await storage.settleClaim(id: item.id, .delivered)
+                if settled.applied {
+                    emitSucceeded(item: item, outcome: outcome)
+                }
                 return
             }
-            let disposition = try await recordFailureOutcome(item: item, outcome: outcome, sentWith: sentWith)
-            if case let .credentialRejected(heldUntil) = disposition {
+            let decision = failureDecision(item: item, outcome: outcome, sentWith: sentWith)
+            let settlement: ClaimSettlement
+            switch decision {
+            case let .credentialHold(holdMs):
+                settlement = .credentialHold(errorCode: outcome.errorCode, holdMs: holdMs, attempts: item.attempts)
+            case let .retry(delayMs):
+                settlement = .retry(errorCode: outcome.errorCode, delayMs: delayMs)
+            case let .deadLetter(errorCode, message):
+                settlement = .deadLetter(errorCode: errorCode,
+                                         errorMessage: Self.deadLetterMessage(for: outcome, fallback: message))
+            }
+            let settled = try await storage.settleClaim(id: item.id, settlement)
+            if let heldUntil = settled.heldUntil {
                 credentialHeldUntil = heldUntil
+            }
+            guard settled.applied else { return }
+            switch decision {
+            case .credentialHold, .retry:
+                emitRetrying(item: item, outcome: outcome)
+            case let .deadLetter(errorCode, _):
+                emitFailed(item: item, outcome: outcome, errorCode: errorCode, deadLettered: true)
             }
         } catch {
             SyncLogger.error("Could not settle the row of a cycle that died; it waits for launch recovery: "

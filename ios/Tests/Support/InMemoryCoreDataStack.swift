@@ -148,6 +148,8 @@ final class SaveFaults: @unchecked Sendable {
     private var toSkip = 0
     private var toFail = 0
     private var failed = 0
+    private var interceptSkip = 0
+    private var interception: (() throws -> Void)?
 
     /// Lets the next `skipped` saves through, then fails the `count` after
     /// them. `Int.max` fails every one.
@@ -158,10 +160,31 @@ final class SaveFaults: @unchecked Sendable {
         }
     }
 
+    /// Runs `action` in the save after the next `skipped` ones, once, before
+    /// it commits, on the transaction's queue. The save goes on unless
+    /// `action` throws. Counted apart from ``fail(_:after:)``.
+    func intercept(after skipped: Int = 0, _ action: @escaping () throws -> Void) {
+        lock.withLock {
+            interceptSkip = skipped
+            interception = action
+        }
+    }
+
     /// The saves failed so far.
     var failures: Int { lock.withLock { failed } }
 
     func check() throws {
+        let action = lock.withLock { () -> (() throws -> Void)? in
+            guard let pending = interception else { return nil }
+            if interceptSkip > 0 {
+                interceptSkip -= 1
+                return nil
+            }
+            interception = nil
+            return pending
+        }
+        try action?()
+
         let fails = lock.withLock { () -> Bool in
             if toSkip > 0 {
                 toSkip -= 1
