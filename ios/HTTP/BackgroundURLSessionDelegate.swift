@@ -30,6 +30,13 @@ final class BackgroundUploadWait: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<BackgroundDispatchOutcome?, Never>?
     private var isSettled = false
+    private var didInstall = false
+
+    /// `true` once ``install(_:)`` took the waiter: the upload was then
+    /// handed to the session, even if a cancellation ended the wait since.
+    var started: Bool {
+        lock.withLock { didInstall }
+    }
 
     /// Takes the waiter.
     /// - Returns: `false` when a cancellation came first. The waiter is then
@@ -38,6 +45,7 @@ final class BackgroundUploadWait: @unchecked Sendable {
         let settled = lock.withLock { () -> Bool in
             if isSettled { return true }
             self.continuation = continuation
+            didInstall = true
             return false
         }
         if settled {

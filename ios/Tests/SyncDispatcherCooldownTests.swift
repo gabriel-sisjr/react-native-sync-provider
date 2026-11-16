@@ -40,13 +40,15 @@ final class SyncDispatcherCooldownTests: XCTestCase {
                                                 defaultHeaders: [:]))
     }
 
-    private func makeDispatcher(config: DispatcherConfig) -> SyncDispatcher {
+    private func makeDispatcher(config: DispatcherConfig,
+                                isAppActive: (@Sendable () async -> Bool)? = nil) -> SyncDispatcher {
         SyncDispatcher(storage: storage,
                        emitter: emitter,
                        connectivity: ConnectivityMonitor.shared,
                        config: config,
                        foregroundSession: foregroundSession,
-                       backgroundSession: backgroundSession)
+                       backgroundSession: backgroundSession,
+                       isAppActive: isAppActive)
     }
 
     private func item(_ id: String) async throws -> StoredSyncItem {
@@ -509,6 +511,62 @@ final class SyncDispatcherCooldownTests: XCTestCase {
         }
     }
 
+    // MARK: - A cancellation before the request reaches URLSession
+
+    /// A row never attempted keeps no attempt time.
+    func test_aCancellationBeforeTheSend_leavesANewRowWithNoAttemptTime() async throws {
+        let id = try await storage.enqueue(input: .sample())
+        try await assertCancelledBeforeTheSend(id)
+    }
+
+    /// A row attempted before keeps the time of that attempt, not its claim's.
+    func test_aCancellationBeforeTheSend_keepsTheEarlierAttemptTime() async throws {
+        let id = try await storage.enqueue(input: .sample())
+        try await storage.markInFlight(id: id)
+        try await storage.releaseClaim(id: id, attempts: 1, lastAttemptAt: nil)
+        clock.advance(ms: 5_000)
+        try await assertCancelledBeforeTheSend(id)
+    }
+
+    /// The flush is cancelled after the claim and before URLSession gets the
+    /// request: nothing went out, so the row comes back as it was before its
+    /// claim, its `lastAttemptAt` included.
+    private func assertCancelledBeforeTheSend(_ id: String,
+                                              file: StaticString = #filePath,
+                                              line: UInt = #line) async throws {
+        let before = try await item(id)
+        URLProtocolStub.setHandler(stubResponse(200))
+        let holder = FlushTask()
+        let dispatcher = makeDispatcher(config: DispatcherConfig(retryPolicy: .exact(maxAttempts: 3,
+                                                                                     baseDelayMs: 300),
+                                                                 requestTimeoutMs: 30_000,
+                                                                 batchSize: 25,
+                                                                 defaultHeaders: [:]),
+                                        isAppActive: { holder.cancel(); return true })
+        var open: AsyncStream<Void>.Continuation?
+        let gate = AsyncStream<Void> { open = $0 }
+        let flush = Task { () -> Error? in
+            for await _ in gate { break }
+            do {
+                _ = try await dispatcher.flush()
+                return nil
+            } catch {
+                return error
+            }
+        }
+        holder.set(flush)
+        open?.yield(())
+        let thrown = await flush.value
+
+        XCTAssertTrue(thrown is CancellationError, file: file, line: line)
+        XCTAssertEqual(URLProtocolStub.capturedRequests.count, 0, "nothing went out", file: file, line: line)
+        let stored = try await item(id)
+        XCTAssertEqual(stored.status, "PENDING", file: file, line: line)
+        XCTAssertEqual(stored.attempts, before.attempts, file: file, line: line)
+        XCTAssertEqual(stored.lastAttemptAt, before.lastAttemptAt, "the time from before the claim",
+                       file: file, line: line)
+    }
+
     /// Deletes the queue row `id` through a context of its own, as a purge by
     /// another caller would.
     private static func purge(_ id: String, in container: NSPersistentContainer) {
@@ -521,6 +579,20 @@ final class SyncDispatcherCooldownTests: XCTestCase {
                 try? context.save()
             }
         }
+    }
+}
+
+/// A flush running in a task of its own, which a hook can cancel.
+private final class FlushTask: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: Task<Error?, Never>?
+
+    func set(_ task: Task<Error?, Never>) {
+        lock.withLock { self.task = task }
+    }
+
+    func cancel() {
+        lock.withLock { task }?.cancel()
     }
 }
 

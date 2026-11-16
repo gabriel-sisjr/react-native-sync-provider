@@ -341,8 +341,9 @@ actor SyncDispatcher {
     /// Cancelled before its cycle starts, the flush emits nothing. Cancelled
     /// during it, the cycle claims no further item, the request in flight is
     /// cancelled and its item goes back to `PENDING` with the attempt its
-    /// claim spent refunded and the claim's `lastAttemptAt` kept (the request
-    /// may have reached the server), and `SYNC_FAILED` ends the cycle without
+    /// claim spent refunded, and `lastAttemptAt` as the claim set it when
+    /// `URLSession` had the request (it may have reached the server) or as it
+    /// was before the claim when it never did, and `SYNC_FAILED` ends the cycle without
     /// `errorCode` or `metadata`: nothing failed, and no history row is kept.
     /// A response that arrived before the cancellation is recorded as usual.
     /// A `CancellationError` thrown while the caller's task is not cancelled,
@@ -531,16 +532,21 @@ actor SyncDispatcher {
             // `configureSync` can land while the request is out. Its answer is
             // about the credential it carried, not the one configured since.
             let sentWith = config
-            guard let outcome = await dispatchOne(item: item) else {
+            let outcome: ItemDispatchOutcome
+            switch await dispatchOne(item: item) {
+            case let .answered(answered):
+                outcome = answered
+            case let .cancelled(requestSent):
                 // Cancelled before an answer came: there is no outcome to
                 // record. The attempt is refunded, so the next cycle sends the
-                // item again; the claim's time stays, as the request may have
-                // reached the server.
+                // item again. The claim's time stays when URLSession had the
+                // request, which may have reached the server; otherwise the
+                // row keeps the time it had before its claim.
                 inFlight.remove(item.id)
                 do {
                     try await storage.releaseClaim(id: item.id,
                                                    attempts: item.attempts,
-                                                   lastAttemptAt: nil)
+                                                   lastAttemptAt: requestSent ? nil : (item.lastAttemptAt ?? 0))
                 } catch {
                     // Still a cancellation, which failed nothing: the row
                     // waits IN_FLIGHT for launch recovery.
@@ -892,16 +898,24 @@ actor SyncDispatcher {
 
     // MARK: - Single-item dispatch
 
-    /// - Returns: `nil` when the caller was cancelled before an answer came:
-    ///   the request was not sent, or it was cancelled.
-    private func dispatchOne(item: StoredSyncItem) async -> ItemDispatchOutcome? {
+    /// What one ``dispatchOne(item:)`` came to.
+    private enum DispatchResult {
+        /// The outcome to record: an answer, a transport error, or a request
+        /// that could not be sent (see ``ItemDispatchOutcome/requestSent``).
+        case answered(ItemDispatchOutcome)
+        /// The caller was cancelled before an answer came. `requestSent` is
+        /// `false` when the request was never handed to `URLSession`.
+        case cancelled(requestSent: Bool)
+    }
+
+    private func dispatchOne(item: StoredSyncItem) async -> DispatchResult {
         guard let url = URL(string: item.url), url.scheme?.hasPrefix("http") == true else {
-            return ItemDispatchOutcome(itemId: item.id,
-                                       succeeded: false,
-                                       statusCode: nil,
-                                       errorCode: "INVALID_URL",
-                                       errorMessage: "Invalid URL: \(item.url)",
-                                       requestSent: false)
+            return .answered(ItemDispatchOutcome(itemId: item.id,
+                                                 succeeded: false,
+                                                 statusCode: nil,
+                                                 errorCode: "INVALID_URL",
+                                                 errorMessage: "Invalid URL: \(item.url)",
+                                                 requestSent: false))
         }
 
         var request = URLRequest(url: url)
@@ -926,7 +940,7 @@ actor SyncDispatcher {
         let bodyData = (item.body ?? "").data(using: .utf8)
 
         let useBackground = await shouldUseBackgroundSession()
-        guard !Task.isCancelled else { return nil }
+        guard !Task.isCancelled else { return .cancelled(requestSent: false) }
 
         if useBackground, let bodyData = bodyData {
             return await dispatchOnBackground(request: request, body: bodyData, item: item)
@@ -936,7 +950,7 @@ actor SyncDispatcher {
 
     private func dispatchOnForeground(request: URLRequest,
                                       body: Data?,
-                                      item: StoredSyncItem) async -> ItemDispatchOutcome? {
+                                      item: StoredSyncItem) async -> DispatchResult {
         var requestCopy = request
         if let body = body, !body.isEmpty {
             requestCopy.httpBody = body
@@ -945,18 +959,19 @@ actor SyncDispatcher {
         do {
             let (_, response) = try await foregroundSession.data(for: requestCopy)
             let statusCode = (response as? HTTPURLResponse)?.statusCode
-            return classifyResponse(itemId: item.id, statusCode: statusCode, transportError: nil)
+            return .answered(classifyResponse(itemId: item.id, statusCode: statusCode, transportError: nil))
         } catch {
             // Cancelling the caller cancels the request: that is no answer,
-            // and must not spend an attempt as a NETWORK_ERROR.
-            if Task.isCancelled { return nil }
-            return classifyResponse(itemId: item.id, statusCode: nil, transportError: error)
+            // and must not spend an attempt as a NETWORK_ERROR. URLSession had
+            // the request, which may have reached the server.
+            if Task.isCancelled { return .cancelled(requestSent: true) }
+            return .answered(classifyResponse(itemId: item.id, statusCode: nil, transportError: error))
         }
     }
 
     private func dispatchOnBackground(request: URLRequest,
                                       body: Data,
-                                      item: StoredSyncItem) async -> ItemDispatchOutcome? {
+                                      item: StoredSyncItem) async -> DispatchResult {
         // Background `URLSession` requires the request body to be on disk.
         let tmpURL = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("syncprovider-\(item.id).body")
@@ -965,7 +980,7 @@ actor SyncDispatcher {
         } catch {
             var outcome = classifyResponse(itemId: item.id, statusCode: nil, transportError: error)
             outcome.requestSent = false
-            return outcome
+            return .answered(outcome)
         }
 
         let task = backgroundSession.uploadTask(with: request, fromFile: tmpURL)
@@ -991,10 +1006,11 @@ actor SyncDispatcher {
         // Best-effort cleanup of the body file.
         try? FileManager.default.removeItem(at: tmpURL)
 
-        guard let completed else { return nil }
-        return classifyResponseSync(itemId: completed.itemId,
-                                    statusCode: completed.statusCode,
-                                    transportError: completed.error)
+        // A wait the cancellation ended first never started its upload.
+        guard let completed else { return .cancelled(requestSent: wait.started) }
+        return .answered(classifyResponseSync(itemId: completed.itemId,
+                                              statusCode: completed.statusCode,
+                                              transportError: completed.error))
     }
 
     /// `true` when an upload must survive the app leaving the foreground. A
