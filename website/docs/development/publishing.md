@@ -133,7 +133,7 @@ Pre-releases come only from `prerelease.yml`: **Actions â†’ Pre-release to NPM â
 2. **Run the workflow.**
    - Under **Use workflow from**, choose the branch to release.
    - Leave **Branch to release from** at `develop`, or set it to that same branch. The checkout uses this input, but the commit hash in a generated version, the `Commit:` line of the GitHub pre-release and the npm provenance come from the branch chosen in **Use workflow from**.
-   - Optional: a version suffix, for example `rc1`, and a description.
+   - Optional: a version suffix, for example `rc1` or `beta.2`, and a description. The suffix must be SemVer pre-release identifiers, and the description is used exactly as typed, quotes included.
 3. **Install it.**
 
    ```bash
@@ -145,6 +145,7 @@ Pre-releases come only from `prerelease.yml`: **Actions â†’ Pre-release to NPM â
 What the run does:
 
 - The version is `<base>-<suffix>`, where `<base>` is the `package.json` version without any pre-release part. With `0.2.0` and `rc1` it gives `0.2.0-rc1`. An empty suffix gives `<base>-beta.<UTC timestamp>.<sha7>`.
+- The suffix must be one or more dot-separated identifiers of letters, digits and hyphens, with no leading zero in an all-digit identifier and no `+build` part. Any other suffix fails the run at **Generate pre-release version**, before anything is built, published or tagged, so the npm version, the tag and the release name always match. See [Pre-Release Version Format](./ci-cd.md#pre-release-version-format).
 - It publishes with `npm publish --access public --tag beta --provenance`, so `rc` versions land on `beta` too.
 - It runs `yarn nitrogen`, `yarn prepare`, `yarn test` and the `npm pack` assertion, but not `yarn lint` or `yarn typecheck`.
 - It commits `package.json` inside the runner but pushes only the tag `v<version>`, so the tag points at a commit that is on no branch. It then creates a GitHub pre-release.
@@ -305,6 +306,15 @@ The GitHub release does not read `CHANGELOG.md`: its notes list commit subjects.
 
 1. Check that the tag points at the published commit.
 2. Create the GitHub release by hand if there is none.
+
+### `prerelease.yml` fails at "Generate pre-release version" with `version_suffix must be SemVer pre-release identifiers`
+
+**Cause.** The `version_suffix` input is not a valid SemVer pre-release part: an empty identifier (`rc..1`, a trailing dot), a character other than a letter, a digit or a hyphen (`rc_1`, `rc 1`), an all-digit identifier with a leading zero (`rc.01`), or a `+build` part. Nothing was built, published or tagged.
+
+**Fix.**
+
+1. Pick a suffix such as `rc1`, `rc.1` or `beta.2`, new on every run.
+2. Re-run the dispatch.
 
 ### `prerelease.yml` cannot find the branch
 

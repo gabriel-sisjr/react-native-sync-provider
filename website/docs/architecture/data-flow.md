@@ -113,7 +113,8 @@ Notes:
 - Cycles do not overlap. On Android, a concurrent `flush()` waits for the running cycle and then runs its own. On iOS, it returns the last result at once.
 - HTTP requests run on the native dispatcher's executor (`URLSession` on iOS, OkHttp + `Dispatchers.IO` on Android). The JS thread is never blocked.
 - The `SyncResult` is persisted to history before the promise resolves.
-- A cycle that dies emits `SYNC_FAILED` and rejects, so every cycle ends with a terminal event.
+- A cycle that dies, for example on a failed storage write, first settles each item it claimed and left without a recorded outcome, then emits `SYNC_FAILED` and rejects, so every cycle ends with a terminal event. Automatic wakes then wait for the [failure hold](../guides/retry-policy.md#the-failure-hold). See [When a Cycle Dies](../guides/error-handling.md#when-a-cycle-dies).
+- A cancelled cycle ends with `SYNC_FAILED` without an `errorCode`, and gives its unsent items back unchanged. See [Cancelled Cycles](../guides/error-handling.md#cancelled-cycles).
 
 ## Background Flush Flow
 
@@ -133,15 +134,15 @@ sequenceDiagram
     Native->>OS: setTaskCompleted(success: true)
 ```
 
-On both platforms, the flush runs the same checks as a foreground one, from the persisted configuration. See [When the gate or the health check skips a window](../guides/background-sync.md#when-the-gate-or-the-health-check-skips-a-window).
+On both platforms, the flush runs the same checks as a foreground one, from the persisted configuration. See [When the gate or the health check skips a window](../guides/background-sync.md#when-the-gate-or-the-health-check-skips-a-window). On iOS the task completes with `success: false` instead when the flush throws or the window [runs out of time](../guides/background-sync.md#when-a-window-runs-out-of-time).
 
 ### Android (WorkManager)
 
-WorkManager runs `SyncWorker`, at most every 15 minutes for the periodic job, and also for the opt-in retry kick. The exception is a retry after a periodic run that failed as a whole, which follows WorkManager's exponential backoff from 1 minute. WorkManager enforces the constraints. The worker stays inert under `foregroundOnly` or a persisted pause. Otherwise, with no JS engine attached, it first resets rows a dead process left `IN_FLIGHT`. It then flushes and returns `Result.success()` on any completed flush, including one with failed items or one the quality gate or the health check skipped, so that WorkManager's backoff cannot race the persisted cooldowns. `Result.retry()` is reserved for a worker that fails as a whole.
+WorkManager runs `SyncWorker`, at most every 15 minutes for the periodic job, and also for the opt-in retry kick. The exception is a retry after a periodic run that failed as a whole, which follows WorkManager's exponential backoff from 1 minute, or WorkManager's default, from 30 seconds, under `requiresDeviceIdle`. WorkManager enforces the constraints. The worker stays inert under `foregroundOnly` or a persisted pause. Otherwise, with no JS engine attached, it first resets rows a dead process left `IN_FLIGHT`. It then flushes and returns `Result.success()` on any completed flush, including one with failed items or one the quality gate or the health check skipped, so that WorkManager's backoff cannot race the persisted cooldowns. `Result.retry()` is reserved for a worker that fails as a whole, a cycle that dies included. A worker that WorkManager stops rethrows the cancellation and reports neither.
 
 ### iOS (BGTaskScheduler)
 
-`BGTaskScheduler` wakes a handler that was registered at process start. The handler re-submits the next request first, so the chain continues if the process is killed, then waits for launch recovery and flushes. It works with no JS loaded. A task that fires under `foregroundOnly` or after `disableBackgroundSync` completes inert. While paused, it completes without dispatching.
+`BGTaskScheduler` wakes a handler that was registered at process start. The handler re-submits the next request first, so the chain continues if the process is killed, then waits for launch recovery and flushes. It works with no JS loaded. A task that fires under `foregroundOnly` or after `disableBackgroundSync` completes inert. While paused, it completes without dispatching. When the window's time runs out, the task completes at once with `success: false`, and the flush claims nothing more and cancels the request in flight, refunding its attempt.
 
 ## Connectivity Change Flow
 
@@ -155,7 +156,7 @@ flowchart LR
     D --> G[React re-render]
 ```
 
-The native monitor is a singleton per process. An event is emitted only when a reported field of the snapshot changes, including `networkQuality` alone. Android never emits one for the state it starts in; iOS starts at `UNKNOWN`, so its first path report emits one. `useAutoSync` reads the starting status when it is enabled and compares each event's status with the last one it knows, so only a real change to `CONNECTED`, or to `METERED` with `flushOnMetered`, triggers its reconnect flush. A quality-only change never does.
+The native monitor is a singleton per process. An event is emitted only when a reported field of the snapshot changes, including `networkQuality` alone. Android never emits one for the state it starts in; iOS starts at `UNKNOWN`, so its first path report emits one. Events reach JS asynchronously, after the new state is stored, in the order of the changes. `useAutoSync` reads the starting status when it is enabled and compares each event's status with the last one it knows, so only a real change to `CONNECTED`, or to `METERED` with `flushOnMetered`, triggers its reconnect flush. A quality-only change never does.
 
 The event does not start a native flush. `useAutoSync` does that from JS. Natively, a reconnect only delivers a wake the [retry timer](../guides/retry-policy.md#who-wakes-the-queue-and-when) owes from firing offline.
 
@@ -171,7 +172,7 @@ flowchart TD
     F --> G[next flush trigger picks them up]
 ```
 
-Recovery handles the "process killed mid-dispatch" case. Without it, items would be stuck `IN_FLIGHT` forever. The reset is **transactional and idempotent** -- safe to run on every launch. It sends no request itself.
+Recovery handles the "process killed mid-dispatch" case, and the rare items a [cycle that died](../guides/error-handling.md#when-a-cycle-dies) could not settle because its settling write failed too. Without it, items would be stuck `IN_FLIGHT` forever. The reset is **transactional and idempotent** -- safe to run on every launch. It sends no request itself.
 
 What starts it differs by platform.
 

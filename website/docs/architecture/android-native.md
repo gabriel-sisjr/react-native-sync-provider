@@ -65,9 +65,15 @@ DAOs expose `suspend` reads and `Flow<List<SyncItemEntity>>` for reactive subscr
 A cycle:
 
 1. Calls `claimPending` to atomically transition one batch of up to `batchSize` eligible rows from `PENDING` to `IN_FLIGHT`.
-2. For each row, concurrently, builds the `Request` with merged headers (`SyncOptions.defaultHeaders` first, then per-item `headers`) and runs one attempt with the configured `requestTimeoutMs`. `attempts` continues from what earlier cycles persisted.
+2. For each row, concurrently, builds the `Request` with merged headers (`SyncOptions.defaultHeaders` first, then per-item `headers`) and runs one attempt bounded by `requestTimeoutMs`, raised to 1 second and capped at 2147483647 ms. `attempts` continues from what earlier cycles persisted.
 3. Applies the result via `markSucceeded | markRetry | markFailed` and emits the corresponding `ITEM_SUCCEEDED | ITEM_RETRYING | ITEM_FAILED` event. On a retriable failure with attempts left, the row returns to `PENDING` with `nextRetryAt` measured from the end of the attempt. A non-retryable failure keeps its real code, and only a retriable one with no attempts left becomes `MAX_ATTEMPTS_EXCEEDED`.
 4. Records the `SyncResult`, emits the terminal event, and calls back to arm the next retry wake.
+
+An attempt that runs out of `requestTimeoutMs`, or hits one of the shared client's socket timeouts (10 s to connect, 30 s for a stalled read or write), fails with `TIMEOUT`; every other I/O failure is `NETWORK_ERROR`, and both are retried. An exception from the attempt itself that is not an I/O error, such as one while OkHttp builds the call, is a permanent `INVALID_PAYLOAD` failure.
+
+Anything raised around an attempt rather than by it, such as a storage write that fails or an `Error`, is not that item's outcome: it ends the cycle. Dispatches already started finish and no new one starts. Each row the cycle claimed without a recorded outcome is then settled in one transaction with what its attempt established, and reported, before the cycle's `SYNC_FAILED` and the `flush()` rejection. A row whose request never went out comes back exactly as before the claim. See [When a Cycle Dies](../guides/error-handling.md#when-a-cycle-dies).
+
+A cycle whose own job is cancelled, such as a worker that WorkManager stops, ends with `SYNC_FAILED` without an `errorCode`. No item fails because of it: a request already on the wire finishes and records its answer, and the claimed rows not yet sent come back unchanged.
 
 With default headers restored from disk, one item goes first. If the server rejects the credential, the rest of the batch is released untouched, so an expired token costs one request per wake. That item stays `PENDING`, no attempt is spent, and it waits at least 60 seconds. See [Cold-start configuration](../guides/background-sync.md#cold-start-configuration).
 
@@ -77,7 +83,7 @@ When paused, or with default headers that cannot be read, `flush()` returns an a
 
 ## Retry Wake
 
-`RetryWake` decides when the queue wakes next, and arms both mechanisms from one place. It runs after every cycle, after recovery, on `configureSync` and on `resumeSync`, and does nothing while paused, under `MANUAL`, or with headers that cannot be read.
+`RetryWake` decides when the queue wakes next, and arms both mechanisms from one place. It runs after every cycle, after recovery, on `configureSync` and on `resumeSync`, and does nothing while paused, under `MANUAL`, or with headers that cannot be read. A wake is never more than 2^53 - 1 ms away, so a deadline as late as the largest JavaScript `Date` still arms both mechanisms.
 
 - **`RetryTimer`** is a single-shot in-process timer, armed only while a JS engine is attached. If it fires offline it does not flush: it owes the wake and delivers it when connectivity returns.
 - **The retry kick** is a delayed `OneTimeWorkRequest` (`syncprovider-flush-now`, `ExistingWorkPolicy.REPLACE`) that survives process death. `scheduleOneTimeFlush` arms it only with background sync enabled and `foregroundOnly` off, under the same constraints as the periodic work.
@@ -85,6 +91,8 @@ When paused, or with default headers that cannot be read, `flush()` returns an a
 `RetryWake` also keeps the credential hold, in memory, as iOS does. After a rejected stored credential, every arm path waits for it, so neither the timer nor a replacement kick fires before the hold ends. `configureSync` clears it, and a new process starts without it. See [When a stored token expires](../guides/background-sync.md#when-a-stored-token-expires).
 
 After a failed health check, the timer and the kick wait for the end of its backoff, and at least 1000 ms after the failure, so a `healthCheckBackoffMs` of `0` cannot make them spin. See [Health check](../guides/connectivity-detection.md#health-check).
+
+After a cycle that dies, `RetryWake` keeps a failure hold, in memory too: every arm path except `resumeSync` waits 30 seconds from that cycle's end, doubling for each failed cycle in a row, at most 15 minutes. A cycle that completes ends it, and a cancelled one neither starts nor ends it. See [The Failure Hold](../guides/retry-policy.md#the-failure-hold).
 
 See [Who wakes the queue](../guides/retry-policy.md#who-wakes-the-queue-and-when).
 
@@ -98,7 +106,7 @@ The background options live in `syncprovider.bgsync.prefs`, managed by `Backgrou
 
 ## ConnectivityMonitor
 
-`ConnectivityMonitor` registers a default-network callback (`registerDefaultNetworkCallback`), so it follows only the network the app's traffic uses. It registers against the `ApplicationContext`, not an `Activity`, so the registration never holds a screen in memory and outlives any one of them. It exposes the latest `ConnectionState` as a `StateFlow<ConnectionState>`. When a reported field changes, `networkQuality` included, it stores the new state first and emits `CONNECTION_CHANGED` from a background coroutine, so a JS listener receives it asynchronously, on the JS thread, and `getConnectionStatus()` can already return the new state, or a later one, when the event arrives. It seeds its state before it registers the callback, so the state it starts in is never emitted.
+`ConnectivityMonitor` registers a default-network callback (`registerDefaultNetworkCallback`), so it follows only the network the app's traffic uses. It registers against the `ApplicationContext`, not an `Activity`, so the registration never holds a screen in memory and outlives any one of them. It exposes the latest `ConnectionState` as a `StateFlow<ConnectionState>`. When a reported field changes, `networkQuality` included, it stores the new state first and queues the change, in order. One background consumer emits the queued changes one at a time, so a JS listener receives `CONNECTION_CHANGED` asynchronously, on the JS thread, in the order of the changes, and `getConnectionStatus()` can already return the new state, or a later one, when the event arrives. An emit that fails loses only that event. It seeds its state before it registers the callback, so the state it starts in is never emitted.
 
 `NetworkCapabilities` are inspected on every change. A default network without `NET_CAPABILITY_INTERNET` is `DISCONNECTED`. Otherwise the link is `METERED` unless it has `NET_CAPABILITY_NOT_METERED`, or, on Android 11 (API 30) and later, `NET_CAPABILITY_TEMPORARILY_NOT_METERED`. `NetworkQualityClassifier` grades the link with the [shared threshold table](../guides/connectivity-detection.md#how-it-is-classified), capping a network without `NET_CAPABILITY_VALIDATED` at `POOR`. With `healthCheckUrl` set, `LatencyProbe` measures it over the `HeadProbe` client, which the health check (`http/HealthCheck.kt`) shares; a measurement is keyed by the network handle, its validation and the URL. The monitor starts when the first JS engine attaches.
 
@@ -106,12 +114,12 @@ The background options live in `syncprovider.bgsync.prefs`, managed by `Backgrou
 
 `SyncWorker` is a `CoroutineWorker` registered via WorkManager:
 
-- **`PeriodicWorkRequest`** (`syncprovider-flush-periodic`) for the regular cadence — enforced floor of **15 minutes** (WorkManager hard limit).
+- **`PeriodicWorkRequest`** (`syncprovider-flush-periodic`) for the regular cadence — enforced floor of **15 minutes** (WorkManager hard limit), and a cap of 2^53 - 1 ms.
 - **`OneTimeWorkRequest`** (`syncprovider-flush-now`) for the [retry kick](#retry-wake).
 
-Both use `Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED)` (or `UNMETERED` when `BackgroundSyncOptions.requiresUnmeteredNetwork` is true) plus `setRequiresCharging` / `setRequiresDeviceIdle` mappings. WorkManager refuses the backoff policy the library sets on an idle-constrained request, so `requiresDeviceIdle: true` makes `enableBackgroundSync()` reject with `BACKGROUND_TASK_REGISTRATION_FAILED`.
+Both use `Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED)` (or `UNMETERED` when `BackgroundSyncOptions.requiresUnmeteredNetwork` is true) plus `setRequiresCharging` / `setRequiresDeviceIdle` mappings. A run that fails as a whole backs off exponentially from 1 minute. An idle-constrained request gets no backoff criteria, which WorkManager refuses on it, so it keeps WorkManager's default, exponential from 30 seconds and at most 5 hours, and also waits for the device to be idle again.
 
-`SyncWorker.doWork()` stays inert when dispatch is blocked by a persisted pause or `foregroundOnly`. `MANUAL` does not block it, because enabling background sync is an explicit request. Otherwise, with no JS engine attached, it first resets rows a dead process left `IN_FLIGHT`. It then calls `dispatcher.flushWithOutcome()` once and returns `Result.success()` on any completed flush, so WorkManager's backoff cannot race the persisted cooldowns. `Result.retry()` is reserved for a worker that fails as a whole.
+`SyncWorker.doWork()` stays inert when dispatch is blocked by a persisted pause or `foregroundOnly`. `MANUAL` does not block it, because enabling background sync is an explicit request. Otherwise, with no JS engine attached, it first resets rows a dead process left `IN_FLIGHT`. It then calls `dispatcher.flushWithOutcome()` once and returns `Result.success()` on any completed flush, so WorkManager's backoff cannot race the persisted cooldowns. `Result.retry()` is reserved for a worker that fails as a whole, a cycle that dies included. A cancellation is rethrown, so a worker that WorkManager stops returns neither, and a periodic run emits no `BACKGROUND_SYNC_COMPLETED`.
 
 Only the periodic job emits `BACKGROUND_SYNC_STARTED` / `BACKGROUND_SYNC_COMPLETED`.
 
@@ -120,10 +128,9 @@ Only the periodic job emits `BACKGROUND_SYNC_STARTED` / `BACKGROUND_SYNC_COMPLET
 `BootCompletedReceiver` is declared in `AndroidManifest.xml` with intent filters for:
 
 - `android.intent.action.BOOT_COMPLETED`
-- `android.intent.action.LOCKED_BOOT_COMPLETED`
 - `android.intent.action.MY_PACKAGE_REPLACED`
 
-`LOCKED_BOOT_COMPLETED` is in the filter, but the receiver is not direct-boot aware, so a locked device does not deliver it. On `BOOT_COMPLETED`, after the first unlock, and on `MY_PACKAGE_REPLACED`, it enqueues a one-time `RecoveryWorker`, which also runs each time a JS engine attaches. The worker:
+It is exported with no `android:permission`: both actions are protected broadcasts that only the system can send, and the receiver ignores any other action. It is not direct-boot aware, because the queue, the configuration and WorkManager's own database live in credential-encrypted storage. On `BOOT_COMPLETED`, which arrives after the first unlock, and on `MY_PACKAGE_REPLACED`, it enqueues a one-time `RecoveryWorker`, which also runs each time a JS engine attaches. The worker:
 
 1. Resets items left `IN_FLIGHT` (e.g., process killed mid-dispatch) back to `PENDING`, under the flush mutex so a running cycle is not disturbed.
 2. Re-arms the periodic `SyncWorker` if background sync is enabled and `foregroundOnly` is off.
@@ -159,7 +166,6 @@ The emitter implements the Nitro listener pattern:
   android:exported="true">
   <intent-filter>
     <action android:name="android.intent.action.BOOT_COMPLETED" />
-    <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
     <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
   </intent-filter>
 </receiver>
@@ -180,11 +186,13 @@ The library does **not** declare a foreground service. WorkManager + `BootComple
 
 `android/proguard-rules.pro` keeps:
 
-- `com.margelo.nitro.syncprovider.**` (Nitro HybridObject + impl).
-- Anything annotated `@com.facebook.proguard.annotations.DoNotStrip` or `@androidx.annotation.Keep`.
-- Room entities, DAOs, and generated `*_Impl` classes.
-- WorkManager `Worker` / `CoroutineWorker` / `ListenableWorker` subclasses.
-- OkHttp / Okio / Coroutines internal class names that R8 would otherwise strip.
+- **The library.** Every class and member of `com.margelo.nitro.syncprovider.**`: the HybridObject, the Nitro-generated structs and enums, and the internals, such as the dispatcher, the workers, the receiver and the Room classes.
+- **`@DoNotStrip`.** Classes and members annotated `@com.facebook.proguard.annotations.DoNotStrip`. The file's `@androidx.annotation.Keep` rules allow shrinking and obfuscation, so on their own they keep nothing: AndroidX's own consumer rules honor `@Keep`.
+- **Room.** The whole `androidx.room.**` runtime, every `RoomDatabase` subclass, `@Entity` and `@Dao` classes, and every `*_Impl` and `*_Impl$*` class, plus a `-dontwarn` for `androidx.room.paging`.
+- **WorkManager.** `Worker` and `CoroutineWorker` subclasses, and the public `(Context, WorkerParameters)` constructor of every `ListenableWorker` subclass, which WorkManager calls by reflection.
+- **OkHttp.** No class. `-dontwarn` lines for its optional platform dependencies (Conscrypt, Bouncy Castle, OpenJSSE, `javax.annotation`) and the `PublicSuffixDatabase` class name, as OkHttp's own rules already do. Nothing for Okio.
+- **Coroutines.** The `MainDispatcherFactory` and `CoroutineExceptionHandler` service names, and the `volatile` fields that its atomic field updaters reach by name.
+- **Kotlin.** The `Signature`, `InnerClasses`, `EnclosingMethod` and annotation attributes, and `kotlin.Metadata`.
 
 The library ships its own ProGuard file via `consumerProguardFiles` so consumer apps inherit the rules automatically.
 

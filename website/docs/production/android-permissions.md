@@ -51,13 +51,14 @@ None of these are runtime ("dangerous") permissions on Android 6+ — they are i
   android:exported="true">
   <intent-filter>
     <action android:name="android.intent.action.BOOT_COMPLETED" />
-    <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
     <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
   </intent-filter>
 </receiver>
 ```
 
-`MY_PACKAGE_REPLACED` is included so an update of your app, a new version installed over the old one, also re-runs recovery. The receiver enqueues recovery as a WorkManager job right after an app update and, after a reboot, once the device is first unlocked. It usually runs before the user opens the app, but nothing orders it before JS, and a JS engine that attaches first schedules the same job. `LOCKED_BOOT_COMPLETED` is in the filter, but the receiver is not direct-boot aware, so a locked device does not deliver it. Recovery also runs each time a JS engine attaches, and `SyncWorker` resets in-flight rows itself when no JS engine is attached, unless a persisted pause or `foregroundOnly` blocks it. Without the receiver, items left in flight at update time would wait for one of those.
+The receiver is exported with no `android:permission`. That is safe: `BOOT_COMPLETED` and `MY_PACKAGE_REPLACED` are protected broadcasts that only the system can send, and the receiver ignores any other action.
+
+`MY_PACKAGE_REPLACED` is included so an update of your app, a new version installed over the old one, also re-runs recovery. The receiver enqueues recovery as a WorkManager job right after an app update and, after a reboot, once the device is first unlocked. It usually runs before the user opens the app, but nothing orders it before JS, and a JS engine that attaches first schedules the same job. The receiver is not direct-boot aware, because the queue, the configuration and WorkManager's own database live in credential-encrypted storage, so nothing runs before that first unlock. Recovery also runs each time a JS engine attaches, and `SyncWorker` resets in-flight rows itself when no JS engine is attached, unless a persisted pause or `foregroundOnly` blocks it. Without the receiver, items left in flight at update time would wait for one of those.
 
 ## What the Library Does NOT Request
 
@@ -97,7 +98,7 @@ An AAB stores its manifest in protobuf format, so read it with `bundletool` rath
 ## Checklist Before Submission
 
 - [ ] The release manifest has `INTERNET`, `ACCESS_NETWORK_STATE` and `RECEIVE_BOOT_COMPLETED`.
-- [ ] The release manifest has `BootCompletedReceiver` with its three actions.
+- [ ] The release manifest has `BootCompletedReceiver` with its two actions, `BOOT_COMPLETED` and `MY_PACKAGE_REPLACED`.
 - [ ] No `tools:node="remove"` in your manifest drops a library permission.
 - [ ] R8 / ProGuard is enabled in the release build, and the queue still drains.
 - [ ] Credentials travel in `defaultHeaders`, not in per-item `headers`.

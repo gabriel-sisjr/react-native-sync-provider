@@ -225,16 +225,16 @@ For the release procedure around this workflow, see [Publishing](./publishing.md
 2. Click **Run workflow**.
 3. Under **Use workflow from**, choose the branch to release (`develop` for a normal pre-release).
 4. Leave **Branch to release from** (the `branch` input) at `develop`, or set it to the same branch as in step 3.
-5. Optional: fill in the version suffix (`version_suffix`, for example `rc1` or `beta1`) and the description (`description`).
+5. Optional: fill in the version suffix (`version_suffix`, for example `rc1` or `beta.2`) and the description (`description`). The suffix must be SemVer pre-release identifiers: see [Pre-Release Version Format](#pre-release-version-format).
 6. Click **Run workflow**.
 
 > **Important — Choose the branch in both fields:** The checkout uses the `branch` input, but the commit hash in a generated version, the `Commit:` line of the GitHub pre-release and the npm provenance all come from the run's own commit, the head of the branch chosen in **Use workflow from**. When you pre-release a branch other than `develop`, choose it in both fields.
 
-> **Note:** Keep single quotes out of the description. The workflow pastes it into a JavaScript string literal, so a quote breaks the step that creates the GitHub pre-release, which runs after the npm publish and the tag push.
+> **Note:** The description is used exactly as typed: quotes, newlines and backslashes are safe. The workflow passes it, like the suffix and the version, to its scripts through the step's environment, never pasted into the script itself.
 
 ### What Happens
 
-1. **Version.** The base is the `package.json` version without any pre-release part. With a suffix the version is `<base>-<suffix>`; without one it is `<base>-beta.<timestamp>.<sha7>`, where the timestamp is `date +%Y%m%d%H%M%S` on the runner (UTC) and `<sha7>` the first seven characters of the run's commit hash. `npm version` writes it to `package.json` with `--no-git-tag-version`.
+1. **Version.** The base is the `package.json` version without any pre-release part. A suffix that is not SemVer pre-release identifiers fails the run here, before anything is built, published or tagged. With a suffix the version is `<base>-<suffix>`; without one it is `<base>-beta.<timestamp>.<sha7>`, where the timestamp is `date +%Y%m%d%H%M%S` on the runner (UTC) and `<sha7>` the first seven characters of the run's commit hash. `npm version` writes it to `package.json` with `--no-git-tag-version`.
 2. `yarn nitrogen`, `yarn prepare`, then `yarn test --coverage --maxWorkers=2`. There is no `yarn lint` or `yarn typecheck` step.
 3. Coverage: the `coverage-prerelease` artifact, a Codecov upload with the `prerelease` flag and the summary table, all `if: always()`.
 4. **Assert npm pack contents**, directly before the publish. The script comes from the branch being released, so a branch older than the script stops here too.
@@ -249,6 +249,8 @@ For the release procedure around this workflow, see [Publishing](./publishing.md
 <base>-beta.<timestamp>.<sha7>    e.g. 0.3.0-beta.20261112143022.a1b2c3d
 <base>-<version_suffix>           e.g. 0.3.0-rc1
 ```
+
+A `version_suffix` must be one or more dot-separated identifiers made of letters, digits and hyphens, with no leading zero in an all-digit identifier and no `+build` part: `rc1`, `rc.1` and `beta.2` pass, `rc.01`, `rc_1` and `rc1+exp` do not. Any other value stops the run at **Generate pre-release version** with `version_suffix must be SemVer pre-release identifiers`, before anything is built, published or tagged, so the npm version, the git tag and the release name are always the same. npm would otherwise rewrite a loose suffix, such as `rc.01` into `rc.1`.
 
 A pre-release of a version that already shipped sorts below it (`0.2.0-rc1 < 0.2.0`), so bump the version before you pre-release it (see [Pre-Releases](./publishing.md#pre-releases)).
 
@@ -480,16 +482,13 @@ Both release workflows publish with `--provenance`, which attaches a signed atte
 
 ### Action Pinning
 
-`ci.yml`, `docs-link-check.yml`, the Setup action, and the checkout steps of `publish.yml` and `prerelease.yml` pin each action by commit SHA, with the version in a trailing comment:
+Every workflow and the Setup action pin each action by commit SHA, with the version in a trailing comment:
 
 ```yaml
 uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 ```
 
-These still use major-version tags:
-
-- `publish.yml` and `prerelease.yml`: `actions/upload-artifact@v4`, `codecov/codecov-action@v5` and `actions/github-script@v7`.
-- `deploy-docs.yml`: `actions/checkout@v4`, `actions/setup-node@v4`, `actions/upload-pages-artifact@v3` and `actions/deploy-pages@v4`.
+Only the local `./.github/actions/setup` is referenced by path.
 
 ---
 
@@ -497,7 +496,7 @@ These still use major-version tags:
 
 ### Updating GitHub Actions
 
-Pin the new version by commit SHA and keep the version in a trailing comment, as `ci.yml` does.
+Pin the new version by commit SHA and keep the version in a trailing comment, as every workflow does. No Dependabot or Renovate configuration updates the SHAs, so bump them by hand.
 
 ### Xcode and Simulators
 

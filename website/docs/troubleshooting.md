@@ -190,7 +190,7 @@ Xcode disables every simulator destination, although the simulator runtime is in
 
 **Fix.**
 
-1. This is the maintainer's Mac being broken, not a code issue. Run on CI (`macos-latest`, with `XCODE_VERSION: 'latest-stable'`, which resolves to the newest stable Xcode on the runner image) for ground truth.
+1. It is not a code issue. Run on CI (`macos-latest`, with `XCODE_VERSION: 'latest-stable'`, which resolves to the newest stable Xcode on the runner image) for ground truth, and see [Local Validation Gotcha](./development/testing.md#local-validation-gotcha) for the setups that do break local runs.
 2. Locally: pick a specific simulator instead of `Any iOS Device`, or wipe `~/Library/Developer/CoreSimulator/` and reinstall the runtime with `xcodebuild -downloadPlatform iOS`, or with `xcrun simctl runtime add <runtime.dmg>`.
 
 **Related:** [CI/CD Pipeline](./development/ci-cd.md), [Testing](./development/testing.md)
@@ -427,7 +427,7 @@ The device comes back online, but nothing flushes until the next interval tick.
 
 Valid requests land in the dead-letter queue after an outage.
 
-**Cause.** A flush ran during the outage. Without `minNetworkQuality`, neither native dispatcher checks connectivity, so each failed request spends a retry attempt, and an item with no attempts left is dead-lettered. `useAutoSync` skips only while the status is `DISCONNECTED`, so `UNKNOWN` still flushes, and a direct `flush()` has no check of its own.
+**Cause.** A flush ran during the outage. Without `minNetworkQuality`, neither native dispatcher checks connectivity. On Android each failed request spends a retry attempt, and an item with no attempts left is dead-lettered. iOS waits for the network instead, with one attempt spent, and dead-letters nothing. `useAutoSync` skips only while the status is `DISCONNECTED`, so `UNKNOWN` still flushes, and a direct `flush()` has no check of its own.
 
 **Fix.**
 
