@@ -77,15 +77,21 @@ final class BackgroundURLSessionDelegate: NSObject, URLSessionDelegate, URLSessi
     /// incrementally — accumulate them so we can attach to the outcome.
     private let lock = NSLock()
     private var responseData: [Int: Data] = [:]
-    /// By task identifier, not by item: a cancelled upload's completion can
-    /// arrive after its item was sent again, and must not end the new wait.
-    private var completions: [Int: BackgroundCompletionHandler] = [:]
+    /// By task identifier, with the task each handler was registered for.
+    /// Keyed by task, not by item: a cancelled upload's completion can arrive
+    /// after its item was sent again, and must not end the new wait. Matched
+    /// to the very task, not to its identifier alone: an identifier is unique
+    /// only within one session, so a task of another session, or one restored
+    /// from an earlier process, can carry it. A task is held only until it
+    /// completes or is unregistered.
+    private var completions: [Int: (task: URLSessionTask, handler: BackgroundCompletionHandler)] = [:]
     private var eventsCompletionHandler: BackgroundEventsCompletionHandler?
 
-    /// Register the completion handler of `task`.
+    /// Register the completion handler of `task`. Only the completion of that
+    /// task object calls it.
     func registerCompletion(for task: URLSessionTask, handler: @escaping BackgroundCompletionHandler) {
         lock.withLock {
-            completions[task.taskIdentifier] = handler
+            completions[task.taskIdentifier] = (task, handler)
         }
     }
 
@@ -93,7 +99,9 @@ final class BackgroundURLSessionDelegate: NSObject, URLSessionDelegate, URLSessi
     /// completion is then ignored.
     func unregisterCompletion(for task: URLSessionTask) {
         lock.withLock {
-            _ = completions.removeValue(forKey: task.taskIdentifier)
+            if completions[task.taskIdentifier]?.task === task {
+                completions.removeValue(forKey: task.taskIdentifier)
+            }
         }
     }
 
@@ -122,9 +130,12 @@ final class BackgroundURLSessionDelegate: NSObject, URLSessionDelegate, URLSessi
         let statusCode = (task.response as? HTTPURLResponse)?.statusCode
 
         let handler = lock.withLock { () -> BackgroundCompletionHandler? in
-            let removed = completions.removeValue(forKey: task.taskIdentifier)
             responseData.removeValue(forKey: task.taskIdentifier)
-            return removed
+            // Another task with the same identifier leaves the wait alone: its
+            // handler stays for the task it belongs to.
+            guard let entry = completions[task.taskIdentifier], entry.task === task else { return nil }
+            completions.removeValue(forKey: task.taskIdentifier)
+            return entry.handler
         }
 
         if itemId.isEmpty {

@@ -17,6 +17,7 @@ final class BackgroundTaskExpiryTests: XCTestCase {
     private var emitter: AwaitingEmitter!
     private var delegate: BackgroundURLSessionDelegate!
     private var delegateQueue: OperationQueue!
+    private var backgroundSession: URLSession!
     private var dispatcher: SyncDispatcher!
     private var manager: BackgroundSyncManager!
     private var defaults: UserDefaults!
@@ -51,6 +52,7 @@ final class BackgroundTaskExpiryTests: XCTestCase {
         delegate = BackgroundURLSessionDelegate()
         delegateQueue = OperationQueue()
         delegateQueue.maxConcurrentOperationCount = 1
+        backgroundSession = URLSession(configuration: configuration, delegate: delegate, delegateQueue: delegateQueue)
         let storage = stack.map { SyncQueueStorage(dao: SyncItemDao(stack: $0), capacity: 10) } ?? self.storage!
         dispatcher = SyncDispatcher(storage: storage,
                                     emitter: emitter,
@@ -61,9 +63,7 @@ final class BackgroundTaskExpiryTests: XCTestCase {
                                                              batchSize: 25,
                                                              defaultHeaders: [:]),
                                     foregroundSession: URLSession(configuration: configuration),
-                                    backgroundSession: URLSession(configuration: configuration,
-                                                                  delegate: delegate,
-                                                                  delegateQueue: delegateQueue),
+                                    backgroundSession: backgroundSession,
                                     backgroundDelegate: delegate,
                                     isAppActive: { appActive })
         let manager = BackgroundSyncManager(dispatcher: dispatcher,
@@ -275,9 +275,109 @@ final class BackgroundTaskExpiryTests: XCTestCase {
                        ["kind": "refresh", "ok": "false"])
         XCTAssertNotNil(emitter.events(ofType: "SYNC_FAILED").first?.errorCode, "a store failure keeps its code")
     }
+
+    // MARK: - Routing
+
+    /// A task identifier is unique only within one session: a task restored
+    /// from an earlier process can carry the identifier of the upload being
+    /// waited on. Its completion, a 200 here, must not end that wait, nor be
+    /// recorded for the waiting item while that item's own request is out.
+    func test_aCompletionForAnotherTaskWithTheSameIdentifier_doesNotEndTheWait() async throws {
+        _ = try makeManager(appActive: false)
+        let id = try await storage.enqueue(input: .sample(url: "https://api.test/waiting"))
+        let started = expectation(description: "the waiting item's upload is out")
+        HeldRequestProtocol.expectNextStart(started)
+        let flush = Task { try await self.dispatcher.flush() }
+        await fulfillment(of: [started], timeout: livenessTimeout)
+        let tasks = await backgroundSession.allTasks
+        let waiting = try XCTUnwrap(tasks.first { $0.taskDescription == id })
+
+        let other = try await completedTask(withIdentifier: waiting.taskIdentifier, status: 200)
+        other.taskDescription = "ANOTHER-ITEM"
+        delegate.urlSession(backgroundSession, task: other, didCompleteWithError: nil)
+        flush.cancel()
+
+        guard case .failure(let error) = await flush.result else {
+            return XCTFail("the other task's 200 ended the wait and was recorded for \(id)")
+        }
+        XCTAssertTrue(error is CancellationError, "\(error)")
+        XCTAssertEqual(emitter.events(ofType: "ITEM_SUCCEEDED").count, 0)
+        let stored = try await row(id)
+        XCTAssertEqual(stored?.status, "PENDING", "released by the cancellation, still to send")
+    }
+
+    /// A task of another session, with `identifier` and a real `status`
+    /// response: what a restored task's completion carries.
+    private func completedTask(withIdentifier identifier: Int, status: Int) async throws -> URLSessionTask {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [AnswerAtOnceProtocol.self]
+        AnswerAtOnceProtocol.status = status
+        let finished = expectation(description: "the other task completed")
+        let signal = CompletionSignal(finished)
+        let session = URLSession(configuration: configuration, delegate: signal, delegateQueue: nil)
+        let body = FileManager.default.temporaryDirectory.appendingPathComponent("routing-\(UUID().uuidString).body")
+        try Data("{}".utf8).write(to: body)
+        let request = URLRequest(url: try XCTUnwrap(URL(string: "https://api.test/other")))
+        var spare: [URLSessionTask] = []
+        var task = session.uploadTask(with: request, fromFile: body)
+        while task.taskIdentifier < identifier {
+            spare.append(task)
+            task = session.uploadTask(with: request, fromFile: body)
+        }
+        try XCTSkipUnless(task.taskIdentifier == identifier, "no identifier collision could be built")
+        task.resume()
+        await fulfillment(of: [finished], timeout: livenessTimeout)
+        withExtendedLifetime(spare) {}
+        try? FileManager.default.removeItem(at: body)
+        XCTAssertEqual((task.response as? HTTPURLResponse)?.statusCode, status)
+        return task
+    }
 }
 
 // MARK: - Support
+
+/// Answers every request at once with ``status``.
+private final class AnswerAtOnceProtocol: URLProtocol {
+    private static let lock = NSLock()
+    private static var answer = 200
+
+    static var status: Int {
+        get { lock.withLock { answer } }
+        set { lock.withLock { answer = newValue } }
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        true
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        guard let url = request.url,
+              let response = HTTPURLResponse(url: url, statusCode: Self.status, httpVersion: "HTTP/1.1",
+                                             headerFields: nil) else { return }
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data())
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+/// Fulfills an expectation when its session's task completes.
+private final class CompletionSignal: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private let expectation: XCTestExpectation
+
+    init(_ expectation: XCTestExpectation) {
+        self.expectation = expectation
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        expectation.fulfill()
+    }
+}
 
 /// Holds every request until it is cancelled, or answers new ones at once
 /// with a status when told to. A held request is never answered later: the
@@ -480,6 +580,35 @@ final class BackgroundUploadWaitTests: XCTestCase {
 /// Completions are routed by task, not by item: a cancelled upload's
 /// completion can arrive after its item was sent again.
 final class BackgroundURLSessionDelegateRoutingTests: XCTestCase {
+    /// Identifiers are unique only within a session: two sessions both start
+    /// at the same one.
+    func test_anotherSessionsTaskWithTheSameIdentifier_doesNotReachTheHandler() throws {
+        let delegate = BackgroundURLSessionDelegate()
+        let waitingSession = URLSession(configuration: .ephemeral)
+        let otherSession = URLSession(configuration: .ephemeral)
+        defer {
+            waitingSession.invalidateAndCancel()
+            otherSession.invalidateAndCancel()
+        }
+        let body = FileManager.default.temporaryDirectory.appendingPathComponent("routing-\(UUID().uuidString).body")
+        try Data("{}".utf8).write(to: body)
+        defer { try? FileManager.default.removeItem(at: body) }
+        let request = URLRequest(url: try XCTUnwrap(URL(string: "https://api.test/items")))
+        let waiting = waitingSession.uploadTask(with: request, fromFile: body)
+        waiting.taskDescription = "WAITING"
+        let other = otherSession.uploadTask(with: request, fromFile: body)
+        other.taskDescription = "OTHER"
+        try XCTSkipUnless(other.taskIdentifier == waiting.taskIdentifier, "the sessions numbered their tasks apart")
+        let calls = Calls()
+        delegate.registerCompletion(for: waiting) { _ in calls.record() }
+
+        delegate.urlSession(otherSession, task: other, didCompleteWithError: nil)
+        XCTAssertEqual(calls.value, 0, "another session's task reached the handler")
+
+        delegate.urlSession(waitingSession, task: waiting, didCompleteWithError: nil)
+        XCTAssertEqual(calls.value, 1, "its own task still does")
+    }
+
     private final class Calls: @unchecked Sendable {
         private let lock = NSLock()
         private var count = 0
