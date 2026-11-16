@@ -90,8 +90,8 @@ enum InMemoryCoreDataStack {
 
     /// Build a fresh `CoreDataStack` whose container is loaded against an
     /// in-memory store. The returned stack is safe to pass to
-    /// `SyncItemDao(stack:)`.
-    static func make(file: StaticString = #file, line: UInt = #line) -> CoreDataStack {
+    /// `SyncItemDao(stack:)`. With `saveFaults`, its saves fail on demand.
+    static func make(saveFaults: SaveFaults? = nil, file: StaticString = #file, line: UInt = #line) -> CoreDataStack {
         let model = makeModel()
         let container = NSPersistentContainer(name: "SyncProvider", managedObjectModel: model)
 
@@ -112,7 +112,8 @@ enum InMemoryCoreDataStack {
         container.viewContext.automaticallyMergesChangesFromParent = true
         container.viewContext.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
 
-        return CoreDataStack(container: container)
+        guard let saveFaults else { return CoreDataStack(container: container) }
+        return CoreDataStack(container: container, beforeSave: { try saveFaults.check() })
     }
 
     // MARK: - Internals
@@ -135,5 +136,48 @@ enum InMemoryCoreDataStack {
             attr.attributeValueClassName = "NSNumber"
         }
         return attr
+    }
+}
+
+/// Fails a stack's saves on demand, the way a store that cannot write does:
+/// the transaction throws and nothing is written. Pass it to
+/// ``InMemoryCoreDataStack/make(saveFaults:file:line:)``. A save is counted
+/// only when its transaction changed something.
+final class SaveFaults: @unchecked Sendable {
+    private let lock = NSLock()
+    private var toSkip = 0
+    private var toFail = 0
+    private var failed = 0
+
+    /// Lets the next `skipped` saves through, then fails the `count` after
+    /// them. `Int.max` fails every one.
+    func fail(_ count: Int, after skipped: Int = 0) {
+        lock.withLock {
+            toSkip = skipped
+            toFail = count
+        }
+    }
+
+    /// The saves failed so far.
+    var failures: Int { lock.withLock { failed } }
+
+    func check() throws {
+        let fails = lock.withLock { () -> Bool in
+            if toSkip > 0 {
+                toSkip -= 1
+                return false
+            }
+            guard toFail > 0 else { return false }
+            if toFail != .max {
+                toFail -= 1
+            }
+            failed += 1
+            return true
+        }
+        if fails {
+            throw NSError(domain: NSCocoaErrorDomain,
+                          code: NSPersistentStoreSaveError,
+                          userInfo: [NSLocalizedDescriptionKey: "A save the test made fail"])
+        }
     }
 }

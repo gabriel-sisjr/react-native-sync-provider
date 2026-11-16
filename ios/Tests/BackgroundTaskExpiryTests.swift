@@ -293,6 +293,30 @@ final class BackgroundTaskExpiryTests: XCTestCase {
         XCTAssertEqual(HeldRequestProtocol.startedCount, 1, "only the first item was sent")
     }
 
+    /// A cancelled cycle still ends as cancelled when giving its row back
+    /// fails: no code on its SYNC_FAILED, and the row waits IN_FLIGHT for
+    /// launch recovery.
+    func test_anExpiryWhoseReleaseFails_stillEndsWithoutACode() async throws {
+        let faults = SaveFaults()
+        let faulty = InMemoryCoreDataStack.make(saveFaults: faults)
+        let manager = try makeManager(appActive: true, stack: faulty)
+        let queue = SyncQueueStorage(dao: SyncItemDao(stack: faulty), capacity: 10)
+        let id = try await queue.enqueue(input: .sample())
+        let task = await fireWithARequestOut(.processing, on: manager)
+        faults.fail(1)
+
+        task.expirationHandler?()
+        await emitter.wait(for: "BACKGROUND_SYNC_COMPLETED", in: self)
+
+        XCTAssertEqual(task.completedResults, [false])
+        XCTAssertEqual(faults.failures, 1, "the release was the write that failed")
+        let failed = emitter.events(ofType: "SYNC_FAILED")
+        XCTAssertEqual(failed.count, 1)
+        XCTAssertNil(failed.first?.errorCode, "a cancelled cycle failed nothing")
+        let stored = try await queue.getAll().first { $0.id == id }
+        XCTAssertEqual(stored?.status, "IN_FLIGHT", "left for launch recovery")
+    }
+
     // MARK: - Exactly once on the other paths
 
     func test_aFlushThatReturns_completesOnce_evenWhenTheExpiryComesLate() async throws {

@@ -70,6 +70,11 @@ struct ItemDispatchOutcome: Sendable {
     let statusCode: Int?
     let errorCode: String?
     let errorMessage: String?
+    /// `false` when the request never reached `URLSession`: its URL is not
+    /// http(s), or its body could not be written for a background upload. A
+    /// cycle that dies before such an outcome is written gives the row back
+    /// as it was before its claim.
+    var requestSent = true
 }
 
 /// What ``SyncDispatcher/recordFailureOutcome(item:outcome:sentWith:)`` decided to do
@@ -329,6 +334,12 @@ actor SyncDispatcher {
     /// may have reached the server), and `SYNC_FAILED` ends the cycle without
     /// `errorCode` or `metadata`: nothing failed, and no history row is kept.
     /// A response that arrived before the cancellation is recorded as usual.
+    ///
+    /// A cycle that dies for any other reason, a write that fails say, ends
+    /// with `SYNC_FAILED` and the cause's code, and the row whose outcome
+    /// could not be written is settled first: its attempt counted, with the
+    /// retry policy's cooldown, when its request went out; as it was before
+    /// its claim when the request never went out.
     func flushOutcome() async throws -> FlushOutcome {
         try Task.checkCancellation()
         if let early = exitBeforeCycle() {
@@ -506,38 +517,52 @@ actor SyncDispatcher {
                 // item again; the claim's time stays, as the request may have
                 // reached the server.
                 inFlight.remove(item.id)
-                try await storage.releaseClaim(id: item.id,
-                                               attempts: item.attempts,
-                                               lastAttemptAt: nil)
+                do {
+                    try await storage.releaseClaim(id: item.id,
+                                                   attempts: item.attempts,
+                                                   lastAttemptAt: nil)
+                } catch {
+                    // Still a cancellation, which failed nothing: the row
+                    // waits IN_FLIGHT for launch recovery.
+                    SyncLogger.error("Could not give a cancelled request's row back: \(error.localizedDescription)",
+                                     category: "dispatcher")
+                }
                 throw CancellationError()
             }
             inFlight.remove(item.id)
 
             emitProgress(index: index, total: total)
 
-            if outcome.succeeded {
-                succeededIds.append(item.id)
-                try await storage.remove(id: item.id)
-                emitter.emit(.now(type: "ITEM_SUCCEEDED",
-                                  itemId: item.id,
-                                  statusCode: outcome.statusCode.map(Double.init),
-                                  attempt: Double(item.attempts + 1)))
-            } else {
-                // Decides retry vs. terminal failure, persists the retry
-                // cooldown, and emits the event.
-                switch try await recordFailureOutcome(item: item, outcome: outcome, sentWith: sentWith) {
-                case .retrying:
-                    break // kept PENDING with a cooldown; not counted as failed
-                case let .failed(_, message):
-                    failedIds.append(item.id)
-                    if firstError == nil {
-                        firstError = message
+            do {
+                if outcome.succeeded {
+                    succeededIds.append(item.id)
+                    try await storage.remove(id: item.id)
+                    emitter.emit(.now(type: "ITEM_SUCCEEDED",
+                                      itemId: item.id,
+                                      statusCode: outcome.statusCode.map(Double.init),
+                                      attempt: Double(item.attempts + 1)))
+                } else {
+                    // Decides retry vs. terminal failure, persists the retry
+                    // cooldown, and emits the event.
+                    switch try await recordFailureOutcome(item: item, outcome: outcome, sentWith: sentWith) {
+                    case .retrying:
+                        break // kept PENDING with a cooldown; not counted as failed
+                    case let .failed(_, message):
+                        failedIds.append(item.id)
+                        if firstError == nil {
+                            firstError = message
+                        }
+                    case let .credentialRejected(heldUntil):
+                        // The next item would carry the same rejected credential.
+                        credentialHeldUntil = heldUntil
+                        break dispatchLoop
                     }
-                case let .credentialRejected(heldUntil):
-                    // The next item would carry the same rejected credential.
-                    credentialHeldUntil = heldUntil
-                    break dispatchLoop
                 }
+            } catch {
+                // The outcome could not be written, and the cycle dies with
+                // `error`. Its row must not wait IN_FLIGHT for the next launch.
+                await settleUnrecorded(item: item, outcome: outcome, cause: error)
+                throw error
             }
         }
 
@@ -698,6 +723,61 @@ actor SyncDispatcher {
         return .retrying(attempt: attemptsAfter)
     }
 
+    /// Settles the row of an item whose outcome could not be written, before
+    /// its cycle dies with `cause`. `item` is the snapshot from before the
+    /// claim, which already counted the attempt.
+    ///
+    /// When the request went out, it may have reached the server: the row
+    /// keeps that attempt and gets the retry policy's cooldown, with
+    /// `ITEM_RETRYING` carrying the cause's code, as after a retryable
+    /// failure, or, with no budget left, moves to the dead-letter store with
+    /// `MAX_ATTEMPTS_EXCEEDED`, with `ITEM_FAILED` and `ITEM_DEAD_LETTERED`.
+    /// Given back at once and uncounted instead, a row whose outcome write
+    /// keeps failing would be sent again at every wake. A request that never
+    /// went out leaves the row as it was before its claim, with no event.
+    /// When this write fails too, the row waits `IN_FLIGHT` for launch
+    /// recovery.
+    private func settleUnrecorded(item: StoredSyncItem, outcome: ItemDispatchOutcome, cause: Error) async {
+        do {
+            guard outcome.requestSent else {
+                try await storage.releaseClaim(id: item.id,
+                                               attempts: item.attempts,
+                                               lastAttemptAt: item.lastAttemptAt ?? 0)
+                return
+            }
+            let failure = wrapAsSyncProviderError(cause)
+            let code = failure.code.stringValue
+            let attempt = item.attempts + 1
+            guard Int(attempt) < config.retryPolicy.maxAttempts else {
+                let exhausted = "MAX_ATTEMPTS_EXCEEDED"
+                let moved = try await storage.moveToDeadLetters(id: item.id,
+                                                                errorCode: exhausted,
+                                                                errorMessage: failure.message)
+                emitter.emit(.now(type: "ITEM_FAILED",
+                                  itemId: item.id,
+                                  errorCode: exhausted,
+                                  attempt: Double(attempt)))
+                if moved {
+                    emitter.emit(.now(type: "ITEM_DEAD_LETTERED",
+                                      itemId: item.id,
+                                      errorCode: "DEAD_LETTERED",
+                                      metadata: ["lastErrorCode": exhausted]))
+                }
+                return
+            }
+            let delayMs = RetryPolicyEvaluator.nextDelayMs(attempt: Int(attempt), policy: config.retryPolicy)
+            try await storage.markPendingForRetry(id: item.id, errorCode: code, retryDelayMs: delayMs)
+            emitter.emit(.now(type: "ITEM_RETRYING",
+                              itemId: item.id,
+                              errorCode: code,
+                              attempt: Double(attempt)))
+        } catch {
+            SyncLogger.error("Could not settle the row of a cycle that died; it waits for launch recovery: "
+                             + error.localizedDescription,
+                             category: "dispatcher")
+        }
+    }
+
     /// What a dead letter says about the failure that ended it: for an HTTP
     /// failure, the status line with its reason phrase (`HTTP 404 Not Found`,
     /// the phrase as Foundation localizes it), otherwise the error's message.
@@ -742,7 +822,8 @@ actor SyncDispatcher {
                                        succeeded: false,
                                        statusCode: nil,
                                        errorCode: "INVALID_URL",
-                                       errorMessage: "Invalid URL: \(item.url)")
+                                       errorMessage: "Invalid URL: \(item.url)",
+                                       requestSent: false)
         }
 
         var request = URLRequest(url: url)
@@ -804,7 +885,9 @@ actor SyncDispatcher {
         do {
             try body.write(to: tmpURL, options: .atomic)
         } catch {
-            return classifyResponse(itemId: item.id, statusCode: nil, transportError: error)
+            var outcome = classifyResponse(itemId: item.id, statusCode: nil, transportError: error)
+            outcome.requestSent = false
+            return outcome
         }
 
         let task = backgroundSession.uploadTask(with: request, fromFile: tmpURL)
