@@ -629,6 +629,80 @@ final class SyncEngineRetryTimerTests: XCTestCase {
         XCTAssertEqual(timer.delayMs, 30_000, "the schedule starts again")
     }
 
+    /// A due row whose next claim fails: the cycle dies, and the wait after it
+    /// runs for 30 s.
+    private func startTheWaitAfterADeadCycle(in engine: SyncEngine) async throws {
+        await engine.configure(.sample(retryPolicy: .exact(maxAttempts: 5, baseDelayMs: 100)))
+        _ = try await enqueueCooling(in: engine, delayMs: 100)
+        clock.advance(ms: 100)
+        fixture.saveFaults.fail(1)
+        _ = try? await engine.dispatcher.flush()
+        XCTAssertEqual(timer.delayMs, 30_000)
+    }
+
+    /// Runs a cycle that is cancelled as its request goes out.
+    private func runACancelledCycle(in engine: SyncEngine,
+                                    file: StaticString = #filePath, line: UInt = #line) async {
+        let flush = CancelledOnRequest()
+        URLProtocolStub.setHandler { request in
+            flush.cancel()
+            return try stubResponse(503)(request)
+        }
+        var open: AsyncStream<Void>.Continuation?
+        let gate = AsyncStream<Void> { open = $0 }
+        let cycle = Task {
+            for await _ in gate { break }
+            _ = try? await engine.dispatcher.flush()
+        }
+        flush.set(cycle)
+        open?.yield(())
+        await cycle.value
+        XCTAssertEqual(requestCount, 1, "the cancelled cycle's request went out", file: file, line: line)
+    }
+
+    /// A cancelled cycle neither starts the wait nor ends it, nor adds to its
+    /// streak: the wake after it waits for what is left, and the next cycle
+    /// that dies doubles from where the streak was.
+    func test_aCancelledCycle_neitherStartsNorEndsTheWaitAfterADeadOne() async throws {
+        let engine = await fixture.makeEngine()
+        await engine.configure(.sample(retryPolicy: .exact(maxAttempts: 5, baseDelayMs: 100)))
+        _ = try await enqueueCooling(in: engine, delayMs: 100)
+        clock.advance(ms: 100)
+
+        await runACancelledCycle(in: engine)
+        XCTAssertLessThan(timer.delayMs ?? 0, 30_000, "a cancelled cycle starts no wait")
+
+        // Past any cooldown the cancelled attempt may have recorded.
+        clock.advance(ms: 1_000)
+        fixture.saveFaults.fail(1)
+        _ = try? await engine.dispatcher.flush()
+        XCTAssertEqual(timer.delayMs, 30_000, "the streak starts at 30 s")
+
+        clock.advance(ms: 10_000)
+        await runACancelledCycle(in: engine)
+        XCTAssertEqual(timer.delayMs, 20_000, "what is left of the wait")
+
+        clock.advance(ms: 20_000)
+        fixture.saveFaults.fail(1)
+        _ = try? await engine.dispatcher.flush()
+        XCTAssertEqual(timer.delayMs, 60_000, "the streak goes on from where it was")
+    }
+
+    /// resumeSync() sends what is due at once, during the wait after a cycle
+    /// that died too, and leaves the wait's streak where it was.
+    func test_resumeSync_dispatchesAtOnce_duringTheWaitAfterADeadCycle() async throws {
+        let engine = await fixture.makeEngine()
+        try await startTheWaitAfterADeadCycle(in: engine)
+
+        await engine.pause()
+        await engine.resume()
+        XCTAssertEqual(timer.delayMs, 0, "what is due goes out at once")
+
+        fixture.saveFaults.fail(1)
+        await timer.fire()
+        XCTAssertEqual(timer.delayMs, 60_000, "the streak is where it was")
+    }
+
     // MARK: - Failure handling
 
     /// No JS caller exists on a timer path. A store that failed to open must
@@ -723,5 +797,19 @@ private final class GatedWakeSource: RetryWakeSource, @unchecked Sendable {
                 continuation.resume()
             }
         }
+    }
+}
+
+/// The flush a stub cancels when its request starts.
+private final class CancelledOnRequest: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: Task<Void, Never>?
+
+    func set(_ task: Task<Void, Never>) {
+        lock.withLock { self.task = task }
+    }
+
+    func cancel() {
+        lock.withLock { task }?.cancel()
     }
 }

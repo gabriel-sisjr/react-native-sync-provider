@@ -349,7 +349,7 @@ final class SyncEngine: @unchecked Sendable {
     func resume() async {
         configStore.setPaused(false)
         await dispatcher.setPaused(false)
-        await rearmRetryTimer(scope: .allPending)
+        await rearmRetryTimer(scope: .allPending, waitsAfterAbort: false)
     }
 
     // MARK: - Retry timer
@@ -374,13 +374,19 @@ final class SyncEngine: @unchecked Sendable {
     /// lasts at least ``kMinHealthCheckRetryBackoffMs`` here, and the wait
     /// after a cycle that died (see ``noteCycleEnd(_:)``).
     ///
-    /// - Parameter notBefore: when the hold on a rejected credential ends. It
-    ///   outlives this call, so a later re-arm cannot wake earlier.
-    func rearmRetryTimer(scope: RetryWakeScope = .attempted, notBefore: Int64? = nil) async {
+    /// - Parameters:
+    ///   - notBefore: when the hold on a rejected credential ends. It outlives
+    ///     this call, so a later re-arm cannot wake earlier.
+    ///   - waitsAfterAbort: `false` for `resumeSync()`, which sends what is
+    ///     due at once: this arm ignores the wait after a cycle that died, and
+    ///     leaves that wait and its streak as they were.
+    func rearmRetryTimer(scope: RetryWakeScope = .attempted, notBefore: Int64? = nil,
+                         waitsAfterAbort: Bool = true) async {
         let (ticket, canArm, holdUntil, abortUntil) = lock.withLock { () -> (UInt64, Bool, Int64, Int64) in
             rearmTicket &+= 1
             credentialHoldUntil = max(credentialHoldUntil, notBefore ?? 0)
-            return (rearmTicket, attachedHybrids > 0 && !options.isManual, credentialHoldUntil, abortBackoffUntil)
+            return (rearmTicket, attachedHybrids > 0 && !options.isManual, credentialHoldUntil,
+                    waitsAfterAbort ? abortBackoffUntil : 0)
         }
         let isPaused = await dispatcher.paused()
 
@@ -424,8 +430,12 @@ final class SyncEngine: @unchecked Sendable {
     /// store that keeps failing every wake would then run the next cycle at
     /// once. After a cycle that died, the wake waits at least 30 s, doubling
     /// to 15 min while cycles keep dying: the schedule a held wake re-checks
-    /// on. A cycle that completes ends the wait, and a cancelled one changes
-    /// nothing. An explicit `flush()` never waits for it.
+    /// on. A cycle that completes, an empty one included, ends the wait; a
+    /// cancelled one, or a flush that ran no cycle, changes nothing. It never
+    /// arms a wake on its own, and it lives in memory, so a new process
+    /// starts at 30 s. An explicit `flush()`, `useAutoSync`, the BGTask
+    /// windows and a reconnect never wait for it, and `resumeSync()` sends
+    /// what is due at once.
     private func noteCycleEnd(_ end: CycleEnd) {
         let nowMs = clock.nowMs()
         lock.withLock {
