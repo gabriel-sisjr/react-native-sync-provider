@@ -131,6 +131,19 @@ final class SyncDispatcherCooldownTests: XCTestCase {
         XCTAssertEqual(wake, now, "a zero-delay retry must stay visible to the retry timer")
     }
 
+    /// No `maxDelayMs` and a huge base: the delay stops at 2^53 - 1 ms, and
+    /// the deadline at the largest valid JavaScript `Date`.
+    func test_aRetryDeadline_neverPassesTheLargestJavaScriptDate() async throws {
+        let id = try await storage.enqueue(input: .sample())
+        URLProtocolStub.setHandler(stubResponse(503))
+
+        _ = try await makeDispatcher(.exact(maxAttempts: 5, baseDelayMs: 9_007_199_254_740_991, maxDelayMs: 0)).flush()
+
+        let stored = try await item(id)
+        XCTAssertEqual(stored.status, "PENDING")
+        XCTAssertEqual(stored.nextRetryAt, 8_640_000_000_000_000)
+    }
+
     func test_coolingItem_isSkipped_untilItsDeadlineElapses() async throws {
         let id = try await storage.enqueue(input: .sample())
         URLProtocolStub.setHandler(stubResponse(503))

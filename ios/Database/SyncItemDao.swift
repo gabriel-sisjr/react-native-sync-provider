@@ -45,7 +45,10 @@ struct StoredSyncItem: Sendable, Equatable {
     /// ``SyncItemDao/markPendingForRetry(id:errorCode:retryDelayMs:)`` (retry
     /// cooldown) or by
     /// ``SyncItemDao/markCredentialRejected(id:errorCode:retryDelayMs:attempts:)``
-    /// (credential hold). `0` does not mean "never attempted": a row recovered
+    /// (credential hold), never past ``RetryPolicyEvaluator/maxDeadlineMs``,
+    /// the largest valid JavaScript `Date`; a row an older version wrote can
+    /// hold a later one until its next attempt. `0` does not mean "never
+    /// attempted": a row recovered
     /// after a kill mid-dispatch, or migrated from the v1 store, can have
     /// `attempts >= 1` with `nextRetryAt == 0`.
     let nextRetryAt: Int64
@@ -406,8 +409,10 @@ final class SyncItemDao {
     /// the attempt timestamp, and a **retry cooldown**.
     ///
     /// The cooldown is persisted as `nextRetryAt = now + retryDelayMs`, where
-    /// `now` is read here, after the attempt finished. ``fetchPending(limit:)``
-    /// honors it, so a degraded server cannot drive a hot-retry loop.
+    /// `now` is read here, after the attempt finished, and stopped at
+    /// ``RetryPolicyEvaluator/maxDeadlineMs``, the largest valid JavaScript
+    /// `Date`. ``fetchPending(limit:)`` honors it, so a degraded server cannot
+    /// drive a hot-retry loop.
     ///
     /// The value is a positive timestamp even when the delay is 0, so the row
     /// keeps `nextRetryAt > 0` ("a cooldown or credential hold is pending")
@@ -430,7 +435,7 @@ final class SyncItemDao {
             entity.status = SyncItemStatus.pending.rawValue
             entity.lastErrorCode = errorCode
             entity.lastAttemptAt = nowMs
-            entity.nextRetryAt = nowMs + Int64(max(0, retryDelayMs))
+            entity.nextRetryAt = RetryPolicyEvaluator.deadline(fromMs: nowMs, delayMs: retryDelayMs)
         }
     }
 
@@ -448,7 +453,7 @@ final class SyncItemDao {
                                 attempts: Int32) async throws -> Int64 {
         try await stack.performBackgroundTask { [clock] context in
             let nowMs = clock.nowMs()
-            let heldUntil = nowMs + Int64(max(0, retryDelayMs))
+            let heldUntil = RetryPolicyEvaluator.deadline(fromMs: nowMs, delayMs: retryDelayMs)
             guard let entity = try Self.fetchEntity(id: id, in: context) else { return heldUntil }
             entity.status = SyncItemStatus.pending.rawValue
             entity.attempts = attempts

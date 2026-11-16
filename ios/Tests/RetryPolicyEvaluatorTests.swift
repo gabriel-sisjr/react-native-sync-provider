@@ -211,4 +211,16 @@ final class RetryPolicyEvaluatorTests: XCTestCase {
             XCTAssertEqual(RetryPolicyEvaluator.nextDelayMs(attempt: 5_000, policy: policy), 0, "\(backoff)")
         }
     }
+
+    // MARK: - Deadlines
+
+    func test_deadline_addsTheDelay_andStopsAtTheLargestJavaScriptDate() {
+        XCTAssertEqual(RetryPolicyEvaluator.maxDeadlineMs, 8_640_000_000_000_000)
+        XCTAssertEqual(RetryPolicyEvaluator.deadline(fromMs: 1_000, delayMs: 500), 1_500)
+        XCTAssertEqual(RetryPolicyEvaluator.deadline(fromMs: 1_000, delayMs: -5), 1_000, "a negative delay is none")
+        XCTAssertEqual(RetryPolicyEvaluator.deadline(fromMs: 1_700_000_000_000, delayMs: 9_007_199_254_740_991),
+                       8_640_000_000_000_000, "the longest computed delay")
+        XCTAssertEqual(RetryPolicyEvaluator.deadline(fromMs: Int64.max - 1, delayMs: Int.max),
+                       8_640_000_000_000_000, "saturates instead of overflowing")
+    }
 }

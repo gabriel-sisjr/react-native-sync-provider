@@ -154,6 +154,21 @@ enum RetryPolicyEvaluator {
         return Int(clamped.rounded())
     }
 
+    /// The latest retry deadline, in epoch ms: the largest valid JavaScript
+    /// `Date`. It is below 2^53, so a JS number holds it exactly. Android
+    /// stops its deadlines at the same value.
+    static let maxDeadlineMs: Int64 = 8_640_000_000_000_000
+
+    /// The deadline `delayMs` after `fromMs`, never past ``maxDeadlineMs``:
+    /// a delay at the ceiling of ``nextDelayMs(attempt:policy:random:)``,
+    /// 2^53 - 1 ms, would otherwise land after any date JS can represent. The
+    /// sum saturates instead of overflowing, and a negative delay counts as 0.
+    /// The retry cooldown and the credential hold are both computed here.
+    static func deadline(fromMs: Int64, delayMs: Int) -> Int64 {
+        let (sum, overflowed) = fromMs.addingReportingOverflow(Int64(max(0, delayMs)))
+        return overflowed ? maxDeadlineMs : min(sum, maxDeadlineMs)
+    }
+
     /// Decide whether an HTTP response should be retried.
     static func shouldRetry(statusCode: Int, policy: RetryPolicyValue) -> Bool {
         return policy.retryOnStatusCodes.contains(statusCode)
