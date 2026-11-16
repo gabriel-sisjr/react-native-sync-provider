@@ -252,6 +252,47 @@ final class BackgroundTaskExpiryTests: XCTestCase {
         XCTAssertEqual(stored?.attempts, 0)
     }
 
+    /// The expiry lands as the first item's success is reported. The cycle
+    /// claims nothing more. Behind it, an item whose budget is spent and an
+    /// item whose URL is not http(s) would each end in the dead-letter store
+    /// without a request, and neither path checks for a cancellation itself.
+    func test_anExpiryBetweenTwoItems_leavesTheItemsBehindItQueued() async throws {
+        let manager = try makeManager(appActive: true)
+        HeldRequestProtocol.answerNewRequests(with: 200)
+        let answered = try await storage.enqueue(input: .sample(priority: "HIGH"))
+        let spent = try await storage.enqueue(input: .sample())
+        for _ in 0..<RetryPolicyValue.default.maxAttempts {
+            try await storage.markInFlight(id: spent)
+            try await storage.markPendingForRetry(id: spent, errorCode: "SERVER_ERROR", retryDelayMs: 0)
+        }
+        let invalid = try await storage.enqueue(input: .sample(url: "ftp://api.test/items"))
+        let spentBefore = try await row(spent)
+        let task = FakeBackgroundTask()
+        emitter.onNext("ITEM_SUCCEEDED") { task.expirationHandler?() }
+
+        manager.handleProcessing(task: task)
+        await emitter.wait(for: "BACKGROUND_SYNC_COMPLETED", in: self)
+
+        XCTAssertEqual(task.completedResults, [false])
+        let answeredRow = try await row(answered)
+        XCTAssertNil(answeredRow, "answered before the expiry")
+        let spentRow = try await row(spent)
+        XCTAssertEqual(spentRow?.status, "PENDING")
+        XCTAssertEqual(spentRow?.attempts, spentBefore?.attempts)
+        XCTAssertEqual(spentRow?.lastAttemptAt, spentBefore?.lastAttemptAt)
+        let invalidRow = try await row(invalid)
+        XCTAssertEqual(invalidRow?.status, "PENDING")
+        XCTAssertEqual(invalidRow?.attempts, 0, "never claimed")
+        XCTAssertNil(invalidRow?.lastAttemptAt)
+        let letters = try await storage.getDeadLetters()
+        XCTAssertEqual(letters.count, 0)
+        XCTAssertEqual(emitter.emittedEvents.map(\.type).filter { $0.hasPrefix("ITEM_") }, ["ITEM_SUCCEEDED"])
+        let failed = emitter.events(ofType: "SYNC_FAILED")
+        XCTAssertEqual(failed.count, 1)
+        XCTAssertNil(failed.first?.errorCode, "a cancelled cycle failed nothing")
+        XCTAssertEqual(HeldRequestProtocol.startedCount, 1, "only the first item was sent")
+    }
+
     // MARK: - Exactly once on the other paths
 
     func test_aFlushThatReturns_completesOnce_evenWhenTheExpiryComesLate() async throws {
@@ -500,16 +541,26 @@ private final class AwaitingEmitter: SyncEventEmitter, @unchecked Sendable {
     private let lock = NSLock()
     private var recorded: [SyncEventPayload] = []
     private var waiters: [(type: String, expectation: XCTestExpectation)] = []
+    private var hooks: [(type: String, body: () -> Void)] = []
 
     override func emit(_ payload: SyncEventPayload) {
-        let due = lock.withLock { () -> [XCTestExpectation] in
+        let (due, bodies) = lock.withLock { () -> ([XCTestExpectation], [() -> Void]) in
             recorded.append(payload)
             let matching = waiters.filter { $0.type == payload.type }.map(\.expectation)
             waiters.removeAll { $0.type == payload.type }
-            return matching
+            let hooked = hooks.filter { $0.type == payload.type }.map(\.body)
+            hooks.removeAll { $0.type == payload.type }
+            return (matching, hooked)
         }
         due.forEach { $0.fulfill() }
+        bodies.forEach { $0() }
         super.emit(payload)
+    }
+
+    /// Runs `body` once, on the emitting thread, right after the next event
+    /// of `type` is recorded.
+    func onNext(_ type: String, _ body: @escaping () -> Void) {
+        lock.withLock { hooks.append((type, body)) }
     }
 
     var emittedEvents: [SyncEventPayload] {
