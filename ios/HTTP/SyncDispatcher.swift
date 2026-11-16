@@ -226,7 +226,6 @@ actor SyncDispatcher {
     // MARK: - State
 
     private var config: DispatcherConfig
-    private var inFlight: Set<String> = []
     private var isCycleRunning = false
     private var credentialHeldUntil: Int64?
     private(set) var lastResult: StoredSyncResult?
@@ -532,11 +531,9 @@ actor SyncDispatcher {
                 continue
             }
 
-            inFlight.insert(item.id)
             // A purge since the batch was read, a logout say, leaves this item
             // nothing to send: no request and no event of its own.
             guard try await storage.markInFlight(id: item.id) else {
-                inFlight.remove(item.id)
                 emitProgress(index: index, total: total)
                 continue
             }
@@ -555,7 +552,6 @@ actor SyncDispatcher {
                 // item again. The claim's time stays when URLSession had the
                 // request, which may have reached the server; otherwise the
                 // row keeps the time it had before its claim.
-                inFlight.remove(item.id)
                 do {
                     try await storage.releaseClaim(id: item.id,
                                                    attempts: item.attempts,
@@ -568,7 +564,6 @@ actor SyncDispatcher {
                 }
                 throw CancellationError()
             }
-            inFlight.remove(item.id)
 
             emitProgress(index: index, total: total)
 

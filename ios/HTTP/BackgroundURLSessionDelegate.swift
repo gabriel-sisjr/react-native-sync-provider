@@ -80,11 +80,8 @@ final class BackgroundUploadWait: @unchecked Sendable {
 typealias BackgroundEventsCompletionHandler = () -> Void
 
 /// Delegate for the background `URLSession`. Thread-safe via `NSLock`.
-final class BackgroundURLSessionDelegate: NSObject, URLSessionDelegate, URLSessionTaskDelegate, URLSessionDataDelegate, @unchecked Sendable {
-    /// Stored response data per task. Background data tasks deliver bytes
-    /// incrementally — accumulate them so we can attach to the outcome.
+final class BackgroundURLSessionDelegate: NSObject, URLSessionDelegate, URLSessionTaskDelegate, @unchecked Sendable {
     private let lock = NSLock()
-    private var responseData: [Int: Data] = [:]
     /// By task identifier, with the task each handler was registered for.
     /// Keyed by task, not by item: a cancelled upload's completion can arrive
     /// after its item was sent again, and must not end the new wait. Matched
@@ -121,14 +118,6 @@ final class BackgroundURLSessionDelegate: NSObject, URLSessionDelegate, URLSessi
         }
     }
 
-    // MARK: - URLSessionDataDelegate
-
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        lock.withLock {
-            responseData[dataTask.taskIdentifier, default: Data()].append(data)
-        }
-    }
-
     // MARK: - URLSessionTaskDelegate
 
     func urlSession(_ session: URLSession,
@@ -138,7 +127,6 @@ final class BackgroundURLSessionDelegate: NSObject, URLSessionDelegate, URLSessi
         let statusCode = (task.response as? HTTPURLResponse)?.statusCode
 
         let handler = lock.withLock { () -> BackgroundCompletionHandler? in
-            responseData.removeValue(forKey: task.taskIdentifier)
             // Another task with the same identifier leaves the wait alone: its
             // handler stays for the task it belongs to.
             guard let entry = completions[task.taskIdentifier], entry.task === task else { return nil }
