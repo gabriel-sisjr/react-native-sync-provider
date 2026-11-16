@@ -703,6 +703,65 @@ final class SyncEngineRetryTimerTests: XCTestCase {
         XCTAssertEqual(timer.delayMs, 60_000, "the streak is where it was")
     }
 
+    /// A cancellation that lands while the claim is being written, a BGTask
+    /// expiring say: the claim still commits and the cycle knows it, so the
+    /// row comes back with the claim's attempt refunded, nothing is sent, and
+    /// the cycle ends as cancelled.
+    func test_aCancellationDuringTheClaimsWrite_givesTheRowBack() async throws {
+        let engine = await fixture.makeEngine()
+        await engine.configure(.sample(retryPolicy: .exact(maxAttempts: 5, baseDelayMs: 100)))
+        let id = try await enqueueCooling(in: engine, delayMs: 100)
+        clock.advance(ms: 100)
+        URLProtocolStub.setHandler(stubResponse(200))
+        let flush = CancelledOnRequest()
+        let cancels = RequestLog()
+        fixture.saveFaults.intercept { // the claim's save, which still commits
+            flush.cancel()
+            cancels.record()
+        }
+        var open: AsyncStream<Void>.Continuation?
+        let gate = AsyncStream<Void> { open = $0 }
+        let cycle = Task {
+            for await _ in gate { break }
+            _ = try? await engine.dispatcher.flush()
+        }
+        flush.set(cycle)
+        open?.yield(())
+        await cycle.value
+
+        XCTAssertEqual(cancels.times.count, 1, "cancelled during the claim's write")
+        let stored = try await engine.storage.getAll().first { $0.id == id }
+        XCTAssertEqual(stored?.status, "PENDING", "not left IN_FLIGHT")
+        XCTAssertEqual(stored?.attempts, 1, "the claim's attempt is refunded")
+        XCTAssertEqual(requestCount, 0, "nothing was sent")
+        XCTAssertEqual(timer.delayMs, 0, "a cancelled cycle starts no wait: the row is due")
+    }
+
+    /// A CancellationError that is not the cycle's own, thrown by a write
+    /// while the cycle's task runs on, is a failure like any other: the wait
+    /// after a cycle that died starts. Its SYNC_FAILED still has no code, as
+    /// on Android.
+    func test_aCancellationErrorThatIsNotTheCyclesOwn_startsTheWait() async throws {
+        let emitter = MockSyncEventEmitter()
+        let engine = await fixture.makeEngine(emitter: emitter)
+        await engine.configure(.sample(retryPolicy: .exact(maxAttempts: 5, baseDelayMs: 100)))
+        _ = try await enqueueCooling(in: engine, delayMs: 100)
+        clock.advance(ms: 100)
+        fixture.saveFaults.intercept { throw CancellationError() } // the claim
+
+        do {
+            _ = try await engine.dispatcher.flush()
+            XCTFail("the cycle was expected to die")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+
+        XCTAssertEqual(timer.delayMs, 30_000, "0 if it counted as a cancellation")
+        let failed = emitter.events(ofType: "SYNC_FAILED")
+        XCTAssertEqual(failed.count, 1)
+        XCTAssertNil(failed.first?.errorCode)
+    }
+
     // MARK: - Failure handling
 
     /// No JS caller exists on a timer path. A store that failed to open must

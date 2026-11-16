@@ -97,7 +97,8 @@ enum CycleEnd: Sendable, Equatable {
     case completed
     /// It died: a write that failed, say. Its `SYNC_FAILED` carries the code.
     case aborted
-    /// It was cancelled, a BGTask that expired say. Nothing failed.
+    /// Its own task was cancelled, a BGTask that expired say. Nothing failed.
+    /// A `CancellationError` that its task did not get ends it as `aborted`.
     case cancelled
 }
 
@@ -344,6 +345,9 @@ actor SyncDispatcher {
     /// may have reached the server), and `SYNC_FAILED` ends the cycle without
     /// `errorCode` or `metadata`: nothing failed, and no history row is kept.
     /// A response that arrived before the cancellation is recorded as usual.
+    /// A `CancellationError` thrown while the caller's task is not cancelled,
+    /// by a callee say, also ends the cycle with `SYNC_FAILED` without a code,
+    /// but counts as a cycle that died for the wait after it.
     ///
     /// A cycle that dies for any other reason, a write that fails say, ends
     /// with `SYNC_FAILED` and its code (see ``cycleFailureCode(_:)``: a cause
@@ -400,7 +404,12 @@ actor SyncDispatcher {
             } else {
                 emitter.emit(.now(type: "SYNC_FAILED", errorCode: Self.cycleFailureCode(error)))
             }
-            await finishCycle(error is CancellationError ? .cancelled : .aborted)
+            // Only a cancellation of the cycle's own task ends it as
+            // cancelled. A CancellationError thrown while that task runs on,
+            // by a callee say, is a failure, and the wait after a cycle that
+            // died applies to it, as on Android.
+            let cancelled = error is CancellationError && Task.isCancelled
+            await finishCycle(cancelled ? .cancelled : .aborted)
             throw error
         }
     }
