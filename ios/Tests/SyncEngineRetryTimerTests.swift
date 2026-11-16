@@ -640,13 +640,15 @@ final class SyncEngineRetryTimerTests: XCTestCase {
         XCTAssertEqual(timer.delayMs, 30_000)
     }
 
-    /// Runs a cycle that is cancelled as its request goes out.
+    /// Runs a cycle that is cancelled as its request goes out. The request
+    /// then fails, with the cancellation already seen, so no answer can be
+    /// recorded first: the claim is refunded and the cycle ends as cancelled.
     private func runACancelledCycle(in engine: SyncEngine,
                                     file: StaticString = #filePath, line: UInt = #line) async {
         let flush = CancelledOnRequest()
-        URLProtocolStub.setHandler { request in
+        URLProtocolStub.setHandler { _ in
             flush.cancel()
-            return try stubResponse(503)(request)
+            throw URLError(.cancelled)
         }
         var open: AsyncStream<Void>.Continuation?
         let gate = AsyncStream<Void> { open = $0 }
@@ -670,10 +672,8 @@ final class SyncEngineRetryTimerTests: XCTestCase {
         clock.advance(ms: 100)
 
         await runACancelledCycle(in: engine)
-        XCTAssertLessThan(timer.delayMs ?? 0, 30_000, "a cancelled cycle starts no wait")
+        XCTAssertEqual(timer.delayMs, 0, "a cancelled cycle starts no wait: the refunded row is due")
 
-        // Past any cooldown the cancelled attempt may have recorded.
-        clock.advance(ms: 1_000)
         fixture.saveFaults.fail(1)
         _ = try? await engine.dispatcher.flush()
         XCTAssertEqual(timer.delayMs, 30_000, "the streak starts at 30 s")
