@@ -108,9 +108,10 @@ internal class RetryWake(
 
   /**
    * Re-arm the kick after the network-quality gate turned it back, [gateStreak] kicks in a
-   * row: no earlier than the next [GateRecheck] step, nor before a credential hold ends. The
-   * next kick carries `gateStreak + 1`, so the delay doubles up to its cap; any other arm
-   * schedules a kick without it, which starts the backoff over.
+   * row: no earlier than the next [GateRecheck] step, nor before any hold ends, be it the
+   * credential hold, the health-check backoff or the failure hold. The next kick carries
+   * `gateStreak + 1`, so the delay doubles up to its cap; any other arm schedules a kick
+   * without it, which starts the backoff over.
    *
    * The in-process timer is left alone: it checks the gate itself and holds its own wakes.
    * A gate that opened meanwhile, through a `configureSync`, makes this a plain [arm].
