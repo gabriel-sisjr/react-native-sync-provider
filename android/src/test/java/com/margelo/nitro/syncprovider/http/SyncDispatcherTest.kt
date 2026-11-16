@@ -1376,6 +1376,7 @@ internal class SyncDispatcherTest {
       val others = List(3) { enqueue("/other$it") }
       val failing = spyk(storage)
       coEvery { failing.markSucceeded(failingId) } throws locked()
+      val events = recordEvents()
 
       val thrown = runCatching { runBlocking { newDispatcher(queue = failing).flush() } }
 
@@ -1384,15 +1385,56 @@ internal class SyncDispatcherTest {
       assertThat(inFlightRows()).isEmpty()
       // Answered with a 2xx: the settle delivered it.
       assertThat(db.syncItemDao().findById(failingId)).isNull()
-      // Delivered and removed, or never started and waiting as it was.
-      others.forEach { other ->
-        db.syncItemDao().findById(other)?.let {
-          assertThat(it.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
-          assertThat(it.attempts).isEqualTo(0)
-          assertThat(it.nextRetryAt).isEqualTo(0L)
+      // Each one either delivered, with its own ITEM_SUCCEEDED, or never started and waiting as
+      // it was, with no event.
+      for (other in others) {
+        val ownEvents = events.filter { it.itemId == other }.types()
+        val waiting = db.syncItemDao().findById(other)
+        if (waiting == null) {
+          assertWithMessage("$other, delivered").that(ownEvents)
+            .containsExactly(SyncEventType.ITEM_SUCCEEDED)
+        } else {
+          assertWithMessage("$other, never started").that(ownEvents).isEmpty()
+          assertThat(waiting.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+          assertThat(waiting.attempts).isEqualTo(0)
+          assertThat(waiting.nextRetryAt).isEqualTo(0L)
         }
       }
+      assertThat(events.filter { it.itemId == failingId }.types())
+        .containsExactly(SyncEventType.ITEM_SUCCEEDED)
+      assertThat(events.last().type).isEqualTo(SyncEventType.SYNC_FAILED)
     }
+
+  /**
+   * The order of the events of a cycle that aborts: each item event of its own as it happens,
+   * then the settle's, once its writes are in, and the cycle's `SYNC_FAILED` last.
+   */
+  @Test
+  fun `after a settle the item events come first and SYNC_FAILED last`() = runTest {
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest): MockResponse =
+        MockResponse().setResponseCode(if (request.path == "/first") 200 else 503)
+    }
+    val first = enqueue("/first")
+    val second = enqueue("/second")
+    val failing = spyk(storage)
+    coEvery { failing.markRetry(second, any(), any(), any(), any()) } throws locked()
+    val events = recordEvents()
+    // Restored headers: the first item goes alone, and records its outcome before the second
+    // one starts.
+    val d = newDispatcher(queue = failing, credentials = { CredentialPolicy.PERSISTED })
+
+    runCatching { runBlocking { d.flush() } }
+
+    assertThat(events.map { it.type to it.itemId })
+      .containsExactly(
+        SyncEventType.SYNC_STARTED to null,
+        SyncEventType.ITEM_SUCCEEDED to first,
+        SyncEventType.ITEM_RETRYING to second,
+        SyncEventType.SYNC_FAILED to null,
+      )
+      .inOrder()
+  }
 
   /**
    * An aborted cycle releases only the rows it claimed. A row `IN_FLIGHT` that it never claimed,
