@@ -684,6 +684,7 @@ final class BackgroundUploadWaitTests: XCTestCase {
 
         XCTAssertTrue(installed)
         XCTAssertNil(status)
+        XCTAssertTrue(wait.started, "the upload was handed to the session before the cancellation")
     }
 
     /// A task cancelled before the wait began: the upload must not start.
@@ -697,6 +698,7 @@ final class BackgroundUploadWaitTests: XCTestCase {
 
         XCTAssertFalse(installed, "the upload must not start")
         XCTAssertNil(status)
+        XCTAssertFalse(wait.started)
     }
 
     /// Both at once, from two threads, many times.

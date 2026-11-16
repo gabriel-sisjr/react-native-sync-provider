@@ -40,6 +40,18 @@ final class SyncDispatcherCooldownTests: XCTestCase {
                                                 defaultHeaders: [:]))
     }
 
+    /// Default headers read back from storage, as in a relaunch with no JS:
+    /// a 401 or 403 to them is the credential hold.
+    private func makeStaleCredentialDispatcher() -> SyncDispatcher {
+        var config = DispatcherConfig(retryPolicy: .exact(maxAttempts: 3, baseDelayMs: 300),
+                                      requestTimeoutMs: 30_000,
+                                      batchSize: 25,
+                                      defaultHeaders: ["Authorization": "Bearer expired"])
+        config.source = .persisted
+        config.hasDefaultHeaders = true
+        return makeDispatcher(config: config)
+    }
+
     private func makeDispatcher(config: DispatcherConfig,
                                 isAppActive: (@Sendable () async -> Bool)? = nil) -> SyncDispatcher {
         SyncDispatcher(storage: storage,
@@ -382,13 +394,7 @@ final class SyncDispatcherCooldownTests: XCTestCase {
     func test_aFailedWriteAfterAStaleCredentialRejection_holdsTheItem() async throws {
         let id = try await storage.enqueue(input: .sample())
         URLProtocolStub.setHandler(stubResponse(401))
-        var config = DispatcherConfig(retryPolicy: .exact(maxAttempts: 3, baseDelayMs: 300),
-                                      requestTimeoutMs: 30_000,
-                                      batchSize: 25,
-                                      defaultHeaders: ["Authorization": "Bearer expired"])
-        config.source = .persisted
-        config.hasDefaultHeaders = true
-        let dispatcher = makeDispatcher(config: config)
+        let dispatcher = makeStaleCredentialDispatcher()
         let ends = CycleEnds()
         dispatcher.hooks.onCycleFinished = { notBefore, end in ends.record(end, notBefore: notBefore) }
         faults.fail(1, after: 1)
@@ -496,9 +502,7 @@ final class SyncDispatcherCooldownTests: XCTestCase {
             emitter.clear()
             faults.intercept(after: 1) { // the outcome's write
                 Self.purge(id, in: container)
-                throw NSError(domain: NSCocoaErrorDomain,
-                              code: NSPersistentStoreSaveError,
-                              userInfo: [NSLocalizedDescriptionKey: "Purged, then failed"])
+                throw Self.saveFailure
             }
 
             await flushExpectingItToDie(makeDispatcher(.exact(maxAttempts: 3, baseDelayMs: 300)))
@@ -508,6 +512,75 @@ final class SyncDispatcherCooldownTests: XCTestCase {
             let letter = try await storage.deadLetter(id)
             XCTAssertNil(letter, "HTTP \(status): nothing is resurrected")
             XCTAssertEqual(eventTypes, ["SYNC_STARTED", "SYNC_FAILED"], "HTTP \(status)")
+        }
+    }
+
+    /// A row set back to PENDING between the failed outcome write and the
+    /// settle, by launch recovery say, is no longer this cycle's claim: the
+    /// settle leaves it as it is, with no event.
+    func test_aRowGivenBackBeforeTheSettle_isLeftAlone_withNoEvent() async throws {
+        let container = stack.persistentContainer
+        for status in [200, 503] {
+            let id = try await storage.enqueue(input: .sample())
+            URLProtocolStub.setHandler(stubResponse(status))
+            emitter.clear()
+            faults.intercept(after: 1) { // the outcome's write
+                Self.giveBack(id, in: container)
+                throw Self.saveFailure
+            }
+
+            await flushExpectingItToDie(makeDispatcher(.exact(maxAttempts: 3, baseDelayMs: 300)))
+
+            let stored = try await item(id)
+            XCTAssertEqual(stored.status, "PENDING", "HTTP \(status)")
+            XCTAssertEqual(stored.attempts, 1, "HTTP \(status): as the claim left it")
+            XCTAssertEqual(stored.nextRetryAt, 0, "HTTP \(status): no cooldown written")
+            XCTAssertNil(stored.lastErrorCode, "HTTP \(status)")
+            XCTAssertEqual(eventTypes, ["SYNC_STARTED", "SYNC_FAILED"], "HTTP \(status)")
+            _ = try await storage.remove(id: id)
+        }
+    }
+
+    /// The credential was rejected whether or not its row is still there: with
+    /// the row purged before the settle, the hold still reaches the wake.
+    func test_aStaleCredentialRejection_whoseRowIsPurgedBeforeTheSettle_stillHoldsTheWake() async throws {
+        let id = try await storage.enqueue(input: .sample())
+        URLProtocolStub.setHandler(stubResponse(401))
+        let dispatcher = makeStaleCredentialDispatcher()
+        let ends = CycleEnds()
+        dispatcher.hooks.onCycleFinished = { notBefore, end in ends.record(end, notBefore: notBefore) }
+        let container = stack.persistentContainer
+        faults.intercept(after: 1) { // the hold's write
+            Self.purge(id, in: container)
+            throw Self.saveFailure
+        }
+        let now = clock.nowMs()
+
+        await flushExpectingItToDie(dispatcher)
+
+        let queued = try await storage.isQueued(id)
+        XCTAssertFalse(queued)
+        XCTAssertEqual(eventTypes, ["SYNC_STARTED", "SYNC_FAILED"])
+        XCTAssertEqual(ends.holds, [now + 60_000], "the hold reaches the wake with the row gone")
+    }
+
+    private static var saveFailure: NSError {
+        NSError(domain: NSCocoaErrorDomain,
+                code: NSPersistentStoreSaveError,
+                userInfo: [NSLocalizedDescriptionKey: "A save the test made fail"])
+    }
+
+    /// Sets the queue row `id` back to PENDING through a context of its own,
+    /// as launch recovery does.
+    private static func giveBack(_ id: String, in container: NSPersistentContainer) {
+        let context = container.newBackgroundContext()
+        context.performAndWait {
+            let request = NSFetchRequest<NSManagedObject>(entityName: "SyncItemEntity")
+            request.predicate = NSPredicate(format: "id == %@", id)
+            if let row = try? context.fetch(request).first {
+                row.setValue("PENDING", forKey: "status")
+                try? context.save()
+            }
         }
     }
 
