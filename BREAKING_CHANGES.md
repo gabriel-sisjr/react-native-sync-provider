@@ -303,7 +303,7 @@ The iOS minimum deployment target declared in `SyncProvider.podspec` is raised f
 
 #### Migration steps
 
-1. In your app's `ios/Podfile`, ensure the platform line is at least `platform :ios, '15.0'`.
+1. In your app's `ios/Podfile`, make sure the platform line resolves to iOS 15.0 or later. A React Native 0.85 Podfile keeps `platform :ios, min_ios_version_supported`, which is `15.1`, so leave it as it is. A Podfile that names a version needs at least `platform :ios, '15.0'`. The library's own floor stays `15.0`.
 2. If you set `IPHONEOS_DEPLOYMENT_TARGET` anywhere (Podfile `post_install`, Xcode build settings), make sure it is `>= 15.0`.
 3. Run `cd ios && bundle exec pod install`.
 

@@ -15,7 +15,7 @@ This library offers:
 - **Connectivity awareness** -- the retry timer and `drainUntilEmpty` wait for the network, `useAutoSync` flushes on reconnect, and an opt-in network-quality gate and health check skip flushes on a poor link or an unhealthy backend
 - **At-least-once delivery** -- every item gets a native ULID, which is not sent with the request; send an `Idempotency-Key` header and dedupe on the server
 - **First-class TypeScript** -- full TSDoc, strict types, discriminated `SyncErrorCode` enum
-- **New Architecture only** -- Nitro Modules + Fabric, no legacy bridge
+- **New Architecture only** -- built on Nitro Modules, and built and tested only on the New Architecture
 
 ## 💝 Why sponsor?
 
