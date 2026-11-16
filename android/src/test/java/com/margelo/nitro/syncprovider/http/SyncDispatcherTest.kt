@@ -17,6 +17,8 @@ import com.margelo.nitro.syncprovider.database.SyncDeadLetterEntity
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
 import com.margelo.nitro.syncprovider.error.SyncException
 import com.margelo.nitro.syncprovider.events.SyncEventEmitter
+import com.margelo.nitro.syncprovider.retry.RetryTimer
+import com.margelo.nitro.syncprovider.retry.RetryWake
 import com.margelo.nitro.syncprovider.storage.SyncQueueStorage
 import com.margelo.nitro.syncprovider.testutil.MovingClock
 import com.margelo.nitro.syncprovider.testutil.TestData
@@ -95,7 +97,9 @@ internal class SyncDispatcherTest {
     batchSize: Int = 25,
     isPaused: () -> Boolean = { false },
     credentials: () -> CredentialPolicy = { CredentialPolicy.TRUSTED },
-    onCycleFinished: suspend (Long?) -> Unit = { finishedCycles += it },
+    onCycleFinished: suspend (Long?, CycleEnding) -> Unit = { notBefore, _ ->
+      finishedCycles += notBefore
+    },
     queue: SyncQueueStorage = storage,
     minNetworkQuality: NetworkQuality? = null,
     quality: () -> NetworkQuality = { NetworkQuality.GOOD },
@@ -588,7 +592,7 @@ internal class SyncDispatcherTest {
     server.enqueue(MockResponse().setResponseCode(503))
     enqueue()
     val d = newDispatcher(
-      onCycleFinished = {
+      onCycleFinished = { _, _ ->
         throw SyncException(SyncErrorCode.BACKGROUND_TASK_REGISTRATION_FAILED, "no WorkManager")
       },
     )
@@ -1178,6 +1182,132 @@ internal class SyncDispatcherTest {
     assertThat(newDispatcher().resetInFlight()).isEqualTo(1)
 
     assertThat(row("orphan").status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+  }
+
+  /* ------------------------ the wake after a failed cycle ------------------------ */
+
+  /** The delays [recordingWake] gave the timer and the kick, in order. */
+  private val timerDelays: MutableList<Long> = Collections.synchronizedList(mutableListOf())
+  private val kickDelays: MutableList<Long> = Collections.synchronizedList(mutableListOf())
+
+  /** The real wake on the test clock, reading the real storage, with both mechanisms recorded. */
+  private fun recordingWake(): RetryWake {
+    val timer = mockk<RetryTimer>(relaxed = true)
+    every { timer.arm(any()) } answers { timerDelays += firstArg<Long>() }
+    return RetryWake(
+      storage = storage,
+      timer = timer,
+      scheduleKick = { kickDelays += it },
+      isHalted = { false },
+      isEngineLive = { true },
+      clock = clock::now,
+    )
+  }
+
+  /** The end of every cycle arms [wake], as the runtime wires it. */
+  private fun armsAfterEachCycle(wake: RetryWake): suspend (Long?, CycleEnding) -> Unit =
+    { notBefore, ending -> wake.arm(notBefore, ending) }
+
+  /** Attempted once, with a cooldown that has already passed: due now. */
+  private suspend fun insertDue(id: String = "due") {
+    db.syncItemDao().insert(
+      TestData.entity(
+        id = id,
+        url = server.url("/x").toString(),
+        attempts = 1,
+        nextRetryAt = clock.now() - 1_000L,
+      ),
+    )
+  }
+
+  /**
+   * A failure between the claim and the send gives the row back as it was, its cooldown already
+   * past. The wake that follows used to fire at once, so a failure that persisted ran cycles back
+   * to back: each one waits for the next gate re-check step now.
+   */
+  @Test
+  fun `a storage failure before the send backs the next wake off instead of looping`() = runTest {
+    insertDue()
+    val failing = spyk(storage)
+    coEvery { failing.isQueued(any()) } throws locked()
+    val d = newDispatcher(queue = failing, onCycleFinished = armsAfterEachCycle(recordingWake()))
+
+    repeat(3) {
+      assertThat(runCatching { runBlocking { d.flush() } }.exceptionOrNull())
+        .isInstanceOf(SQLiteDatabaseLockedException::class.java)
+    }
+
+    assertThat(server.requestCount).isEqualTo(0)
+    assertThat(row("due").status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(row("due").attempts).isEqualTo(1)
+    assertThat(row("due").nextRetryAt).isEqualTo(clock.now() - 1_000L)
+    assertThat(timerDelays).containsExactly(30_000L, 60_000L, 120_000L).inOrder()
+    assertThat(kickDelays).containsExactly(30_000L, 60_000L, 120_000L).inOrder()
+  }
+
+  /** The same when the claim itself fails: nothing was claimed, and the due row stays due. */
+  @Test
+  fun `a failed claim backs the next wake off instead of looping`() = runTest {
+    insertDue()
+    val failing = spyk(storage)
+    coEvery { failing.claimPending(any(), any()) } throws locked()
+    val d = newDispatcher(queue = failing, onCycleFinished = armsAfterEachCycle(recordingWake()))
+
+    repeat(3) {
+      assertThat(runCatching { runBlocking { d.flush() } }.exceptionOrNull())
+        .isInstanceOf(SQLiteDatabaseLockedException::class.java)
+    }
+
+    assertThat(server.requestCount).isEqualTo(0)
+    assertThat(timerDelays).containsExactly(30_000L, 60_000L, 120_000L).inOrder()
+    assertThat(kickDelays).containsExactly(30_000L, 60_000L, 120_000L).inOrder()
+  }
+
+  /** A cancellation says nothing about the storage: the wake after it is armed as before. */
+  @Test
+  fun `a cancelled cycle does not start the failure backoff`() = runTest {
+    insertDue()
+    val wake = recordingWake()
+    val stopping = spyk(storage)
+    coEvery { stopping.isQueued(any()) } throws CancellationException("stopped")
+    val failing = spyk(storage)
+    coEvery { failing.isQueued(any()) } throws locked()
+    val toCancel = newDispatcher(queue = stopping, onCycleFinished = armsAfterEachCycle(wake))
+    val toFail = newDispatcher(queue = failing, onCycleFinished = armsAfterEachCycle(wake))
+
+    val cancelled = runCatching { runBlocking { toCancel.flush() } }
+    runCatching { runBlocking { toFail.flush() } }
+
+    assertThat(cancelled.exceptionOrNull()).isInstanceOf(CancellationException::class.java)
+    // At once after the cancellation; the first step only after the failure that follows it.
+    assertThat(timerDelays).containsExactly(0L, 30_000L).inOrder()
+    assertThat(kickDelays).containsExactly(0L, 30_000L).inOrder()
+  }
+
+  /**
+   * A cycle that completes, here with an item that failed, starts the steps over, and the wake
+   * after it is armed as before. The explicit flush right after the failures is not held back.
+   */
+  @Test
+  fun `a completed cycle starts the failure backoff over`() = runTest {
+    insertDue()
+    val wake = recordingWake()
+    val failing = spyk(storage)
+    coEvery { failing.claimPending(any(), any()) } throws locked()
+    val broken = newDispatcher(queue = failing, onCycleFinished = armsAfterEachCycle(wake))
+    repeat(2) { runCatching { runBlocking { broken.flush() } } }
+
+    server.enqueue(MockResponse().setResponseCode(503))
+    newDispatcher(onCycleFinished = armsAfterEachCycle(wake)).flush()
+    val cooldown = row("due").nextRetryAt - clock.now()
+    runCatching { runBlocking { broken.flush() } }
+
+    assertThat(server.requestCount).isEqualTo(1)
+    assertThat(row("due").attempts).isEqualTo(2)
+    assertThat(cooldown).isGreaterThan(0L)
+    assertThat(cooldown).isLessThan(30_000L)
+    assertThat(timerDelays).containsExactly(30_000L, 60_000L, cooldown, 30_000L).inOrder()
+    assertThat(kickDelays).containsExactly(30_000L, 60_000L, cooldown, 30_000L).inOrder()
   }
 
   /* --------------------------- restored credentials ----------------------- */

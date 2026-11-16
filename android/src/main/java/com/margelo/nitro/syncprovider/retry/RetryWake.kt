@@ -1,5 +1,6 @@
 package com.margelo.nitro.syncprovider.retry
 
+import com.margelo.nitro.syncprovider.http.CycleEnding
 import com.margelo.nitro.syncprovider.storage.SyncQueueStorage
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -21,6 +22,15 @@ import java.util.concurrent.atomic.AtomicLong
  * The hold lives in memory only. A new process starts without it, so a row that is
  * already due there can cost one more request with the rejected credential, whose
  * rejection sets the hold again.
+ *
+ * It keeps the failure hold too. After a cycle that failed, one that a cause other than a
+ * cancellation ended (a storage read or write, an event emit, an [Error]), no wake on any path
+ * fires before the next [GateRecheck] step: 30 s after the first such cycle, doubling for each
+ * one that follows, at most 15 min. Otherwise a row that cycle gave back with a cooldown already
+ * past would re-arm both mechanisms at once, and a failure that persists would run cycles back
+ * to back. A cycle that completes lifts the hold and starts the steps over; a cancelled one
+ * leaves both as they are. Explicit flushes and the periodic worker never wait for it. It lives
+ * in memory only, like the credential hold, so a new process starts at the first step.
  *
  * @param scheduleKick arms the WorkManager kick. Applies the `isEnabled` and
  *   `foregroundOnly` gates itself and never throws.
@@ -61,21 +71,35 @@ internal class RetryWake(
   /** No wake before this instant, in epoch millis. `0` means no hold. */
   private val credentialHoldUntil = AtomicLong(0L)
 
+  /** Cycles that failed in a row, since the last one that completed. Guarded by [armMutex]. */
+  private var failedCycles = 0
+
   /**
-   * Arm for the soonest retry deadline, but not before the credential hold ends. A
-   * deadline already in the past yields delay 0, so a row whose cooldown elapsed during
-   * a cycle is never stranded.
+   * No wake before this instant after a cycle that failed, in epoch millis: one [GateRecheck]
+   * step after it, the step set by [failedCycles]. `0` once a cycle completes. Guarded by
+   * [armMutex].
+   */
+  private var failureHoldUntil = 0L
+
+  /**
+   * Arm for the soonest retry deadline, but not before the holds end. A deadline already
+   * in the past yields delay 0, so a row whose cooldown elapsed during a cycle is never
+   * stranded.
    *
    * @param notBefore when the hold on a rejected credential ends. Only the end of a
    *   cycle passes it. It outlives this call, so a later arm cannot wake earlier.
+   * @param ending how the cycle that just ended finished. Only the end of a cycle passes it: a
+   *   failed cycle sets the failure hold one step further, a completed one lifts it, and a
+   *   cancelled one leaves it as it is.
    */
-  suspend fun arm(notBefore: Long? = null) {
+  suspend fun arm(notBefore: Long? = null, ending: CycleEnding? = null) {
     armMutex.withLock {
       // Before the gates: a cycle that ends while paused, or with nothing left to wake
       // for, still holds back the wake that comes next.
       if (notBefore != null) {
         credentialHoldUntil.accumulateAndGet(notBefore) { held, reported -> maxOf(held, reported) }
       }
+      ending?.let(::recordEnding)
       armLocked()
     }
   }
@@ -151,8 +175,24 @@ internal class RetryWake(
     scheduleKick(delayMs)
   }
 
-  /** No wake before the credential hold or the health-check backoff ends. */
-  private fun notBeforeAny(): Long = maxOf(credentialHoldUntil.get(), healthBackoffUntil())
+  /** Caller holds [armMutex]. */
+  private fun recordEnding(ending: CycleEnding) {
+    when (ending) {
+      CycleEnding.COMPLETED -> {
+        failedCycles = 0
+        failureHoldUntil = 0L
+      }
+      CycleEnding.FAILED -> failureHoldUntil = clock() + GateRecheck.delayMs(failedCycles++)
+      CycleEnding.CANCELLED -> Unit
+    }
+  }
+
+  /**
+   * No wake before the credential hold, the health-check backoff or the failure hold ends.
+   * Caller holds [armMutex].
+   */
+  private fun notBeforeAny(): Long =
+    maxOf(credentialHoldUntil.get(), healthBackoffUntil(), failureHoldUntil)
 
   /**
    * The wait until [deadline]: 0 for a deadline already past, and at most

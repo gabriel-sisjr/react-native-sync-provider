@@ -124,7 +124,7 @@ internal class SyncProviderRuntime private constructor(
     networkQuality = { connectivityMonitor.qualityForGate() },
     healthCheck = healthCheck,
     onHealthCheckSkipped = { retryWake.arm() },
-    onCycleFinished = { notBefore -> retryWake.arm(notBefore) },
+    onCycleFinished = { notBefore, ending -> retryWake.arm(notBefore, ending) },
   )
 
   private val retryTimer = RetryTimer(
@@ -211,7 +211,7 @@ internal class SyncProviderRuntime private constructor(
     retryWake.armForResume()
   }
 
-  /** Arm the next retry wake from the current queue, no earlier than a credential hold. */
+  /** Arm the next retry wake from the current queue, no earlier than the holds [RetryWake] keeps. */
   suspend fun armRetryWake() {
     retryWake.arm()
   }

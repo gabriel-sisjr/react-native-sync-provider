@@ -53,7 +53,8 @@ import kotlin.random.Random
  * - [SyncItemEntity.attempts] is cross-cycle: it continues from whatever prior
  *   cycles persisted, so the retry budget survives process death and reboots.
  * - [onCycleFinished] fires after every cycle, whatever its outcome, so the next
- *   wake is always re-armed.
+ *   wake is always re-armed. It is told how the cycle ended ([CycleEnding]): the wake after a
+ *   cycle that failed is held back, so a failure that persists cannot run cycles back to back.
  *
  * Concurrency model:
  * - [flushMutex] serializes cycles: a concurrent [flush] waits for the running one
@@ -83,8 +84,8 @@ import kotlin.random.Random
  * @param healthCheck run before the claim while `healthCheckUrl` is set.
  * @param onHealthCheckSkipped called after every cycle the health check skipped, to arm the
  *   next wake no earlier than its backoff.
- * @param onCycleFinished called after every cycle. Its argument, when present, is
- *   the earliest instant the next wake may fire. Failures are logged and never
+ * @param onCycleFinished called after every cycle, with how it ended. Its first argument, when
+ *   present, is the earliest instant the next wake may fire. Failures are logged and never
  *   reject a cycle that already completed.
  * @param httpClient the one OkHttp client, built once, on the first cycle with items to send,
  *   before any attempt: a client that cannot be built fails that cycle, not its items. Each
@@ -103,7 +104,8 @@ internal class SyncDispatcher(
   private val networkQuality: () -> NetworkQuality = { NetworkQuality.GOOD },
   private val healthCheck: HealthCheck = HealthCheck(HeadProbe()),
   private val onHealthCheckSkipped: suspend () -> Unit = {},
-  private val onCycleFinished: suspend (notBefore: Long?) -> Unit = {},
+  private val onCycleFinished: suspend (notBefore: Long?, ending: CycleEnding) -> Unit =
+    { _, _ -> },
   private val httpClient: Lazy<OkHttpClient> = lazy { newClient(verboseLogging()) },
 ) {
   private val flushMutex = Mutex()
@@ -205,6 +207,7 @@ internal class SyncDispatcher(
     val startedAt = clock()
     syncing.set(true)
     var notBefore: Long? = null
+    var ending = CycleEnding.COMPLETED
     var terminalEventSent = false
     var claimed: List<SyncItemEntity> = emptyList()
     requestsSent.clear()
@@ -239,12 +242,13 @@ internal class SyncDispatcher(
       )
       return result
     } catch (t: Throwable) {
+      ending = if (t is CancellationException) CycleEnding.CANCELLED else CycleEnding.FAILED
       withContext(NonCancellable) { abortCycle(t, terminalEventSent, claimed, options.retryPolicy) }
       throw t
     } finally {
       syncing.set(false)
       withContext(NonCancellable) {
-        runCatching { onCycleFinished(notBefore) }
+        runCatching { onCycleFinished(notBefore, ending) }
           .onFailure { Log.w(TAG, "Could not arm the next retry wake", it) }
       }
     }
