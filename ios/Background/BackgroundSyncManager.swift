@@ -188,11 +188,20 @@ final class BackgroundSyncManager: @unchecked Sendable {
 
     // MARK: - Submission
 
+    /// The wait before the next app-refresh window, in seconds, from
+    /// `minimumIntervalMs`: at least 60 s, for NaN and -Infinity too, and at
+    /// most 2^53 - 1 ms, the cap Android puts on its periodic interval, so
+    /// +Infinity and huge values still give a finite begin date.
+    static func refreshDelaySeconds(_ minimumIntervalMs: Double) -> TimeInterval {
+        let floorSeconds: TimeInterval = 60
+        guard !minimumIntervalMs.isNaN else { return floorSeconds }
+        return max(min(minimumIntervalMs, 9_007_199_254_740_991) / 1000, floorSeconds)
+    }
+
     private func scheduleAppRefresh(options: BackgroundSyncOptionsValue) throws {
         #if canImport(BackgroundTasks)
         let request = BGAppRefreshTaskRequest(identifier: kBackgroundRefreshIdentifier)
-        let intervalSeconds = max(options.minimumIntervalMs / 1000.0, 60)
-        request.earliestBeginDate = Date(timeIntervalSinceNow: intervalSeconds)
+        request.earliestBeginDate = Date(timeIntervalSinceNow: Self.refreshDelaySeconds(options.minimumIntervalMs))
         do {
             try scheduler.submit(request)
         } catch {
