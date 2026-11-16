@@ -14,6 +14,7 @@ import com.margelo.nitro.syncprovider.SyncOptions
 import com.margelo.nitro.syncprovider.SyncResult
 import com.margelo.nitro.syncprovider.database.SyncDatabase
 import com.margelo.nitro.syncprovider.database.SyncDeadLetterEntity
+import com.margelo.nitro.syncprovider.database.SyncItemDao
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
 import com.margelo.nitro.syncprovider.error.SyncException
 import com.margelo.nitro.syncprovider.events.SyncEventEmitter
@@ -1147,6 +1148,59 @@ internal class SyncDispatcherTest {
 
     assertThat(row(unsent).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
     assertThat(row("elsewhere").status).isEqualTo(SyncItemEntity.STATUS_IN_FLIGHT)
+  }
+
+  /** The real DAO, whose claim commits, says so, and then waits for [release] to return. */
+  private class HeldClaimDao(
+    private val real: SyncItemDao,
+    private val committed: CompletableDeferred<Unit>,
+    private val release: CountDownLatch,
+  ) : SyncItemDao by real {
+    override suspend fun claimPending(now: Long, limit: Int): List<SyncItemEntity> =
+      real.claimPending(now, limit).also {
+        committed.complete(Unit)
+        release.await(20, TimeUnit.SECONDS)
+      }
+  }
+
+  /**
+   * A cancellation that lands while the claim returns, its transaction already committed. The
+   * claim's result was discarded, so its rows stayed `IN_FLIGHT` and only recovery released them.
+   * The claim now finishes, and the settle gives its rows back as they were.
+   */
+  @Test
+  fun `a cancellation during the claim gives the claimed rows back`() = runTest {
+    val id = enqueue()
+    val committed = CompletableDeferred<Unit>()
+    val release = CountDownLatch(1)
+    val held = SyncQueueStorage(
+      itemDao = HeldClaimDao(db.syncItemDao(), committed, release),
+      resultDao = db.syncResultDao(),
+      deadLetterDao = db.syncDeadLetterDao(),
+    )
+    val endings: MutableList<CycleEnding> = Collections.synchronizedList(mutableListOf())
+    val events = recordEvents()
+    val d = newDispatcher(queue = held, onCycleFinished = { _, ending -> endings += ending })
+
+    val cycle = launch(Dispatchers.IO) { d.flush() }
+    runBlocking { withTimeout(20_000L) { committed.await() } }
+    cycle.cancel()
+    release.countDown()
+    cycle.join()
+
+    val released = row(id)
+    assertThat(released.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(released.attempts).isEqualTo(0)
+    assertThat(released.nextRetryAt).isEqualTo(0L)
+    assertThat(server.requestCount).isEqualTo(0)
+    assertThat(endings).containsExactly(CycleEnding.CANCELLED)
+    assertThat(events.types())
+      .containsExactly(SyncEventType.SYNC_STARTED, SyncEventType.SYNC_FAILED)
+      .inOrder()
+    assertThat(events.last().errorCode).isNull()
+    // Claimable again: the next cycle sends it.
+    server.enqueue(MockResponse().setResponseCode(200))
+    assertThat(newDispatcher().flush().succeededIds.toList()).containsExactly(id)
   }
 
   @Test

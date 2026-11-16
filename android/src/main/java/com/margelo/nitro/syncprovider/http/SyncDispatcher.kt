@@ -215,7 +215,10 @@ internal class SyncDispatcher(
       emitter.emit(SyncEventEmitter.event(SyncEventType.SYNC_STARTED))
 
       val batchSize = (options.batchSize?.toInt() ?: DEFAULT_BATCH_SIZE).coerceAtLeast(1)
-      claimed = storage.claimPending(batchSize, startedAt)
+      // Not cancellable: a cancellation that lands once the claim has committed would discard
+      // the rows it took, and only recovery would release them. It surfaces right after, at the
+      // first check, and the rows are then the settle's to give back.
+      claimed = withContext(NonCancellable) { storage.claimPending(batchSize, startedAt) }
       val outcomes = if (claimed.isEmpty()) {
         emptyList()
       } else {
