@@ -854,52 +854,162 @@ internal class SyncDispatcherTest {
 
   /**
    * A local write that fails around the attempt is no outcome of the item, and after a `2xx`
-   * the server has the request. The cycle aborts, as on iOS, and the row goes back to `PENDING`
-   * instead of becoming a dead letter.
+   * the server has the request. The cycle aborts, as on iOS, and the row is not dead-lettered:
+   * its request went out, so the attempt counts and the row waits for its cooldown, as after a
+   * retryable failure. Released at once and uncounted, it was sent again on every wake.
    */
   @Test
-  fun `a failed write after a 2xx aborts the cycle instead of failing the delivered item`() =
+  fun `a failed write after a 2xx aborts the cycle and the row waits for its cooldown`() =
     runTest {
       server.enqueue(MockResponse().setResponseCode(200))
       val id = enqueue()
       val failing = spyk(storage)
       coEvery { failing.markSucceeded(any()) } throws locked()
       val events = recordEvents()
+      val d = newDispatcher(queue = failing, baseDelayMs = 1_000L)
+
+      val thrown = runCatching { runBlocking { d.flush() } }
+
+      assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+      assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+      assertThat(row(id).attempts).isEqualTo(1)
+      assertThat(row(id).lastErrorCode).isEqualTo(SyncErrorCode.NETWORK_ERROR.name)
+      assertThat(row(id).nextRetryAt).isEqualTo(clock.now() + 1_000L)
+      assertThat(thrown.exceptionOrNull()).isInstanceOf(SQLiteDatabaseLockedException::class.java)
+      assertThat(events.single { it.type == SyncEventType.SYNC_FAILED }.errorCode)
+        .isEqualTo(SyncErrorCode.NETWORK_ERROR)
+      val retrying = events.single { it.type == SyncEventType.ITEM_RETRYING }
+      assertThat(retrying.itemId).isEqualTo(id)
+      assertThat(retrying.attempt).isEqualTo(1.0)
+      assertThat(events.types())
+        .containsNoneOf(SyncEventType.ITEM_FAILED, SyncEventType.ITEM_DEAD_LETTERED)
+      assertThat(storage.getHistory()).isEmpty()
+      // Not due yet: a flush right away sends nothing.
+      d.flush()
+      assertThat(server.requestCount).isEqualTo(1)
+    }
+
+  @Test
+  fun `a failed write after a retryable 503 aborts the cycle and the retry waits its cooldown`() =
+    runTest {
+      server.dispatcher = respondAfter(attemptMs = 0L, code = 503)
+      val id = enqueue()
+      val failing = spyk(storage)
+      coEvery { failing.markRetry(any(), any(), any(), any(), any()) } throws locked()
+      val events = recordEvents()
 
       val thrown = runCatching { runBlocking { newDispatcher(queue = failing).flush() } }
 
       assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
       assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
-      assertThat(row(id).attempts).isEqualTo(0)
-      assertThat(server.requestCount).isEqualTo(1)
+      assertThat(row(id).attempts).isEqualTo(1)
+      assertThat(row(id).nextRetryAt).isEqualTo(clock.now() + 1_000L)
       assertThat(thrown.exceptionOrNull()).isInstanceOf(SQLiteDatabaseLockedException::class.java)
       assertThat(events.single { it.type == SyncEventType.SYNC_FAILED }.errorCode)
         .isEqualTo(SyncErrorCode.NETWORK_ERROR)
-      assertThat(events.types())
-        .containsNoneOf(SyncEventType.ITEM_FAILED, SyncEventType.ITEM_DEAD_LETTERED)
-      assertThat(storage.getHistory()).isEmpty()
+      // With the storage healthy, the retry still waits for its cooldown.
+      newDispatcher().flush()
+      assertThat(server.requestCount).isEqualTo(1)
+      clock.advance(1_000L)
+      newDispatcher().flush()
+      assertThat(server.requestCount).isEqualTo(2)
+      assertThat(row(id).attempts).isEqualTo(2)
     }
 
+  /**
+   * The claim succeeds and the outcome write always fails. Each aborted cycle counts the
+   * attempt and pushes the deadline out, so no wake comes back at once, and the budget ends in a
+   * dead letter, as for any retryable failure.
+   */
   @Test
-  fun `a failed write after a retryable 503 aborts the cycle and the item is retried`() = runTest {
-    server.enqueue(MockResponse().setResponseCode(503))
+  fun `an outcome write that always fails spends the budget instead of resending in a loop`() =
+    runTest {
+      server.dispatcher = respondAfter(attemptMs = 0L, code = 200)
+      val id = enqueue()
+      val failing = spyk(storage)
+      coEvery { failing.markSucceeded(any()) } throws locked()
+      val events = recordEvents()
+      val d = newDispatcher(queue = failing, maxAttempts = 3, baseDelayMs = 1_000L)
+      val deadlines = mutableListOf<Long>()
+
+      repeat(2) { cycle ->
+        runCatching { runBlocking { d.flush() } }
+        assertWithMessage("attempts after cycle ${cycle + 1}")
+          .that(row(id).attempts).isEqualTo(cycle + 1)
+        val deadline = checkNotNull(storage.nextRetryDeadline())
+        assertWithMessage("the wake after cycle ${cycle + 1} waits")
+          .that(deadline).isGreaterThan(clock.now())
+        deadlines += deadline
+        // Not due yet: nothing is sent.
+        d.flush()
+        assertThat(server.requestCount).isEqualTo(cycle + 1)
+        clock.advance(deadline - clock.now())
+      }
+      runCatching { runBlocking { d.flush() } }
+
+      assertThat(deadlines[1] - deadlines[0]).isAtLeast(2_000L)
+      assertThat(server.requestCount).isEqualTo(3)
+      val dead = deadLetter(id)
+      assertThat(dead.lastErrorCode).isEqualTo(SyncErrorCode.MAX_ATTEMPTS_EXCEEDED.name)
+      assertThat(dead.attempts).isEqualTo(3)
+      assertThat(events.filter { it.itemId == id }.types().takeLast(2))
+        .containsExactly(SyncEventType.ITEM_FAILED, SyncEventType.ITEM_DEAD_LETTERED)
+        .inOrder()
+      assertThat(storage.nextRetryDeadline()).isNull()
+    }
+
+  /** A claimed row whose request never went out goes back as it was. */
+  @Test
+  fun `a claimed row that was never sent comes back unchanged when the cycle aborts`() = runTest {
+    server.dispatcher = respondAfter(attemptMs = 0L, code = 200)
+    val sent = enqueue("/sent")
+    val unsent = enqueue("/unsent")
+    val failing = spyk(storage)
+    coEvery { failing.markSucceeded(sent) } throws locked()
+    // Restored headers send one item first: the cycle aborts before the other one goes out.
+    val d = newDispatcher(queue = failing, credentials = { CredentialPolicy.PERSISTED })
+
+    runCatching { runBlocking { d.flush() } }
+
+    assertThat(server.requestCount).isEqualTo(1)
+    assertThat(row(sent).attempts).isEqualTo(1)
+    assertThat(row(sent).nextRetryAt).isGreaterThan(clock.now())
+    val waiting = row(unsent)
+    assertThat(waiting.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(waiting.attempts).isEqualTo(0)
+    assertThat(waiting.nextRetryAt).isEqualTo(0L)
+    assertThat(waiting.lastErrorCode).isNull()
+  }
+
+  /** An Error after the request went out counts the attempt too, so it cannot loop either. */
+  @Test
+  fun `an Error after the request went out counts the attempt`() = runTest {
     server.enqueue(MockResponse().setResponseCode(200))
     val id = enqueue()
     val failing = spyk(storage)
-    coEvery { failing.markRetry(any(), any(), any(), any(), any()) } throws locked()
-    val events = recordEvents()
+    coEvery { failing.markSucceeded(any()) } throws NoClassDefFoundError("a class R8 removed")
 
     val thrown = runCatching { runBlocking { newDispatcher(queue = failing).flush() } }
 
-    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(thrown.exceptionOrNull()).isInstanceOf(NoClassDefFoundError::class.java)
+    assertThat(row(id).attempts).isEqualTo(1)
+    assertThat(row(id).nextRetryAt).isEqualTo(clock.now() + 1_000L)
+  }
+
+  /** A cancellation stays no outcome: the row comes back unchanged, even after its request. */
+  @Test
+  fun `a cancellation after the request went out counts no attempt`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(200))
+    val id = enqueue()
+    val failing = spyk(storage)
+    coEvery { failing.markSucceeded(any()) } throws CancellationException("stopped")
+
+    val thrown = runCatching { runBlocking { newDispatcher(queue = failing).flush() } }
+
+    assertThat(thrown.exceptionOrNull()).isInstanceOf(CancellationException::class.java)
     assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
     assertThat(row(id).attempts).isEqualTo(0)
-    assertThat(thrown.exceptionOrNull()).isInstanceOf(SQLiteDatabaseLockedException::class.java)
-    assertThat(events.single { it.type == SyncEventType.SYNC_FAILED }.errorCode)
-      .isEqualTo(SyncErrorCode.NETWORK_ERROR)
-    // With the storage healthy again, the next cycle sends it.
-    assertThat(newDispatcher().flush().succeededIds.toList()).containsExactly(id)
-    assertThat(server.requestCount).isEqualTo(2)
+    assertThat(row(id).nextRetryAt).isEqualTo(0L)
   }
 
   /**
@@ -967,7 +1077,7 @@ internal class SyncDispatcherTest {
     val id = enqueue()
     val failing = spyk(storage)
     coEvery { failing.isQueued(any()) } throws locked()
-    coEvery { failing.releaseClaimed(any()) } throws locked()
+    coEvery { failing.settleAbortedClaims(any()) } throws locked()
 
     val thrown = runCatching { runBlocking { newDispatcher(queue = failing).flush() } }
 
@@ -995,10 +1105,14 @@ internal class SyncDispatcherTest {
       assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
       assertThat(inFlightRows()).isEmpty()
       assertThat(row(failingId).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
-      // Delivered and removed, or never started and still waiting.
+      // The failing one was sent: its attempt counts.
+      assertThat(row(failingId).attempts).isEqualTo(1)
+      // Delivered and removed, or never started and waiting as it was.
       others.forEach { other ->
         db.syncItemDao().findById(other)?.let {
           assertThat(it.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+          assertThat(it.attempts).isEqualTo(0)
+          assertThat(it.nextRetryAt).isEqualTo(0L)
         }
       }
     }

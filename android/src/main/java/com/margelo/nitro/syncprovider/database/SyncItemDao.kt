@@ -161,27 +161,6 @@ internal interface SyncItemDao {
   ): Int
 
   /**
-   * Put back to `PENDING` the rows among [ids] that are still `IN_FLIGHT`: claimed, with no
-   * outcome recorded since. A row whose outcome was recorded, or that a purge removed, is left
-   * as it is, and so is every row not in [ids].
-   *
-   * @return how many rows went back to `PENDING`.
-   */
-  @Transaction
-  suspend fun releaseInFlight(ids: List<String>): Int =
-    ids.chunked(MAX_IDS_PER_STATEMENT).sumOf { releaseInFlightChunk(it) }
-
-  /** One statement of [releaseInFlight]. */
-  @Query(
-    """
-      UPDATE sync_items
-      SET status = '${SyncItemEntity.STATUS_PENDING}'
-      WHERE status = '${SyncItemEntity.STATUS_IN_FLIGHT}' AND id IN (:ids)
-    """,
-  )
-  suspend fun releaseInFlightChunk(ids: List<String>): Int
-
-  /**
    * Atomically reset every row currently marked `IN_FLIGHT` back to `PENDING`.
    * Used by the recovery flow after process death or device reboot.
    */
