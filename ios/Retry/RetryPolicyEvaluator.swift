@@ -3,11 +3,15 @@
 //  SyncProvider
 //
 //  Pure-Swift implementation of the retry-backoff math. Mirrors the JS
-//  implementation in `src/utils/retryBackoff.ts` 1:1 so behavior is consistent
-//  across platforms and the JS-side `SyncOptions.retryPolicy` produces the
-//  same delay sequence it would on iOS. iOS reads the policy's numbers after
-//  `NumericOption` converted them, so NaN, ±Infinity and 2^63 or more follow
-//  that conversion, not the JS curve.
+//  implementation in `src/utils/retryBackoff.ts`, so the JS-side
+//  `SyncOptions.retryPolicy` produces the same delay sequence on iOS for the
+//  numbers both read alike. iOS reads the policy's numbers after
+//  `NumericOption` converted them, and leaves the JS curve where that
+//  conversion changes a number: NaN, ±Infinity and 2^63 or more follow the
+//  conversion, and a fractional `baseDelayMs` or `maxDelayMs` is truncated to
+//  whole milliseconds before the curve, where JS keeps the fraction and
+//  rounds the result. A base of 1000.5 ms gives a first delay of 1000 ms on
+//  iOS and 1001 ms in JS, and a `maxDelayMs` between 0 and 1 is no cap here.
 //
 
 import Foundation
