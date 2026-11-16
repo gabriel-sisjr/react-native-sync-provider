@@ -6,8 +6,10 @@ import androidx.work.Data
 import androidx.work.ListenableWorker
 import androidx.work.testing.TestListenableWorkerBuilder
 import com.google.common.truth.Truth.assertThat
+import com.margelo.nitro.syncprovider.SyncEventType
 import com.margelo.nitro.syncprovider.SyncProviderRuntime
 import com.margelo.nitro.syncprovider.SyncResult
+import com.margelo.nitro.syncprovider.events.SyncEventEmitter
 import com.margelo.nitro.syncprovider.http.FlushOutcome
 import com.margelo.nitro.syncprovider.http.FlushSkip
 import com.margelo.nitro.syncprovider.http.SyncDispatcher
@@ -18,6 +20,9 @@ import io.mockk.mockk
 import io.mockk.mockkObject
 import io.mockk.unmockkObject
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import org.junit.After
@@ -122,6 +127,38 @@ internal class SyncWorkerTest {
     val worker = TestListenableWorkerBuilder<SyncWorker>(context).build()
 
     assertThrows(CancellationException::class.java) { runBlocking { worker.doWork() } }
+  }
+
+  /**
+   * WorkManager stops a periodic run while its flush is running, by cancelling the worker's job.
+   * The cancellation is rethrown, not turned into a retry, and no `BACKGROUND_SYNC_COMPLETED`
+   * follows the `BACKGROUND_SYNC_STARTED` the run emitted.
+   */
+  @Test
+  fun `a periodic run stopped mid-flush emits no BACKGROUND_SYNC_COMPLETED`() = runTest {
+    val emitter = mockk<SyncEventEmitter>(relaxed = true)
+    every { runtime.emitter } returns emitter
+    val flushing = CompletableDeferred<Unit>()
+    coEvery { dispatcher.flushWithOutcome() } coAnswers {
+      flushing.complete(Unit)
+      awaitCancellation()
+    }
+    val input = Data.Builder().putBoolean(SyncWorker.KEY_PERIODIC, true).build()
+    val worker = TestListenableWorkerBuilder<SyncWorker>(context).setInputData(input).build()
+
+    val run = async { worker.doWork() }
+    flushing.await()
+    run.cancel()
+    val thrown = runCatching { run.await() }.exceptionOrNull()
+
+    assertThat(run.isCancelled).isTrue()
+    assertThat(thrown).isInstanceOf(CancellationException::class.java)
+    coVerify(exactly = 1) {
+      emitter.emit(match { it.type == SyncEventType.BACKGROUND_SYNC_STARTED })
+    }
+    coVerify(exactly = 0) {
+      emitter.emit(match { it.type == SyncEventType.BACKGROUND_SYNC_COMPLETED })
+    }
   }
 
   @Test
