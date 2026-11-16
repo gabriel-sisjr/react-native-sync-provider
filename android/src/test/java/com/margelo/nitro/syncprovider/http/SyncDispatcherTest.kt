@@ -1546,25 +1546,67 @@ internal class SyncDispatcherTest {
     assertThat(kickDelays).containsExactly(30_000L, 60_000L, 120_000L).inOrder()
   }
 
-  /** A cancellation says nothing about the storage: the wake after it is armed as before. */
+  /**
+   * A cancellation of the cycle's own job says nothing about the storage: the wake after it is
+   * armed as before. Here the job is cancelled while the claim returns.
+   */
   @Test
   fun `a cancelled cycle does not start the failure backoff`() = runTest {
     insertDue()
     val wake = recordingWake()
-    val stopping = spyk(storage)
-    coEvery { stopping.isQueued(any()) } throws CancellationException("stopped")
+    val committed = CompletableDeferred<Unit>()
+    val release = CountDownLatch(1)
+    val held = SyncQueueStorage(
+      itemDao = HeldClaimDao(db.syncItemDao(), committed, release),
+      resultDao = db.syncResultDao(),
+      deadLetterDao = db.syncDeadLetterDao(),
+    )
     val failing = spyk(storage)
     coEvery { failing.isQueued(any()) } throws locked()
-    val toCancel = newDispatcher(queue = stopping, onCycleFinished = armsAfterEachCycle(wake))
+    val toCancel = newDispatcher(queue = held, onCycleFinished = armsAfterEachCycle(wake))
     val toFail = newDispatcher(queue = failing, onCycleFinished = armsAfterEachCycle(wake))
 
-    val cancelled = runCatching { runBlocking { toCancel.flush() } }
+    val cancelled = launch(Dispatchers.IO) { toCancel.flush() }
+    runBlocking { withTimeout(20_000L) { committed.await() } }
+    cancelled.cancel()
+    release.countDown()
+    cancelled.join()
     runCatching { runBlocking { toFail.flush() } }
 
-    assertThat(cancelled.exceptionOrNull()).isInstanceOf(CancellationException::class.java)
+    assertThat(cancelled.isCancelled).isTrue()
+    assertThat(server.requestCount).isEqualTo(0)
     // At once after the cancellation; the first step only after the failure that follows it.
     assertThat(timerDelays).containsExactly(0L, 30_000L).inOrder()
     assertThat(kickDelays).containsExactly(0L, 30_000L).inOrder()
+  }
+
+  /**
+   * A `CancellationException` raised while the cycle's own job is still active is no
+   * cancellation of the cycle: the wake after it is held back as after any other failure, so a
+   * source that kept raising one cannot run cycles back to back. Its rows still come back as
+   * after a cancellation, and its `SYNC_FAILED` still carries no code.
+   */
+  @Test
+  fun `a cancellation that is not the cycle's own backs the next wake off`() = runTest {
+    insertDue()
+    val stopping = spyk(storage)
+    coEvery { stopping.isQueued(any()) } throws CancellationException("not this cycle's")
+    val events = recordEvents()
+    val d = newDispatcher(queue = stopping, onCycleFinished = armsAfterEachCycle(recordingWake()))
+
+    repeat(3) {
+      assertThat(runCatching { runBlocking { d.flush() } }.exceptionOrNull())
+        .isInstanceOf(CancellationException::class.java)
+    }
+
+    assertThat(server.requestCount).isEqualTo(0)
+    assertThat(row("due").status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(row("due").attempts).isEqualTo(1)
+    assertThat(row("due").nextRetryAt).isEqualTo(clock.now() - 1_000L)
+    assertThat(events.filter { it.type == SyncEventType.SYNC_FAILED }.map { it.errorCode })
+      .containsExactly(null, null, null)
+    assertThat(timerDelays).containsExactly(30_000L, 60_000L, 120_000L).inOrder()
+    assertThat(kickDelays).containsExactly(30_000L, 60_000L, 120_000L).inOrder()
   }
 
   /**

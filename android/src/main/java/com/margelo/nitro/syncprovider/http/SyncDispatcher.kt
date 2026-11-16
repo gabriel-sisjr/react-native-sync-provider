@@ -22,6 +22,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -247,7 +248,12 @@ internal class SyncDispatcher(
       )
       return result
     } catch (t: Throwable) {
-      ending = if (t is CancellationException) CycleEnding.CANCELLED else CycleEnding.FAILED
+      // From the cycle's own job, read here: inside the block below it is always active.
+      ending = if (t is CancellationException && !currentCoroutineContext().isActive) {
+        CycleEnding.CANCELLED
+      } else {
+        CycleEnding.FAILED
+      }
       val held = withContext(NonCancellable) {
         abortCycle(t, terminalEventSent, claimed, options.retryPolicy)
       }

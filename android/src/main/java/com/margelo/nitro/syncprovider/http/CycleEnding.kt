@@ -8,12 +8,15 @@ internal enum class CycleEnding {
   /** The cycle ran to its end, whatever its items' outcomes. */
   COMPLETED,
 
-  /** A cancellation ended it, a worker WorkManager stopped for example. It failed at nothing. */
+  /**
+   * Its own job was cancelled, a worker WorkManager stopped for example. It failed at nothing.
+   */
   CANCELLED,
 
   /**
    * Any other cause ended it before it completed: a storage read or write, an event emit, an
-   * [Error]. The next cycle may well meet the same failure.
+   * [Error], or a `CancellationException` raised while its job was still active. The next cycle
+   * may well meet the same failure.
    */
   FAILED,
 }
