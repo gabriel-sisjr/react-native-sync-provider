@@ -325,7 +325,8 @@ actor SyncDispatcher {
     /// Cancelled before its cycle starts, the flush emits nothing. Cancelled
     /// during it, the cycle claims no further item, the request in flight is
     /// cancelled and its item goes back to `PENDING` with the attempt its
-    /// claim spent refunded, and `SYNC_FAILED` ends the cycle without
+    /// claim spent refunded and the claim's `lastAttemptAt` kept (the request
+    /// may have reached the server), and `SYNC_FAILED` ends the cycle without
     /// `errorCode` or `metadata`: nothing failed, and no history row is kept.
     /// A response that arrived before the cancellation is recorded as usual.
     func flushOutcome() async throws -> FlushOutcome {
@@ -501,12 +502,13 @@ actor SyncDispatcher {
             let sentWith = config
             guard let outcome = await dispatchOne(item: item) else {
                 // Cancelled before an answer came: there is no outcome to
-                // record. The claim is undone, the attempt refunded, so the
-                // next cycle sends the item again.
+                // record. The attempt is refunded, so the next cycle sends the
+                // item again; the claim's time stays, as the request may have
+                // reached the server.
                 inFlight.remove(item.id)
                 try await storage.releaseClaim(id: item.id,
                                                attempts: item.attempts,
-                                               lastAttemptAt: item.lastAttemptAt ?? 0)
+                                               lastAttemptAt: nil)
                 throw CancellationError()
             }
             inFlight.remove(item.id)

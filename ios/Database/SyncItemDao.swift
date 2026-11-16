@@ -32,9 +32,11 @@ struct StoredSyncItem: Sendable, Equatable {
     /// dispatch starts, so a kill mid-request still spends it. After a
     /// credential rejection under a persisted credential,
     /// ``SyncItemDao/markCredentialRejected(id:errorCode:retryDelayMs:attempts:)``
-    /// restores the count from before the dispatch, so `0` does not prove the
-    /// request never left the device. `lastAttemptAt` is the field that records
-    /// whether a dispatch ever started.
+    /// restores the count from before the dispatch, and so does
+    /// ``SyncItemDao/releaseClaim(id:attempts:lastAttemptAt:)`` after a
+    /// cancelled cycle, so `0` does not prove the request never left the
+    /// device. `lastAttemptAt` is the field that records whether a dispatch
+    /// ever started.
     let attempts: Int32
     let lastAttemptAt: Int64?
     /// Epoch-ms timestamp before which the item is **not** eligible for
@@ -457,23 +459,29 @@ final class SyncItemDao {
         }
     }
 
-    /// Undoes ``markInFlight(id:)`` for an item whose request got no answer
-    /// because its cycle was cancelled, a BGTask expiring say: back to
-    /// `PENDING`, with the attempt count and time from before the claim, and
-    /// its cooldown untouched. A cancellation says nothing about the item, so
-    /// it must not spend the retry budget. A row that is gone, or no longer
+    /// Undoes the count of ``markInFlight(id:)`` for an item whose request got
+    /// no answer because its cycle was cancelled, a BGTask expiring say: back
+    /// to `PENDING`, with the attempt count from before the claim, and its
+    /// cooldown untouched. A cancellation says nothing about the item, so it
+    /// must not spend the retry budget. A row that is gone, or no longer
     /// `IN_FLIGHT`, is left alone.
     ///
     /// - Parameters:
     ///   - attempts: the value from before the claim.
-    ///   - lastAttemptAt: the value from before the claim, `0` for none.
-    func releaseClaim(id: String, attempts: Int32, lastAttemptAt: Int64) async throws {
+    ///   - lastAttemptAt: `nil` keeps the claim's time: the request may have
+    ///     reached the server, and `lastAttemptAt` records that a dispatch
+    ///     started, as after a credential rejection. A value, `0` for none,
+    ///     puts back the time from before the claim, for a request that never
+    ///     went out.
+    func releaseClaim(id: String, attempts: Int32, lastAttemptAt: Int64?) async throws {
         try await stack.performSerializedTask { context in
             guard let entity = try Self.fetchEntity(id: id, in: context),
                   entity.status == SyncItemStatus.inFlight.rawValue else { return }
             entity.status = SyncItemStatus.pending.rawValue
             entity.attempts = attempts
-            entity.lastAttemptAt = lastAttemptAt
+            if let lastAttemptAt {
+                entity.lastAttemptAt = lastAttemptAt
+            }
         }
     }
 

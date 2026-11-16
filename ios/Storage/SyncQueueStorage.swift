@@ -171,9 +171,9 @@ actor SyncQueueStorage {
                                              attempts: attempts)
     }
 
-    /// Undo a claim whose request got no answer because its cycle was
-    /// cancelled. See ``SyncItemDao/releaseClaim(id:attempts:lastAttemptAt:)``.
-    func releaseClaim(id: String, attempts: Int32, lastAttemptAt: Int64) async throws {
+    /// Give a claimed row back with the attempt count from before the claim.
+    /// See ``SyncItemDao/releaseClaim(id:attempts:lastAttemptAt:)``.
+    func releaseClaim(id: String, attempts: Int32, lastAttemptAt: Int64?) async throws {
         try await dao.releaseClaim(id: id, attempts: attempts, lastAttemptAt: lastAttemptAt)
     }
 

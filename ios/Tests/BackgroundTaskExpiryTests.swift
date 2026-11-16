@@ -112,8 +112,13 @@ final class BackgroundTaskExpiryTests: XCTestCase {
         try await storage.getAll().first { $0.id == id }
     }
 
-    /// What every expired window must leave behind.
-    private func assertExpired(_ task: FakeBackgroundTask, kind: String, itemId id: String,
+    private static func nowMs() -> Int64 {
+        Int64(Date().timeIntervalSince1970 * 1000)
+    }
+
+    /// What every expired window must leave behind. `sentAfter`: a time taken
+    /// before the item was claimed.
+    private func assertExpired(_ task: FakeBackgroundTask, kind: String, itemId id: String, sentAfter: Int64,
                                file: StaticString = #filePath, line: UInt = #line) async throws {
         await emitter.wait(for: "BACKGROUND_SYNC_COMPLETED", in: self)
         XCTAssertEqual(task.completedResults, [false], "completed once, with false", file: file, line: line)
@@ -132,7 +137,10 @@ final class BackgroundTaskExpiryTests: XCTestCase {
         let stored = try await row(id)
         XCTAssertEqual(stored?.status, "PENDING", "back in the queue, not IN_FLIGHT", file: file, line: line)
         XCTAssertEqual(stored?.attempts, 0, "the attempt the claim spent is refunded", file: file, line: line)
-        XCTAssertNil(stored?.lastAttemptAt, file: file, line: line)
+        // The request may have reached the server: the claim's time stays.
+        let lastAttemptAt = try XCTUnwrap(stored?.lastAttemptAt, "the claim's time is kept", file: file, line: line)
+        XCTAssertGreaterThanOrEqual(lastAttemptAt, sentAfter, file: file, line: line)
+        XCTAssertLessThanOrEqual(lastAttemptAt, Self.nowMs(), file: file, line: line)
         XCTAssertEqual(stored?.nextRetryAt, 0, "no cooldown", file: file, line: line)
         let letters = try await storage.getDeadLetters()
         XCTAssertEqual(letters.count, 0, file: file, line: line)
@@ -160,12 +168,13 @@ final class BackgroundTaskExpiryTests: XCTestCase {
     private func expireDuringAForegroundRequest(_ handler: Handler) async throws {
         let manager = try makeManager(appActive: true)
         let id = try await storage.enqueue(input: .sample())
+        let sentAfter = Self.nowMs()
         let task = await fireWithARequestOut(handler, on: manager)
 
         task.expirationHandler?()
 
         XCTAssertEqual(task.completedResults, [false], "completed at once, before the time runs out")
-        try await assertExpired(task, kind: handler.kind, itemId: id)
+        try await assertExpired(task, kind: handler.kind, itemId: id, sentAfter: sentAfter)
         try await assertAFollowingFlushSends(id)
     }
 
@@ -180,12 +189,13 @@ final class BackgroundTaskExpiryTests: XCTestCase {
     func test_expiryDuringABackgroundUpload_completesOnce_andGivesTheItemBack() async throws {
         let manager = try makeManager(appActive: false)
         let id = try await storage.enqueue(input: .sample())
+        let sentAfter = Self.nowMs()
         let task = await fireWithARequestOut(.processing, on: manager)
 
         task.expirationHandler?()
 
         XCTAssertEqual(task.completedResults, [false], "completed at once, before the time runs out")
-        try await assertExpired(task, kind: "processing", itemId: id)
+        try await assertExpired(task, kind: "processing", itemId: id, sentAfter: sentAfter)
         try await assertAFollowingFlushSends(id)
     }
 
