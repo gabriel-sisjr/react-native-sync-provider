@@ -191,8 +191,12 @@ final class SyncEngine: @unchecked Sendable {
         self.healthCheck = healthCheck
         self.probe = probe
 
-        dispatcher.hooks.onCycleFinished = { [weak self] notBefore, end in
+        // Noted when the cycle ends, before the next one can start, so a late
+        // re-arm cannot put an older end over a newer one.
+        dispatcher.hooks.onCycleEnded = { [weak self] end in
             self?.noteCycleEnd(end)
+        }
+        dispatcher.hooks.onCycleFinished = { [weak self] notBefore, _ in
             await self?.rearmRetryTimer(notBefore: notBefore)
         }
         dispatcher.hooks.recoverCredentials = { [weak self] in

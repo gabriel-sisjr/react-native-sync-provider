@@ -783,6 +783,37 @@ final class SyncEngineRetryTimerTests: XCTestCase {
         XCTAssertEqual(timer.delayMs, 100, "the wait ended with the completed cycle (20 000 if it had not)")
     }
 
+    /// A cycle's end is noted when the cycle ends, before another one can
+    /// start, not when its follow-up runs: the late follow-up of a cycle that
+    /// died cannot overwrite the end of a later cycle that completed.
+    func test_aLateFollowUpOfADeadCycle_doesNotOverwriteALaterCompletedOne() async throws {
+        let engine = await fixture.makeEngine()
+        await engine.configure(.sample(retryPolicy: .exact(maxAttempts: 5, baseDelayMs: 100)))
+        _ = try await enqueueCooling(in: engine, delayMs: 100)
+        clock.advance(ms: 100)
+        let parked = ParkedFollowUp()
+        let followUp = engine.dispatcher.hooks.onCycleFinished
+        engine.dispatcher.hooks.onCycleFinished = { notBefore, end in
+            if end == .aborted {
+                await parked.park()
+            }
+            await followUp?(notBefore, end)
+        }
+        fixture.saveFaults.fail(1) // the first cycle's claim
+        let dead = Task { _ = try? await engine.dispatcher.flush() }
+        await parked.waitUntilParked()
+
+        URLProtocolStub.setHandler(stubResponse(200))
+        _ = try await engine.dispatcher.flush()
+        XCTAssertEqual(requestCount, 1, "a second cycle completed while the first one's follow-up waited")
+        parked.release()
+        await dead.value
+
+        _ = try await enqueueCooling(in: engine, delayMs: 100)
+        await engine.rearmRetryTimer()
+        XCTAssertEqual(timer.delayMs, 100, "30 000 if the dead cycle's late end overwrote the completed one")
+    }
+
     // MARK: - Failure handling
 
     /// No JS caller exists on a timer path. A store that failed to open must
@@ -877,6 +908,56 @@ private final class GatedWakeSource: RetryWakeSource, @unchecked Sendable {
                 continuation.resume()
             }
         }
+    }
+}
+
+/// Holds a cycle's follow-up until released, and tells the test once it holds
+/// one.
+private final class ParkedFollowUp: @unchecked Sendable {
+    private let lock = NSLock()
+    private var held: CheckedContinuation<Void, Never>?
+    private var parkedWaiter: CheckedContinuation<Void, Never>?
+    private var isParked = false
+    private var isReleased = false
+
+    func park() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let (goOn, waiter) = lock.withLock { () -> (Bool, CheckedContinuation<Void, Never>?) in
+                isParked = true
+                defer { parkedWaiter = nil }
+                if isReleased {
+                    return (true, parkedWaiter)
+                }
+                held = continuation
+                return (false, parkedWaiter)
+            }
+            waiter?.resume()
+            if goOn {
+                continuation.resume()
+            }
+        }
+    }
+
+    func waitUntilParked() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let already = lock.withLock { () -> Bool in
+                if isParked { return true }
+                parkedWaiter = continuation
+                return false
+            }
+            if already {
+                continuation.resume()
+            }
+        }
+    }
+
+    func release() {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            isReleased = true
+            defer { held = nil }
+            return held
+        }
+        continuation?.resume()
     }
 }
 

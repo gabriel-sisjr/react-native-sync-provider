@@ -132,6 +132,7 @@ final class DispatcherHooks: @unchecked Sendable {
     private let lock = NSLock()
     private var foregroundOnlyValue = false
     private var pausedValue = false
+    private var cycleEnded: (@Sendable (CycleEnd) -> Void)?
     private var cycleFinished: (@Sendable (Int64?, CycleEnd) async -> Void)?
     private var credentialRecovery: (@Sendable () -> [String: String]?)?
     private var qualitySource: (@Sendable () -> NetworkQualityLevel)?
@@ -152,9 +153,18 @@ final class DispatcherHooks: @unchecked Sendable {
         set { lock.withLock { pausedValue = newValue } }
     }
 
+    /// Called when a flush cycle ends, with how it ended, on the actor and
+    /// before another cycle can start, so cycle ends reach it in the order the
+    /// cycles ran. It must not block.
+    var onCycleEnded: (@Sendable (CycleEnd) -> Void)? {
+        get { lock.withLock { cycleEnded } }
+        set { lock.withLock { cycleEnded = newValue } }
+    }
+
     /// Awaited when a flush cycle ends, whatever its outcome, so whoever awaits
     /// `flush()` sees its effects. Receives the moment a credential hold ends
-    /// when the cycle was stopped by one, and how the cycle ended.
+    /// when the cycle was stopped by one, and how the cycle ended. Another
+    /// cycle can start while it runs: see ``onCycleEnded``.
     var onCycleFinished: (@Sendable (Int64?, CycleEnd) async -> Void)? {
         get { lock.withLock { cycleFinished } }
         set { lock.withLock { cycleFinished = newValue } }
@@ -416,6 +426,9 @@ actor SyncDispatcher {
     }
 
     private func finishCycle(_ end: CycleEnd) async {
+        // Before the next cycle can start: the follow-up below suspends, and
+        // a whole cycle could run before it does.
+        hooks.onCycleEnded?(end)
         isCycleRunning = false
         let notBefore = credentialHeldUntil
         credentialHeldUntil = nil
