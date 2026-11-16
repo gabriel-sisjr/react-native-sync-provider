@@ -482,22 +482,43 @@ internal class RetryWakeTest {
   }
 
   @Test
-  fun `every arm path waits for the failure hold`() = runTest {
+  fun `every arm path but resume waits for the failure hold`() = runTest {
     insert("due", clock.now() - 500L)
-    insert("fresh", nextRetryAt = 0L)
     repeat(2) { wake.arm(ending = CycleEnding.FAILED) } // The second step: 60 s.
     clock.advance(5_000L)
     armed.clear()
     kicks.clear()
 
     wake.arm() // configureSync, recovery and a health-check skip arm this way.
-    wake.armForResume()
     wake.armAfterGate(gateStreak = 0)
 
-    assertThat(armed).containsExactly(55_000L, 55_000L).inOrder()
-    assertThat(kicks).containsExactly(55_000L, 55_000L).inOrder()
+    assertThat(armed).containsExactly(55_000L)
+    assertThat(kicks).containsExactly(55_000L)
     assertThat(gatedKicks).containsExactly(55_000L to 1)
   }
+
+  /**
+   * `resumeSync` is documented to dispatch the items with no cooldown left right away, waiting
+   * only for a credential hold or a health-check backoff. It leaves the failure hold in place.
+   */
+  @Test
+  fun `resume dispatches at once during a failure hold, which still holds the next arm`() =
+    runTest {
+      insert("due", clock.now() - 500L)
+      insert("fresh", nextRetryAt = 0L)
+      wake.arm(ending = CycleEnding.FAILED) // The first step: 30 s.
+      clock.advance(5_000L)
+      armed.clear()
+      kicks.clear()
+
+      wake.armForResume()
+      wake.arm()
+      wake.arm(ending = CycleEnding.FAILED)
+
+      // At once, then what is left of the hold, then the second step: the streak survived.
+      assertThat(armed).containsExactly(0L, 25_000L, 60_000L).inOrder()
+      assertThat(kicks).containsExactly(0L, 25_000L, 60_000L).inOrder()
+    }
 
   @Test
   fun `a cooldown later than the failure hold keeps its own deadline`() = runTest {

@@ -24,13 +24,15 @@ import java.util.concurrent.atomic.AtomicLong
  * rejection sets the hold again.
  *
  * It keeps the failure hold too. After a cycle that failed, one that a cause other than a
- * cancellation ended (a storage read or write, an event emit, an [Error]), no wake on any path
- * fires before the next [GateRecheck] step: 30 s after the first such cycle, doubling for each
- * one that follows, at most 15 min. Otherwise a row that cycle gave back with a cooldown already
- * past would re-arm both mechanisms at once, and a failure that persists would run cycles back
- * to back. A cycle that completes lifts the hold and starts the steps over; a cancelled one
- * leaves both as they are. Explicit flushes and the periodic worker never wait for it. It lives
- * in memory only, like the credential hold, so a new process starts at the first step.
+ * cancellation ended (a storage read or write, an event emit, an [Error]), no wake fires before
+ * the next [GateRecheck] step: 30 s after the first such cycle, doubling for each one that
+ * follows, at most 15 min. Otherwise a row that cycle gave back with a cooldown already past
+ * would re-arm both mechanisms at once, and a failure that persists would run cycles back to
+ * back. Every path that arms a wake waits for it except `resumeSync`, which is documented to
+ * dispatch at once (see [armForResume]); explicit flushes and the periodic worker never wait for
+ * it either. A cycle that completes lifts the hold and starts the steps over; a cancelled one
+ * leaves both as they are. It lives in memory only, like the credential hold, so a new process
+ * starts at the first step.
  *
  * @param scheduleKick arms the WorkManager kick. Applies the `isEnabled` and
  *   `foregroundOnly` gates itself and never throws.
@@ -131,7 +133,10 @@ internal class RetryWake(
 
   /**
    * Arm after `resumeSync`. The timer considers every `PENDING` row, so rows with no
-   * cooldown (`nextRetryAt = 0`) dispatch at once, unless a credential hold is active.
+   * cooldown (`nextRetryAt = 0`) dispatch at once, unless a credential hold or a health-check
+   * backoff is active. The failure hold does not delay it, since `resumeSync` promises that
+   * dispatch, and stays in place for the other arms: a cycle that fails again sets it one step
+   * further.
    */
   suspend fun armForResume() {
     armMutex.withLock {
@@ -144,7 +149,7 @@ internal class RetryWake(
         timer.cancel()
         return@withLock
       }
-      val holdUntil = notBeforeAny()
+      val holdUntil = credentialOrHealthHold()
       timer.arm(delayUntil(maxOf(pendingDeadline, holdUntil)))
       storage.nextRetryDeadline()?.let { scheduleKick(delayUntil(maxOf(it, holdUntil))) }
     }
@@ -187,12 +192,15 @@ internal class RetryWake(
     }
   }
 
+  /** No wake before the credential hold or the health-check backoff ends. */
+  private fun credentialOrHealthHold(): Long =
+    maxOf(credentialHoldUntil.get(), healthBackoffUntil())
+
   /**
    * No wake before the credential hold, the health-check backoff or the failure hold ends.
    * Caller holds [armMutex].
    */
-  private fun notBeforeAny(): Long =
-    maxOf(credentialHoldUntil.get(), healthBackoffUntil(), failureHoldUntil)
+  private fun notBeforeAny(): Long = maxOf(credentialOrHealthHold(), failureHoldUntil)
 
   /**
    * The wait until [deadline]: 0 for a deadline already past, and at most
