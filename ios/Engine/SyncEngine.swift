@@ -61,6 +61,11 @@ final class SyncEngine: @unchecked Sendable {
     /// The one HEAD probe of the process: measurements and the health check
     /// share it, and with it one connection to the host.
     let probe: HeadProbing
+    /// The JS callbacks installed in this process, by the hybrid that
+    /// installed each. See ``attachCallbacks()``.
+    let callbacks: CallbackRegistry
+    /// Where native waits for the answers of those callbacks.
+    let gateway: CallbackGateway
 
     private let configStore: SyncConfigStore
     private let recovery: RecoveryManager
@@ -131,6 +136,8 @@ final class SyncEngine: @unchecked Sendable {
     ///   - retryTimer: tests fire it explicitly.
     ///   - heldWakeTimer: re-checks a held wake; tests fire it explicitly.
     ///   - wrapWakeSource: test seam around the deadline queries.
+    ///   - callbackTimer: the timeouts of the JS callbacks; tests fire them
+    ///     explicitly.
     init(stack: CoreDataStack = .shared,
          configStore: SyncConfigStore = SyncConfigStore(),
          backgroundStore: BackgroundSyncOptionsStore = BackgroundSyncOptionsStore(),
@@ -143,7 +150,8 @@ final class SyncEngine: @unchecked Sendable {
          clock: SyncClock = SystemClock(),
          retryTimer: RetryWakeScheduling = RetryWakeTimer(),
          heldWakeTimer: RetryWakeScheduling = RetryWakeTimer(),
-         wrapWakeSource: ((RetryWakeSource) -> RetryWakeSource)? = nil) {
+         wrapWakeSource: ((RetryWakeSource) -> RetryWakeSource)? = nil,
+         callbackTimer: CallbackTimer = DispatchCallbackTimer()) {
         let loaded = configStore.load()
         let storage = SyncQueueStorage(dao: SyncItemDao(stack: stack, clock: clock),
                                        capacity: loaded.options.queueCapacity)
@@ -190,6 +198,8 @@ final class SyncEngine: @unchecked Sendable {
         self.qualityMonitor = qualityMonitor
         self.healthCheck = healthCheck
         self.probe = probe
+        self.callbacks = CallbackRegistry()
+        self.gateway = CallbackGateway(timer: callbackTimer)
 
         // Noted when the cycle ends, before the next one can start, so a late
         // re-arm cannot put an older end over a newer one.
@@ -276,6 +286,24 @@ final class SyncEngine: @unchecked Sendable {
         if wasLast {
             disarmRetryTimer()
         }
+    }
+
+    /// The owner token of the JS callbacks a newly created hybrid installs.
+    /// That hybrid becomes their only owner: what older hybrids installed is
+    /// evicted, a hybrid from before a JS reload say, and their pending waits
+    /// end at once, as when no answer comes.
+    func attachCallbacks() -> UInt64 {
+        let owner = callbacks.attach()
+        gateway.failPending { $0 < owner }
+        return owner
+    }
+
+    /// A hybrid went away: what it installed is removed, and its pending waits
+    /// end at once, as when no answer comes. A newer hybrid's installs are
+    /// left alone.
+    func detachCallbacks(owner: UInt64) {
+        callbacks.detach(owner: owner)
+        gateway.failPending { $0 == owner }
     }
 
     /// Returns once a flush started by connectivity coming back has finished.

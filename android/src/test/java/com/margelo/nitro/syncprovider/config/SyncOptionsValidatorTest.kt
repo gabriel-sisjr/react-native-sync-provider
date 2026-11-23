@@ -81,4 +81,37 @@ internal class SyncOptionsValidatorTest {
 
     assertThat(rejected.code).isEqualTo(SyncErrorCode.INVALID_URL)
   }
+
+  @Test
+  fun `options_callbackTimeoutMs_validation, only a finite number of at least 1 passes`() {
+    val invalid = listOf(
+      Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY, 0.0, -1.0, 0.5, 0.999,
+    )
+
+    invalid.forEach { value ->
+      val rejected = rejection(TestData.syncOptions(callbackTimeoutMs = value))
+      assertThat(rejected.code).isEqualTo(SyncErrorCode.INVALID_PAYLOAD)
+      assertThat(rejected.rawMessage).isEqualTo(
+        "SyncOptions.callbackTimeoutMs must be a finite number of at least 1, was $value.",
+      )
+    }
+    listOf(1.0, 3_000.7, 1e300).forEach { value ->
+      SyncOptionsValidator.validate(TestData.syncOptions(callbackTimeoutMs = value))
+    }
+    // Checked last, as in the JS facade: an earlier field's failure is the one reported.
+    val first = rejection(TestData.syncOptions(healthCheckTtlMs = -1.0, callbackTimeoutMs = 0.0))
+    assertThat(first.rawMessage).contains("healthCheckTtlMs")
+  }
+
+  @Test
+  fun `options_callbackTimeoutMs_validation at use, unset waits 3000 ms, a fraction is dropped, and the wait stops at 2147483647 ms`() {
+    fun waitFor(value: Double?): Long = CallbackTimeout.ms(TestData.syncOptions(callbackTimeoutMs = value))
+
+    assertThat(waitFor(null)).isEqualTo(3_000L)
+    assertThat(waitFor(1.0)).isEqualTo(1L)
+    assertThat(waitFor(1.9)).isEqualTo(1L)
+    assertThat(waitFor(3_000.7)).isEqualTo(3_000L)
+    assertThat(waitFor(2_147_483_647.9)).isEqualTo(2_147_483_647L)
+    assertThat(waitFor(1e300)).isEqualTo(2_147_483_647L)
+  }
 }

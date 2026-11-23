@@ -140,7 +140,8 @@ final class NumericOptionEngineTests: XCTestCase {
     private func syncOptions(maxAttempts: Double = 5,
                              baseDelayMs: Double = 1_000,
                              maxDelayMs: Double = 60_000,
-                             statusCodes: [Double] = [503]) -> SyncOptions {
+                             statusCodes: [Double] = [503],
+                             callbackTimeoutMs: Double? = nil) -> SyncOptions {
         SyncOptions(strategy: .automatic,
                     retryPolicy: RetryPolicy(maxAttempts: maxAttempts,
                                              backoff: .exponential,
@@ -156,7 +157,39 @@ final class NumericOptionEngineTests: XCTestCase {
                     minNetworkQuality: nil,
                     healthCheckUrl: nil,
                     healthCheckTtlMs: nil,
-                    healthCheckBackoffMs: nil)
+                    healthCheckBackoffMs: nil,
+                    callbackTimeoutMs: callbackTimeoutMs)
+    }
+
+    /// Checked before anything is applied or persisted: finite and at least 1.
+    /// An accepted value is kept as given, and truncated only at use.
+    func test_options_callbackTimeoutMs_validation() async throws {
+        let engine = await fixture.makeEngine()
+        let hybrid = HybridSyncProvider(engine: engine)
+        let accepted = await settle(try hybrid.configureSync(options: syncOptions(callbackTimeoutMs: 2_500)))
+        XCTAssertNoThrow(try accepted?.get())
+
+        for rejected in [Double.nan, .infinity, -.infinity, 0, -1, 0.5] {
+            let result = await settle(try hybrid.configureSync(options: syncOptions(maxAttempts: 9,
+                                                                                    callbackTimeoutMs: rejected)))
+            guard case let .failure(error)? = result else {
+                XCTFail("\(rejected) was accepted")
+                continue
+            }
+            XCTAssertEqual((error as? SyncProviderError)?.codeName, "INVALID_PAYLOAD", "\(rejected)")
+            XCTAssertEqual(engine.currentOptions().callbackTimeoutMs, 2_500, "Nothing applied for \(rejected)")
+            XCTAssertEqual(engine.currentOptions().retryPolicy.maxAttempts, 5, "Nothing applied for \(rejected)")
+        }
+        let cold = await fixture.makeColdEngine()
+        XCTAssertEqual(cold.currentOptions().callbackTimeoutMs, 2_500, "Nothing persisted")
+
+        for (given, used) in [(1.0, 1), (3_000.7, 3_000)] {
+            let result = await settle(try hybrid.configureSync(options: syncOptions(callbackTimeoutMs: given)))
+            XCTAssertNoThrow(try result?.get(), "\(given)")
+            XCTAssertEqual(engine.currentOptions().callbackTimeoutMs, given, "Kept as given")
+            let config = await engine.dispatcher.currentConfig()
+            XCTAssertEqual(config.callbackTimeoutMs, used, "Truncated at use")
+        }
     }
 
     /// Every `retryPolicy` number went through `Int(_:)` in the bridge,
@@ -248,6 +281,17 @@ final class NumericOptionTests: XCTestCase {
                                       (2_147_483_647, int32Max), (2_147_483_648, int32Max), (-1e300, 1)]
         for (input, expected) in cases {
             XCTAssertEqual(NumericOption.count(input), expected, "\(input)")
+        }
+    }
+
+    /// 3000 when unset or unusable, truncated, and at most 2147483647 at use.
+    func test_callbackTimeoutMs_truncates_andIsCappedAtUse() {
+        let cases: [(Double?, Int)] = [(nil, 3_000), (.nan, 3_000), (.infinity, 3_000), (-.infinity, 3_000),
+                                       (0, 3_000), (0.5, 3_000), (-1, 3_000), (1, 1), (1.9, 1),
+                                       (3_000.7, 3_000), (2_147_483_647, int32Max), (2_147_483_648, int32Max),
+                                       (twoTo63, int32Max), (1e300, int32Max)]
+        for (input, expected) in cases {
+            XCTAssertEqual(NumericOption.callbackTimeoutMs(input), expected, "\(String(describing: input))")
         }
     }
 

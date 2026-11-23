@@ -60,6 +60,16 @@ interface SyncMock {
   isBackgroundSyncEnabled: jest.Mock;
   addListener: jest.Mock;
   removeListener: jest.Mock;
+  setRetryDecider: jest.Mock;
+  clearRetryDecider: jest.Mock;
+  isRetryDeciderInstalled: jest.Mock;
+  setHeaderResolver: jest.Mock;
+  clearHeaderResolver: jest.Mock;
+  setBeforeDispatch: jest.Mock;
+  clearBeforeDispatch: jest.Mock;
+  setAfterDispatch: jest.Mock;
+  clearAfterDispatch: jest.Mock;
+  answerCallback: jest.Mock;
 }
 
 const getMock = (): SyncMock =>

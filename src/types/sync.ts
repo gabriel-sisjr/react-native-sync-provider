@@ -534,6 +534,26 @@ export interface SyncOptions {
    * A stored value that is negative or not finite loads as unset.
    */
   healthCheckBackoffMs?: number;
+  /**
+   * How long the engine waits for an installed JS callback to answer, in ms:
+   * the retry decider, the header resolver, `beforeDispatch` and
+   * `afterDispatch` share it. Defaults to `3000`. Fractions truncate toward
+   * zero, and a value above 2147483647 ms (about 24.8 days) is capped there at
+   * use.
+   *
+   * Without an answer in time, the retry decider's attempt falls back to the
+   * policy's own decision, the header resolver and `beforeDispatch` defer the
+   * item (`ITEM_RETRYING` with `INTERCEPTOR_FAILED`), and `afterDispatch` is
+   * only logged. A JS runtime that is gone, for example after a reload, also
+   * gives no answer, so it costs this wait too.
+   *
+   * Persisted with the rest of the configuration. `getSyncConfig()` returns it
+   * only when it was set, as given. `configureSync` rejects a value that is not
+   * a finite number of at least `1` with `INVALID_PAYLOAD`, before anything is
+   * applied or stored. A stored value that is not finite or is below `1` loads
+   * as unset.
+   */
+  callbackTimeoutMs?: number;
 }
 
 /* -------------------------------------------------------------------------- */

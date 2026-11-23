@@ -17,7 +17,8 @@ internal object SyncOptionsValidator {
    *   absolute http(s) URL, the check item URLs pass. The message leaves the URL out:
    *   its query can carry a token.
    * @throws SyncException [SyncErrorCode.INVALID_PAYLOAD] when `healthCheckTtlMs` or
-   *   `healthCheckBackoffMs` is not a finite number of at least 0.
+   *   `healthCheckBackoffMs` is not a finite number of at least 0, or `callbackTimeoutMs` is not
+   *   a finite number of at least 1.
    */
   fun validate(options: SyncOptions) {
     val healthCheckUrl = options.healthCheckUrl
@@ -29,6 +30,13 @@ internal object SyncOptionsValidator {
     }
     requireNonNegativeFinite("healthCheckTtlMs", options.healthCheckTtlMs)
     requireNonNegativeFinite("healthCheckBackoffMs", options.healthCheckBackoffMs)
+    val callbackTimeoutMs = options.callbackTimeoutMs
+    if (callbackTimeoutMs != null && !CallbackTimeout.isValid(callbackTimeoutMs)) {
+      throw SyncException(
+        SyncErrorCode.INVALID_PAYLOAD,
+        "SyncOptions.callbackTimeoutMs must be a finite number of at least 1, was $callbackTimeoutMs.",
+      )
+    }
   }
 
   private fun requireNonNegativeFinite(field: String, value: Double?) {

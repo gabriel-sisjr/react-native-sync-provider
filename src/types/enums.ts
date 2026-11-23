@@ -424,3 +424,81 @@ export const SyncEventType = {
 } as const;
 /** See {@link SyncEventType} value set. */
 export type SyncEventType = (typeof SyncEventType)[keyof typeof SyncEventType];
+
+/* -------------------------------------------------------------------------- */
+/*                     Retry decider and interceptor enums                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * What a retry decider asks the engine to do with a failed attempt.
+ *
+ * Returned as {@link RetryDecision.action} by the function installed with
+ * `setRetryDecider`. The decider is consulted only for an attempt that the
+ * declarative {@link RetryPolicy} would retry, so it can veto a retry or change
+ * its delay, but never retry a failure the policy would not.
+ */
+export const RetryAction = {
+  /**
+   * Retry as the policy would. A valid {@link RetryDecision.delayMs} replaces
+   * the policy's delay; without one, the policy's delay applies.
+   */
+  RETRY: 'RETRY',
+  /**
+   * Fail the item and delete it, without a dead letter: `ITEM_FAILED` with
+   * `RETRY_DECIDER_REJECTED`, and no `ITEM_DEAD_LETTERED`.
+   */
+  DROP: 'DROP',
+  /**
+   * Fail the item and move it to the dead-letter queue: `ITEM_FAILED` with
+   * `RETRY_DECIDER_REJECTED`, then `ITEM_DEAD_LETTERED`.
+   */
+  DEAD_LETTER: 'DEAD_LETTER',
+} as const;
+/** See {@link RetryAction} value set. */
+export type RetryAction = (typeof RetryAction)[keyof typeof RetryAction];
+
+/**
+ * What a `beforeDispatch` hook asks the engine to do with the request it was
+ * shown.
+ *
+ * Returned as {@link BeforeDispatchResult.action} by the hook installed with
+ * `setBeforeDispatch`. A hook that returns nothing proceeds.
+ */
+export const BeforeDispatchAction = {
+  /** Send the request unchanged. */
+  PROCEED: 'PROCEED',
+  /**
+   * Defer the item without sending it. It goes back to `PENDING` with its
+   * attempt count unchanged, becomes due again after the policy's delay for
+   * that attempt and no sooner than 60 s, and emits `ITEM_RETRYING` with
+   * `INTERCEPTOR_FAILED`.
+   */
+  SKIP: 'SKIP',
+} as const;
+/** See {@link BeforeDispatchAction} value set. */
+export type BeforeDispatchAction =
+  (typeof BeforeDispatchAction)[keyof typeof BeforeDispatchAction];
+
+/**
+ * How a request reported to an `afterDispatch` hook ended.
+ *
+ * Reported as {@link AfterDispatchContext.outcome} to the hook installed with
+ * `setAfterDispatch`.
+ */
+export const DispatchOutcome = {
+  /** The server answered with a `2xx` status. */
+  SUCCEEDED: 'SUCCEEDED',
+  /**
+   * The item went back to wait for a retry, a hold after a credential
+   * rejection included.
+   */
+  RETRYING: 'RETRYING',
+  /**
+   * The item failed permanently: a non-retryable failure, a retriable one with
+   * no attempts left, or a retry decider's `DROP` or `DEAD_LETTER`.
+   */
+  FAILED: 'FAILED',
+} as const;
+/** See {@link DispatchOutcome} value set. */
+export type DispatchOutcome =
+  (typeof DispatchOutcome)[keyof typeof DispatchOutcome];

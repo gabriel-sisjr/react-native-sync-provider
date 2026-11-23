@@ -166,6 +166,27 @@ export const SyncErrorCode = {
    * Reported on `ITEM_DEAD_LETTERED`.
    */
   DEAD_LETTERED: 'DEAD_LETTERED',
+  /**
+   * The retry decider answered `DROP` or `DEAD_LETTER` for a failed attempt
+   * that the retry policy would have retried. Permanent: the item is deleted
+   * (`DROP`) or moved to the dead-letter queue (`DEAD_LETTER`).
+   *
+   * Reported on `ITEM_FAILED`, with the attempt's `statusCode` when an HTTP
+   * answer came back. After a `DEAD_LETTER`, also the `metadata.lastErrorCode`
+   * of the `ITEM_DEAD_LETTERED` that follows and the dead letter's
+   * `lastErrorCode`, while its `lastErrorMessage` keeps the real failure.
+   */
+  RETRY_DECIDER_REJECTED: 'RETRY_DECIDER_REJECTED',
+  /**
+   * The header resolver or the `beforeDispatch` hook failed for an item, or
+   * the hook answered `SKIP`. A failure is a throw or a rejection, an invalid
+   * result, or no answer within `SyncOptions.callbackTimeoutMs`. Nothing is
+   * sent and no attempt is spent: the item goes back to `PENDING` and becomes
+   * due again no sooner than 60 s later.
+   *
+   * Reported on `ITEM_RETRYING`, without a `statusCode`.
+   */
+  INTERCEPTOR_FAILED: 'INTERCEPTOR_FAILED',
   // New members go at the end: nitrogen numbers the generated native enum
   // cases by position.
 } as const;

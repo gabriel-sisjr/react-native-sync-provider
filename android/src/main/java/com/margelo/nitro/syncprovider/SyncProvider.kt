@@ -5,6 +5,8 @@ import android.util.Log
 import com.facebook.proguard.annotations.DoNotStrip
 import com.margelo.nitro.NitroModules
 import com.margelo.nitro.core.Promise
+import com.margelo.nitro.core.resolved
+import com.margelo.nitro.syncprovider.callbacks.HybridInstalls
 import com.margelo.nitro.syncprovider.error.SyncException
 import com.margelo.nitro.syncprovider.events.SyncEventEmitter
 import com.margelo.nitro.syncprovider.http.SyncDispatcher
@@ -24,6 +26,13 @@ import kotlin.coroutines.cancellation.CancellationException
  * background sync). The bridge wraps each call in a [Promise.async] backed by
  * the module-scoped [coroutineScope] so failures route through Nitro's
  * Promise rejection path.
+ *
+ * The JS callbacks are the exception. Their `set…`, `clear…` and `isRetryDeciderInstalled`
+ * calls answer from memory, on the JS thread and in call order, with a promise already settled,
+ * which settles after [dispose] too; `answerCallback` returns nothing. None of them builds the
+ * runtime. The callbacks this instance installs carry the generation it took when it was
+ * created, which evicted every older instance's installs (see
+ * [com.margelo.nitro.syncprovider.callbacks.HybridInstalls]).
  *
  * Errors:
  * - Every escaping throwable is normalized to [SyncException], so the Promise
@@ -60,6 +69,12 @@ class SyncProvider : HybridSyncProviderSpec() {
   }
 
   private val runtime: SyncProviderRuntime by lazyRuntime
+
+  /**
+   * What this instance installs. Created with the instance, so a JS reload's new instance evicts
+   * the callbacks of the runtime it replaced before it can install any of its own.
+   */
+  private val installs = HybridInstalls(SyncProviderRuntime.callbacks)
 
   /* ------------------------------ Queue ops ----------------------------- */
 
@@ -196,19 +211,92 @@ class SyncProvider : HybridSyncProviderSpec() {
     runtime.emitter.remove(event, subscriptionId)
   }
 
+  /* ----------------------------- Callbacks ------------------------------ */
+
+  override fun setRetryDecider(
+    decider: (requestId: String, context: RetryDeciderContext) -> Unit,
+  ): Promise<Unit> = installed(installs.setRetryDecider(decider))
+
+  override fun clearRetryDecider(): Promise<Unit> {
+    installs.clearRetryDecider()
+    return Promise.resolved()
+  }
+
+  override fun isRetryDeciderInstalled(): Promise<Boolean> =
+    Promise.resolved(installs.isRetryDeciderInstalled())
+
+  override fun setHeaderResolver(
+    resolver: (requestId: String, context: HeaderResolverContext) -> Unit,
+  ): Promise<Unit> = installed(installs.setHeaderResolver(resolver))
+
+  override fun clearHeaderResolver(): Promise<Unit> {
+    installs.clearHeaderResolver()
+    return Promise.resolved()
+  }
+
+  override fun setBeforeDispatch(
+    hook: (requestId: String, context: BeforeDispatchContext) -> Unit,
+  ): Promise<Unit> = installed(installs.setBeforeDispatch(hook))
+
+  override fun clearBeforeDispatch(): Promise<Unit> {
+    installs.clearBeforeDispatch()
+    return Promise.resolved()
+  }
+
+  override fun setAfterDispatch(
+    hook: (requestId: String, context: AfterDispatchContext) -> Unit,
+  ): Promise<Unit> = installed(installs.setAfterDispatch(hook))
+
+  override fun clearAfterDispatch(): Promise<Unit> {
+    installs.clearAfterDispatch()
+    return Promise.resolved()
+  }
+
+  /**
+   * The facade's answer to a callback request, on the JS thread. It only hands the answer to the
+   * waiting request, and never throws: a late, unknown or repeated id does nothing.
+   */
+  override fun answerCallback(requestId: String, answer: CallbackAnswer) {
+    try {
+      SyncProviderRuntime.callbacks.gateway.answer(requestId, answer)
+    } catch (e: Exception) {
+      // Never the answer itself: it can carry header values.
+      Log.w(tag, "Could not take a callback answer: ${e.javaClass.simpleName}")
+    }
+  }
+
   /* ------------------------------ teardown ------------------------------ */
 
   /**
-   * Detach from the runtime and cancel the module scope. Called by Nitro when the
-   * HybridObject is disposed via JS.
+   * Uninstall this instance's callbacks, detach from the runtime and cancel the module scope.
+   * Called by Nitro when the HybridObject is disposed via JS, never on a reload: a reload's new
+   * instance evicts the callbacks when it is created.
    */
   override fun dispose() {
+    runCatching { installs.teardown() }
     if (lazyRuntime.isInitialized()) runCatching { runtime.detachEngine() }
     runCatching { coroutineScope.coroutineContext[Job]?.cancel() }
     super.dispose()
   }
 
   /* ------------------------------ helpers ------------------------------- */
+
+  /**
+   * A `set…` answers at once: resolved, or rejected when this instance no longer owns the
+   * callbacks, because it was disposed or a newer JS runtime has attached.
+   */
+  private fun installed(accepted: Boolean): Promise<Unit> =
+    if (accepted) {
+      Promise.resolved()
+    } else {
+      Promise.rejected(
+        SyncException(
+          SyncErrorCode.NATIVE_MODULE_UNAVAILABLE,
+          "This SyncProvider instance no longer owns the callbacks: it was disposed, " +
+            "or a newer JS runtime has attached.",
+        ),
+      )
+    }
 
   /**
    * Wrap a suspend block into a Nitro [Promise], translating any throwable

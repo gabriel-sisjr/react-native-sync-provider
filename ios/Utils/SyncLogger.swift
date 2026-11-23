@@ -26,6 +26,9 @@ enum SyncLogger {
         "events": OSLog(subsystem: subsystem, category: "events"),
         "connectivity": OSLog(subsystem: subsystem, category: "connectivity"),
         "recovery": OSLog(subsystem: subsystem, category: "recovery"),
+        // The JS callbacks: never a header, a body or a context, and messages
+        // from JS cut to `kCallbackLogMessageMaxLength` characters.
+        "callbacks": OSLog(subsystem: subsystem, category: "callbacks"),
         "general": OSLog(subsystem: subsystem, category: "general")
     ]
 

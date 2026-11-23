@@ -61,6 +61,8 @@ struct SyncProviderError: LocalizedError, CustomNSError {
         case .networkQualityTooLow: return 13
         case .healthCheckFailed: return 14
         case .deadLettered: return 15
+        case .retryDeciderRejected: return 16
+        case .interceptorFailed: return 17
         @unknown default: return 0
         }
     }

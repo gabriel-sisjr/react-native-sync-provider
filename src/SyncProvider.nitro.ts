@@ -29,8 +29,12 @@ import type { HybridObject } from 'react-native-nitro-modules';
 
 import type { SyncErrorCode } from './errors';
 import type {
+  AfterDispatchContext,
   BackgroundSyncOptions,
+  BeforeDispatchContext,
   ConnectionState,
+  HeaderResolverContext,
+  RetryDeciderContext,
   SyncDeadLetterItem,
   SyncEvent,
   SyncItem,
@@ -38,6 +42,7 @@ import type {
   SyncOptions,
   SyncResult,
 } from './types';
+import type { CallbackAnswer } from './types/bridge';
 
 // `SyncErrorCode` is referenced in TSDoc `@throws` blocks below — keep the
 // import for documentation-as-code linkage and to surface the symbol to
@@ -506,4 +511,138 @@ export interface SyncProvider extends HybridObject<{
    * await sync.removeListener('sync-event', subscriptionId);
    */
   removeListener(event: string, subscriptionId: string): Promise<void>;
+
+  /* ---------------------------- Retry decider --------------------------- */
+
+  /**
+   * Install the retry decider, replacing any installed one. The install lasts
+   * until `clearRetryDecider()`, or until the JS runtime that made it goes
+   * away: its hybrid's teardown, or the first use of the library by a newer
+   * runtime after a reload.
+   *
+   * The engine consults it only for a failed attempt that
+   * `SyncOptions.retryPolicy` would retry: a retryable failure with attempts
+   * left, outside a credential hold. Never for a success, a non-retryable
+   * failure, a spent budget, a credential hold or an item that was not sent.
+   * A `FAILED` answer, an invalid one, or no answer within
+   * `SyncOptions.callbackTimeoutMs` leaves the decision to the policy, with a
+   * native log line only. Does no I/O.
+   *
+   * @param decider — the native-facing callback. Native calls it with a
+   *   request id and the context, and the facade answers that id through
+   *   {@link answerCallback}. It must never throw: the facade wraps the
+   *   consumer's function.
+   */
+  setRetryDecider(
+    decider: (requestId: string, context: RetryDeciderContext) => void
+  ): Promise<void>;
+
+  /**
+   * Uninstall the retry decider, so the policy decides alone again. With
+   * nothing installed it is a no-op. Does no I/O.
+   */
+  clearRetryDecider(): Promise<void>;
+
+  /**
+   * Check whether a retry decider is installed.
+   *
+   * @returns `true` from `setRetryDecider()` until the install ends (see
+   *   {@link setRetryDecider}). Does no I/O.
+   */
+  isRetryDeciderInstalled(): Promise<boolean>;
+
+  /* ------------------------ Dispatch interceptors ----------------------- */
+
+  /**
+   * Install the header resolver, replacing any installed one. The install
+   * lasts like the retry decider's (see {@link setRetryDecider}).
+   *
+   * Native calls it right before each request, with the attempt about to be
+   * made, and merges the headers it answers as `defaultHeaders` < resolver <
+   * item headers. A `FAILED` answer, an invalid one, a payload native rejects,
+   * or no answer within `SyncOptions.callbackTimeoutMs` sends nothing for that
+   * item in this cycle. The item goes back to `PENDING` with its attempts
+   * unchanged, becomes due again after the longer of the policy's delay for
+   * that attempt and 60 s, and emits `ITEM_RETRYING` with `INTERCEPTOR_FAILED`.
+   * The cycle goes on with the next item. With nothing installed, or with no
+   * JS running, the static headers go out. Does no I/O.
+   *
+   * @param resolver — the native-facing callback, answered through
+   *   {@link answerCallback} like the retry decider's.
+   */
+  setHeaderResolver(
+    resolver: (requestId: string, context: HeaderResolverContext) => void
+  ): Promise<void>;
+
+  /**
+   * Uninstall the header resolver, so the static headers go out alone again.
+   * With nothing installed it is a no-op. Does no I/O.
+   */
+  clearHeaderResolver(): Promise<void>;
+
+  /**
+   * Install the `beforeDispatch` hook, replacing any installed one. The
+   * install lasts like the retry decider's (see {@link setRetryDecider}).
+   *
+   * Native calls it after the header resolver, right before each request,
+   * with the final merged headers and the attempt about to be made. `PROCEED`
+   * sends the request unchanged. `SKIP` defers the item the way a failing
+   * header resolver does, and so does a `FAILED` answer, an invalid one, or no
+   * answer within `SyncOptions.callbackTimeoutMs`. It is not called when the
+   * header resolver failed. Does no I/O.
+   *
+   * @param hook — the native-facing callback, answered through
+   *   {@link answerCallback} like the retry decider's.
+   */
+  setBeforeDispatch(
+    hook: (requestId: string, context: BeforeDispatchContext) => void
+  ): Promise<void>;
+
+  /**
+   * Uninstall the `beforeDispatch` hook. With nothing installed it is a no-op.
+   * Does no I/O.
+   */
+  clearBeforeDispatch(): Promise<void>;
+
+  /**
+   * Install the `afterDispatch` hook, replacing any installed one. The install
+   * lasts like the retry decider's (see {@link setRetryDecider}).
+   *
+   * Native calls it once for each request that went out, after the outcome is
+   * stored and the item's event emitted, and never waits for it: `flush()` may
+   * resolve first. A `FAILED` answer, or no answer within
+   * `SyncOptions.callbackTimeoutMs`, is logged natively and changes nothing.
+   * It is not called when no request went out, nor for an iOS background
+   * upload that completes after a relaunch. Does no I/O.
+   *
+   * @param hook — the native-facing callback, answered through
+   *   {@link answerCallback} like the retry decider's.
+   */
+  setAfterDispatch(
+    hook: (requestId: string, context: AfterDispatchContext) => void
+  ): Promise<void>;
+
+  /**
+   * Uninstall the `afterDispatch` hook. With nothing installed it is a no-op.
+   * Does no I/O.
+   */
+  clearAfterDispatch(): Promise<void>;
+
+  /* ------------------------ Callback answer path ------------------------ */
+
+  /**
+   * Answer one native callback request. Internal: only the facade's callback
+   * wrappers call it, and no facade function exposes it.
+   *
+   * Synchronous, on the JS thread: native only looks up the pending request,
+   * completes it and returns. An unknown id, a late answer or a second answer
+   * is a silent no-op that never throws. A throw can only come from converting
+   * `answer`, and the facade then retries once with a bare `FAILED`.
+   *
+   * @param requestId — the id native passed as the callback's first argument.
+   * @param answer — the facade's normalized answer.
+   *
+   * @internal
+   */
+  answerCallback(requestId: string, answer: CallbackAnswer): void;
 }

@@ -21,9 +21,9 @@ struct LoadedSyncConfig: Sendable {
 
 /// The non-secret half of `SyncOptions`. `defaultHeaders` is reduced to a flag.
 ///
-/// The network-health fields are optional and absent while unset, so a record
-/// written before they existed still decodes, and an older build reading a
-/// newer record ignores them.
+/// The network-health fields and `callbackTimeoutMs` are optional and absent
+/// while unset, so a record written before they existed still decodes, and an
+/// older build reading a newer record ignores them.
 ///
 /// Every number is kept as the app passed it, converted only at use, as
 /// Android stores them. JSON has no NaN or ±Infinity, so the coders write and
@@ -47,6 +47,7 @@ private struct PersistedSyncRecord: Codable {
     var healthCheckUrl: String?
     var healthCheckTtlMs: Double?
     var healthCheckBackoffMs: Double?
+    var callbackTimeoutMs: Double?
 
     init(_ options: SyncOptionsSnapshot) {
         strategy = options.strategy
@@ -65,6 +66,7 @@ private struct PersistedSyncRecord: Codable {
         healthCheckUrl = options.healthCheckUrl
         healthCheckTtlMs = options.healthCheckTtlMs
         healthCheckBackoffMs = options.healthCheckBackoffMs
+        callbackTimeoutMs = options.callbackTimeoutMs
     }
 
     var options: SyncOptionsSnapshot {
@@ -90,8 +92,9 @@ private struct PersistedSyncRecord: Codable {
             minNetworkQuality: quality,
             healthCheckUrl: healthCheckUrl,
             healthCheckTtlMs: healthCheckTtlMs,
-            healthCheckBackoffMs: healthCheckBackoffMs
-        ).droppingInvalidNetworkHealth()
+            healthCheckBackoffMs: healthCheckBackoffMs,
+            callbackTimeoutMs: callbackTimeoutMs
+        ).droppingInvalidNetworkHealth().droppingInvalidCallbackTimeout()
     }
 }
 

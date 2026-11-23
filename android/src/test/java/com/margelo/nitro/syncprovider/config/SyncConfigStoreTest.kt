@@ -51,6 +51,7 @@ internal class SyncConfigStoreTest {
     healthCheckUrl = "https://api.example.com/health",
     healthCheckTtlMs = 0.0,
     healthCheckBackoffMs = 15_000.0,
+    callbackTimeoutMs = 3_000.7,
   )
 
   private fun prefs() =
@@ -119,6 +120,29 @@ internal class SyncConfigStoreTest {
     assertThat(options.healthCheckUrl).isNull()
     assertThat(options.healthCheckTtlMs).isNull()
     assertThat(options.healthCheckBackoffMs).isNull()
+    assertThat(options.callbackTimeoutMs).isNull()
+  }
+
+  @Test
+  fun `a record saved before callbackTimeoutMs existed loads it as unset`() {
+    store.save(fullOptions())
+    // What 0.3.1 left on disk: every key except this one.
+    prefs().edit().remove("callbackTimeoutMs").commit()
+
+    assertThat(store.load()!!.options).isEqualTo(fullOptions().copy(callbackTimeoutMs = null))
+  }
+
+  @Test
+  fun `options_callbackTimeoutMs_damagedStoredValue_loadsUnset, and the rest of the record stays`() {
+    val damaged = listOf(
+      Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY, 0.0, -1.0, 0.5,
+    )
+    for (value in damaged) {
+      store.save(fullOptions())
+      prefs().edit().putLong("callbackTimeoutMs", value.toRawBits()).commit()
+
+      assertThat(store.load()!!.options).isEqualTo(fullOptions().copy(callbackTimeoutMs = null))
+    }
   }
 
   @Test

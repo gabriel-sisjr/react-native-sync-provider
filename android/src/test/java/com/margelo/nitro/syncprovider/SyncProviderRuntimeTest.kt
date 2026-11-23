@@ -17,6 +17,7 @@ import androidx.work.testing.WorkManagerTestInitHelper
 import com.google.common.collect.Range
 import com.google.common.truth.Truth.assertThat
 import com.google.common.truth.Truth.assertWithMessage
+import com.margelo.nitro.syncprovider.callbacks.HybridInstalls
 import com.margelo.nitro.syncprovider.config.ConfigSource
 import com.margelo.nitro.syncprovider.config.SecretStore
 import com.margelo.nitro.syncprovider.connectivity.ConnectivityMonitor
@@ -1162,7 +1163,63 @@ internal class SyncProviderRuntimeTest {
       assertThat(options.healthCheckUrl).isNull()
       assertThat(options.healthCheckTtlMs).isNull()
       assertThat(options.healthCheckBackoffMs).isNull()
+      assertThat(options.callbackTimeoutMs).isNull()
     }
+  }
+
+  /* ------------------------------- the JS callbacks ------------------------------- */
+
+  @Test
+  fun `options_callbackTimeoutMs_echoedOnlyWhenSet_andPersisted`() = runBlocking<Unit> {
+    // The 3000 ms default applies where the wait happens; it is never echoed.
+    assertThat(runtime.currentOptions().callbackTimeoutMs).isNull()
+
+    runtime.configure(TestData.syncOptions(callbackTimeoutMs = 3_000.7))
+    assertThat(runtime.currentOptions().callbackTimeoutMs).isEqualTo(3_000.7)
+    restartProcess()
+    assertThat(runtime.configSource).isEqualTo(ConfigSource.PERSISTED)
+    assertThat(runtime.currentOptions().callbackTimeoutMs).isEqualTo(3_000.7)
+
+    runtime.configure(TestData.syncOptions())
+    assertThat(runtime.currentOptions().callbackTimeoutMs).isNull()
+    restartProcess()
+    assertThat(runtime.currentOptions().callbackTimeoutMs).isNull()
+  }
+
+  @Test
+  fun `options_callbackTimeoutMs_validation, configureSync rejects before anything changes`() =
+    runBlocking<Unit> {
+      val applied = TestData.syncOptions(callbackTimeoutMs = 5_000.0)
+      runtime.configure(applied)
+
+      val rejections = listOf(Double.NaN, Double.POSITIVE_INFINITY, 0.0, -1.0, 0.5)
+        .map { value ->
+          runCatching { runtime.configure(TestData.syncOptions(callbackTimeoutMs = value)) }
+            .exceptionOrNull() as? SyncException
+        }
+
+      assertThat(rejections.map { it?.code }).containsExactly(
+        SyncErrorCode.INVALID_PAYLOAD,
+        SyncErrorCode.INVALID_PAYLOAD,
+        SyncErrorCode.INVALID_PAYLOAD,
+        SyncErrorCode.INVALID_PAYLOAD,
+        SyncErrorCode.INVALID_PAYLOAD,
+      )
+      assertThat(runtime.currentOptions()).isEqualTo(applied)
+      restartProcess()
+      assertThat(runtime.currentOptions()).isEqualTo(applied)
+    }
+
+  @Test
+  fun `a shutdown forgets every installed callback, which live outside the runtime`() {
+    val hybrid = HybridInstalls(SyncProviderRuntime.callbacks)
+    assertThat(hybrid.setRetryDecider { _, _ -> }).isTrue()
+    assertThat(hybrid.setAfterDispatch { _, _ -> }).isTrue()
+
+    restartProcess()
+
+    assertThat(SyncProviderRuntime.callbacks.registry.retryDecider.installed).isNull()
+    assertThat(SyncProviderRuntime.callbacks.registry.afterDispatch.installed).isNull()
   }
 
   @Test

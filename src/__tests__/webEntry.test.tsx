@@ -30,10 +30,30 @@ const NOT_THROWING = new Set([
   'SyncProvider',
   'addSyncEventListener',
   'cancelDrain',
+  'clearAfterDispatch',
+  'clearBeforeDispatch',
+  'clearHeaderResolver',
+  'clearRetryDecider',
   'generateId',
   'isNativeModuleAvailable',
   'removeSyncEventListener',
 ]);
+
+/** The uninstallers, no-ops on web because they sit in cleanup paths. */
+const UNINSTALLERS = [
+  'clearRetryDecider',
+  'clearHeaderResolver',
+  'clearBeforeDispatch',
+  'clearAfterDispatch',
+];
+
+/** The installers, which reject on web whatever they are given. */
+const INSTALLERS = [
+  'setRetryDecider',
+  'setHeaderResolver',
+  'setBeforeDispatch',
+  'setAfterDispatch',
+];
 
 const isHook = (name: string) => /^use[A-Z]/.test(name);
 
@@ -56,10 +76,33 @@ describe('web facade', () => {
         'listDeadLetter',
         'replayDeadLetter',
         'discardDeadLetter',
+        ...INSTALLERS,
+        'isRetryDeciderInstalled',
       ])
     );
-    expect(FACADE_FUNCTIONS).toHaveLength(23);
+    expect(FACADE_FUNCTIONS).toHaveLength(28);
   });
+
+  it.each(INSTALLERS)(
+    '%s rejects as unavailable with a function too',
+    async (name) => {
+      await expect(
+        (web[name] as (callback: () => void) => Promise<void>)(() => undefined)
+      ).rejects.toMatchObject({
+        code: webEntry.SyncErrorCode.NATIVE_MODULE_UNAVAILABLE,
+        message: `react-native-sync-provider.${name} is not available on web.`,
+      });
+    }
+  );
+
+  it.each(UNINSTALLERS)(
+    '%s is a no-op, because it sits in cleanup paths',
+    async (name) => {
+      await expect(
+        (web[name] as () => Promise<void>)()
+      ).resolves.toBeUndefined();
+    }
+  );
 
   it.each(['replayDeadLetter', 'discardDeadLetter'])(
     '%s rejects as unavailable with an id too',

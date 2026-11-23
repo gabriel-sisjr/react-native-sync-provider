@@ -53,6 +53,9 @@ struct DispatcherConfig: Sendable {
     var healthCheckTtlMs: Int64 = SyncOptionsSnapshot.defaultHealthCheckTtlMs
     /// How long cycles are skipped, without a HEAD, after a failed check.
     var healthCheckBackoffMs: Int64 = SyncOptionsSnapshot.defaultHealthCheckBackoffMs
+    /// How long native waits for the answer of an installed JS callback, in
+    /// milliseconds. See ``NumericOption/callbackTimeoutMs(_:)``.
+    var callbackTimeoutMs: Int = SyncOptionsSnapshot.defaultCallbackTimeoutMs
 
     static let `default` = DispatcherConfig(
         retryPolicy: .default,

@@ -1,4 +1,5 @@
 import CoreData
+import NitroModules
 import XCTest
 @testable import SyncProvider
 
@@ -675,6 +676,42 @@ final class SyncEngineConfigTests: XCTestCase {
         XCTAssertEqual(stored.status, "PENDING")
         XCTAssertEqual(stored.nextRetryAt, left.nextRetryAt, "the cooldown must survive recovery")
         XCTAssertEqual(stored.attempts, left.attempts, "no attempt was made")
+    }
+
+    // MARK: - Callback timeout
+
+    /// `getSyncConfig()` echoes it only once set, as given; it is truncated
+    /// at use, and a cold start reads it back, a JS process that installs
+    /// callbacks before its own `configureSync` say.
+    func test_options_callbackTimeoutMs_echoedOnlyWhenSet_andPersisted() async throws {
+        let engine = await fixture.makeEngine()
+        let hybrid = HybridSyncProvider(engine: engine)
+        let unset = try XCTUnwrap(try attachLikeTheBridge(try hybrid.getSyncConfig()).value?.get())
+        XCTAssertNil(unset.callbackTimeoutMs, "not echoed while unset")
+        let unsetConfig = await engine.dispatcher.currentConfig()
+        XCTAssertEqual(unsetConfig.callbackTimeoutMs, 3_000, "the default at use")
+
+        var options = SyncOptionsSnapshot.sample()
+        options.callbackTimeoutMs = 4_500.5
+        await engine.configure(options)
+
+        let set = try XCTUnwrap(try attachLikeTheBridge(try hybrid.getSyncConfig()).value?.get())
+        XCTAssertEqual(set.callbackTimeoutMs, 4_500.5, "echoed as given")
+        let setConfig = await engine.dispatcher.currentConfig()
+        XCTAssertEqual(setConfig.callbackTimeoutMs, 4_500)
+        engine.shutdown()
+
+        let cold = await fixture.makeColdEngine()
+        XCTAssertEqual(cold.currentOptions().callbackTimeoutMs, 4_500.5, "a cold start reads it back")
+        let coldConfig = await cold.dispatcher.currentConfig()
+        XCTAssertEqual(coldConfig.callbackTimeoutMs, 4_500)
+
+        await cold.configure(.sample())
+        cold.shutdown()
+        let later = await fixture.makeColdEngine()
+        XCTAssertNil(later.currentOptions().callbackTimeoutMs, "configured without it: unset for a cold start too")
+        let laterConfig = await later.dispatcher.currentConfig()
+        XCTAssertEqual(laterConfig.callbackTimeoutMs, 3_000)
     }
 }
 

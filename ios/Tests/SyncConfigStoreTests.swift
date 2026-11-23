@@ -165,4 +165,38 @@ final class SyncConfigStoreTests: XCTestCase {
         XCTAssertEqual(loaded.options, .default)
         XCTAssertEqual(loaded.source, .defaults)
     }
+
+    // MARK: - Callback timeout
+
+    func test_callbackTimeoutMs_survivesARoundTrip_andIsAbsentWhileUnset() throws {
+        store.save(sample())
+        let unsetRecord = try XCTUnwrap(defaults.data(forKey: "config.v1"))
+        XCTAssertFalse(String(decoding: unsetRecord, as: UTF8.self).contains("callbackTimeoutMs"),
+                       "an unset value is not written")
+
+        var options = sample()
+        options.callbackTimeoutMs = 2_000.5
+        store.save(options)
+
+        XCTAssertEqual(SyncConfigStore(defaults: defaults, secrets: secrets).load().options.callbackTimeoutMs, 2_000.5)
+    }
+
+    /// The record is outside the app's control once written: a stored value
+    /// `configureSync` would reject loads as unset, and the rest still applies.
+    func test_options_callbackTimeoutMs_damagedStoredValue_loadsUnset() {
+        for damaged in ["\"NaN\"", "\"Infinity\"", "\"-Infinity\"", "0", "-5", "0.5"] {
+            defaults.set(Data("""
+            {"strategy":"MANUAL","maxAttempts":3,"backoff":"LINEAR","baseDelayMs":100,"maxDelayMs":1000,\
+            "jitter":false,"retryOnStatusCodes":[503],"batchSize":5,"requestTimeoutMs":2000,\
+            "maxQueueSize":50,"persistQueue":true,"hasDefaultHeaders":false,"callbackTimeoutMs":\(damaged)}
+            """.utf8), forKey: "config.v1")
+
+            let loaded = SyncConfigStore(defaults: defaults, secrets: secrets).load()
+
+            XCTAssertEqual(loaded.source, .persisted, damaged)
+            XCTAssertNil(loaded.options.callbackTimeoutMs, damaged)
+            XCTAssertEqual(loaded.options.batchSize, 5, "the rest of the record still applies, \(damaged)")
+            XCTAssertEqual(loaded.options.toDispatcherConfig().callbackTimeoutMs, 3_000, damaged)
+        }
+    }
 }

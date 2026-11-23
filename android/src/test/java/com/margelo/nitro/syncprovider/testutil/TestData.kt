@@ -48,6 +48,7 @@ internal object TestData {
     healthCheckUrl: String? = null,
     healthCheckTtlMs: Double? = null,
     healthCheckBackoffMs: Double? = null,
+    callbackTimeoutMs: Double? = null,
   ): SyncOptions = SyncOptions(
     strategy = strategy,
     retryPolicy = retryPolicy,
@@ -60,6 +61,7 @@ internal object TestData {
     healthCheckUrl = healthCheckUrl,
     healthCheckTtlMs = healthCheckTtlMs,
     healthCheckBackoffMs = healthCheckBackoffMs,
+    callbackTimeoutMs = callbackTimeoutMs,
   )
 
   fun backgroundSyncOptions(

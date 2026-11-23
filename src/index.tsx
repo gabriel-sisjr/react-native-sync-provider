@@ -8,7 +8,7 @@
  *
  * This module re-exports the entire public surface:
  *
- *   - 24 facade functions: 22 wrap the Nitro `SyncProvider` HybridObject, plus
+ *   - 33 facade functions: 31 wrap the Nitro `SyncProvider` HybridObject, plus
  *     `drainUntilEmpty` and `cancelDrain`, which are JS-side.
  *   - 2 listener helpers (`addSyncEventListener`, `removeSyncEventListener`).
  *   - 9 React hooks (`useConnection`, `useSyncQueue`, `useSyncStatus`,
@@ -36,9 +36,23 @@ import type {
   SyncOptions,
   SyncResult,
 } from './types/sync';
+import type {
+  AfterDispatchHook,
+  BeforeDispatchHook,
+  HeaderResolver,
+  RetryDecider,
+} from './types/callbacks';
 import type { ConnectionState } from './types/connection';
 import type { DrainOptions, DrainResult } from './types/drain';
 import { assertNativeModuleAvailable } from './utils/assertNativeModuleAvailable';
+import {
+  AFTER_DISPATCH,
+  BEFORE_DISPATCH,
+  bridgeCallback,
+  HEADER_RESOLVER,
+  RETRY_DECIDER,
+  validateCallback,
+} from './utils/callbackBridge';
 import { cancelActiveDrain, runDrain } from './utils/drainController';
 import { wrapNativeError } from './utils/errors';
 import { getNativeSyncProvider } from './utils/isNativeModuleAvailable';
@@ -758,7 +772,8 @@ export async function isSyncing(): Promise<boolean> {
  * @throws {SyncError} {@link SyncErrorCode.INVALID_PAYLOAD} when
  *   `minNetworkQuality` is not a {@link NetworkQuality} value,
  *   `healthCheckTtlMs` or `healthCheckBackoffMs` is not a finite number of at
- *   least `0`, or `options` is not an object, with `validationErrors` set.
+ *   least `0`, `callbackTimeoutMs` is not a finite number of at least `1`, or
+ *   `options` is not an object, with `validationErrors` set.
  *   Checked before any native call. Also, with no `validationErrors`, when
  *   native rejects the call.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
@@ -779,10 +794,11 @@ export async function isSyncing(): Promise<boolean> {
  * which starts the network-quality gate's re-check schedule over (see
  * {@link SyncOptions.minNetworkQuality}).
  *
- * Only `minNetworkQuality`, `healthCheckUrl`, `healthCheckTtlMs` and
- * `healthCheckBackoffMs` are validated in JS, in that order and only when
- * present; the other fields go to native as they are. When several are
- * invalid, the first one sets the code, and `validationErrors` lists them all.
+ * Only `minNetworkQuality`, `healthCheckUrl`, `healthCheckTtlMs`,
+ * `healthCheckBackoffMs` and `callbackTimeoutMs` are validated in JS, in that
+ * order and only when present; the other fields go to native as they are.
+ * When several are invalid, the first one sets the code, and
+ * `validationErrors` lists them all.
  *
  * @example
  * await configureSync({
@@ -1120,6 +1136,279 @@ export async function removeSyncEventListener(
   const native = nativeOrThrow();
   try {
     await native!.removeListener(SYNC_EVENT_CHANNEL, subscriptionId);
+  } catch (err) {
+    wrapNativeError(err, SyncErrorCode.INVALID_PAYLOAD);
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                Retry decider                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Install a JS retry decider, replacing any installed one.
+ *
+ * The engine consults it for a failed attempt that the declarative
+ * `RetryPolicy` would retry, and applies its {@link RetryDecision}: `RETRY`,
+ * optionally after its own `delayMs`, `DROP` or `DEAD_LETTER`. It can veto a
+ * retry or change its delay, but never retry a failure the policy would not,
+ * nor add attempts.
+ *
+ * It runs only while JS is alive. A throw, a rejection, an invalid result, or
+ * no answer within `SyncOptions.callbackTimeoutMs` leaves the decision to the
+ * policy, which also decides alone when no JS runs, for example in a
+ * background launch. {@link clearRetryDecider} is the only way to uninstall it.
+ *
+ * @param decider — the {@link RetryDecider}, sync or async.
+ * @throws {SyncError} {@link SyncErrorCode.INVALID_PAYLOAD} when `decider` is
+ *   not a function, with `validationErrors` set, before any native call.
+ * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
+ *   the native module is not loaded, and for every native rejection. Native
+ *   rejects the call when a newer JS runtime has attached since this one, for
+ *   example after a reload, and so owns the installs now.
+ *
+ * @example
+ * await setRetryDecider(({ attempt, metadata }) =>
+ *   metadata?.kind === 'analytics' && attempt >= 2
+ *     ? { action: RetryAction.DROP }
+ *     : { action: RetryAction.RETRY }
+ * );
+ *
+ * @public
+ */
+export async function setRetryDecider(decider: RetryDecider): Promise<void> {
+  validateCallback(decider, 'setRetryDecider', 'decider');
+  const native = nativeOrThrow();
+  try {
+    await native!.setRetryDecider(
+      bridgeCallback(native!, RETRY_DECIDER, decider)
+    );
+  } catch (err) {
+    wrapNativeError(err, SyncErrorCode.NATIVE_MODULE_UNAVAILABLE);
+  }
+}
+
+/**
+ * Uninstall the retry decider, so the declarative `RetryPolicy` decides alone
+ * again. Resolves with nothing installed too.
+ *
+ * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
+ *   the native module is not loaded.
+ *
+ * @example
+ * await clearRetryDecider();
+ *
+ * @public
+ */
+export async function clearRetryDecider(): Promise<void> {
+  const native = nativeOrThrow();
+  try {
+    await native!.clearRetryDecider();
+  } catch (err) {
+    wrapNativeError(err, SyncErrorCode.INVALID_PAYLOAD);
+  }
+}
+
+/**
+ * Check whether a retry decider is installed.
+ *
+ * @returns `true` from {@link setRetryDecider} until {@link clearRetryDecider}.
+ * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
+ *   the native module is not loaded.
+ *
+ * @example
+ * if (!(await isRetryDeciderInstalled())) await setRetryDecider(decider);
+ *
+ * @public
+ */
+export async function isRetryDeciderInstalled(): Promise<boolean> {
+  const native = nativeOrThrow();
+  try {
+    return await native!.isRetryDeciderInstalled();
+  } catch (err) {
+    wrapNativeError(err, SyncErrorCode.INVALID_PAYLOAD);
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                            Dispatch interceptors                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Install a JS header resolver, replacing any installed one. It supplies
+ * headers right before each request, for example a fresh access token. They
+ * are merged as `defaultHeaders` < resolver < the item's own headers.
+ *
+ * It fails closed: a throw, a rejection, an invalid result (a value that is
+ * not a string, or a header name or value that native rejects), or no answer
+ * within `SyncOptions.callbackTimeoutMs` sends nothing for that item. The item
+ * stays pending without spending an attempt, becomes due again no sooner than
+ * 60 s later, and emits `ITEM_RETRYING` with `INTERCEPTOR_FAILED`. With no JS
+ * running, for example in a background launch, the static headers go out.
+ * {@link clearHeaderResolver} is the only way to uninstall it.
+ *
+ * @param resolver — the {@link HeaderResolver}, sync or async.
+ * @throws {SyncError} {@link SyncErrorCode.INVALID_PAYLOAD} when `resolver` is
+ *   not a function, with `validationErrors` set, before any native call.
+ * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
+ *   the native module is not loaded, and for every native rejection. Native
+ *   rejects the call when a newer JS runtime has attached since this one, for
+ *   example after a reload, and so owns the installs now.
+ *
+ * @example
+ * await setHeaderResolver(async () => ({
+ *   Authorization: `Bearer ${await session.getAccessToken()}`,
+ * }));
+ *
+ * @public
+ */
+export async function setHeaderResolver(
+  resolver: HeaderResolver
+): Promise<void> {
+  validateCallback(resolver, 'setHeaderResolver', 'resolver');
+  const native = nativeOrThrow();
+  try {
+    await native!.setHeaderResolver(
+      bridgeCallback(native!, HEADER_RESOLVER, resolver)
+    );
+  } catch (err) {
+    wrapNativeError(err, SyncErrorCode.NATIVE_MODULE_UNAVAILABLE);
+  }
+}
+
+/**
+ * Uninstall the header resolver, so the static headers go out alone again.
+ * Resolves with nothing installed too.
+ *
+ * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
+ *   the native module is not loaded.
+ *
+ * @example
+ * await clearHeaderResolver();
+ *
+ * @public
+ */
+export async function clearHeaderResolver(): Promise<void> {
+  const native = nativeOrThrow();
+  try {
+    await native!.clearHeaderResolver();
+  } catch (err) {
+    wrapNativeError(err, SyncErrorCode.INVALID_PAYLOAD);
+  }
+}
+
+/**
+ * Install a JS `beforeDispatch` hook, replacing any installed one. It sees
+ * each request right before it is sent, after the header resolver, with the
+ * final headers, and answers `PROCEED` or `SKIP`. Returning nothing proceeds.
+ *
+ * `SKIP` defers the item the way a failing header resolver does (see
+ * {@link setHeaderResolver}), and so does a throw, a rejection, an invalid
+ * result, or no answer within `SyncOptions.callbackTimeoutMs`.
+ * {@link clearBeforeDispatch} is the only way to uninstall it.
+ *
+ * @param hook — the {@link BeforeDispatchHook}, sync or async.
+ * @throws {SyncError} {@link SyncErrorCode.INVALID_PAYLOAD} when `hook` is
+ *   not a function, with `validationErrors` set, before any native call.
+ * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
+ *   the native module is not loaded, and for every native rejection. Native
+ *   rejects the call when a newer JS runtime has attached since this one, for
+ *   example after a reload, and so owns the installs now.
+ *
+ * @example
+ * await setBeforeDispatch(({ url }) =>
+ *   url.includes('/uploads/') && isOnCellular()
+ *     ? { action: BeforeDispatchAction.SKIP }
+ *     : undefined
+ * );
+ *
+ * @public
+ */
+export async function setBeforeDispatch(
+  hook: BeforeDispatchHook
+): Promise<void> {
+  validateCallback(hook, 'setBeforeDispatch', 'hook');
+  const native = nativeOrThrow();
+  try {
+    await native!.setBeforeDispatch(
+      bridgeCallback(native!, BEFORE_DISPATCH, hook)
+    );
+  } catch (err) {
+    wrapNativeError(err, SyncErrorCode.NATIVE_MODULE_UNAVAILABLE);
+  }
+}
+
+/**
+ * Uninstall the `beforeDispatch` hook. Resolves with nothing installed too.
+ *
+ * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
+ *   the native module is not loaded.
+ *
+ * @example
+ * await clearBeforeDispatch();
+ *
+ * @public
+ */
+export async function clearBeforeDispatch(): Promise<void> {
+  const native = nativeOrThrow();
+  try {
+    await native!.clearBeforeDispatch();
+  } catch (err) {
+    wrapNativeError(err, SyncErrorCode.INVALID_PAYLOAD);
+  }
+}
+
+/**
+ * Install a JS `afterDispatch` hook, replacing any installed one. It observes
+ * each request that went out, after the outcome is stored and the item's
+ * event emitted. It never carries headers or a body.
+ *
+ * Dispatch never waits for it, so `flush()` may resolve before it runs, and
+ * its result is ignored. A throw or a rejection is only logged natively.
+ * {@link clearAfterDispatch} is the only way to uninstall it.
+ *
+ * @param hook — the {@link AfterDispatchHook}, sync or async.
+ * @throws {SyncError} {@link SyncErrorCode.INVALID_PAYLOAD} when `hook` is
+ *   not a function, with `validationErrors` set, before any native call.
+ * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
+ *   the native module is not loaded, and for every native rejection. Native
+ *   rejects the call when a newer JS runtime has attached since this one, for
+ *   example after a reload, and so owns the installs now.
+ *
+ * @example
+ * await setAfterDispatch(({ url, outcome, durationMs }) => {
+ *   metrics.record(url, outcome, durationMs);
+ * });
+ *
+ * @public
+ */
+export async function setAfterDispatch(hook: AfterDispatchHook): Promise<void> {
+  validateCallback(hook, 'setAfterDispatch', 'hook');
+  const native = nativeOrThrow();
+  try {
+    await native!.setAfterDispatch(
+      bridgeCallback(native!, AFTER_DISPATCH, hook)
+    );
+  } catch (err) {
+    wrapNativeError(err, SyncErrorCode.NATIVE_MODULE_UNAVAILABLE);
+  }
+}
+
+/**
+ * Uninstall the `afterDispatch` hook. Resolves with nothing installed too.
+ *
+ * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
+ *   the native module is not loaded.
+ *
+ * @example
+ * await clearAfterDispatch();
+ *
+ * @public
+ */
+export async function clearAfterDispatch(): Promise<void> {
+  const native = nativeOrThrow();
+  try {
+    await native!.clearAfterDispatch();
   } catch (err) {
     wrapNativeError(err, SyncErrorCode.INVALID_PAYLOAD);
   }
