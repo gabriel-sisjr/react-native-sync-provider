@@ -260,7 +260,8 @@ internal class SyncQueueStorage(
    * `PENDING` until [nextRetryAt], with [lastErrorCode]. Its `attempts` and `lastAttemptAt` are
    * left as they were, since no attempt was made.
    *
-   * @return false when the queue had no such row, a purge having removed it.
+   * @return false, with nothing written, when the queue holds no such row in flight: a purge
+   *   removed it, or it is no longer claimed.
    */
   suspend fun markDeferred(
     id: String,

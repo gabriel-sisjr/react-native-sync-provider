@@ -3516,6 +3516,32 @@ internal class SyncDispatcherTest {
     }
 
   @Test
+  fun `android_interceptor_releasedDuringWait_leftAsItIs, no longer in flight and nothing reported`() =
+    runBlocking<Unit> {
+      answerAll(200)
+      val id = enqueue()
+      val before = row(id)
+      val resolver = js.function<HeaderResolverContext> { requestId, _ ->
+        later {
+          // The claim is given back meanwhile, as another process's recovery would give it back.
+          db.syncItemDao().resetInFlight()
+          answer(requestId, FakeJs.failed("no token"))
+        }
+      }
+      assertThat(hybrid.setHeaderResolver(resolver)).isTrue()
+      val events = collectEvents()
+
+      val result = newDispatcher().flush()
+
+      // Not deferred: the row is as the release left it, and nothing reports it.
+      assertThat(server.requestCount).isEqualTo(0)
+      assertThat(resolver.calls).hasSize(1)
+      assertThat(row(id)).isEqualTo(before)
+      assertThat(events.of(id)).isEmpty()
+      assertThat(result.successCount + result.failureCount).isEqualTo(0.0)
+    }
+
+  @Test
   fun `interceptor_after_calledOncePerSentRequest, with how each request ended`() = runBlocking<Unit> {
     val purged = enqueue("/purged")
     server.dispatcher = object : Dispatcher() {

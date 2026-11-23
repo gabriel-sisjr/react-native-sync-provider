@@ -143,6 +143,42 @@ internal class SyncItemDaoTest {
   }
 
   @Test
+  fun `deferById defers only a row still in flight, and leaves a pending row of that id as it is`() =
+    runTest {
+      listOf(
+        "claimed" to SyncItemEntity.STATUS_IN_FLIGHT,
+        "pending" to SyncItemEntity.STATUS_PENDING,
+        "failed" to SyncItemEntity.STATUS_FAILED,
+      ).forEach { (id, status) ->
+        dao.insert(
+          TestData.entity(id, attempts = 2, status = status, nextRetryAt = 5L)
+            .copy(lastAttemptAt = 1_234L, lastErrorCode = "SERVER_ERROR"),
+        )
+      }
+      val claimed = dao.findById("claimed")!!
+      val pending = dao.findById("pending")!!
+      val failed = dao.findById("failed")!!
+
+      assertThat(dao.deferById("claimed", "INTERCEPTOR_FAILED", 9_876L)).isEqualTo(1)
+      // No longer claimed, or never there: 0 rows, which the caller takes for gone.
+      assertThat(dao.deferById("pending", "INTERCEPTOR_FAILED", 9_876L)).isEqualTo(0)
+      assertThat(dao.deferById("failed", "INTERCEPTOR_FAILED", 9_876L)).isEqualTo(0)
+      assertThat(dao.deferById("missing", "INTERCEPTOR_FAILED", 9_876L)).isEqualTo(0)
+
+      // The claim goes back without an attempt counted; the other rows are untouched.
+      assertThat(dao.findById("claimed")).isEqualTo(
+        claimed.copy(
+          status = SyncItemEntity.STATUS_PENDING,
+          lastErrorCode = "INTERCEPTOR_FAILED",
+          nextRetryAt = 9_876L,
+        ),
+      )
+      assertThat(dao.findById("pending")).isEqualTo(pending)
+      assertThat(dao.findById("failed")).isEqualTo(failed)
+      assertThat(dao.count()).isEqualTo(3)
+    }
+
+  @Test
   fun `claimPending flips only eligible rows and skips cooling ones`() = runTest {
     val now = 5_000L
     dao.insert(TestData.entity("high", priority = "HIGH", createdAt = 1L, nextRetryAt = 0L))

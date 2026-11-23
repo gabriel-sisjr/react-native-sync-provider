@@ -777,8 +777,9 @@ internal class SyncDispatcher(
    * `ITEM_RETRYING` then reports it with that code, no status, and the would-be attempt.
    *
    * Only this item waits: it counts in neither total, it sets no hold, and the cycle goes on. A
-   * row purged during the wait stays purged, with no event. When the write fails, nothing was
-   * remembered for the row, so the cycle's settle gives it back as it was.
+   * row purged during the wait stays purged, and one no longer in flight is left as it is: both
+   * are gone, with no event. When the write fails, nothing was remembered for the row, so the
+   * cycle's settle gives it back as it was.
    */
   private suspend fun deferForInterceptor(
     entity: SyncItemEntity,

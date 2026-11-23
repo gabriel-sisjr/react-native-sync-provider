@@ -164,7 +164,10 @@ internal interface SyncItemDao {
    * Put row [id] back to `PENDING` until [nextRetryAt], with [lastErrorCode], without counting an
    * attempt: its `attempts` and `lastAttemptAt` stay as they are, since no request went out.
    *
-   * @return the rows changed: 0 when no row has that id.
+   * Only a row still `IN_FLIGHT`, the cycle's claim, changes, as with the settle's writes. A row
+   * no longer in flight, given back to `PENDING` meanwhile, is left as it is.
+   *
+   * @return the rows changed: 0 when no row with that id is in flight, which means it is gone.
    */
   @Query(
     """
@@ -172,7 +175,7 @@ internal interface SyncItemDao {
       SET status = '${SyncItemEntity.STATUS_PENDING}',
           lastErrorCode = :lastErrorCode,
           nextRetryAt = :nextRetryAt
-      WHERE id = :id
+      WHERE id = :id AND status = '${SyncItemEntity.STATUS_IN_FLIGHT}'
     """,
   )
   suspend fun deferById(id: String, lastErrorCode: String, nextRetryAt: Long): Int
