@@ -45,8 +45,13 @@ final class BackgroundTaskExpiryTests: XCTestCase {
 
     /// A manager with background sync on, over a dispatcher whose sessions
     /// both go to ``HeldRequestProtocol``. `appActive` picks the session: the
-    /// foreground one while active, the background one otherwise.
-    private func makeManager(appActive: Bool, stack: CoreDataStack? = nil) throws -> BackgroundSyncManager {
+    /// foreground one while active, the background one otherwise. The JS
+    /// callbacks are `callbacks`, answered through `gateway`.
+    private func makeManager(appActive: Bool,
+                             stack: CoreDataStack? = nil,
+                             callbacks: CallbackRegistry = CallbackRegistry(),
+                             gateway: CallbackGateway = CallbackGateway(timer: ManualCallbackTimer()))
+        throws -> BackgroundSyncManager {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [HeldRequestProtocol.self]
         delegate = BackgroundURLSessionDelegate()
@@ -65,7 +70,9 @@ final class BackgroundTaskExpiryTests: XCTestCase {
                                     foregroundSession: URLSession(configuration: configuration),
                                     backgroundSession: backgroundSession,
                                     backgroundDelegate: delegate,
-                                    isAppActive: { appActive })
+                                    isAppActive: { appActive },
+                                    callbacks: callbacks,
+                                    gateway: gateway)
         let manager = BackgroundSyncManager(dispatcher: dispatcher,
                                             emitter: emitter,
                                             scheduler: FakeBackgroundTaskScheduler(),
@@ -315,6 +322,69 @@ final class BackgroundTaskExpiryTests: XCTestCase {
         XCTAssertNil(failed.first?.errorCode, "a cancelled cycle failed nothing")
         let stored = try await queue.getAll().first { $0.id == id }
         XCTAssertEqual(stored?.status, "IN_FLIGHT", "left for launch recovery")
+    }
+
+    // MARK: - The retry decider
+
+    /// The expiry lands while the retry decider is asked about a 503: the
+    /// wait ends at once, not at its timeout, and the retry policy's verdict
+    /// is written, since the answer came before the expiry. The cycle then
+    /// claims nothing more.
+    func test_decider_stopMidWait_appliesPolicy() async throws {
+        let callbacks = CallbackRegistry()
+        let callbackTimer = ManualCallbackTimer()
+        let gateway = CallbackGateway(timer: callbackTimer)
+        let manager = try makeManager(appActive: true, callbacks: callbacks, gateway: gateway)
+        HeldRequestProtocol.answerNewRequests(with: 503)
+        let first = try await storage.enqueue(input: .sample(priority: "HIGH"))
+        let second = try await storage.enqueue(input: .sample(url: "https://api.test/second", priority: "LOW"))
+        let task = FakeBackgroundTask()
+        let decider = FakeDecider(registry: callbacks, gateway: gateway) { _, _ in
+            task.expirationHandler?()
+            return nil
+        }
+        let sentAfter = Self.nowMs()
+
+        manager.handleProcessing(task: task)
+        await emitter.wait(for: "BACKGROUND_SYNC_COMPLETED", in: self)
+
+        XCTAssertEqual(task.completedResults, [false], "completed once, at the expiry")
+        XCTAssertEqual(decider.callCount, 1)
+        XCTAssertEqual(callbackTimer.delays, [3_000], "armed, and never fired")
+        XCTAssertEqual(gateway.pendingCount, 0)
+        let firstRow = try await row(first)
+        XCTAssertEqual(firstRow?.status, "PENDING")
+        XCTAssertEqual(firstRow?.attempts, 1, "the request went out: its attempt is spent")
+        XCTAssertEqual(firstRow?.lastErrorCode, "SERVER_ERROR")
+        XCTAssertGreaterThan(firstRow?.nextRetryAt ?? 0, sentAfter, "the policy's cooldown")
+        XCTAssertEqual(emitter.events(ofType: "ITEM_RETRYING").map(\.itemId), [first])
+        let secondRow = try await row(second)
+        XCTAssertEqual(secondRow?.status, "PENDING")
+        XCTAssertEqual(secondRow?.attempts, 0, "never claimed")
+        XCTAssertNil(secondRow?.lastAttemptAt)
+        let failed = emitter.events(ofType: "SYNC_FAILED")
+        XCTAssertEqual(failed.count, 1)
+        XCTAssertNil(failed.first?.errorCode, "a cancelled cycle failed nothing")
+        XCTAssertEqual(emitter.events(ofType: "BACKGROUND_SYNC_COMPLETED").first?.metadata,
+                       ["kind": "processing", "ok": "false"])
+        XCTAssertEqual(HeldRequestProtocol.startedCount, 1, "only the first item was sent")
+    }
+
+    /// The expiry lands while the request is out: no outcome came, so the
+    /// decider is never asked, and the row comes back as before.
+    func test_decider_stopMidWait_appliesPolicy_anExpiryDuringTheRequestNeverAsksIt() async throws {
+        let callbacks = CallbackRegistry()
+        let gateway = CallbackGateway(timer: ManualCallbackTimer())
+        let manager = try makeManager(appActive: true, callbacks: callbacks, gateway: gateway)
+        let decider = FakeDecider(registry: callbacks, gateway: gateway) { _, _ in .decision(.drop) }
+        let id = try await storage.enqueue(input: .sample())
+        let sentAfter = Self.nowMs()
+        let task = await fireWithARequestOut(.processing, on: manager)
+
+        task.expirationHandler?()
+
+        try await assertExpired(task, kind: "processing", itemId: id, sentAfter: sentAfter)
+        XCTAssertEqual(decider.callCount, 0)
     }
 
     // MARK: - Exactly once on the other paths

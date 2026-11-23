@@ -59,6 +59,18 @@ enum CallbackSkip: Error, Sendable, Equatable, CustomStringConvertible {
             return "the wait was cancelled"
         }
     }
+
+    /// `true` for an end that is no fault of the callback: its wait was
+    /// cancelled, or the runtime that installed it went away. The others mean
+    /// the callback failed or never answered.
+    var isStop: Bool {
+        switch self {
+        case .cancelled, .ownerGone:
+            return true
+        case .failed, .invalid, .invokeFailed, .timedOut:
+            return false
+        }
+    }
 }
 
 /// What one callback request came to.
@@ -206,11 +218,23 @@ final class PendingCallback: @unchecked Sendable {
 /// It never holds its lock while it resumes a waiter or calls into JS, and
 /// ``answer(_:_:)``, which runs on the JS thread, only looks the request up,
 /// completes it and returns.
+///
+/// An owner is retired when the hybrid that installed its callbacks goes away
+/// or a newer one attaches, and every owner when the engine shuts down. Its
+/// waits then end at once, and a request made for it later never calls JS.
+/// Clearing or replacing a callback retires nothing: JS is alive, and the
+/// timeout still bounds a wait already out.
 final class CallbackGateway: @unchecked Sendable {
     private let timer: CallbackTimer
     private let lock = NSLock()
     private var pending: [String: PendingCallback] = [:]
     private var lastId: UInt64 = 0
+    /// Every owner below this one is retired.
+    private var retiredBelow: UInt64 = 0
+    /// Owners retired one by one, at their hybrid's teardown.
+    private var retired: Set<UInt64> = []
+    /// Every owner is retired: the engine shut down.
+    private var retiredAll = false
 
     init(timer: CallbackTimer = DispatchCallbackTimer()) {
         self.timer = timer
@@ -278,11 +302,28 @@ final class CallbackGateway: @unchecked Sendable {
         take(requestId)?.finish(.success(reply))
     }
 
-    /// Ends at once every wait whose owner `matches`: the hybrid that
-    /// installed the callback went away. Each one ends as if no answer came.
-    func failPending(ownedBy matches: (UInt64) -> Bool) {
+    /// Retires `owner`: the hybrid that installed its callbacks went away.
+    func retireOwner(_ owner: UInt64) {
+        retire { $0.retired.insert(owner) }
+    }
+
+    /// Retires every owner below `generation`: a newer hybrid attached.
+    func retireOwners(below generation: UInt64) {
+        retire { $0.retiredBelow = max($0.retiredBelow, generation) }
+    }
+
+    /// Retires every owner: the engine shut down.
+    func retireAll() {
+        retire { $0.retiredAll = true }
+    }
+
+    /// Applies `mark` and ends, as if no answer came, every wait whose owner
+    /// is now retired. Registering a request checks the same state under the
+    /// same lock, so no request slips in between.
+    private func retire(_ mark: (CallbackGateway) -> Void) {
         let ended = lock.withLock { () -> [PendingCallback] in
-            let owned = pending.filter { matches($0.value.owner) }
+            mark(self)
+            let owned = pending.filter { isRetiredLocked($0.value.owner) }
             for id in owned.keys {
                 pending.removeValue(forKey: id)
             }
@@ -291,6 +332,10 @@ final class CallbackGateway: @unchecked Sendable {
         for entry in ended {
             entry.finish(.failure(.ownerGone))
         }
+    }
+
+    private func isRetiredLocked(_ owner: UInt64) -> Bool {
+        retiredAll || owner < retiredBelow || retired.contains(owner)
     }
 
     // MARK: - Answer classification
@@ -356,9 +401,18 @@ final class CallbackGateway: @unchecked Sendable {
     }
 
     /// Registers `entry`, arms its timeout, then calls into JS: an answer can
-    /// only find a request that is already registered.
+    /// only find a request that is already registered. A request for a
+    /// retired owner ends at once and never calls JS.
     private func start(_ id: String, _ entry: PendingCallback, timeoutMs: Int, send: (String) throws -> Void) {
-        register(id, entry)
+        let registered = lock.withLock { () -> Bool in
+            guard !isRetiredLocked(entry.owner) else { return false }
+            pending[id] = entry
+            return true
+        }
+        guard registered else {
+            entry.finish(.failure(.ownerGone))
+            return
+        }
         entry.arm(timer.schedule(afterMs: timeoutMs) { [weak self] in
             self?.take(id)?.finish(.failure(.timedOut(afterMs: timeoutMs)))
         })
@@ -374,14 +428,25 @@ final class CallbackGateway: @unchecked Sendable {
         }
     }
 
+    /// One line for a callback that gave nothing to use: WARN when the
+    /// callback failed or never answered, INFO when its wait was stopped.
+    /// Never an answer, a context or a header.
+    static func log(_ text: String, for skip: CallbackSkip) {
+        if skip.isStop {
+            SyncLogger.info(text, category: "callbacks")
+        } else {
+            SyncLogger.warning(text, category: "callbacks")
+        }
+    }
+
     private static func logNotification(_ id: String, _ outcome: PendingCallback.Outcome) {
         switch outcome {
         case let .success(reply):
             guard reply.status == .failed else { return }
-            SyncLogger.error("afterDispatch \(id) failed: \(forLog(reply.message ?? "no message"))",
-                             category: "callbacks")
+            log("afterDispatch \(id): \(CallbackSkip.failed(message: reply.message))",
+                for: .failed(message: reply.message))
         case let .failure(skip):
-            SyncLogger.error("afterDispatch \(id): \(skip)", category: "callbacks")
+            log("afterDispatch \(id): \(skip)", for: skip)
         }
     }
 
@@ -391,10 +456,6 @@ final class CallbackGateway: @unchecked Sendable {
             return lastId
         }
         return "\(kind.rawValue):\(number)"
-    }
-
-    private func register(_ id: String, _ entry: PendingCallback) {
-        lock.withLock { pending[id] = entry }
     }
 
     @discardableResult

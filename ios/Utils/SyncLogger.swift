@@ -54,6 +54,13 @@ enum SyncLogger {
         os_log("%{public}@", log: log, type: .info, message())
     }
 
+    /// Something went wrong outside the library, in a JS callback say, and
+    /// the library carried on. The unified log's default level.
+    static func warning(_ message: @autoclosure () -> String, category: String = "general") {
+        let log = categories[category] ?? categories["general"]!
+        os_log("%{public}@", log: log, type: .default, message())
+    }
+
     static func error(_ message: @autoclosure () -> String, category: String = "general") {
         let log = categories[category] ?? categories["general"]!
         os_log("%{public}@", log: log, type: .error, message())

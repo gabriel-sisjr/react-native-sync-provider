@@ -93,3 +93,46 @@ extension CallbackAnswer {
 
 /// A failure a fake throws.
 struct FakeCallbackError: Error {}
+
+/// A retry decider installed straight into a registry, as a hybrid installs
+/// one. It records each request, then answers through the gateway, as the
+/// facade's `answerCallback` does, with what `reply` returns; `nil` sends no
+/// answer. `reply` runs on the thread that asks, before the wait, so it may
+/// first fire the timeout, purge the row, or expire a BGTask.
+final class FakeDecider: @unchecked Sendable {
+    typealias Reply = @Sendable (_ requestId: String, _ request: RetryDeciderRequest) -> CallbackReply?
+
+    let requests = Recorder<RetryDeciderRequest>()
+    let requestIds = Recorder<String>()
+    /// The owner the install carries.
+    let owner: UInt64
+    /// `false` when the registry refused the install.
+    private(set) var installed = false
+
+    var callCount: Int {
+        requests.values.count
+    }
+
+    /// Installed on `engine` as a newly created hybrid would install it.
+    convenience init(engine: SyncEngine, reply: @escaping Reply) {
+        self.init(registry: engine.callbacks, gateway: engine.gateway, owner: engine.attachCallbacks(), reply: reply)
+    }
+
+    /// Installed as the new current owner of `registry`.
+    convenience init(registry: CallbackRegistry, gateway: CallbackGateway, reply: @escaping Reply) {
+        self.init(registry: registry, gateway: gateway, owner: registry.attach(), reply: reply)
+    }
+
+    private init(registry: CallbackRegistry, gateway: CallbackGateway, owner: UInt64, reply: @escaping Reply) {
+        self.owner = owner
+        let requests = self.requests
+        let requestIds = self.requestIds
+        installed = registry.setRetryDecider(CallbackInstall(owner: owner) { requestId, request in
+            requestIds.record(requestId)
+            requests.record(request)
+            if let answer = reply(requestId, request) {
+                gateway.answer(requestId, answer)
+            }
+        })
+    }
+}

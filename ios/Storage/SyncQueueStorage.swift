@@ -65,6 +65,13 @@ actor SyncQueueStorage {
         try await dao.delete(id: id)
     }
 
+    /// Removes the queue row with `id`, whatever its status, and never a dead
+    /// letter. See ``SyncItemDao/deleteQueued(id:)``.
+    @discardableResult
+    func deleteQueued(id: String) async throws -> Bool {
+        try await dao.deleteQueued(id: id)
+    }
+
     /// Removes every item, queued or dead-lettered.
     func clear() async throws {
         try await dao.clear()

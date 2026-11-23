@@ -572,6 +572,117 @@ final class SettleMatrixTests: XCTestCase {
         XCTAssertEqual(timer.delayMs, 30_000)
     }
 
+    // MARK: - R8: a verdict the retry decider was asked for
+
+    // The settle applies the verdict the failed write held, the decider's or,
+    // with no decision, the policy's. It never asks the decider again.
+
+    func test_decider_abortSettle_appliesRecordedOutcome_deadLetter() async throws {
+        let engine = await liveEngine()
+        let decider = FakeDecider(engine: engine) { _, _ in .decision(.deadLetter) }
+        let id = try await seed(engine)
+        try await seedWitness(engine)
+        await armForTheDueRow(engine)
+        answer(503)
+
+        await runACycleThatDies(engine, settleFails: false)
+
+        let queued = try await row(id, in: engine)
+        XCTAssertNil(queued)
+        let found = try await engine.storage.deadLetter(id)
+        let letter = try XCTUnwrap(found)
+        XCTAssertEqual(letter.lastErrorCode, "RETRY_DECIDER_REJECTED")
+        XCTAssertEqual(letter.lastErrorMessage, "HTTP 503 Service Unavailable")
+        XCTAssertEqual(letter.attempts, 2)
+        XCTAssertEqual(letter.lastAttemptAt, t1, "the claim's time")
+        XCTAssertEqual(letter.deadLetteredAt, settled)
+        XCTAssertEqual(events, ["SYNC_STARTED", "SYNC_PROGRESS", "ITEM_FAILED(RETRY_DECIDER_REJECTED)",
+                                "ITEM_DEAD_LETTERED(DEAD_LETTERED)", "SYNC_FAILED(NETWORK_ERROR)"])
+        XCTAssertEqual(emitter.events(ofType: "ITEM_DEAD_LETTERED").first?.metadata,
+                       ["lastErrorCode": "RETRY_DECIDER_REJECTED"])
+        XCTAssertEqual(decider.callCount, 1, "The settle did not ask again")
+        XCTAssertEqual(timer.delayMs, 30_000, "the witness is due sooner")
+    }
+
+    /// The delete fails, and the settle deletes the row: `ITEM_FAILED` goes
+    /// out once, from the settle.
+    func test_decider_abortSettle_appliesRecordedOutcome_drop() async throws {
+        let engine = await liveEngine()
+        let decider = FakeDecider(engine: engine) { _, _ in .decision(.drop) }
+        let id = try await seed(engine)
+        try await seedWitness(engine)
+        await armForTheDueRow(engine)
+        answer(503)
+
+        await runACycleThatDies(engine, settleFails: false)
+
+        let queued = try await row(id, in: engine)
+        XCTAssertNil(queued, "deleted")
+        let letter = try await engine.storage.deadLetter(id)
+        XCTAssertNil(letter, "a drop writes no dead letter")
+        XCTAssertEqual(events, ["SYNC_STARTED", "SYNC_PROGRESS", "ITEM_FAILED(RETRY_DECIDER_REJECTED)",
+                                "SYNC_FAILED(NETWORK_ERROR)"])
+        let failed = emitter.events(ofType: "ITEM_FAILED").first
+        XCTAssertEqual(failed?.statusCode, 503)
+        XCTAssertEqual(failed?.attempt, 2)
+        XCTAssertEqual(decider.callCount, 1)
+        XCTAssertEqual(timer.delayMs, 30_000, "the witness is due sooner")
+
+        _ = try await engine.dispatcher.flush()
+        XCTAssertEqual(requestCount, 1, "not sent again")
+    }
+
+    /// The decided delay, 45 s where the policy would wait 40 s, counts from
+    /// the settle's write.
+    func test_decider_abortSettle_appliesRecordedOutcome_retryDelayMs() async throws {
+        let engine = await liveEngine(baseDelayMs: 20_000)
+        let decider = FakeDecider(engine: engine) { _, _ in .decision(.retry, delayMs: 45_000) }
+        let id = try await seed(engine)
+        await armForTheDueRow(engine)
+        answer(503)
+
+        await runACycleThatDies(engine, settleFails: false)
+
+        try await assertRow(id, in: engine, status: "PENDING", attempts: 2, lastAttemptAt: settled,
+                            nextRetryAt: settled + 45_000, lastErrorCode: "SERVER_ERROR")
+        XCTAssertEqual(events, ["SYNC_STARTED", "SYNC_PROGRESS", "ITEM_RETRYING(SERVER_ERROR)",
+                                "SYNC_FAILED(NETWORK_ERROR)"])
+        XCTAssertEqual(decider.callCount, 1)
+        XCTAssertEqual(timer.delayMs, 45_000, "the decided delay, later than the 30 s wait")
+    }
+
+    /// No decision came, a FAILED answer here: the settle applies the
+    /// policy's verdict, as with no decider at all.
+    func test_decider_abortSettle_appliesRecordedOutcome_nothingRecorded() async throws {
+        let engine = await liveEngine(baseDelayMs: 20_000)
+        let decider = FakeDecider(engine: engine) { _, _ in .failed("the decider threw") }
+        let id = try await seed(engine)
+        await armForTheDueRow(engine)
+        answer(503)
+
+        await runACycleThatDies(engine, settleFails: false)
+
+        try await assertRow(id, in: engine, status: "PENDING", attempts: 2, lastAttemptAt: settled,
+                            nextRetryAt: settled + 40_000, lastErrorCode: "SERVER_ERROR")
+        XCTAssertEqual(events, ["SYNC_STARTED", "SYNC_PROGRESS", "ITEM_RETRYING(SERVER_ERROR)",
+                                "SYNC_FAILED(NETWORK_ERROR)"])
+        XCTAssertEqual(decider.callCount, 1)
+        XCTAssertEqual(timer.delayMs, 40_000)
+    }
+
+    func test_decider_abortSettle_appliesRecordedOutcome_deadLetterWhoseSettleFailsToo() async throws {
+        let engine = await liveEngine()
+        let decider = FakeDecider(engine: engine) { _, _ in .decision(.deadLetter) }
+        let id = try await seed(engine)
+        await armForTheDueRow(engine)
+        answer(503)
+
+        await runACycleThatDies(engine, settleFails: true)
+
+        try await assertLeftInFlight(id, in: engine)
+        XCTAssertEqual(decider.callCount, 1)
+    }
+
     // MARK: - R6: a request that never went out
 
     /// A URL that is not http(s) is never sent. When its dead letter cannot

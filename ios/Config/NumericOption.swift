@@ -95,6 +95,16 @@ enum NumericOption {
         return Int(min(value.rounded(.towardZero), Double(int32Max)))
     }
 
+    /// The retry decider's `delayMs`, in whole milliseconds, or `nil` when it
+    /// must be ignored: missing, not finite, or negative, so the policy's
+    /// delay applies. Fractions truncate, and anything above ``maxDelayMs``
+    /// is ``maxDelayMs``; the deadline then stops at
+    /// ``RetryPolicyEvaluator/maxDeadlineMs``.
+    static func decidedDelayMs(_ value: Double?) -> Int? {
+        guard let value, value.isFinite, value >= 0 else { return nil }
+        return Int(min(value.rounded(.towardZero), Double(maxDelayMs)))
+    }
+
     /// The `getSyncHistory` limit, where 0 means every result. NaN,
     /// -Infinity and anything below 1 give 0; +Infinity and 2^31 or more give
     /// 2147483647.

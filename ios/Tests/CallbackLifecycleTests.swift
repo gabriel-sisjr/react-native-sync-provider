@@ -174,6 +174,23 @@ final class CallbackLifecycleTests: XCTestCase {
         withExtendedLifetime(newer) {}
     }
 
+    /// An engine that shuts down ends every wait for a JS callback at once.
+    func test_shuttingTheEngineDown_endsEveryCallbackWait() async throws {
+        let hybrid = HybridSyncProvider(engine: engine)
+        let owner = hybrid.callbackOwner
+        let gateway = engine.gateway
+        let sent = expectation(description: "the decider was called")
+        let wait = Task { await gateway.requestDecision(owner: owner, timeoutMs: 3_000) { _ in sent.fulfill() } }
+        await fulfillment(of: [sent], timeout: livenessTimeout)
+
+        engine.shutdown()
+
+        let outcome = await wait.value
+        XCTAssertEqual(outcome, .skipped(.ownerGone))
+        XCTAssertEqual(gateway.pendingCount, 0)
+        withExtendedLifetime(hybrid) {}
+    }
+
     // MARK: - Replacing and clearing
 
     func test_aSetFromTheCurrentOwner_replaces_andItsClearUninstalls() throws {

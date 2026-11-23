@@ -230,4 +230,46 @@ final class SyncQueueStorageTests: XCTestCase {
         let history = try await storage.getHistory(limit: 0)
         XCTAssertTrue(history.isEmpty)
     }
+
+    // MARK: - The retry decider's drop
+
+    /// A drop deletes the queue row whatever its status, and never a dead
+    /// letter: `remove(id:)` would fall through to one.
+    func test_deleteQueued_removesTheQueueRow_inAnyStatus_andNeverADeadLetter() async throws {
+        let pending = try await storage.enqueue(input: makeInput(url: "https://example.com/pending"))
+        let claimed = try await storage.enqueue(input: makeInput(url: "https://example.com/claimed"))
+        try await storage.markInFlight(id: claimed)
+        let lettered = try await storage.enqueue(input: makeInput(url: "https://example.com/lettered"))
+        try await storage.moveToDeadLetters(id: lettered, errorCode: "SERVER_ERROR", errorMessage: "HTTP 404")
+
+        let deletedPending = try await storage.deleteQueued(id: pending)
+        let deletedClaimed = try await storage.deleteQueued(id: claimed)
+        let deletedLetter = try await storage.deleteQueued(id: lettered)
+
+        XCTAssertTrue(deletedPending)
+        XCTAssertTrue(deletedClaimed)
+        XCTAssertFalse(deletedLetter, "A dead letter is no queue row")
+        let queue = try await storage.getAll()
+        XCTAssertTrue(queue.isEmpty)
+        let letters = try await storage.getDeadLetters()
+        XCTAssertEqual(letters.map(\.id), [lettered], "The dead letter stays")
+    }
+
+    /// The settle of a drop whose own delete failed: only a row still in
+    /// flight is deleted, and no dead letter is written.
+    func test_aDroppedSettlement_deletesOnlyAClaimedRow() async throws {
+        let claimed = try await storage.enqueue(input: makeInput(url: "https://example.com/claimed"))
+        try await storage.markInFlight(id: claimed)
+        let pending = try await storage.enqueue(input: makeInput(url: "https://example.com/pending"))
+
+        let settledClaimed = try await storage.settleClaim(id: claimed, .dropped)
+        let settledPending = try await storage.settleClaim(id: pending, .dropped)
+
+        XCTAssertEqual(settledClaimed, SettledClaim(applied: true, heldUntil: nil))
+        XCTAssertEqual(settledPending, SettledClaim(applied: false, heldUntil: nil), "A row not in flight is left alone")
+        let queue = try await storage.getAll()
+        XCTAssertEqual(queue.map(\.id), [pending])
+        let letters = try await storage.getDeadLetters()
+        XCTAssertTrue(letters.isEmpty)
+    }
 }

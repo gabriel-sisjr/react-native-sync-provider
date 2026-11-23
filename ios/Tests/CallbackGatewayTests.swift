@@ -326,7 +326,7 @@ final class CallbackGatewayTests: XCTestCase {
 
     // MARK: - Owners
 
-    func test_failPending_endsOnlyTheMatchingOwnersWaits_atOnce() async {
+    func test_retiringAnOwner_endsOnlyItsWaits_atOnce() async {
         let gateway = self.gateway!
         let ids = Recorder<String>()
         let sentByOld = expectation(description: "the old owner's callback was called")
@@ -340,7 +340,7 @@ final class CallbackGatewayTests: XCTestCase {
         }
         await fulfillment(of: [sentByOld, sentByNew], timeout: livenessTimeout)
 
-        gateway.failPending { $0 == 1 }
+        gateway.retireOwner(1)
 
         let oldOutcome = await old.value
         XCTAssertEqual(oldOutcome, .skipped(.ownerGone))
@@ -348,6 +348,48 @@ final class CallbackGatewayTests: XCTestCase {
         gateway.answer(ids.values.first ?? "", .headers(["X-A": "b"]))
         let newOutcome = await new.value
         XCTAssertEqual(newOutcome, .answered(["X-A": "b"]))
+    }
+
+    /// The decider's install can be read just before its hybrid goes away:
+    /// the request that follows ends at once, and JS is not called.
+    func test_aRequestForARetiredOwner_neverCallsJS() async {
+        let gateway = self.gateway!
+        let sends = Recorder<String>()
+        gateway.retireOwner(3)
+        gateway.retireOwners(below: 2)
+
+        let tornDown = await gateway.requestDecision(owner: 3, timeoutMs: 3_000) { sends.record($0) }
+        let evicted = await gateway.requestHeaders(owner: 1, timeoutMs: 3_000) { sends.record($0) }
+        gateway.notifyAfterDispatch(owner: 1, timeoutMs: 3_000) { sends.record($0) }
+        let current = await gateway.requestBeforeDispatch(owner: 2, timeoutMs: 3_000) { id in
+            sends.record(id)
+            gateway.answer(id, .before(.proceed))
+        }
+
+        XCTAssertEqual(tornDown, .skipped(.ownerGone))
+        XCTAssertEqual(evicted, .skipped(.ownerGone))
+        XCTAssertEqual(current, .answered(.proceed), "A live owner is not affected")
+        XCTAssertEqual(sends.values.count, 1, "Only the live owner's callback was called")
+        XCTAssertEqual(timer.delays, [3_000], "Only the live owner's request was armed")
+        XCTAssertEqual(gateway.pendingCount, 0)
+    }
+
+    /// An engine that shuts down ends every wait, and every later request.
+    func test_retiringEveryOwner_endsEveryWait_andEveryLaterRequest() async {
+        let gateway = self.gateway!
+        let sent = expectation(description: "the callback was called")
+        let wait = Task { await gateway.requestDecision(owner: 7, timeoutMs: 3_000) { _ in sent.fulfill() } }
+        await fulfillment(of: [sent], timeout: livenessTimeout)
+
+        gateway.retireAll()
+
+        let pending = await wait.value
+        XCTAssertEqual(pending, .skipped(.ownerGone))
+        let sends = Recorder<String>()
+        let later = await gateway.requestDecision(owner: 8, timeoutMs: 3_000) { sends.record($0) }
+        XCTAssertEqual(later, .skipped(.ownerGone))
+        XCTAssertEqual(sends.values, [])
+        XCTAssertEqual(gateway.pendingCount, 0)
     }
 
     // MARK: - Helpers

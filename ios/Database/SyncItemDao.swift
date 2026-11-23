@@ -121,6 +121,9 @@ enum ClaimSettlement: Sendable, Equatable {
     /// Moved to the dead-letter store, as
     /// ``SyncItemDao/moveToDeadLetters(id:errorCode:errorMessage:)`` moves it.
     case deadLetter(errorCode: String, errorMessage: String?)
+    /// The retry decider's DROP: the row is deleted, as for ``delivered``,
+    /// and no dead letter is written.
+    case dropped
 }
 
 /// What ``SyncItemDao/settleClaim(id:_:)`` did.
@@ -550,7 +553,7 @@ final class SyncItemDao {
                 return SettledClaim(applied: false, heldUntil: heldUntil)
             }
             switch settlement {
-            case .delivered:
+            case .delivered, .dropped:
                 context.delete(entity)
             case let .retry(errorCode, delayMs):
                 entity.status = SyncItemStatus.pending.rawValue
@@ -607,6 +610,22 @@ final class SyncItemDao {
             }
             guard let letter = try Self.fetchDeadLetter(id: id, in: context) else { return false }
             context.delete(letter)
+            return true
+        }
+    }
+
+    /// Deletes the queue row `id`, in any status, and only from the queue: a
+    /// dead letter with that id is never touched. The retry decider's DROP.
+    ///
+    /// Runs one at a time with the purges (see
+    /// ``CoreDataStack/performSerializedTask(_:)``).
+    ///
+    /// - Returns: `false` when no queue row has `id`, purged meanwhile.
+    @discardableResult
+    func deleteQueued(id: String) async throws -> Bool {
+        try await stack.performSerializedTask { context in
+            guard let entity = try Self.fetchEntity(id: id, in: context) else { return false }
+            context.delete(entity)
             return true
         }
     }

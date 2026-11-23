@@ -157,6 +157,8 @@ final class SyncEngine: @unchecked Sendable {
                                        capacity: loaded.options.queueCapacity)
         let config = loaded.options.toDispatcherConfig(source: loaded.source,
                                                        credentialsUnavailable: loaded.credentialsUnavailable)
+        let callbacks = CallbackRegistry()
+        let gateway = CallbackGateway(timer: callbackTimer)
         let dispatcher: SyncDispatcher
         if let sessions {
             dispatcher = SyncDispatcher(storage: storage,
@@ -165,13 +167,17 @@ final class SyncEngine: @unchecked Sendable {
                                         config: config,
                                         foregroundSession: sessions.foreground,
                                         backgroundSession: sessions.background,
-                                        paused: loaded.paused)
+                                        paused: loaded.paused,
+                                        callbacks: callbacks,
+                                        gateway: gateway)
         } else {
             dispatcher = SyncDispatcher(storage: storage,
                                         emitter: emitter,
                                         connectivity: connectivity,
                                         config: config,
-                                        paused: loaded.paused)
+                                        paused: loaded.paused,
+                                        callbacks: callbacks,
+                                        gateway: gateway)
         }
 
         self.clock = clock
@@ -198,8 +204,8 @@ final class SyncEngine: @unchecked Sendable {
         self.qualityMonitor = qualityMonitor
         self.healthCheck = healthCheck
         self.probe = probe
-        self.callbacks = CallbackRegistry()
-        self.gateway = CallbackGateway(timer: callbackTimer)
+        self.callbacks = callbacks
+        self.gateway = gateway
 
         // Noted when the cycle ends, before the next one can start, so a late
         // re-arm cannot put an older end over a newer one.
@@ -294,7 +300,7 @@ final class SyncEngine: @unchecked Sendable {
     /// end at once, as when no answer comes.
     func attachCallbacks() -> UInt64 {
         let owner = callbacks.attach()
-        gateway.failPending { $0 < owner }
+        gateway.retireOwners(below: owner)
         return owner
     }
 
@@ -303,7 +309,7 @@ final class SyncEngine: @unchecked Sendable {
     /// left alone.
     func detachCallbacks(owner: UInt64) {
         callbacks.detach(owner: owner)
-        gateway.failPending { $0 == owner }
+        gateway.retireOwner(owner)
     }
 
     /// Returns once a flush started by connectivity coming back has finished.
@@ -312,13 +318,15 @@ final class SyncEngine: @unchecked Sendable {
     }
 
     /// Stops the engine's timers and subscriptions for good: a wake already in
-    /// flight will not re-arm. The shared engine lives as long as the process;
-    /// this exists for short-lived instances.
+    /// flight will not re-arm, and every wait for a JS callback ends at once,
+    /// as when no answer comes. The shared engine lives as long as the
+    /// process; this exists for short-lived instances.
     func shutdown() {
         lock.withLock { isShutDown = true }
         retryTimer.cancel()
         heldWakeTimer.cancel()
         qualityMonitor.stop()
+        gateway.retireAll()
     }
 
     // MARK: - Network

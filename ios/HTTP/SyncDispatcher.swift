@@ -6,8 +6,8 @@
 //    - One `URLSession(configuration: .default)` for in-app flushes.
 //    - One `URLSession(configuration: .background(withIdentifier:))` for
 //      OS-driven sync (BGTask handlers + iOS-resumed background uploads).
-//    - The `flush` cycle: drains the queue, applies retry policy, records
-//      results, emits events.
+//    - The `flush` cycle: drains the queue, applies the retry policy and the
+//      JS retry decider, records results, emits events.
 //
 
 import Foundation
@@ -22,6 +22,11 @@ let kBackgroundURLSessionIdentifier = "com.gabriel-sisjr.syncprovider.background
 /// The least a persisted credential is left alone after a rejection. `attempts`
 /// does not advance on one, so backoff alone would stay at its first value.
 let kMinCredentialHoldMs = 60_000
+
+/// The code of an item the retry decider dropped or dead-lettered: on its
+/// `ITEM_FAILED`, as its dead letter's `lastErrorCode`, and in the metadata
+/// of its `ITEM_DEAD_LETTERED`.
+let kRetryDeciderRejectedCode = "RETRY_DECIDER_REJECTED"
 
 /// How long a flush behind a network-quality gate waits for the process's
 /// first path update. A BGTask launch flushes before it has one, and judging
@@ -222,6 +227,10 @@ actor SyncDispatcher {
     private let backgroundSession: URLSession
     private let backgroundDelegate: BackgroundURLSessionDelegate
     private let isAppActive: @Sendable () async -> Bool
+    /// The JS callbacks installed in this process.
+    private let callbacks: CallbackRegistry
+    /// Where a cycle waits for the answers of those callbacks.
+    private let gateway: CallbackGateway
 
     /// See ``DispatcherHooks``.
     nonisolated let hooks = DispatcherHooks()
@@ -240,13 +249,17 @@ actor SyncDispatcher {
          emitter: SyncEventEmitter,
          connectivity: ConnectivityProviding = ConnectivityMonitor.shared,
          config: DispatcherConfig = .default,
-         paused: Bool = false) {
+         paused: Bool = false,
+         callbacks: CallbackRegistry = CallbackRegistry(),
+         gateway: CallbackGateway = CallbackGateway()) {
         self.storage = storage
         self.emitter = emitter
         self.connectivity = connectivity
         self.config = config
         self.hooks.paused = paused
         self.isAppActive = Self.applicationIsActive
+        self.callbacks = callbacks
+        self.gateway = gateway
 
         let foreground = URLSessionConfiguration.default
         foreground.timeoutIntervalForRequest = TimeInterval(config.requestTimeoutMs) / 1000.0
@@ -281,7 +294,9 @@ actor SyncDispatcher {
                   backgroundSession: URLSession,
                   backgroundDelegate: BackgroundURLSessionDelegate = BackgroundURLSessionDelegate(),
                   paused: Bool = false,
-                  isAppActive: (@Sendable () async -> Bool)? = nil) {
+                  isAppActive: (@Sendable () async -> Bool)? = nil,
+                  callbacks: CallbackRegistry = CallbackRegistry(),
+                  gateway: CallbackGateway = CallbackGateway()) {
         self.storage = storage
         self.emitter = emitter
         self.connectivity = connectivity
@@ -291,6 +306,8 @@ actor SyncDispatcher {
         self.backgroundDelegate = backgroundDelegate
         self.hooks.paused = paused
         self.isAppActive = isAppActive ?? Self.applicationIsActive
+        self.callbacks = callbacks
+        self.gateway = gateway
     }
 
     // MARK: - Configuration
@@ -357,7 +374,9 @@ actor SyncDispatcher {
     /// `URLSession` had the request (it may have reached the server) or as it
     /// was before the claim when it never did, and `SYNC_FAILED` ends the cycle without
     /// `errorCode` or `metadata`: nothing failed, and no history row is kept.
-    /// A response that arrived before the cancellation is recorded as usual.
+    /// A response that arrived before the cancellation is recorded as usual,
+    /// and a cancellation while the retry decider is asked about it ends that
+    /// wait at once: the retry policy's verdict is recorded.
     /// A `CancellationError` thrown while the caller's task is not cancelled,
     /// by a callee say, also ends the cycle with `SYNC_FAILED` without a code,
     /// but counts as a cycle that died for the wait after it.
@@ -570,15 +589,26 @@ actor SyncDispatcher {
 
             emitProgress(index: index, total: total)
 
+            // What the outcome does to the row, decided once: by the retry
+            // policy, then by the retry decider where it is asked. The write
+            // below and the settle of a cycle that dies apply this same verdict.
+            let verdict: ItemVerdict
+            if outcome.succeeded {
+                verdict = .delivered
+            } else {
+                verdict = .failed(await decideFailure(item: item, outcome: outcome, sentWith: sentWith))
+            }
+
             do {
-                if outcome.succeeded {
+                switch verdict {
+                case .delivered:
                     succeededIds.append(item.id)
                     try await storage.remove(id: item.id)
                     emitSucceeded(item: item, outcome: outcome)
-                } else {
-                    // Decides retry vs. terminal failure, persists the retry
-                    // cooldown, and emits the event.
-                    switch try await recordFailureOutcome(item: item, outcome: outcome, sentWith: sentWith) {
+                case let .failed(decision):
+                    // Persists the cooldown, the hold, the dead letter or the
+                    // drop, and emits the events.
+                    switch try await recordFailureOutcome(item: item, outcome: outcome, decision: decision) {
                     case .retrying:
                         break // kept PENDING with a cooldown; not counted as failed
                     case let .failed(_, message):
@@ -595,7 +625,7 @@ actor SyncDispatcher {
             } catch {
                 // The outcome could not be written, and the cycle dies with
                 // `error`. Its row must not wait IN_FLIGHT for the next launch.
-                await settleUnrecorded(item: item, outcome: outcome, sentWith: sentWith)
+                await settleUnrecorded(item: item, outcome: outcome, verdict: verdict)
                 throw error
             }
         }
@@ -671,41 +701,37 @@ actor SyncDispatcher {
         return true
     }
 
-    /// Records the outcome of a **failed** dispatch: decides retry vs. terminal
-    /// failure, persists the retry cooldown (`nextRetryAt`) via
-    /// ``RetryPolicyEvaluator`` when retrying, and otherwise moves the item to
-    /// the dead-letter store, then emits the matching events.
+    /// Records the outcome of a **failed** dispatch, as `decision` says:
+    /// persists the retry cooldown (`nextRetryAt`) when retrying, holds the
+    /// row for a stale credential, moves it to the dead-letter store, or
+    /// deletes it for the retry decider's DROP, then emits the matching events.
     ///
-    /// A terminal failure emits `ITEM_FAILED` with the real code, then, right
+    /// A terminal failure emits `ITEM_FAILED` with its code, then, right
     /// after, `ITEM_DEAD_LETTERED` with `DEAD_LETTERED` and that code in
     /// `metadata.lastErrorCode`. The dead letter keeps the failure's message
     /// (a status line or an error's description, never a header or a body),
-    /// cut to ``kDeadLetterMessageMaxLength`` characters.
+    /// cut to ``kDeadLetterMessageMaxLength`` characters. A drop emits only
+    /// `ITEM_FAILED`, with ``kRetryDeciderRejectedCode``, after its delete.
     ///
-    /// This is the single source of truth for failure handling. The background
-    /// `URLSession` delegate does not use it yet: a completion delivered after
-    /// a relaunch is still dropped, and that item comes back through launch
-    /// recovery instead, with no cooldown. Routing that path here is follow-up
-    /// work.
-    ///
-    /// A retriable failure with no budget left ends as `MAX_ATTEMPTS_EXCEEDED`.
-    /// A non-retryable failure keeps its real code, even on the last attempt.
+    /// The background `URLSession` delegate does not use this yet: a
+    /// completion delivered after a relaunch is still dropped, and that item
+    /// comes back through launch recovery instead, with no cooldown. Routing
+    /// that path here is follow-up work.
     ///
     /// - Important: `item` must be the snapshot taken **before**
-    ///   ``SyncQueueStorage/markInFlight(id:)``. This method computes the
-    ///   current attempt as `item.attempts + 1`, so a row re-read from storage
-    ///   after the dispatch would count the same attempt twice. A caller that
-    ///   only has the row, like a delegate fallback after a relaunch, must
-    ///   subtract one. `attempts` itself is never reset, so the backoff curve
-    ///   keeps advancing.
-    /// - Parameter sentWith: the configuration the request went out with.
+    ///   ``SyncQueueStorage/markInFlight(id:)``. The current attempt is
+    ///   `item.attempts + 1`, so a row re-read from storage after the dispatch
+    ///   would count the same attempt twice. A caller that only has the row,
+    ///   like a delegate fallback after a relaunch, must subtract one.
+    ///   `attempts` itself is never reset, so the backoff curve keeps
+    ///   advancing.
+    /// - Parameter decision: from ``decideFailure(item:outcome:sentWith:)``.
     /// - Returns: the ``FailureDisposition`` so callers can update their
     ///   aggregate counters.
-    @discardableResult
-    func recordFailureOutcome(item: StoredSyncItem,
-                              outcome: ItemDispatchOutcome,
-                              sentWith: DispatcherConfig) async throws -> FailureDisposition {
-        switch failureDecision(item: item, outcome: outcome, sentWith: sentWith) {
+    private func recordFailureOutcome(item: StoredSyncItem,
+                                      outcome: ItemDispatchOutcome,
+                                      decision: FailureDecision) async throws -> FailureDisposition {
+        switch decision {
         case let .credentialHold(holdMs):
             let heldUntil = try await storage.markCredentialRejected(id: item.id,
                                                                      errorCode: outcome.errorCode,
@@ -729,20 +755,108 @@ actor SyncDispatcher {
                                                   retryDelayMs: delayMs)
             emitRetrying(item: item, outcome: outcome)
             return .retrying(attempt: item.attempts + 1)
+        case let .drop(message):
+            // The delete comes first: when it fails, the settle deletes the
+            // row and reports it, so `ITEM_FAILED` goes out once either way.
+            // A row removed while its request was out has nothing to delete,
+            // and still reports how its request ended.
+            try await storage.deleteQueued(id: item.id)
+            emitFailed(item: item, outcome: outcome, errorCode: kRetryDeciderRejectedCode, deadLettered: false)
+            return .failed(errorCode: kRetryDeciderRejectedCode, message: message)
         }
     }
 
-    /// What a failed attempt does to its row. Decided here for the normal
-    /// path and for the settle of a cycle that dies before writing it, so the
-    /// two cannot differ.
-    private enum FailureDecision {
+    /// What one attempt's outcome does to its row, fixed before anything is
+    /// written. The normal path writes it, and the settle of a cycle that dies
+    /// before that write applies the very same value: it never asks the retry
+    /// decider again, nor recomputes a delay.
+    private enum ItemVerdict: Sendable {
+        /// A 2xx: the row is removed as delivered.
+        case delivered
+        case failed(FailureDecision)
+    }
+
+    /// What a failed attempt does to its row.
+    private enum FailureDecision: Sendable, Equatable {
         /// A 401/403 to default headers read back from storage: the attempt is
         /// refunded, and the row waits `holdMs`.
         case credentialHold(holdMs: Int)
-        /// Retryable, with attempts left: the row cools for `delayMs`.
+        /// Retryable, with attempts left: the row cools for `delayMs`, the
+        /// policy's or the retry decider's.
         case retry(delayMs: Int)
-        /// Permanent, or retryable with no attempt left.
+        /// Permanent, retryable with no attempt left, or dead-lettered by the
+        /// retry decider (with ``kRetryDeciderRejectedCode``).
         case deadLetter(errorCode: String, message: String)
+        /// Dropped by the retry decider: the row is deleted, with no dead
+        /// letter. `message` is the failure's, for the cycle's result.
+        case drop(message: String)
+    }
+
+    /// The verdict on a failed attempt: the retry policy's, then the retry
+    /// decider's wherever the policy would retry, a retryable failure with
+    /// budget left whose request went out, and not a stale credential's
+    /// hold. The decider can keep the retry, with its own delay or the
+    /// policy's, drop the item or dead-letter it. It cannot retry what the
+    /// policy would not, nor add attempts.
+    ///
+    /// While the cycle waits for the decider, other calls can land on this
+    /// actor: a pause, a configuration, a flush that joins the cycle. None of
+    /// them changes this verdict, whose policy half is fixed before the wait.
+    /// The row itself is read again by the write that follows, and the loop
+    /// checks for a cancellation and a pause before the next item.
+    ///
+    /// Anything other than a decision leaves the policy's verdict, with one
+    /// log line: a FAILED answer, an answer of another kind, no answer within
+    /// `callbackTimeoutMs`, the decider's hybrid going away, or a cancellation
+    /// of the cycle, a BGTask that expires say. A delay the decider gives
+    /// replaces the policy's as given: no jitter, no `maxDelayMs`, only the
+    /// deadline clamp. Either delay counts from the write that follows the
+    /// decision.
+    private func decideFailure(item: StoredSyncItem,
+                               outcome: ItemDispatchOutcome,
+                               sentWith: DispatcherConfig) async -> FailureDecision {
+        let policy = failureDecision(item: item, outcome: outcome, sentWith: sentWith)
+        guard case .retry = policy,
+              outcome.requestSent,
+              let decider = callbacks.retryDecider else {
+            return policy
+        }
+        let errorCode = outcome.errorCode ?? "NETWORK_ERROR"
+        let request = RetryDeciderRequest(itemId: item.id,
+                                          attempt: item.attempts + 1,
+                                          errorCode: errorCode,
+                                          statusCode: outcome.statusCode,
+                                          url: item.url,
+                                          method: item.method,
+                                          metadata: item.metadata)
+        let answer = await gateway.requestDecision(owner: decider.owner,
+                                                   timeoutMs: config.callbackTimeoutMs) { requestId in
+            decider.invoke(requestId, request)
+        }
+        switch answer {
+        case let .answered(decision):
+            let message = outcome.errorMessage ?? errorCode
+            switch decision.action {
+            case .retry:
+                guard let decidedMs = NumericOption.decidedDelayMs(decision.delayMs) else {
+                    if decision.delayMs != nil {
+                        SyncLogger.debug("The retry decider's delay for \(item.id) is unusable; "
+                                         + "the policy's delay applies", category: "callbacks")
+                    }
+                    return policy
+                }
+                return .retry(delayMs: decidedMs)
+            case .drop:
+                return .drop(message: message)
+            case .deadLetter:
+                return .deadLetter(errorCode: kRetryDeciderRejectedCode, message: message)
+            }
+        case let .skipped(skip):
+            CallbackGateway.log("The retry decider gave no decision for \(item.id): \(skip). "
+                                + "The retry policy applies.",
+                                for: skip)
+            return policy
+        }
     }
 
     private func failureDecision(item: StoredSyncItem,
@@ -806,30 +920,31 @@ actor SyncDispatcher {
 
     /// Settles the row of an item whose outcome could not be written, before
     /// its cycle dies. `item` is the snapshot from before the claim, which
-    /// already counted the attempt, and `sentWith` the configuration the
-    /// request went out with.
+    /// already counted the attempt, and `verdict` what the normal path tried
+    /// to write.
     ///
-    /// When the request went out, the settle applies the outcome that could
-    /// not be written, in its own transaction, as the normal path records it:
-    /// a 2xx removes the row as delivered, with `ITEM_SUCCEEDED`; a retryable
-    /// failure cools it with the retry policy's backoff and its own code, or,
-    /// with no budget left, ends as `MAX_ATTEMPTS_EXCEEDED`; a permanent one
-    /// moves it to the dead-letter store with its own code; a 401 or 403 to
-    /// default headers read back from storage refunds the attempt and holds
-    /// the row, and the hold reaches the wake armed after the cycle. Each one
-    /// comes with the normal path's events. Every request that went out has
-    /// an outcome here: a failure during the send is a transport error, which
-    /// the classifier turns into one (`NETWORK_ERROR` or `TIMEOUT`, say). A
-    /// request that never went out leaves the row as it was before its claim,
-    /// with no event. When this write fails too, the row waits `IN_FLIGHT`
-    /// for launch recovery.
+    /// When the request went out, the settle applies that same verdict, in its
+    /// own transaction, with the normal path's events: a 2xx removes the row
+    /// as delivered, with `ITEM_SUCCEEDED`; a retry cools it for the delay the
+    /// verdict holds, the retry decider's or the policy's, with the attempt's
+    /// own code; a dead letter moves it with the verdict's code, the attempt's
+    /// own, `MAX_ATTEMPTS_EXCEEDED` or the decider's
+    /// ``kRetryDeciderRejectedCode``; the decider's drop deletes it, with
+    /// `ITEM_FAILED`; a 401 or 403 to default headers read back from storage
+    /// refunds the attempt and holds the row, and the hold reaches the wake
+    /// armed after the cycle. It never asks the decider again. Every request
+    /// that went out has an outcome here: a failure during the send is a
+    /// transport error, which the classifier turns into one (`NETWORK_ERROR`
+    /// or `TIMEOUT`, say). A request that never went out leaves the row as it
+    /// was before its claim, with no event. When this write fails too, the
+    /// row waits `IN_FLIGHT` for launch recovery.
     ///
     /// Only a row still `IN_FLIGHT` is settled, as on Android: a row purged
     /// since, a logout say, stays gone and gets no event. The credential
     /// hold applies either way.
     private func settleUnrecorded(item: StoredSyncItem,
                                   outcome: ItemDispatchOutcome,
-                                  sentWith: DispatcherConfig) async {
+                                  verdict: ItemVerdict) async {
         do {
             guard outcome.requestSent else {
                 try await storage.releaseClaim(id: item.id,
@@ -837,14 +952,17 @@ actor SyncDispatcher {
                                                lastAttemptAt: item.lastAttemptAt ?? 0)
                 return
             }
-            if outcome.succeeded {
+            let decision: FailureDecision
+            switch verdict {
+            case .delivered:
                 let settled = try await storage.settleClaim(id: item.id, .delivered)
                 if settled.applied {
                     emitSucceeded(item: item, outcome: outcome)
                 }
                 return
+            case let .failed(recorded):
+                decision = recorded
             }
-            let decision = failureDecision(item: item, outcome: outcome, sentWith: sentWith)
             let settlement: ClaimSettlement
             switch decision {
             case let .credentialHold(holdMs):
@@ -854,6 +972,8 @@ actor SyncDispatcher {
             case let .deadLetter(errorCode, message):
                 settlement = .deadLetter(errorCode: errorCode,
                                          errorMessage: Self.deadLetterMessage(for: outcome, fallback: message))
+            case .drop:
+                settlement = .dropped
             }
             let settled = try await storage.settleClaim(id: item.id, settlement)
             if let heldUntil = settled.heldUntil {
@@ -865,6 +985,8 @@ actor SyncDispatcher {
                 emitRetrying(item: item, outcome: outcome)
             case let .deadLetter(errorCode, _):
                 emitFailed(item: item, outcome: outcome, errorCode: errorCode, deadLettered: true)
+            case .drop:
+                emitFailed(item: item, outcome: outcome, errorCode: kRetryDeciderRejectedCode, deadLettered: false)
             }
         } catch {
             SyncLogger.error("Could not settle the row of a cycle that died; it waits for launch recovery: "
