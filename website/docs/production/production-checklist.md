@@ -1,7 +1,7 @@
 ---
 sidebar_position: 1
 title: Production Checklist
-description: Cross-platform pre-release checklist for apps using @gabriel-sisjr/react-native-sync-provider — permissions, compliance, functionality, UX, testing, and performance.
+description: Cross-platform pre-release checklist for apps using @gabriel-sisjr/react-native-sync-provider — permissions, compliance, functionality, UX, testing, performance, and the JS callbacks.
 keywords:
   - production checklist
   - release readiness
@@ -33,7 +33,7 @@ See the [iOS Background Modes](./ios-background-modes.md), [Android Permissions]
 ## Functionality
 
 - [ ] Endpoint base URL points to the production environment (not a tunnel / localhost).
-- [ ] `SyncOptions.defaultHeaders` set to whatever your backend requires (auth, app version, device id). Credentials go here, not in per-item `headers`, which are stored in plain text.
+- [ ] `SyncOptions.defaultHeaders` set to whatever your backend requires (auth, app version, device id). Credentials go here, not in per-item `headers`, which are stored in plain text. A header resolver can override them while JS runs, but a run with no JS sends only these.
 - [ ] `configureSync` runs at launch and whenever the token changes, and without `defaultHeaders` on logout. A process with no JS cannot renew a token.
 - [ ] `RetryPolicy.retryOnStatusCodes` matches your backend's transient-error contract.
 - [ ] `RetryPolicy.maxAttempts` is high enough to ride out a typical outage but low enough to surface terminal failures within a useful window.
@@ -42,7 +42,7 @@ See the [iOS Background Modes](./ios-background-modes.md), [Android Permissions]
 - [ ] `useAutoSync` (or equivalent) mounted. Nothing dispatches a new item on its own, under any strategy. After `resumeSync()`, and on iOS also after a failed health check, the retry timer also flushes items that have no cooldown.
 - [ ] Endpoints are idempotent, with a stable `Idempotency-Key` in `headers`. Delivery is at least once.
 - [ ] Failures are observed through `ITEM_FAILED` events, which work on both platforms. `SyncResult.errors` is always empty on iOS.
-- [ ] Failure cases handled with appropriate UI feedback (`UNAUTHORIZED` → re-auth flow, `MAX_ATTEMPTS_EXCEEDED` → notify user).
+- [ ] Failure cases handled with appropriate UI feedback (`UNAUTHORIZED` → re-auth flow, `MAX_ATTEMPTS_EXCEEDED` → notify user, `RETRY_DECIDER_REJECTED` → what your retry decider chose).
 - [ ] Dead letters are handled: replayed with `replayDeadLetter` once the cause is fixed, or discarded with `discardDeadLetter`. The dead-letter queue is unbounded and keeps each request's headers and body.
 - [ ] `clearQueue()` runs on logout, before `configureSync` drops the credentials, so the dead letters are purged along with the queue. It does not need to wait for a running cycle.
 
@@ -113,6 +113,23 @@ The quality gate and the health check are off by default. Skip this section if y
 
 See the [Connectivity Detection](../guides/connectivity-detection.md#the-quality-gate) guide for how the gate and the health check decide.
 
+## Retry Decider and Dispatch Interceptors (If Installed)
+
+Skip this section if your app installs none of `setRetryDecider`, `setHeaderResolver`, `setBeforeDispatch` and `setAfterDispatch`.
+
+- [ ] The `set…` calls are the first library calls at startup, at module scope of the entry file: before `configureSync`, and before `<SyncProvider>` or any hook mounts. They install unconditionally, never behind `isRetryDeciderInstalled()`.
+- [ ] Every credential a run with no JS needs is in `defaultHeaders`, kept current with `configureSync`. With no stored `defaultHeaders`, a 401 in a background run with no JS dead-letters the item.
+- [ ] The header resolver refreshes its token before it expires, and shares one refresh between concurrent calls: Android asks for up to `batchSize` items at once. In a process that called `configureSync`, a 401 or 403 on the resolver's token is still terminal.
+- [ ] The resolver returns a plain object of strings, with printable-ASCII names that hold no space, and printable-ASCII values, and is passed as an arrow function or a bound method.
+- [ ] `callbackTimeoutMs` (default `3000`) covers your slowest legitimate answer, such as a token refresh, and no more. With JS hung, iOS pays it for every item.
+- [ ] No callback awaits `flush()` or `drainUntilEmpty()`.
+- [ ] No callback puts a token or a response body in a message it throws: an `Error`'s message reaches the native log.
+- [ ] `ITEM_RETRYING` with `INTERCEPTOR_FAILED` is monitored. A broken resolver defers its items for good, while every cycle reports `SYNC_SUCCEEDED` and 0/0.
+- [ ] A retry decider answers `DEAD_LETTER`, not `DROP`, for anything you may need to replay.
+- [ ] Tested a JS reload with callbacks installed, and a background run with no JS, whose requests carry only the stored `defaultHeaders`.
+
+See the [Dispatch Interceptors](../guides/dispatch-interceptors.md) guide and the [Retry Decider](../guides/retry-policy.md#retry-decider) section of the Retry Policy guide.
+
 ## See Also
 
 - [Android Permissions](./android-permissions.md) -- The permissions and the receiver merged into your manifest
@@ -123,3 +140,4 @@ See the [Connectivity Detection](../guides/connectivity-detection.md#the-quality
 - [Battery Optimization](../guides/battery-optimization.md) -- What makes the library use the network, and the option that controls each
 - [Crash Recovery](../guides/crash-recovery.md) -- What happens to in-flight items after a kill, a reboot or an update
 - [Connectivity Detection](../guides/connectivity-detection.md) -- Network quality, the quality gate and the health check
+- [Dispatch Interceptors](../guides/dispatch-interceptors.md) -- The header resolver, `beforeDispatch`, `afterDispatch` and their timeout

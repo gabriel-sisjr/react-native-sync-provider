@@ -1,7 +1,7 @@
 ---
 sidebar_position: 6
 title: Priority and Ordering
-description: Control dispatch order with SyncPriority HIGH/NORMAL/LOW, understand queue ordering rules, and use defaultHeaders with per-item overrides.
+description: Control dispatch order with SyncPriority HIGH/NORMAL/LOW, understand queue ordering rules, and merge defaultHeaders, header-resolver headers and per-item headers.
 keywords:
   - priority
   - sync-priority
@@ -13,7 +13,7 @@ keywords:
 
 # Priority and Ordering
 
-This guide explains how to use `SyncPriority` and how `defaultHeaders` interact with per-item headers.
+This guide explains how to use `SyncPriority`, and how `defaultHeaders`, a header resolver's headers and per-item headers are merged.
 
 ## Overview
 
@@ -110,7 +110,15 @@ await configureSync({
 });
 ```
 
-Per-item headers **override** `defaultHeaders` on key collision (case-insensitive on the native side):
+Each request's headers come from three layers, merged in this order, a later layer winning on a name collision:
+
+1. `defaultHeaders`, from `configureSync`.
+2. The headers your [header resolver](./dispatch-interceptors.md#header-resolver) returns for that request, when one is installed and JS is running.
+3. The item's own `headers`.
+
+Names match case-insensitively, and the winning layer's spelling is kept. Inside one layer, do not set two names that differ only by case, such as `Authorization` and `authorization`: which one is sent is unspecified.
+
+Per-item headers **override** both other layers:
 
 ```ts
 await enqueue({
@@ -133,12 +141,16 @@ The merged headers attached to the dispatched request are:
 }
 ```
 
+If a header resolver returned `{ authorization: 'Bearer fresh-token' }` for an item without its own `Authorization`, that value would replace the `defaultHeaders` one, sent under the resolver's spelling, `authorization`. A run with no JS calls no resolver, so it sends the `defaultHeaders` value. See [Dispatch Interceptors](./dispatch-interceptors.md#when-no-js-runs).
+
 ### `Content-Type` Priority
 
 Set the type through `SyncItemInput.contentType`, and leave it out of `headers` and `defaultHeaders`. The platforms resolve a conflict differently:
 
 - **Android** uses `contentType`. When it is omitted, a request with a body goes out as `application/json`, even if `headers` sets `Content-Type`.
 - **iOS** uses the value in `headers` or `defaultHeaders`, and applies `contentType` only when neither has one.
+
+A header resolver's `Content-Type` is a layer like the others. The `headers` a [`beforeDispatch`](./dispatch-interceptors.md#beforedispatch) hook receives hold a `Content-Type` only when a layer sets one, so on Android they can show one that the body's media type, `contentType` or the `application/json` default, replaces on the wire.
 
 ```ts
 await enqueue({
@@ -158,7 +170,7 @@ await configureSync({
 });
 ```
 
-`batchSize` caps how many items one cycle dispatches. The default is `25`. Android sends them concurrently, and iOS one at a time, so on Android it is also the concurrency limit. Raise it for upload-heavy workloads on stable networks; lower it on flaky connections to avoid swamping the retry queue.
+`batchSize` caps how many items one cycle dispatches. The default is `25`. Android sends them concurrently, and iOS one at a time, so on Android it is also the concurrency limit, for the requests and for the [JS callbacks](./dispatch-interceptors.md#concurrency) they wait on. Raise it for upload-heavy workloads on stable networks; lower it on flaky connections to avoid swamping the retry queue.
 
 ## Per-Item Timeout
 
@@ -168,4 +180,5 @@ await configureSync({
 
 - [Idempotency](./idempotency.md) -- ULIDs and `Idempotency-Key`
 - [Retry Policy](./retry-policy.md) -- Backoff curves and budgets
+- [Dispatch Interceptors](./dispatch-interceptors.md) -- The header resolver and the hooks around each request
 - [Types & Interfaces](../api-reference/types.md#syncoptions) -- The `SyncOptions` reference, including `batchSize` and `defaultHeaders`

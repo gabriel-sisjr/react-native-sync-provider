@@ -1,7 +1,7 @@
 ---
 sidebar_position: 4
 title: iOS Native Architecture
-description: Deep dive into the iOS native layer — SyncEngine, Core Data persistence, URLSession dispatch (foreground + background), NWPathMonitor, BGTaskScheduler, RecoveryManager, persisted configuration, and event emitter.
+description: Deep dive into the iOS native layer — SyncEngine, Core Data persistence, URLSession dispatch (foreground + background), the JS callback gateway, NWPathMonitor, BGTaskScheduler, RecoveryManager, persisted configuration, and event emitter.
 keywords:
   - ios
   - swift
@@ -23,7 +23,8 @@ All iOS native code lives under `ios/`. The implementation uses Swift 5.9+, Core
 | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
 | `ios/Database/`                                    | `CoreDataStack` singleton, `SyncProvider.xcdatamodeld` (manual codegen), `SyncItemDao`, `CoreDataMigration` (the explicit migration to the current model, with the mapping built in code). |
 | `ios/Storage/`                                     | `SyncQueueStorage` — high-level wrapper around the DAOs (filtering, ordering, status transitions).             |
-| `ios/HTTP/`                                        | `SyncDispatcher` (foreground + background `URLSession`) and `BackgroundURLSessionDelegate`; `HeadProbe` (one `HEAD` on a session of its own) and `HealthCheck` (the check before a cycle, its cache and its backoff). |
+| `ios/HTTP/`                                        | `SyncDispatcher` (foreground + background `URLSession`) and `BackgroundURLSessionDelegate`; `HeaderMerge` (the three header layers of one request); `HeadProbe` (one `HEAD` on a session of its own) and `HealthCheck` (the check before a cycle, its cache and its backoff). |
+| `ios/Callbacks/`                                   | `CallbackGateway` (calls JS and waits for its answer), `CallbackRegistry` (the four callback slots, and which hybrid owns them), `CallbackPayloads` (the request and answer shapes, and the header rules a resolver's answer must meet). |
 | `ios/Connectivity/`                                | `ConnectivityMonitor` over `NWPathMonitor`; `NetworkQualityMonitor`, `NetworkQualityClassifier` (the shared threshold table) and `NetworkQualityLevel`. |
 | `ios/Engine/`                                      | `SyncEngine` (the process-wide runtime, independent of JS) and `RetryWakeTimer`.                               |
 | `ios/Config/`                                      | `SyncConfigStore`, `SecretStore` (Keychain), `SyncOptionsSnapshot`.                                            |
@@ -41,6 +42,8 @@ The HybridObject implementation lives in `ios/SyncProvider.swift` (`final class 
 `SyncEngine.shared` owns the queue, the dispatcher, the retry timer and the configuration. It exists independently of JS, because a BGTask launch needs all of them with no bridge loaded. It is built on first use, from whichever side gets there first: JS creating the hybrid, or a fired BGTask.
 
 On start it loads the persisted configuration, starts `ConnectivityMonitor`, and runs launch recovery. It counts JS-facing hybrids: the retry timer runs only while there is one, and creating a hybrid clears a persisted pause, because JS cannot read the flag and starts out unpaused.
+
+It also owns the callback registry and the gateway, so the callbacks belong to no hybrid. Creating a hybrid attaches it as the newest owner, which evicts every older install and ends its waits, then re-arms the retry timer. A hybrid's `deinit` retires its installs: they stay in place as orphans that count as installed, and every request for one ends at once without calling JS, until a newer hybrid attaches. See [JS Callbacks](#js-callbacks).
 
 > **Note:** The Swift class is named `HybridSyncProvider`, not `SyncProvider`, as `nitro.json` maps it (`autolinking.SyncProvider.ios.implementationClassName: "HybridSyncProvider"`). The name was chosen in v0.1.1 to avoid a symbol clash with the code Nitro generated then. The Nitro `iosModuleName` (`SyncProvider`) and the JS lookup (`NitroModules.createHybridObject<SyncProvider>('SyncProvider')`) are unchanged — only the underlying Swift class name differs. The Kotlin implementation remains `class SyncProvider`.
 
@@ -82,17 +85,33 @@ Every store operation runs on a fresh background `NSManagedObjectContext`, which
 | Foreground                 | `URLSessionConfiguration.default`, with `waitsForConnectivity`. Used when the app is active, and always under `foregroundOnly`. |
 | Background (OS-resumable)  | `URLSessionConfiguration.background(withIdentifier: "com.gabriel-sisjr.syncprovider.background-upload")`. Used when the app is not active, unless `foregroundOnly` is set. The body goes through a temporary file, and the OS may finish the upload while the app is suspended. |
 
-The dispatcher reads eligible rows from `SyncQueueStorage`, applies the active `RetryPolicy` (linear / exponential / fibonacci with optional equal jitter), and reports per-item outcomes back as Core Data status transitions plus `SyncEvent`s on the emitter. A retriable failure writes `nextRetryAt` from a clock read after the attempt. A non-retryable failure keeps its real code, and `MAX_ATTEMPTS_EXCEEDED` applies only to a retriable failure with no attempts left. `configureSync` applies as soon as the call resolves, even inside a running cycle, which keeps only its batch and the outcome of its quality gate and health check. A request already in flight keeps the headers and timeout it was sent with, but its response is classified under the new `retryPolicy`.
+The dispatcher reads eligible rows from `SyncQueueStorage`, runs the installed [JS callbacks](#js-callbacks) around each request, applies the active `RetryPolicy` (linear / exponential / fibonacci with optional equal jitter), then the retry decider when one is installed and the failure qualifies, and reports per-item outcomes back as Core Data status transitions plus `SyncEvent`s on the emitter. A retriable failure writes `nextRetryAt` from a clock read after the attempt, or after the decision when a retry decider was consulted. A non-retryable failure keeps its real code, and `MAX_ATTEMPTS_EXCEEDED` applies only to a retriable failure with no attempts left. `configureSync` applies as soon as the call resolves, even inside a running cycle, which keeps only its batch and the outcome of its quality gate and health check. A request already in flight keeps the headers and timeout it was sent with, but its response is classified under the new `retryPolicy`.
 
 Every request that goes out ends with a classified outcome or a cancellation. When the write of an outcome fails, the cycle dies, and first the row is settled in its own write with that outcome: a `2xx` removes it as delivered, a retryable failure cools it, or dead-letters it with no attempts left, a permanent failure dead-letters it, and a 401 or 403 to restored `defaultHeaders` holds it. A row whose request never went out comes back exactly as before its claim. Only a row still `IN_FLIGHT` is settled, so one purged since stays as it is. The cycle then ends with `SYNC_FAILED`, carrying a library error's own code or `NETWORK_ERROR` for any other cause, such as a Core Data error, and `flush()` rejects. When the settle's write fails too, the row waits `IN_FLIGHT` for launch recovery. See [When a Cycle Dies](../guides/error-handling.md#when-a-cycle-dies).
 
 A cancellation of the cycle's own task, as at a [BGTask expiry](../guides/background-sync.md#when-a-window-runs-out-of-time), claims no further item and cancels the request in flight, in either session. Its item goes back to `PENDING` with the attempt refunded and the cooldown untouched, and the cycle ends with `SYNC_FAILED` without `errorCode` or `metadata`, with no history row.
 
-`flush()` during a running cycle returns the last result at once. When paused, or with default headers that cannot be read, it returns a zero-count result with real timestamps and no cycle runs.
+With a retry decider installed, a settle applies the decision recorded for that attempt, or the policy's when none was recorded, without asking JS. Its retry delay counts from the settle's own write, while Android counts it from when the outcome was decided, a difference of one failed write that predates v0.4.
+
+`flush()` during a running cycle returns the last result at once, so a callback that awaits it gets that result and sends nothing. When paused, or with default headers that cannot be read, it returns a zero-count result with real timestamps and no cycle runs.
 
 `BackgroundURLSessionDelegate` routes a completion back to the dispatcher while the call that started the upload is still waiting, and receives the `application(_:handleEventsForBackgroundURLSession:completionHandler:)` call the host app forwards through `HybridSyncProvider.handleBackgroundURLSessionEvents`.
 
 > **Warning — A completion delivered after a relaunch is dropped:** The row stays `IN_FLIGHT` until launch recovery puts it back to `PENDING`, with no cooldown and its attempt spent. The server may have accepted the request, so it can be sent twice. See [Idempotency](../guides/idempotency.md).
+
+The header resolver and `beforeDispatch` run while the request's headers are assembled, before the upload task is created, so the upload carries the headers resolved then. A completion delivered after a relaunch gets no `afterDispatch` call, because no JS installed one in that process.
+
+## JS Callbacks
+
+`CallbackGateway` and `CallbackRegistry` belong to `SyncEngine`. See the [Dispatch Interceptors guide](../guides/dispatch-interceptors.md) for the behavior apps see.
+
+- **The gateway.** It calls the installed JS function with a fresh request id, and the facade answers through the internal `answerCallback`. Each wait is a continuation resumed exactly once: by the answer, a failed answer, its timeout, a cancellation, or its owner going away. The timeout is a one-shot timer on uptime, freed as soon as the request ends, so it fires even when the JS promise never settles. A late, unknown or repeated answer does nothing.
+- **Claim timing.** The header resolver and `beforeDispatch` run after the spent-budget guard and before the claim, so the row stays `PENDING` during their waits, and `getPendingItems()` shows it. The claim is the final check that the row is still queued. A deferral writes `lastErrorCode: INTERCEPTOR_FAILED` and the new `nextRetryAt` in a write that applies only while the row is `PENDING`, and leaves `attempts` and `lastAttemptAt` as they were.
+- **One configuration per item.** The dispatcher takes one configuration snapshot right after the resolver returns. It feeds the merge, `beforeDispatch`, the request and its timeout, and the credential judgment. A `configureSync` during the `beforeDispatch` wait therefore applies from the next item. The retry decider's timeout comes from the same snapshot.
+- **One item at a time.** Each awaited callback adds its wait to its item, so with JS hung each item costs up to `callbackTimeoutMs`.
+- **The merge.** `HeaderMerge` layers `defaultHeaders`, the resolver's headers and the item's, compares names case-insensitively, and keeps the winning layer's spelling. Names that differ only by case inside one layer resolve deterministically here, unlike earlier builds, but Android makes no such promise, so the guides call that winner unspecified. A `Content-Type` from `contentType` is not part of the merge: the request adds it when no layer sets one.
+- **`afterDispatch`.** It is called on the main queue, behind the item event the emitter posted, for a request that went out. Nothing waits for it.
+- **Logs.** Category `callbacks`. Each request without a usable answer is logged once, at most 256 characters of any JS text, logged as private. Headers, bodies and contexts are never logged. An unusable `delayMs` is logged as a warning.
 
 ## Retry Wake
 

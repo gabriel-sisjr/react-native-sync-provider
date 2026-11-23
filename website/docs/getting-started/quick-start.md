@@ -156,6 +156,8 @@ The Provider applies `configureSync(options)` on mount and on every change to `o
 
 > **Warning — Omitting `defaultHeaders` is a logout:** Each `configureSync` replaces the whole configuration, and omitting `defaultHeaders` deletes the stored copy. See [Cold-start configuration](../guides/background-sync.md#cold-start-configuration).
 
+> **Tip — A fresh token for each request:** Rebuilding `options` when the token changes keeps the stored copy current for background runs, which run no JS. While JS runs, a [header resolver](../guides/dispatch-interceptors.md#header-resolver) can also supply the token for each request. Install it before the Provider mounts: see [Install Them First at Startup](../guides/dispatch-interceptors.md#install-them-first-at-startup).
+
 ### 2. Enqueue a Request
 
 In a component, take `enqueue` from `useSyncQueue()`, as the minimal example does. If you prefer to call the facade directly (for example, from a non-React module or a background callback), use the top-level function:
@@ -294,4 +296,5 @@ See [Debugging](../development/debugging.md) for log filters and for inspecting 
 - [useSyncQueue](../api-reference/hooks/useSyncQueue.md) -- The hook that mirrors the pending queue, with its state, methods and re-render behavior
 - [Background Sync](../guides/background-sync.md) -- Deep dive into BGTaskScheduler and WorkManager constraints
 - [Retry Policy](../guides/retry-policy.md) -- Backoff curves, jitter, and status-code allowlists
+- [Dispatch Interceptors](../guides/dispatch-interceptors.md) -- Per-request headers, such as a fresh token, and hooks around each request
 - [Production Checklist](../production/production-checklist.md) -- Pre-launch checklist

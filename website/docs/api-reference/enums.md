@@ -1,7 +1,7 @@
 ---
 sidebar_position: 5
 title: Enums
-description: All enum definitions for @gabriel-sisjr/react-native-sync-provider — ConnectionStatus, ConnectionType, SyncStrategy, SyncPriority, BackoffStrategy, HttpMethod, SyncEventType, and NetworkQuality.
+description: All enum definitions for @gabriel-sisjr/react-native-sync-provider — ConnectionStatus, ConnectionType, SyncStrategy, SyncPriority, BackoffStrategy, HttpMethod, SyncEventType, NetworkQuality, RetryAction, BeforeDispatchAction, and DispatchOutcome.
 keywords:
   - react-native
   - sync-provider
@@ -10,6 +10,7 @@ keywords:
   - SyncPriority
   - BackoffStrategy
   - SyncEventType
+  - RetryAction
 ---
 
 # Enums
@@ -26,6 +27,9 @@ import {
   HttpMethod,
   SyncEventType,
   NetworkQuality,
+  RetryAction,
+  BeforeDispatchAction,
+  DispatchOutcome,
 } from '@gabriel-sisjr/react-native-sync-provider';
 ```
 
@@ -313,15 +317,15 @@ enum SyncEventType {
 | `SYNC_SUCCEEDED` | A cycle finishes with no permanent failure. That includes a 0/0 cycle with nothing eligible, and a cycle whose items all went back to wait for a retry. | iOS: `metadata.attempted` and `metadata.succeeded`, plus `metadata.failed` on an empty cycle. Android: base fields only. |
 | `SYNC_FAILED` | A cycle finishes with one or more permanent failures, [dies](../guides/error-handling.md#when-a-cycle-dies), or is [cancelled](../guides/error-handling.md#cancelled-cycles). Also emitted, with no `SYNC_STARTED` before it and no history row, when the [quality gate](../guides/connectivity-detection.md#the-quality-gate) or the [health check](../guides/connectivity-detection.md#health-check) skips the cycle. | `errorCode`, only when the cycle died (the library error's own code, or `NETWORK_ERROR`) or was skipped (`NETWORK_QUALITY_TOO_LOW` or `HEALTH_CHECK_FAILED`). None after a cancellation. iOS, for a cycle that ended with permanent failures: `metadata.attempted`, `metadata.succeeded` and `metadata.failed`. |
 | `ITEM_SUCCEEDED` | A single item dispatched successfully. | `itemId`, `statusCode`, `attempt` |
-| `ITEM_FAILED` | A single item failed permanently: a non-retryable failure, or a retriable one with no attempts left. The item has already moved to the dead-letter queue, and `ITEM_DEAD_LETTERED` follows. An item [removed or cleared while its request was in flight](./functions.md#what-a-purge-stops) gets `ITEM_FAILED` alone. | `itemId`, `errorCode`, `statusCode`, `attempt` |
-| `ITEM_RETRYING` | A single item failed and went back to wait, including a [credential hold](../guides/background-sync.md#cold-start-configuration). | `itemId`, `errorCode`, `statusCode`, `attempt` |
+| `ITEM_FAILED` | A single item failed permanently: a non-retryable failure, a retriable one with no attempts left, or a [retry decider's](./functions.md#setretrydecider) `DROP` or `DEAD_LETTER`, which report `RETRY_DECIDER_REJECTED`. The item has already moved to the dead-letter queue, and `ITEM_DEAD_LETTERED` follows. An item [removed or cleared while its request was in flight](./functions.md#what-a-purge-stops) gets `ITEM_FAILED` alone, and so does an item the decider dropped, which is deleted. | `itemId`, `errorCode`, `statusCode`, `attempt` |
+| `ITEM_RETRYING` | A single item failed and went back to wait, including a [credential hold](../guides/background-sync.md#cold-start-configuration), which reports `UNAUTHORIZED`. After a retry decider's `RETRY`, `errorCode` is still the attempt's own code. Also emitted for an item the header resolver or `beforeDispatch` [deferred](./functions.md#fail-closed) without sending it: `errorCode` is `INTERCEPTOR_FAILED`, with no `statusCode`, and `attempt` is the attempt that would have been made. | `itemId`, `errorCode`, `statusCode`, `attempt` |
 | `QUEUE_CLEARED` | After `clearQueue`, which deletes dead letters too. Once per call. | -- |
 | `CONNECTION_CHANGED` | A reported [`ConnectionState`](./types.md#connectionstate) field changed: `status`, `type`, `isInternetReachable`, `isExpensive` or `networkQuality`. Never for a duplicate, and on Android never for the state it starts in. iOS starts at `UNKNOWN`, so its first path report emits one. A change of `networkQuality` alone emits it with an unchanged `connectionStatus`. Delivered to JS asynchronously on both platforms, after the new state is stored, in the order of the changes. Its order relative to other event types is not promised. | `connectionStatus` |
 | `PAUSED` | After `pauseSync`. | -- |
 | `RESUMED` | After `resumeSync`. iOS also emits it at launch when recovery put interrupted items back in the queue. A pause cleared by a launch emits nothing. | iOS recovery's `RESUMED`: `metadata.recovered`, the count, as a string. Otherwise base fields only. |
 | `BACKGROUND_SYNC_STARTED` | A background window starts: a BGTask on iOS, the periodic worker on Android. Android's one-time retry kick emits neither background event. | iOS processing task: `metadata.kind` (`"processing"`). Otherwise base fields only. |
 | `BACKGROUND_SYNC_COMPLETED` | The same window finishes. iOS emits it whether the window's flush returned or threw, and when the window [runs out of time](../guides/background-sync.md#when-a-window-runs-out-of-time), even before its cycle started. Android emits it only after the flush returns: a cycle that dies emits `SYNC_FAILED` with its code, a cancelled one `SYNC_FAILED` without, and then no `BACKGROUND_SYNC_COMPLETED`. | iOS: `metadata.kind` (`"refresh"` or `"processing"`), and `metadata.ok: "false"` when the flush threw or the window ran out of time. Android: base fields only. `errorCode` is never set, on either platform: the code is on the `SYNC_FAILED` of a cycle that died or was skipped, and on each `ITEM_FAILED` of a cycle that ended with permanent item failures. |
-| `ITEM_DEAD_LETTERED` | A permanently failed item was moved to the dead-letter queue. Emitted right after that item's `ITEM_FAILED`, on both platforms. Read the dead letter with [`listDeadLetter`](./functions.md#listdeadletter). | `itemId`, `errorCode: 'DEAD_LETTERED'`, `metadata.lastErrorCode` (the real failure code, the one `ITEM_FAILED` reported) |
+| `ITEM_DEAD_LETTERED` | A permanently failed item was moved to the dead-letter queue. Emitted right after that item's `ITEM_FAILED`, on both platforms. Read the dead letter with [`listDeadLetter`](./functions.md#listdeadletter). | `itemId`, `errorCode: 'DEAD_LETTERED'`, `metadata.lastErrorCode` (the real failure code, the one `ITEM_FAILED` reported: `RETRY_DECIDER_REJECTED` after a retry decider's `DEAD_LETTER`) |
 
 **Platform:** Android and iOS, except `SYNC_PROGRESS`, which only iOS emits.
 
@@ -398,6 +402,116 @@ if (isAtLeast(networkQuality, NetworkQuality.GOOD)) {
 
 ---
 
+## `RetryAction`
+
+What a [retry decider](./functions.md#setretrydecider) asks the engine to do with a failed attempt, returned as [`RetryDecision.action`](./types.md#retrydecision). The decider is consulted only for an attempt the [`RetryPolicy`](./types.md#retrypolicy) would retry, so it can veto a retry or change its delay, but never retry a failure the policy would not.
+
+```ts
+enum RetryAction {
+  RETRY = 'RETRY',
+  DROP = 'DROP',
+  DEAD_LETTER = 'DEAD_LETTER',
+}
+```
+
+| Value | Effect |
+|-------|--------|
+| `RETRY` | Retry as the policy would. A valid `delayMs` replaces the policy's delay; without one, the policy's delay applies. Either way the delay counts from the decision. `ITEM_RETRYING` reports the attempt's own code. |
+| `DROP` | Fail the item and delete it, without a dead letter: `ITEM_FAILED` with `RETRY_DECIDER_REJECTED`, and no `ITEM_DEAD_LETTERED`. It counts in `failureCount`. The only case where the engine itself deletes a failed item instead of dead-lettering it. |
+| `DEAD_LETTER` | Fail the item and move it to the dead-letter queue: `ITEM_FAILED` with `RETRY_DECIDER_REJECTED`, then `ITEM_DEAD_LETTERED`. The dead letter's `lastErrorCode` is `RETRY_DECIDER_REJECTED`, and its `lastErrorMessage` describes the attempt's failure. |
+
+**Platform:** Android and iOS
+
+### Usage
+
+```ts
+import {
+  RetryAction,
+  setRetryDecider,
+} from '@gabriel-sisjr/react-native-sync-provider';
+
+await setRetryDecider(({ statusCode }) =>
+  statusCode === 503
+    ? { action: RetryAction.RETRY, delayMs: 5 * 60 * 1000 }
+    : { action: RetryAction.RETRY }
+);
+```
+
+---
+
+## `BeforeDispatchAction`
+
+What a [`beforeDispatch`](./functions.md#setbeforedispatch) hook asks the engine to do with the request it was shown, returned as [`BeforeDispatchResult.action`](./types.md#beforedispatchresult). Only a result with an `action` key asks for something: any other value, nothing included, means `PROCEED`.
+
+```ts
+enum BeforeDispatchAction {
+  PROCEED = 'PROCEED',
+  SKIP = 'SKIP',
+}
+```
+
+| Value | Effect |
+|-------|--------|
+| `PROCEED` | Send the request unchanged. |
+| `SKIP` | Defer the item without sending it. It goes back to `PENDING` with its attempt count unchanged, becomes due again after the longer of the policy's delay for that attempt and 60 s, and emits `ITEM_RETRYING` with `INTERCEPTOR_FAILED`. See [Fail Closed](./functions.md#fail-closed). |
+
+An `action` with any other value is a failure, and defers the item the same way.
+
+**Platform:** Android and iOS
+
+### Usage
+
+```ts
+import {
+  BeforeDispatchAction,
+  setBeforeDispatch,
+} from '@gabriel-sisjr/react-native-sync-provider';
+
+// isPaused(url) is the app's own check.
+await setBeforeDispatch(({ url }) =>
+  isPaused(url) ? { action: BeforeDispatchAction.SKIP } : undefined
+);
+```
+
+---
+
+## `DispatchOutcome`
+
+How a request reported to an [`afterDispatch`](./functions.md#setafterdispatch) hook ended, as [`AfterDispatchContext.outcome`](./types.md#afterdispatchcontext).
+
+```ts
+enum DispatchOutcome {
+  SUCCEEDED = 'SUCCEEDED',
+  RETRYING = 'RETRYING',
+  FAILED = 'FAILED',
+}
+```
+
+| Value | Reported when |
+|-------|---------------|
+| `SUCCEEDED` | The server answered with a `2xx` status. |
+| `RETRYING` | The item went back to wait for a retry, a hold after a credential rejection included, which reports `errorCode: 'UNAUTHORIZED'`. |
+| `FAILED` | The item failed permanently: a non-retryable failure, a retriable one with no attempts left, or a retry decider's `DROP` or `DEAD_LETTER`, which report `errorCode: 'RETRY_DECIDER_REJECTED'`. |
+
+**Platform:** Android and iOS
+
+### Usage
+
+```ts
+import {
+  DispatchOutcome,
+  setAfterDispatch,
+} from '@gabriel-sisjr/react-native-sync-provider';
+
+await setAfterDispatch(({ outcome, errorCode, url }) => {
+  if (outcome === DispatchOutcome.FAILED) {
+    console.warn(`Gave up on ${url}: ${errorCode}`);
+  }
+});
+```
+
+---
+
 ## See Also
 
 - [Types & Interfaces](./types.md) -- `SyncEvent`, the payload every event type arrives in, and `SyncDeadLetterItem`, the record behind `ITEM_DEAD_LETTERED`
@@ -405,3 +519,4 @@ if (isAtLeast(networkQuality, NetworkQuality.GOOD)) {
 - [useSyncEvents](./hooks/useSyncEvents.md) -- Subscribe to events from a component
 - [Errors](./errors.md) -- `SyncErrorCode`
 - [Connectivity Detection](../guides/connectivity-detection.md) -- Network quality, the quality gate and the health check
+- [Functions](./functions.md#retry-decider) -- The retry decider and the dispatch interceptors, which `RetryAction`, `BeforeDispatchAction` and `DispatchOutcome` serve

@@ -1,7 +1,7 @@
 ---
 sidebar_position: 3
 title: Android Native Architecture
-description: Deep dive into the Android native layer — Room database, OkHttp dispatcher, ConnectivityManager monitor, WorkManager-based background sync, retry wake, persisted configuration, and boot-time recovery.
+description: Deep dive into the Android native layer — Room database, OkHttp dispatcher, JS callback gateway, ConnectivityManager monitor, WorkManager-based background sync, retry wake, persisted configuration, and boot-time recovery.
 keywords:
   - android
   - kotlin
@@ -25,6 +25,7 @@ All Android native code lives under `android/src/main/java/com/margelo/nitro/syn
 | `database/`        | Room `SyncDatabase`, `SyncItemEntity`, `SyncDeadLetterEntity`, `SyncResultEntity`, DAOs (suspend + Flow). KSP processes the schema. |
 | `storage/`         | `SyncQueueStorage` — high-level wrapper around the DAOs (claim atomicity, status transitions, sort).    |
 | `http/`            | `SyncDispatcher` (OkHttp 4.12.0 + Coroutines) and `CredentialPolicy`; `HeadProbe` (one `HEAD` request) and `HealthCheck` (the check before a cycle, with its cache and backoff); `FlushOutcome` (what a flush did, and why it skipped a cycle). |
+| `callbacks/`       | `JsCallbacks` (the process-wide callback state), `CallbackRegistry` (one install per kind, tagged with the hybrid that made it), `HybridInstalls` (one hybrid's `set…`, `clear…` and `isRetryDeciderInstalled`), `JsCallbackGateway` (calls JS and waits for its answer) and `CallbackAnswers` (what a usable answer must carry). |
 | `retry/`           | `RetryPolicyEvaluator` (the backoff math), `RetryTimer` (in-process timer), `RetryWake` (arms the timer and the kick), `GateRecheck` (when a wake the quality gate holds is checked again). |
 | `config/`          | `SyncConfigStore`, `SecretStore`, `KeystoreSecretStore`, `SyncOptionsValidator` (the checks `configureSync` runs before anything is applied). |
 | `connectivity/`    | `ConnectivityMonitor` over the default-network callback, `NetworkQualityClassifier`, `LatencyProbe`.     |
@@ -33,7 +34,7 @@ All Android native code lives under `android/src/main/java/com/margelo/nitro/syn
 | `error/`           | `SyncException` — typed errors mapped to `SyncErrorCode`.                                                |
 | `util/`            | `Ulid`, `JsonMap`, `UrlValidator` and other small helpers.                                               |
 
-The HybridObject implementation lives in `SyncProvider.kt` (`class SyncProvider : HybridSyncProviderSpec()`, marked `@DoNotStrip`). `SyncProviderRuntime.kt` is the process-wide container, shared with WorkManager workers. It restores the persisted configuration whichever process builds it, and tracks attached JS engines: the retry timer and the connectivity watch only run while one is attached. `SyncProviderPackage.kt` is the Nitro autolinking entry point and calls `System.loadLibrary("syncprovider")`.
+The HybridObject implementation lives in `SyncProvider.kt` (`class SyncProvider : HybridSyncProviderSpec()`, marked `@DoNotStrip`). `SyncProviderRuntime.kt` is the process-wide container, shared with WorkManager workers. It restores the persisted configuration whichever process builds it, and tracks attached JS engines: the retry timer and the connectivity watch only run while one is attached. The [JS callbacks](#js-callbacks) live in its companion, outside any runtime instance. `SyncProviderPackage.kt` is the Nitro autolinking entry point and calls `System.loadLibrary("syncprovider")`.
 
 ## Room Database
 
@@ -65,13 +66,16 @@ DAOs expose `suspend` reads and `Flow<List<SyncItemEntity>>` for reactive subscr
 A cycle:
 
 1. Calls `claimPending` to atomically transition one batch of up to `batchSize` eligible rows from `PENDING` to `IN_FLIGHT`.
-2. For each row, concurrently, builds the `Request` with merged headers (`SyncOptions.defaultHeaders` first, then per-item `headers`) and runs one attempt bounded by `requestTimeoutMs`, raised to 1 second and capped at 2147483647 ms. `attempts` continues from what earlier cycles persisted.
-3. Applies the result via `markSucceeded | markRetry | markFailed` and emits the corresponding `ITEM_SUCCEEDED | ITEM_RETRYING | ITEM_FAILED` event. On a retriable failure with attempts left, the row returns to `PENDING` with `nextRetryAt` measured from the end of the attempt. A non-retryable failure keeps its real code, and only a retriable one with no attempts left becomes `MAX_ATTEMPTS_EXCEEDED`.
-4. Records the `SyncResult`, emits the terminal event, and calls back to arm the next retry wake.
+2. For each row, concurrently, asks the header resolver when one is installed, and builds the `Request` with merged headers: `SyncOptions.defaultHeaders`, then the resolver's, then per-item `headers`, a later layer winning and names compared case-insensitively. It then asks `beforeDispatch`, and checks that the row is still claimed. A failure or a `SKIP` defers the row instead, without sending it. Otherwise it runs one attempt bounded by `requestTimeoutMs`, raised to 1 second and capped at 2147483647 ms. `attempts` continues from what earlier cycles persisted.
+3. Applies the result via `markSucceeded | markRetry | markFailed` and emits the corresponding `ITEM_SUCCEEDED | ITEM_RETRYING | ITEM_FAILED` event. On a retriable failure with attempts left, the row returns to `PENDING` with `nextRetryAt` measured from the end of the attempt, or, when a retry decider is consulted, from its decision. The decider can replace the delay, or turn the retry into a dead letter or a drop. A non-retryable failure keeps its real code, and only a retriable one with no attempts left becomes `MAX_ATTEMPTS_EXCEEDED`.
+4. Calls `afterDispatch` when one is installed, after the outcome is written and its event emitted. Nothing waits for it.
+5. Records the `SyncResult`, emits the terminal event, and calls back to arm the next retry wake.
 
 An attempt that runs out of `requestTimeoutMs`, or hits one of the shared client's socket timeouts (10 s to connect, 30 s for a stalled read or write), fails with `TIMEOUT`; every other I/O failure is `NETWORK_ERROR`, and both are retried. An exception from the attempt itself that is not an I/O error, such as one while OkHttp builds the call, is a permanent `INVALID_PAYLOAD` failure.
 
 Anything raised around an attempt rather than by it, such as a storage write that fails or an `Error`, is not that item's outcome: it ends the cycle. Dispatches already started finish and no new one starts. Each row the cycle claimed without a recorded outcome is then settled in one transaction with what its attempt established, and reported, before the cycle's `SYNC_FAILED` and the `flush()` rejection. A row whose request never went out comes back exactly as before the claim. See [When a Cycle Dies](../guides/error-handling.md#when-a-cycle-dies).
+
+The settlement is remembered before the write that can fail, so the settle never asks JS. Before it waits for a retry decider, the dispatcher remembers the policy's retry, then replaces it with the decided outcome. A retry the settle writes counts its delay from when its outcome was decided. iOS counts it from the settle's own write instead, so the two differ by the duration of one failed write, as they did before v0.4.
 
 A cycle whose own job is cancelled, such as a worker that WorkManager stops, ends with `SYNC_FAILED` without an `errorCode`. No item fails because of it: a request already on the wire finishes and records its answer, and the claimed rows not yet sent come back unchanged.
 
@@ -80,6 +84,19 @@ With default headers restored from disk, one item goes first. If the server reje
 When paused, or with default headers that cannot be read, `flush()` returns an all-zero result and no cycle runs.
 
 `isSyncing` flips around the entire cycle so hooks can mirror it.
+
+## JS Callbacks
+
+`JsCallbacks` holds what JS installed, in `CallbackRegistry`, and the requests waiting for an answer, in `JsCallbackGateway`. It lives in the `SyncProviderRuntime` companion, so the bridge installs and answers on the JS thread without building a runtime, and an answer still lands after its hybrid was disposed. See the [Dispatch Interceptors guide](../guides/dispatch-interceptors.md) for the behavior apps see.
+
+- **The gateway.** It calls the installed JS function with a fresh request id, and the facade answers through the internal `answerCallback`. Each wait races a `CompletableDeferred` against `callbackTimeoutMs`, so the timeout fires even inside `NonCancellable`. A Nitro `Promise` is never awaited, because its `await()` cannot be cancelled. A late, unknown or repeated answer does nothing. An `Exception` from the call itself counts as a failed answer, while an `Error` still ends the cycle, as anything raised around an attempt does.
+- **Ownership.** Each hybrid takes a generation when it is created, and that creation evicts every install an older hybrid made. Only the newest hybrid may install or clear, and a `set…` from any other rejects. `dispose()` cancels the hybrid's scope, then retires its installs: they stay as orphans that count as installed, and every request for one ends at once without calling JS. A JS reload disposes nothing, so the old installs stay live and time out at each consult until the new hybrid's creation evicts them.
+- **Claim timing.** The batch is claimed when the cycle starts, so an item waits for its callbacks `IN_FLIGHT`, and `getPendingItems()` leaves it out. A deferral gives the claimed row back as `PENDING`, with `lastErrorCode` set to `INTERCEPTOR_FAILED` and a new `nextRetryAt`, without counting an attempt, and only while the row is still `IN_FLIGHT`. If that write fails, the row comes back exactly as it was before the cycle.
+- **Options.** A cycle reads its options once, so a `configureSync` during a wait applies from the next cycle.
+- **Concurrency.** The items of a batch wait concurrently, so up to `batchSize` calls can be in flight on the JS thread. With `defaultHeaders` restored from disk, the first item probes the credential alone; when it is deferred, the next one probes alone.
+- **The flush mutex.** The whole cycle runs under it, callback waits included. The answer path never takes it, so nothing deadlocks, but a callback that awaits `flush()` stalls the cycle until `callbackTimeoutMs`.
+- **Headers.** A resolver header that OkHttp would refuse fails the whole answer, and the item is deferred. Invalid item headers and `defaultHeaders` keep their earlier handling. The body's media type still replaces a layer's `Content-Type` on the wire.
+- **Logs.** Tag `SyncCallbacks`. Each request without a usable answer is logged once, at WARN, or at INFO when its cycle stopped or its owner went away. A line keeps at most 256 characters of a JS message, and never a header, a body or a context.
 
 ## Retry Wake
 

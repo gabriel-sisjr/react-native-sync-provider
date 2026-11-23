@@ -68,7 +68,7 @@ After toggling, watch for `CONNECTION_CHANGED` events emitted by the library —
 ## Android Logcat Tag Filters
 
 ```bash
-adb logcat *:S SyncProvider:V SyncProviderRuntime:V SyncDispatcher:V SyncWorker:V RecoveryWorker:V RetryTimer:V BackgroundSyncManager:V BootCompletedReceiver:V ConnectivityMonitor:V SyncConfigStore:V KeystoreSecretStore:V SyncEventEmitter:V WM-WorkerWrapper:V
+adb logcat *:S SyncProvider:V SyncProviderRuntime:V SyncDispatcher:V SyncCallbacks:V SyncWorker:V RecoveryWorker:V RetryTimer:V BackgroundSyncManager:V BootCompletedReceiver:V ConnectivityMonitor:V SyncConfigStore:V KeystoreSecretStore:V SyncEventEmitter:V WM-WorkerWrapper:V
 ```
 
 Useful tags:
@@ -76,6 +76,7 @@ Useful tags:
 | Tag                  | What it tells you                                                   |
 | -------------------- | ------------------------------------------------------------------- |
 | `SyncProvider`, `SyncDispatcher` | Problems only, not state. `SyncProvider` logs an error when a bridge call or one of its coroutines throws unexpectedly. `SyncDispatcher` logs a warning when stored `defaultHeaders` cannot be read, which skips the cycle, or when the next retry wake cannot be armed, and an error when a request cannot be built or an aborted cycle cannot be cleaned up. Requests are not logged. A cycle skipped by the quality gate or the health check is not logged either: it emits `SYNC_FAILED`. |
+| `SyncCallbacks`      | The [JS callbacks](../guides/dispatch-interceptors.md#messages-and-logs). Each request without a usable answer is logged once: a failure or a timeout at warning level, a stopped cycle or a runtime that went away at info level. Also each `SKIP` from `beforeDispatch`, at info level, and a retry decider's unusable `delayMs`, at warning level. A line keeps at most 256 characters of a JS message, and never a header, a body or a context. |
 | `SyncWorker`, `RecoveryWorker`, `RetryTimer`, `BackgroundSyncManager` | Failures only, plus the number of items `RecoveryWorker` reset. Arming or running a wake is not logged. |
 | `SyncProviderRuntime`, `SyncConfigStore`, `KeystoreSecretStore` | The process-wide runtime, the persisted configuration and the encrypted `defaultHeaders`. |
 | `ConnectivityMonitor`, `SyncEventEmitter`, `BootCompletedReceiver` | `ConnectivityMonitor` logs only a callback that fails to register or unregister: no network change and no quality grade. `SyncEventEmitter` logs a listener that throws. `BootCompletedReceiver` logs each boot or update broadcast it receives, at info level, and an error when it cannot schedule the recovery. |
@@ -92,7 +93,9 @@ The library logs through `os.log` with subsystem `com.gabriel-sisjr.syncprovider
 subsystem:com.gabriel-sisjr.syncprovider
 ```
 
-Categories: `core-data`, `dispatcher`, `background`, `connectivity`, `recovery`, `general`.
+Categories: `core-data`, `dispatcher`, `background`, `connectivity`, `recovery`, `callbacks`, `general`.
+
+The `callbacks` category logs each JS callback request without a usable answer, once, and a retry decider's unusable `delayMs`. Any text that came from JS, such as an `Error`'s message, is cut to 256 characters and logged as private, so the system redacts it unless private data logging is enabled. Headers, bodies and contexts are never logged.
 
 Per-update lines, such as connectivity changes and held wakes, are debug-level: they appear only in a Debug build of the pod, with Debug messages turned on.
 

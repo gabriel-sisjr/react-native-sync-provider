@@ -138,7 +138,7 @@ Without `healthCheckUrl` nothing is measured, so the level never reaches `EXCELL
 
 ### When It Is Measured
 
-Nothing is ever measured without `healthCheckUrl`, and nothing is sent while the device is offline. The probes go to that URL only, never to a third-party host. They carry no `defaultHeaders` and no item header, and send `Cache-Control: no-cache`.
+Nothing is ever measured without `healthCheckUrl`, and nothing is sent while the device is offline. The probes go to that URL only, never to a third-party host. They carry no `defaultHeaders` and no item header, and send `Cache-Control: no-cache`. They never call the header resolver or any other [JS callback](./dispatch-interceptors.md).
 
 - **Network change.** After a path update on iOS, or on Android when the monitor starts or the default network or its capabilities change, a measurement starts after a 1000 ms debounce if the network has none, or only one 30 s old or older: the first report of a process, a move to another network, or a stale measurement on the same network. After a move, the link-signal value is reported until it completes.
 - **Reuse.** A measurement belongs to one network. It does not expire, and it survives an offline blip: if the same network comes back while the measurement is less than 30 s old, the measurement is reused instead of taken again.
@@ -210,12 +210,12 @@ Set [`SyncOptions.healthCheckUrl`](../api-reference/types.md#syncoptions) to che
 How a cycle uses it:
 
 1. **Cached result.** If a healthy result younger than `healthCheckTtlMs` exists, no request is sent. A `2xx` sample from a kept [quality measurement](#when-it-is-measured) counts as a healthy result too, for `healthCheckTtlMs`, so the endpoint is not hit twice, but it does not end a running backoff. The samples of a measurement cancelled midway, for example by an offline update, are discarded.
-2. **Probe.** Otherwise the engine sends one `HEAD`, with a 2 s timeout, no `defaultHeaders` or item headers, and `Cache-Control: no-cache`.
+2. **Probe.** Otherwise the engine sends one `HEAD`, with a 2 s timeout, no `defaultHeaders` or item headers, and `Cache-Control: no-cache`. No JS callback is called for it.
 3. **Failure.** The cycle is skipped like a gated one: `SYNC_FAILED` with `errorCode: 'HEALTH_CHECK_FAILED'`, no `SYNC_STARTED`, no history row, no item change. A backoff then runs until `healthCheckBackoffMs` has passed since the failed `HEAD` finished, and every cycle in it is skipped the same way without sending a request. The in-process retry timer holds silently during the backoff.
 4. **Next wake.** The next retry wake is the latest of the item's own deadline, a [credential hold](./background-sync.md#when-a-stored-token-expires), the end of the backoff with its floor of 1000 ms after the failed check, and a running [failure hold](./retry-policy.md#the-failure-hold) after a cycle that died. That floor holds even with `healthCheckBackoffMs: 0`, for every automatic wake: the in-process retry timer and its held-wake re-checks, the wakes after `resumeSync()` and on reconnect, and the Android retry kick. A check that keeps failing therefore cannot make them spin. It does not apply to an explicit `flush()`: with a backoff of `0`, a `flush()` right after a failure sends a new `HEAD`.
 5. **Recovery.** A healthy check clears the backoff, and so does every `configureSync` call, which ends it early. The backoff is kept in memory only, so a new process starts without one.
 
-> **Warning — Point it at an endpoint that answers without authentication:** The probes carry no credentials, so an endpoint that requires them answers `401` and every cycle is skipped. Prefer `https://`: a captive portal can answer a plain `http://` probe with a `2xx`. Only Android's `NET_CAPABILITY_VALIDATED` cap covers that case, and only for the quality level.
+> **Warning — Point it at an endpoint that answers without authentication:** The probes carry no credentials, and a header resolver cannot add them, so an endpoint that requires them answers `401` and every cycle is skipped. Prefer `https://`: a captive portal can answer a plain `http://` probe with a `2xx`. Only Android's `NET_CAPABILITY_VALIDATED` cap covers that case, and only for the quality level.
 
 `configureSync` rejects a `healthCheckUrl` that is not an absolute `http(s)` URL with `INVALID_URL`, and a negative or non-finite duration with `INVALID_PAYLOAD`. The options are persisted for background workers. A stored value that cannot be used, which only a damaged record can hold, loads as unset.
 

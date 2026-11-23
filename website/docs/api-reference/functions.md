@@ -1,7 +1,7 @@
 ---
 sidebar_position: 1
 title: Functions
-description: API reference for every public function in @gabriel-sisjr/react-native-sync-provider — queue, dead letters, sync, configuration, history, connection, and background sync APIs.
+description: API reference for every public function in @gabriel-sisjr/react-native-sync-provider — queue, dead letters, sync, configuration, history, connection, background sync, retry decider and dispatch interceptor APIs.
 keywords:
   - react-native
   - sync-provider
@@ -10,11 +10,13 @@ keywords:
   - flush
   - configureSync
   - background-sync
+  - setRetryDecider
+  - setHeaderResolver
 ---
 
 # Functions
 
-The full list of facade functions exported from `@gabriel-sisjr/react-native-sync-provider`. Every function except [`cancelDrain`](#canceldrain) and the [utilities](#utilities) is async, returns a `Promise`, and throws a [`SyncError`](./errors.md) with a typed [`SyncErrorCode`](./errors.md#syncerrorcode) on failure. Calls made on web / SSR / before native linking throw `NATIVE_MODULE_UNAVAILABLE`. A rejection from native reaches you under one fallback code per function: see [Native Rejections](./errors.md#native-rejections).
+The full list of facade functions exported from `@gabriel-sisjr/react-native-sync-provider`. Every function except [`cancelDrain`](#canceldrain) and the [utilities](#utilities) is async, returns a `Promise`, and throws a [`SyncError`](./errors.md) with a typed [`SyncErrorCode`](./errors.md#syncerrorcode) on failure. Calls made on web / SSR / before native linking throw `NATIVE_MODULE_UNAVAILABLE`, except the four `clear…` callback functions, which resolve without doing anything on web. A rejection from native reaches you under one fallback code per function: see [Native Rejections](./errors.md#native-rejections).
 
 Every function is a named export; the package has no default export.
 
@@ -51,6 +53,17 @@ import {
   enableBackgroundSync,
   disableBackgroundSync,
   isBackgroundSyncEnabled,
+  // Retry decider
+  setRetryDecider,
+  clearRetryDecider,
+  isRetryDeciderInstalled,
+  // Dispatch interceptors
+  setHeaderResolver,
+  clearHeaderResolver,
+  setBeforeDispatch,
+  clearBeforeDispatch,
+  setAfterDispatch,
+  clearAfterDispatch,
   // Utilities
   generateId,
   isNativeModuleAvailable,
@@ -273,6 +286,8 @@ function getPendingItems(): Promise<SyncItem[]>;
 
 `Promise<`[`SyncItem`](./types.md#syncitem)`[]>`.
 
+While the [header resolver](#setheaderresolver) or [`beforeDispatch`](#setbeforedispatch) is being waited on for an item, iOS still returns that item, because it claims the row only after them. Android does not, because its cycle claimed the row already.
+
 #### Throws
 
 `NATIVE_MODULE_UNAVAILABLE`.
@@ -288,7 +303,9 @@ items.forEach((item) => console.log(item.id, item.url));
 
 ## Dead Letters
 
-An item that fails permanently is not dropped. In one transaction it leaves the queue and enters the dead-letter queue, then `ITEM_FAILED` reports the real code and `ITEM_DEAD_LETTERED` follows, unless the item was [removed or cleared while its request was in flight](#what-a-purge-stops). That covers attempts exhausted, a response that is not retried, and a 401 or 403 under a configuration set in the current process. Items that had failed permanently before the upgrade to v0.3 are moved there too. See [`SyncDeadLetterItem`](./types.md#syncdeadletteritem) for the fields.
+An item that fails permanently is not dropped. In one transaction it leaves the queue and enters the dead-letter queue, then `ITEM_FAILED` reports the real code and `ITEM_DEAD_LETTERED` follows, unless the item was [removed or cleared while its request was in flight](#what-a-purge-stops). That covers attempts exhausted, a response that is not retried, a 401 or 403 under a configuration set in the current process, and a [retry decider](#setretrydecider) that answers `DEAD_LETTER`, which reports `RETRY_DECIDER_REJECTED`. Items that had failed permanently before the upgrade to v0.3 are moved there too. See [`SyncDeadLetterItem`](./types.md#syncdeadletteritem) for the fields.
+
+The only case where the engine itself deletes a failed item is a retry decider that answers `DROP`: `ITEM_FAILED` reports `RETRY_DECIDER_REJECTED`, and no dead letter follows.
 
 > **Warning — Nothing prunes the dead-letter queue:** It is unbounded and counts toward no capacity cap. Each dead letter keeps its request's headers and body until it is replayed, discarded, removed with [`removeItem`](#removeitem) or cleared with [`clearQueue`](#clearqueue). Discard what you do not replay.
 
@@ -366,6 +383,7 @@ Replays, discards and purges of dead letters run one at a time. Two overlapping 
 
 ```ts
 // After a token refresh, retry what the old token got rejected.
+// With a header resolver installed, its fresh token wins over defaultHeaders.
 await configureSync({
   ...SYNC_OPTIONS,
   defaultHeaders: { Authorization: `Bearer ${freshToken}` },
@@ -442,7 +460,7 @@ function flush(): Promise<SyncResult>;
 
 `Promise<SyncResult>` -- `startedAt`, `finishedAt`, `successCount`, `failureCount`, plus `succeededIds`, `failedIds` and `errors` on Android. Those three are always empty on iOS.
 
-An item that went back to wait for a retry counts as neither a success nor a failure. An item that failed permanently is counted in `failureCount` and is now in the [dead-letter queue](#dead-letters), except one that `removeItem` or `clearQueue` purged while its request was in flight: it counts, but is not dead-lettered. See [What a Purge Stops](#what-a-purge-stops).
+An item that went back to wait for a retry counts as neither a success nor a failure, and so does an item a [dispatch interceptor](#setheaderresolver) deferred. An item that failed permanently is counted in `failureCount` and is now in the [dead-letter queue](#dead-letters), except one that `removeItem` or `clearQueue` purged while its request was in flight, which counts but is not dead-lettered (see [What a Purge Stops](#what-a-purge-stops)), and one a [retry decider](#setretrydecider) dropped, which counts and is deleted.
 
 #### Throws
 
@@ -472,6 +490,8 @@ The result of a skipped flush is 0/0 on both platforms and does not say why. And
 - **Nothing eligible.** With an empty queue, or every item cooling, the cycle resolves with a 0/0 result, emits `SYNC_SUCCEEDED`, and adds a row to the sync history.
 - **Connectivity is checked only through the gate.** Without `minNetworkQuality`, `flush()` does not check connectivity first. Offline, Android can spend retry attempts, until valid items reach the dead-letter queue. iOS waits for the network instead: the call stays pending until it returns, with the first item claimed and one attempt spent, and dead-letters nothing. Any `minNetworkQuality` other than `OFFLINE` blocks an offline flush. Otherwise check [`getConnectionStatus`](#getconnectionstatus) first, or use [`drainUntilEmpty`](#drainuntilempty), which does not flush while `DISCONNECTED`.
 - **While a cycle is running.** iOS returns the last finished cycle's result at once, or a 0/0 one. Android waits, then runs its own cycle.
+- **Never inside a callback.** Do not await `flush()` in a retry decider or a dispatch interceptor. On Android the running cycle stalls until [`callbackTimeoutMs`](./types.md#syncoptions), then the policy decides or the item is deferred. On iOS it returns the last result at once.
+- **`afterDispatch` can come later.** Nothing waits for the [`afterDispatch`](#setafterdispatch) calls, so `flush()` may resolve before they run.
 
 #### Usage
 
@@ -679,7 +699,8 @@ Apply a full [`SyncOptions`](./types.md#syncoptions) configuration and persist i
   - **Android** keeps the options a running cycle started with, `defaultHeaders`, `maxAttempts` and the backoff included, except `retryOnStatusCodes`, which is read again for each response, including the response to a request already in flight. `maxQueueSize` applies from the next enqueue, and `strategy` from the next retry wake, which the call re-arms at once.
   - **iOS** applies the new options as soon as `configureSync` resolves, even inside a running cycle, which keeps only its batch and the outcome of its quality gate and health check. A request already in flight keeps the headers and timeout it was sent with, but its response is classified under the new `retryPolicy`.
 - **Persisted.** A worker or BGTask in a fresh process honors the options, including `maxAttempts`, `batchSize` and `requestTimeoutMs`. See [Cold-start configuration](../guides/background-sync.md#cold-start-configuration).
-- **`defaultHeaders`.** Encrypted at rest. Calling `configureSync` without them deletes the stored copy, which makes it the logout path. Pass them on every other call, and call `configureSync` whenever the token changes.
+- **`defaultHeaders`.** Encrypted at rest. Calling `configureSync` without them deletes the stored copy, which makes it the logout path. Pass them on every other call, and call `configureSync` whenever the token changes. A [header resolver](#setheaderresolver) can supply a changing token per request instead, but only while JS runs: keep any credential a worker or BGTask needs in `defaultHeaders`.
+- **Callbacks.** `callbackTimeoutMs` bounds each wait for the [retry decider](#setretrydecider) and the dispatch interceptors. The call arms the retry wake, so install those callbacks before the first `configureSync`: see [Install Order and Lifetime](#install-order-and-lifetime).
 - **Retry timer.** It is re-armed from the current queue, so a strategy change takes effect at once. A wake the quality gate was holding restarts its re-check backoff. After a cycle that died, the re-armed wake still waits for the [failure hold](../guides/retry-policy.md#the-failure-hold).
 - **Holds and backoffs.** Every call clears a [credential hold](../guides/background-sync.md#when-a-stored-token-expires) and ends a running [health-check backoff](../guides/connectivity-detection.md#health-check), whether or not anything changed.
 - **Network quality and health check.** `minNetworkQuality` turns on the [quality gate](../guides/connectivity-detection.md#the-quality-gate), and `healthCheckUrl` the [health check](../guides/connectivity-detection.md#health-check) and the latency measurement. Both are opt-in.
@@ -696,7 +717,7 @@ function configureSync(options: SyncOptions): Promise<void>;
 
 | Name      | Type                                    | Required | Description                                                                                |
 | --------- | --------------------------------------- | -------- | ------------------------------------------------------------------------------------------ |
-| `options` | [`SyncOptions`](./types.md#syncoptions) | Yes      | Strategy, retry policy, batch size, timeout, queue cap, persistence flag, default headers, quality gate, health check. |
+| `options` | [`SyncOptions`](./types.md#syncoptions) | Yes      | Strategy, retry policy, batch size, timeout, queue cap, persistence flag, default headers, quality gate, health check, callback timeout. |
 
 #### Return Value
 
@@ -705,11 +726,11 @@ function configureSync(options: SyncOptions): Promise<void>;
 #### Throws
 
 - `INVALID_URL` -- `healthCheckUrl` is not an absolute `http(s)` URL, with `validationErrors` set. Checked before any native call.
-- `INVALID_PAYLOAD` -- `minNetworkQuality` is not a [`NetworkQuality`](./enums.md#networkquality) value, `healthCheckTtlMs` or `healthCheckBackoffMs` is not a finite number of at least `0`, or `options` is not an object, with `validationErrors` set. Checked before any native call.
-- `INVALID_PAYLOAD` with no `validationErrors` -- native rejected the call.
+- `INVALID_PAYLOAD` -- `minNetworkQuality` is not a [`NetworkQuality`](./enums.md#networkquality) value, `healthCheckTtlMs` or `healthCheckBackoffMs` is not a finite number of at least `0`, `callbackTimeoutMs` is not a finite number of at least `1`, or `options` is not an object, with `validationErrors` set. Checked before any native call.
+- `INVALID_PAYLOAD` with no `validationErrors` -- native rejected the call. Native checks `callbackTimeoutMs` again, before it applies or stores anything.
 - `NATIVE_MODULE_UNAVAILABLE`.
 
-Only those four fields are validated in JS, only when present, in the order `minNetworkQuality`, `healthCheckUrl`, `healthCheckTtlMs`, `healthCheckBackoffMs`. When several are invalid, the first one sets the code, and `validationErrors` lists them all. The other fields go to native as they are. Out-of-range numbers, `NaN` and `Infinity` included, never fail the call: both platforms convert them, as [Out-of-Range Numbers](./types.md#out-of-range-numbers) lists.
+Only those five fields are validated in JS, only when present, in the order `minNetworkQuality`, `healthCheckUrl`, `healthCheckTtlMs`, `healthCheckBackoffMs`, `callbackTimeoutMs`. When several are invalid, the first one sets the code, and `validationErrors` lists them all. The other fields go to native as they are. Out-of-range numbers, `NaN` and `Infinity` included, never fail the call: both platforms convert them, as [Out-of-Range Numbers](./types.md#out-of-range-numbers) lists.
 
 #### Usage
 
@@ -750,7 +771,7 @@ function getSyncConfig(): Promise<SyncOptions>;
 
 `Promise<SyncOptions>` -- the active config: the defaults until `configureSync` first runs, then the last options applied, restored from disk in a new process. After a `configureSync` that omitted `batchSize`, `requestTimeoutMs`, `maxQueueSize`, `persistQueue` or `defaultHeaders`, iOS returns them filled with their defaults, including `defaultHeaders: {}`. Android returns them as `undefined`.
 
-`minNetworkQuality`, `healthCheckUrl`, `healthCheckTtlMs` and `healthCheckBackoffMs` are not filled in: both platforms return them only when they were set.
+`minNetworkQuality`, `healthCheckUrl`, `healthCheckTtlMs`, `healthCheckBackoffMs` and `callbackTimeoutMs` are not filled in: both platforms return them only when they were set. A stored value of theirs that the engine cannot use, which only a damaged record can hold, loads as unset and is left out too.
 
 Numbers come back as they were given, `NaN` and `Infinity` included, not as the engine converted them: see [Out-of-Range Numbers](./types.md#out-of-range-numbers).
 
@@ -1021,6 +1042,448 @@ if (!(await isBackgroundSyncEnabled())) {
 
 ---
 
+## Retry Decider
+
+A retry decider is a JS function that judges a failed attempt before the [`RetryPolicy`](./types.md#retrypolicy) does: retry it, with the policy's delay or its own, drop the item, or dead-letter it. It runs only in a live JS runtime, so the policy keeps deciding alone in a worker or a BGTask with no JS. See [Retry Decider](../guides/retry-policy.md#retry-decider) in the Retry Policy guide.
+
+### `setRetryDecider`
+
+Install a JS retry decider, replacing any installed one.
+
+The engine consults it only after an attempt fails with an error the policy would retry, while attempts are left. It is never consulted for a success, a failure that is not retried (a status missing from `retryOnStatusCodes`, or a 401 or 403 under a configuration set in the current process), a spent budget, a [credential hold](../guides/background-sync.md#when-a-stored-token-expires), or an item that was not sent. It can veto a retry or change its delay, but never retry a failure the policy would not, nor add attempts.
+
+| Answer        | What happens                                                                                                                                                                                                                                                                         |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `RETRY`       | The item is rescheduled. A valid `delayMs` replaces the policy's delay and is used as given: no jitter and no `maxDelayMs` cap, but still at most 2^53 - 1 ms and never past the largest JavaScript `Date`. Without one, or with one that is not finite or is negative, which native logs as a warning, the policy's delay applies. `ITEM_RETRYING` reports the attempt's own code. |
+| `DEAD_LETTER` | The item moves to the dead-letter queue with `lastErrorCode: 'RETRY_DECIDER_REJECTED'`, and `lastErrorMessage` keeps the real failure, such as `HTTP 503`, worded differently per platform. `ITEM_FAILED` (`RETRY_DECIDER_REJECTED`, with the attempt's `statusCode` and `attempt`) is followed by `ITEM_DEAD_LETTERED`. It counts in `failureCount`. |
+| `DROP`        | The item is deleted: no dead letter and no `ITEM_DEAD_LETTERED`. `ITEM_FAILED` reports `RETRY_DECIDER_REJECTED`, and the item counts in `failureCount`. Android also lists it in `failedIds` and `errors`; on iOS those stay empty, as always. |
+
+Once the decider is consulted, the delay counts from the decision, not from the end of the attempt, whichever side chose it. The policy decides, with a native log line and no event, when the decider throws, rejects, answers something invalid or does not answer within [`callbackTimeoutMs`](./types.md#syncoptions), and when a BGTask expires or the cycle is cancelled during the wait. On such a stop the policy's retry is written at once. A purge during the wait is never undone, and `ITEM_FAILED` still goes out for a `DROP` or a `DEAD_LETTER`, because the request was sent.
+
+**Platform:** Android and iOS
+
+#### Signature
+
+```ts
+function setRetryDecider(decider: RetryDecider): Promise<void>;
+
+type RetryDecider = (
+  context: RetryDeciderContext
+) => RetryDecision | Promise<RetryDecision>;
+```
+
+#### Parameters
+
+| Name      | Type                                      | Required | Description                                                                                                                                         |
+| --------- | ----------------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `decider` | [`RetryDecider`](./types.md#retrydecider) | Yes      | Sync or async. Receives a [`RetryDeciderContext`](./types.md#retrydecidercontext) and answers a [`RetryDecision`](./types.md#retrydecision). |
+
+#### Return Value
+
+`Promise<void>` -- resolves once the decider is installed.
+
+#### Throws
+
+- `INVALID_PAYLOAD` -- `decider` is not a function, with `validationErrors` set. Checked before any native call.
+- `NATIVE_MODULE_UNAVAILABLE` -- the native module is not loaded, or native rejected the call. Native rejects it when this JS runtime no longer owns the installs: a newer runtime has attached since, for example after a reload, or this runtime's native module was torn down.
+
+#### How Callbacks Run {#how-callbacks-run}
+
+These rules hold for the retry decider and for the three [dispatch interceptors](#dispatch-interceptors).
+
+- **Sync or async, always bounded.** The function may return its answer or a promise of it. Native waits at most `callbackTimeoutMs`, 3000 ms by default, even when the promise never settles.
+- **Failures stay inside the library.** A throw, a rejection or an invalid result becomes a failed answer at once, so native falls back without waiting for the timeout. Nothing is thrown into React Native.
+- **Failure messages reach the native log.** An `Error` keeps its message, and native logs up to 256 characters of it: privately on iOS, in the app's logcat on Android. Keep tokens and personal data out of it. Any other thrown value is described by its type only, such as "a thrown string". Headers, bodies and contexts are never logged.
+- **Concurrency.** Android dispatches a batch concurrently, so up to `batchSize` callback calls can be in flight at once. iOS dispatches one item at a time, so with the JS thread hung, each awaited callback adds up to `callbackTimeoutMs` per item.
+- **Never await `flush()` inside a callback.** On Android it stalls the cycle until `callbackTimeoutMs`, then the policy decides or the item is deferred. On iOS it returns the last result at once.
+- **No `this`.** The function is called without a `this`, so pass an arrow function or a bound method, not `auth.getHeaders`.
+- **Probes stay out.** The health-check and network-quality probes never call a callback.
+
+#### Install Order and Lifetime {#install-order-and-lifetime}
+
+- **Install first.** Make the `set…` calls the first library calls at startup, before `configureSync` and before mounting [`SyncProvider`](./context.md) or any hook. The first library call creates the native module, which arms the retry wake, and so does every `configureSync`. An item that is due before a `set…` lands goes out without that callback, with the static headers only. Installing first keeps that window to a few synchronous calls; it does not close it completely after a reload.
+- **Replace and clear.** A repeated `set…` replaces the previous function. A `clear…` from the runtime that installed it uninstalls at once.
+- **The newest runtime wins.** A newer JS runtime's first library call, after a reload for example, removes every older runtime's installs, and their pending waits end at once. Nothing is installed again until the new runtime calls `set…`.
+- **A torn-down runtime fails closed.** When a runtime's native module is torn down, its installs stay in place until a newer runtime attaches, and fail at once without calling JS: the decider leaves the decision to the policy, the header resolver and `beforeDispatch` defer their items, and `afterDispatch` is only logged.
+- **Android reloads.** A JS reload on Android tears nothing down, so until the new JS first uses the library, the old runtime's installs time out at each call instead, with the same result.
+- **Each runtime sees its own installs.** `clear…` and [`isRetryDeciderInstalled`](#isretrydeciderinstalled) see only the calling runtime's installs, and a `set…` from a runtime that no longer owns them rejects with `NATIVE_MODULE_UNAVAILABLE`.
+- **No JS at all.** In a cold worker or a BGTask launch, nothing is installed: requests go out with the persisted `defaultHeaders`, and the `RetryPolicy` decides retries.
+
+#### Usage
+
+```ts
+import {
+  RetryAction,
+  setRetryDecider,
+} from '@gabriel-sisjr/react-native-sync-provider';
+
+// At startup, before configureSync and before mounting SyncProvider.
+await setRetryDecider(({ attempt, statusCode, metadata }) => {
+  if (metadata?.kind === 'analytics' && attempt >= 2) {
+    return { action: RetryAction.DROP };
+  }
+  if (statusCode === 503) {
+    return { action: RetryAction.RETRY, delayMs: 5 * 60 * 1000 };
+  }
+  return { action: RetryAction.RETRY };
+});
+```
+
+---
+
+### `clearRetryDecider`
+
+Uninstall this runtime's retry decider, so the [`RetryPolicy`](./types.md#retrypolicy) decides alone again. It resolves with nothing installed too, and a call from a runtime that no longer owns the installs changes nothing.
+
+**Platform:** Android and iOS. On web it resolves without doing anything.
+
+#### Signature
+
+```ts
+function clearRetryDecider(): Promise<void>;
+```
+
+#### Return Value
+
+`Promise<void>`.
+
+#### Throws
+
+`NATIVE_MODULE_UNAVAILABLE`, except on web.
+
+#### Usage
+
+```ts
+await clearRetryDecider();
+```
+
+---
+
+### `isRetryDeciderInstalled`
+
+Whether this JS runtime's retry decider is installed: `true` from this runtime's [`setRetryDecider`](#setretrydecider) until its [`clearRetryDecider`](#clearretrydecider), or until a newer runtime's first library call removes the install. It never reports another runtime's install, so after a reload it is `false` until the new runtime installs its own. The dispatch interceptors have no such query.
+
+> **Warning — Do not use it to skip the install:** Install unconditionally at startup. After a Fast Refresh, a check like `if (!(await isRetryDeciderInstalled()))` sees the old install and keeps the edited decider out.
+
+**Platform:** Android and iOS
+
+#### Signature
+
+```ts
+function isRetryDeciderInstalled(): Promise<boolean>;
+```
+
+#### Return Value
+
+`Promise<boolean>`.
+
+#### Throws
+
+`NATIVE_MODULE_UNAVAILABLE`.
+
+#### Usage
+
+```ts
+if (__DEV__ && !(await isRetryDeciderInstalled())) {
+  console.warn('No retry decider: the RetryPolicy decides alone.');
+}
+```
+
+---
+
+## Dispatch Interceptors
+
+Three JS callbacks run around each request. For each item, the engine runs:
+
+1. the check that the item was not purged;
+2. the [header resolver](#setheaderresolver);
+3. the [header merge](#the-header-merge);
+4. [`beforeDispatch`](#setbeforedispatch);
+5. a re-check that the item is still queued (on iOS, claiming the item is that check);
+6. the request;
+7. the outcome, with the [retry decider](#setretrydecider) when it applies;
+8. the item's event;
+9. [`afterDispatch`](#setafterdispatch), which nothing waits for.
+
+An item that cannot be sent, because its attempts are spent or its URL is invalid, reaches no interceptor. [How Callbacks Run](#how-callbacks-run) and [Install Order and Lifetime](#install-order-and-lifetime) apply to all three. See the [Dispatch Interceptors guide](../guides/dispatch-interceptors.md).
+
+### `setHeaderResolver`
+
+Install a JS header resolver, replacing any installed one. It supplies headers right before each request, retries included, for example a fresh access token.
+
+**Platform:** Android and iOS
+
+#### Signature
+
+```ts
+function setHeaderResolver(resolver: HeaderResolver): Promise<void>;
+
+type HeaderResolver = (
+  context: HeaderResolverContext
+) => Record<string, string> | Promise<Record<string, string>>;
+```
+
+#### Parameters
+
+| Name       | Type                                          | Required | Description                                                                                                         |
+| ---------- | --------------------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------- |
+| `resolver` | [`HeaderResolver`](./types.md#headerresolver) | Yes      | Sync or async. Receives a [`HeaderResolverContext`](./types.md#headerresolvercontext) and returns the headers to add. |
+
+#### Return Value
+
+`Promise<void>` -- resolves once the resolver is installed.
+
+#### Throws
+
+- `INVALID_PAYLOAD` -- `resolver` is not a function, with `validationErrors` set. Checked before any native call.
+- `NATIVE_MODULE_UNAVAILABLE` -- the native module is not loaded, or native rejected the call because this runtime no longer owns the installs: see [Install Order and Lifetime](#install-order-and-lifetime).
+
+#### The Header Merge {#the-header-merge}
+
+- **Precedence.** `defaultHeaders` < the resolver's headers < the item's `headers`.
+- **Names.** They match case-insensitively, and the winning layer's spelling is kept. When two names in one layer differ only by case, which one wins is not specified: do not do this.
+- **A valid result.** A plain object, that is an object literal or one without a prototype, whose values are all strings. Each name may use only the characters `!` to `~`, and each value only tab and the characters from space to `~`. Anything else, a class instance, a `Map` or an array included, is a failure.
+
+#### Fail Closed {#fail-closed}
+
+A throw, a rejection, an invalid result, no answer within [`callbackTimeoutMs`](./types.md#syncoptions), or an install left by a torn-down runtime defers the item:
+
+- Nothing is sent, and no attempt is spent: `attempts` and the last attempt time stay as they were.
+- `nextRetryAt` becomes now plus the longer of the policy's delay for that attempt and 60 s.
+- `ITEM_RETRYING` is emitted with `errorCode: 'INTERCEPTOR_FAILED'`, no `statusCode`, and the `attempt` that would have been made.
+- The item counts in neither `successCount` nor `failureCount`, and the other items go on.
+
+Deferrals never escalate: a resolver that keeps failing holds its items but never dead-letters them, and the cycles end normally, with `SYNC_SUCCEEDED` and a 0/0 result. A [`beforeDispatch`](#setbeforedispatch) `SKIP` defers the item the same way.
+
+#### During a Wait {#during-an-interceptor-wait}
+
+- **A stop is not a failure.** A cancellation or a BGTask expiry during the wait sends nothing, leaves the item unchanged and emits no event.
+- **A purge wins.** An item removed or cleared during the wait is not sent and gets no event.
+- **`getPendingItems`.** iOS still returns the waiting item, and Android does not: see [`getPendingItems`](#getpendingitems).
+- **`configureSync`.** A call made during the wait applies from the next item on iOS, and from the next cycle on Android.
+- **Restored credentials on Android.** In a batch sent on `defaultHeaders` restored from disk, the first item goes alone. When that item is deferred, the next one goes alone instead, so with the JS thread hung, a cycle can take about `batchSize` × `callbackTimeoutMs`.
+
+#### Credentials {#resolver-credentials}
+
+- **Only with JS.** A worker or BGTask with no JS sends the persisted `defaultHeaders` alone, so a credential the server needs there belongs in `defaultHeaders`. With no stored `defaultHeaders`, a 401 or 403 to a request sent without JS fails the item, which is dead-lettered.
+- **The credential rules stay.** The resolver's headers do not change how a 401 or 403 is handled: it is still a [credential hold](../guides/background-sync.md#when-a-stored-token-expires) under stored `defaultHeaders` in a process that has not called `configureSync`, and terminal under a configuration set in the process.
+- **One refresh at a time.** On Android up to `batchSize` calls can run at once, so share one token refresh between them, as the example below does.
+- **iOS background uploads.** A request sent through the background session carries the headers resolved when its upload task was created.
+
+#### Usage
+
+```ts
+import { setHeaderResolver } from '@gabriel-sisjr/react-native-sync-provider';
+
+// One refresh at a time, shared by every concurrent call.
+let refreshing: Promise<string> | undefined;
+const accessToken = () =>
+  (refreshing ??= session.getAccessToken().finally(() => {
+    refreshing = undefined;
+  }));
+
+// At startup, before configureSync and before mounting SyncProvider.
+await setHeaderResolver(async () => ({
+  Authorization: `Bearer ${await accessToken()}`,
+}));
+```
+
+---
+
+### `clearHeaderResolver`
+
+Uninstall this runtime's header resolver, so the static headers go out alone again. It resolves with nothing installed too, and a call from a runtime that no longer owns the installs changes nothing.
+
+**Platform:** Android and iOS. On web it resolves without doing anything.
+
+#### Signature
+
+```ts
+function clearHeaderResolver(): Promise<void>;
+```
+
+#### Return Value
+
+`Promise<void>`.
+
+#### Throws
+
+`NATIVE_MODULE_UNAVAILABLE`, except on web.
+
+#### Usage
+
+```ts
+await clearHeaderResolver();
+```
+
+---
+
+### `setBeforeDispatch`
+
+Install a JS `beforeDispatch` hook, replacing any installed one. It sees each request right before it is sent, after the header resolver, and can defer the item. It is not called when the header resolver failed.
+
+**Platform:** Android and iOS
+
+#### Signature
+
+```ts
+function setBeforeDispatch(hook: BeforeDispatchHook): Promise<void>;
+
+type BeforeDispatchHook = (
+  context: BeforeDispatchContext
+) => BeforeDispatchResult | void | Promise<BeforeDispatchResult | void>;
+```
+
+#### Parameters
+
+| Name   | Type                                                  | Required | Description                                                                                                                  |
+| ------ | ----------------------------------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `hook` | [`BeforeDispatchHook`](./types.md#beforedispatchhook) | Yes      | Sync or async. Receives a [`BeforeDispatchContext`](./types.md#beforedispatchcontext): the merged headers, and no body. |
+
+#### Return Value
+
+`Promise<void>` -- resolves once the hook is installed.
+
+#### Throws
+
+- `INVALID_PAYLOAD` -- `hook` is not a function, with `validationErrors` set. Checked before any native call.
+- `NATIVE_MODULE_UNAVAILABLE` -- the native module is not loaded, or native rejected the call because this runtime no longer owns the installs: see [Install Order and Lifetime](#install-order-and-lifetime).
+
+#### What the Hook Can Answer {#what-the-hook-can-answer}
+
+| Result                                                                                           | What happens                                                                                                                       |
+| ------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `{ action: 'PROCEED' }`                                                                          | The request goes out unchanged.                                                                                                    |
+| `{ action: 'SKIP' }`                                                                             | The item is deferred, as under [Fail Closed](#fail-closed).                                                                        |
+| A value without an `action` key: `undefined`, `null`, a primitive, an array, an object without `action` | Same as `PROCEED`. So `(c) => track(c)` proceeds even when `track` returns a value. A bare `'SKIP'` string is a primitive, and proceeds too. |
+| An `action` other than `PROCEED` or `SKIP`, a throw, a rejection, or no answer within `callbackTimeoutMs` | A failure: the item is deferred.                                                                                         |
+
+`context.headers` leaves out the `Content-Type` the engine adds when no layer sets one, which comes from `contentType`, or on Android from its `application/json` default for a body. On Android the body's media type also replaces a layer's `Content-Type` on the wire, so the map can show a `Content-Type` the request does not carry.
+
+#### Usage
+
+```ts
+import {
+  BeforeDispatchAction,
+  setBeforeDispatch,
+} from '@gabriel-sisjr/react-native-sync-provider';
+
+// Hold uploads on a metered link. isOnMeteredLink() is the app's own check,
+// kept up to date from useConnection() for example.
+await setBeforeDispatch(({ url }) =>
+  url.includes('/uploads/') && isOnMeteredLink()
+    ? { action: BeforeDispatchAction.SKIP }
+    : undefined
+);
+```
+
+---
+
+### `clearBeforeDispatch`
+
+Uninstall this runtime's `beforeDispatch` hook. It resolves with nothing installed too, and a call from a runtime that no longer owns the installs changes nothing.
+
+**Platform:** Android and iOS. On web it resolves without doing anything.
+
+#### Signature
+
+```ts
+function clearBeforeDispatch(): Promise<void>;
+```
+
+#### Return Value
+
+`Promise<void>`.
+
+#### Throws
+
+`NATIVE_MODULE_UNAVAILABLE`, except on web.
+
+#### Usage
+
+```ts
+await clearBeforeDispatch();
+```
+
+---
+
+### `setAfterDispatch`
+
+Install a JS `afterDispatch` hook, replacing any installed one. It observes each request that went out, for tracing or metrics.
+
+**Platform:** Android and iOS
+
+#### Signature
+
+```ts
+function setAfterDispatch(hook: AfterDispatchHook): Promise<void>;
+
+type AfterDispatchHook = (context: AfterDispatchContext) => unknown;
+```
+
+#### Parameters
+
+| Name   | Type                                                | Required | Description                                                                                                         |
+| ------ | --------------------------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------- |
+| `hook` | [`AfterDispatchHook`](./types.md#afterdispatchhook) | Yes      | Sync or async. Receives an [`AfterDispatchContext`](./types.md#afterdispatchcontext). What it returns is ignored. |
+
+#### Return Value
+
+`Promise<void>` -- resolves once the hook is installed.
+
+#### Throws
+
+- `INVALID_PAYLOAD` -- `hook` is not a function, with `validationErrors` set. Checked before any native call.
+- `NATIVE_MODULE_UNAVAILABLE` -- the native module is not loaded, or native rejected the call because this runtime no longer owns the installs: see [Install Order and Lifetime](#install-order-and-lifetime).
+
+#### When It Is Called {#when-afterdispatch-is-called}
+
+- **Once per request that went out,** after its outcome is saved and its `ITEM_*` event is emitted. That it comes after the event is best effort, not a guarantee.
+- **Never awaited.** The dispatcher does not wait for it, so `flush()` may resolve before it runs. A throw, a rejection or no answer within `callbackTimeoutMs` is only logged.
+- **Not called** for an item that was not sent, nor for an iOS background upload that completes after a relaunch, when no JS runs.
+- **`outcome`** is `SUCCEEDED` for a 2xx, `RETRYING` for a reschedule or a credential hold, which reports `UNAUTHORIZED`, and `FAILED` for a dead letter, exhausted attempts, or a retry decider's `DROP` or `DEAD_LETTER`, which report `RETRY_DECIDER_REJECTED`. See [`DispatchOutcome`](./enums.md#dispatchoutcome).
+- **`durationMs`** is the request's own duration in whole milliseconds, without any callback wait. The context never holds headers or a body.
+
+#### Usage
+
+```ts
+import { setAfterDispatch } from '@gabriel-sisjr/react-native-sync-provider';
+
+await setAfterDispatch(({ url, outcome, statusCode, durationMs }) => {
+  metrics.record({ url, outcome, statusCode, durationMs });
+});
+```
+
+---
+
+### `clearAfterDispatch`
+
+Uninstall this runtime's `afterDispatch` hook. It resolves with nothing installed too, and a call from a runtime that no longer owns the installs changes nothing.
+
+**Platform:** Android and iOS. On web it resolves without doing anything.
+
+#### Signature
+
+```ts
+function clearAfterDispatch(): Promise<void>;
+```
+
+#### Return Value
+
+`Promise<void>`.
+
+#### Throws
+
+`NATIVE_MODULE_UNAVAILABLE`, except on web.
+
+#### Usage
+
+```ts
+await clearAfterDispatch();
+```
+
+---
+
 ## Utilities
 
 ### `generateId`
@@ -1082,6 +1545,8 @@ if (isNativeModuleAvailable()) {
 ## See Also
 
 - [Event Listeners](./listeners.md) -- `addSyncEventListener` and `removeSyncEventListener`
+- [Retry Policy](../guides/retry-policy.md) -- The declarative policy, and how the retry decider comes first
+- [Dispatch Interceptors](../guides/dispatch-interceptors.md) -- The header resolver, `beforeDispatch` and `afterDispatch` in practice
 - [useSyncQueue](./hooks/useSyncQueue.md) -- Reactive wrapper over the queue functions
 - [Errors](./errors.md) -- `SyncError` and `SyncErrorCode`
 - [Platform Comparison](../production/platform-comparison.md) -- How dispatch, results and timings differ between Android and iOS

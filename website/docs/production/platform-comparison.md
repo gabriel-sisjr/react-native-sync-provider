@@ -1,7 +1,7 @@
 ---
 sidebar_position: 4
 title: Platform Comparison
-description: Feature-by-feature comparison of Android and iOS in @gabriel-sisjr/react-native-sync-provider — persistence, HTTP dispatch, background scheduling, recovery, connectivity, network quality, events, setup and testing.
+description: Feature-by-feature comparison of Android and iOS in @gabriel-sisjr/react-native-sync-provider — persistence, HTTP dispatch, background scheduling, recovery, connectivity, network quality, events, JS callbacks, setup and testing.
 keywords:
   - react-native
   - react-native-sync-provider
@@ -25,6 +25,7 @@ Side-by-side comparison of how `@gabriel-sisjr/react-native-sync-provider` works
 | Persistence | Room (SQLite), `syncprovider.db` | Core Data (SQLite), `SyncProvider.sqlite` |
 | HTTP dispatch | OkHttp, one shared client | `URLSession`: a foreground session, and a background session while the app is not active |
 | Items in one cycle | Sent concurrently, except that with `defaultHeaders` restored from disk the first item goes alone | Sent one at a time |
+| JS callbacks in one cycle | Up to `batchSize` waiting at once | One at a time. See [JS Callbacks](#js-callbacks) |
 | Background scheduling | WorkManager periodic work, plus an opt-in retry kick | `BGTaskScheduler` app-refresh and processing tasks |
 | Recovery of interrupted items | `RecoveryWorker`, on boot, on app update and each time a JS engine attaches | `RecoveryManager`, once per process, when the engine starts |
 | Connectivity | `ConnectivityManager` default-network callback | `NWPathMonitor` |
@@ -164,11 +165,30 @@ These events reach a listener only while a JS engine is running. A worker or BGT
 
 | Feature | Android | iOS |
 |---|---|---|
-| `succeededIds`, `failedIds` and `errors` on `SyncResult` | Filled for the cycle, and kept in its history row | Always empty, in `flush()` results and in the history. Use `ITEM_FAILED` events |
+| `succeededIds`, `failedIds` and `errors` on `SyncResult` | Filled for the cycle, and kept in its history row. An item a retry decider dropped is in `failedIds`, and in `errors` as `RETRY_DECIDER_REJECTED: …` | Always empty, in `flush()` results and in the history. Use `ITEM_FAILED` events |
 | A `flush()` that ran no cycle | `startedAt` and `finishedAt` are `0` | `startedAt` and `finishedAt` are the time the check stopped the flush, which can be a moment after the call while the gate waits for the link or the health check's request runs. A `flush()` that joined a running cycle returns the last finished cycle's result, or a 0/0 one |
 | `lastErrorMessage` of an HTTP failure | `HTTP <code> <reason>`, with the reason phrase the server sent, as in `HTTP 404 Not Found` over HTTP/1.1. HTTP/2 has no reason phrase, so `HTTP 404` | Foundation's reason phrase, localized and capitalized, as in `HTTP 404 Not Found` |
 
 Branch on `lastErrorCode`, never on the `lastErrorMessage` text. See [`SyncResult`](../api-reference/types.md#syncresult) and [`SyncDeadLetterItem`](../api-reference/types.md#syncdeadletteritem).
+
+## JS Callbacks
+
+The retry decider and the dispatch interceptors behave the same way on both platforms, with these differences:
+
+| Feature | Android | iOS |
+|---|---|---|
+| Callback calls in one cycle | Up to `batchSize` waiting at once, all answered on the JS thread. A header resolver must share one token refresh between them | One at a time: each awaited callback adds its wait to its item |
+| A cycle while JS is hung | The items' waits overlap: about one `callbackTimeoutMs`. With `defaultHeaders` restored from disk, items probe the credential one at a time, so about `batchSize` × `callbackTimeoutMs` | Up to `callbackTimeoutMs` per item and awaited callback |
+| After a JS reload | No teardown runs. Each consult of the old installs waits `callbackTimeoutMs`, then defers the item or falls back to the policy, until the new JS first calls the library. An item whose retry falls due then is deferred for about 60 seconds | The old runtime's teardown retires its installs. Each consult ends at once, without calling JS, with the same deferral or fallback, until the new JS first calls the library. The retry timer is disarmed while no hybrid is attached, so a retry due then waits for the new runtime |
+| `getPendingItems()` during an interceptor wait | Leaves the item out: the batch is claimed when the cycle starts, so it is `IN_FLIGHT` | Includes the item: it is claimed only after the interceptors, so it stays `PENDING` |
+| `configureSync()` during an interceptor wait | Applies from the next cycle | Applies from the next item |
+| `Content-Type` in `beforeDispatch`'s `headers` | Can show a layer's `Content-Type` that the body's media type replaces on the wire | The layer's `Content-Type` is the one sent |
+| `flush()` awaited inside a callback | Stalls the cycle until `callbackTimeoutMs` ends the callback's wait | Returns the last result at once, and sends nothing |
+| A retry decider's `DROP` in `SyncResult` | In `failedIds` and `errors` | Not listed: both are always empty |
+| JS text in the logs | logcat, tag `SyncCallbacks`, which other apps cannot read | `os.log`, logged as private, category `callbacks` |
+| Background uploads | Not applicable | The upload carries the headers resolved before its task was created. One that completes after a relaunch gets no `afterDispatch` |
+
+On both platforms, a process with no JS has nothing installed: its requests carry the stored `defaultHeaders`, and the `RetryPolicy` decides its retries. See [Dispatch Interceptors](../guides/dispatch-interceptors.md).
 
 ## Persisted Configuration
 
@@ -179,7 +199,7 @@ Branch on `lastErrorCode`, never on the `lastErrorMessage` text. See [`SyncResul
 | Background options | SharedPreferences file `syncprovider.bgsync.prefs` | The same UserDefaults suite, keys `background.options.v1` and `background.enabled` |
 | Stored headers cannot be read when | The Keystore key cannot decrypt them, as after a backup was restored onto another device | The device has not been unlocked since boot, the stored data is unusable, or the Keychain item is missing while the stored configuration declares headers, as after a backup was restored onto another device (`ThisDeviceOnly` items are not restored there) |
 | Numbers in the saved options | Saved as given, `NaN` and `Infinity` included, as raw bits, and converted when used | Saved as given, with `NaN` and `Infinity` written as strings, and converted when used. A v0.2 build cannot read back a fractional `retryPolicy` number, or one that is not finite or is 2^63 or more: see [Rolling Back](../migration/v0-3-0.md#rolling-back-from-v03) |
-| `getSyncConfig()` after `configureSync()` omitted a field | The field comes back `undefined` | `batchSize`, `requestTimeoutMs`, `maxQueueSize`, `persistQueue` and `defaultHeaders` come back with their defaults, `defaultHeaders: {}` included. The quality and health-check options come back only when set, as on Android |
+| `getSyncConfig()` after `configureSync()` omitted a field | The field comes back `undefined` | `batchSize`, `requestTimeoutMs`, `maxQueueSize`, `persistQueue` and `defaultHeaders` come back with their defaults, `defaultHeaders: {}` included. The quality and health-check options and `callbackTimeoutMs` come back only when set, as on Android |
 
 On both platforms, nothing is dispatched while stored headers cannot be read, and calling `configureSync()` ends the wait. See [Background Sync](../guides/background-sync.md).
 
@@ -255,6 +275,7 @@ export function SyncFailureBanner() {
 - [Android Permissions](./android-permissions.md) -- What the library manifest merges into your app
 - [iOS Privacy Manifest](./privacy-manifest.md) -- What the library declares for App Store review
 - [Background Sync](../guides/background-sync.md) -- BGTaskScheduler and WorkManager in depth
+- [Dispatch Interceptors](../guides/dispatch-interceptors.md) -- The JS callbacks, their timeout and their lifecycle
 - [Crash Recovery](../guides/crash-recovery.md) -- What happens to queued and in-flight items after a kill, a reboot or an update
 - [Connectivity Detection](../guides/connectivity-detection.md) -- Connectivity, network quality and the health check
 - [Android Native Architecture](../architecture/android-native.md) -- Room, OkHttp, WorkManager and recovery internals

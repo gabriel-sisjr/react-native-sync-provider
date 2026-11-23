@@ -41,7 +41,8 @@ Jest ignores `<rootDir>/example/node_modules` and `<rootDir>/lib/`. Don't put te
 - `react-native-nitro-modules` — `NitroModules.createHybridObject` returns a stable fake stored on `globalThis.__syncMock`.
 - `react-native` — `Platform`, `AppState`, `NativeEventEmitter`, `NativeModules`.
 - AppState helpers — `simulateAppStateChange('active' | 'background')`.
-- Full mock surface for all 24 HybridObject methods (queue/dead letters/sync/config/history/connection/background + listeners).
+- Full mock surface for all 34 HybridObject methods (queue/dead letters/sync/config/history/connection/background + listeners + the retry decider and dispatch interceptor installs, and the internal `answerCallback`).
+- Callback helpers — `__invokeCallback(kind, context)` calls the installed callback the way native does and resolves with the answer it sends back, and `__installedCallback(kind)` returns it.
 
 The facade caches `createHybridObject` on first import. To reset between tests, mutate the same singleton via `Object.assign(currentHybrid, fresh)` instead of recreating — that keeps the same reference alive across tests without `jest.resetModules()`.
 
@@ -63,6 +64,8 @@ The `coverageThreshold` is set to 0 % globally — same convention as the siblin
 
 `src/__tests__/webParity.test.ts` also runs here: it uses the TypeScript compiler to assert that `src/index.tsx` and `src/index.web.tsx` export the same names, each with the same kind and shape.
 
+`src/__tests__/facade.callbacks.test.ts` covers the facade side of the retry decider and the dispatch interceptors: argument validation, sync and async functions, a throw, a rejection or an invalid result answered as a failure, the messages that reach native, and a wrapper that never throws into React Native. The native suites below cover the waits, the timeouts and the lifecycle.
+
 ---
 
 ## Android (JUnit + Robolectric)
@@ -82,22 +85,24 @@ CI runs the same command on `ubuntu-latest` with JDK 17 (Zulu) and uploads the H
 
 | Suite                                  | Cases | What it exercises                                                                       |
 | -------------------------------------- | ----- | --------------------------------------------------------------------------------------- |
-| `SyncProviderRuntimeTest`              | 82    | Configuration, pause, retry wake, credential holds and cold workers against a fresh runtime. |
-| `database/SyncItemDaoTest`             | 16    | Room in-memory + Robolectric SDK 30. Insert/batch/count/delete, ordering, status flips. |
+| `SyncProviderRuntimeTest`              | 87    | Configuration, pause, retry wake, credential holds and cold workers against a fresh runtime, plus `callbackTimeoutMs` and a callback installed before `configureSync`. |
+| `database/SyncItemDaoTest`             | 17    | Room in-memory + Robolectric SDK 30. Insert/batch/count/delete, ordering, status flips, and a deferral that applies only to a row still in flight. |
 | `database/SyncResultDaoTest`           | 5     | History persistence, ordering DESC.                                                     |
 | `database/SyncDatabaseMigrationTest`   | 6     | Room v1→v2→v3 migrations against the exported schemas, and the destructive downgrade.  |
-| `storage/SyncQueueStorageTest`         | 35    | enqueue + INVALID_URL + QUEUE_FULL + claim atomicity + cooldowns + dead-letter moves + roundtrip. |
+| `storage/SyncQueueStorageTest`         | 38    | enqueue + INVALID_URL + QUEUE_FULL + claim atomicity + cooldowns + dead-letter moves + interceptor deferrals + decider drops + roundtrip. |
 | `storage/DeadLetterReplayRaceTest`     | 3     | A replay holds one write transaction, so a purge, a discard or a second replay waits for it. |
-| `http/SyncDispatcherTest`              | 95    | MockWebServer 4.12.0 — success, retry, terminal codes, timeouts, credential hold, cancellation, a cycle that dies and its settle, the quality gate, the health check, dead letters. |
-| `http/SettleMatrixTest`                | 24    | Each cell of the abort and settle matrix: what a cycle that dies or is cancelled leaves of each claimed row, the events in order, and the next wake. |
+| `http/SyncDispatcherTest`              | 150   | MockWebServer 4.12.0 — success, retry, terminal codes, timeouts, credential hold, cancellation, a cycle that dies and its settle, the quality gate, the health check, dead letters, the retry decider, the dispatch interceptors and the callback lifecycle. |
+| `http/SettleMatrixTest`                | 41    | Each cell of the abort and settle matrix, the waits for JS callbacks included: what a cycle that dies or is cancelled leaves of each claimed row, the events in order, and the next wake. |
 | `http/HeadProbeTest`                   | 14    | The `HEAD` client that the health check and the latency probe share.                   |
 | `http/HealthCheckTest`                 | 6     | The healthy-result cache per URL and its clocks, and the backoff after a failure.      |
+| `callbacks/JsCallbackGatewayTest`      | 20    | The one gateway every callback kind shares: answers before the timeout, late, unknown and repeated answers ignored, a wrong-kind payload or a throwing call answered as a failure, cancellations, and the `afterDispatch` notifications that nothing waits for. |
+| `callbacks/CallbackRegistryTest`       | 12    | Who owns the installs: a newer hybrid evicts older ones, a teardown retires its own, a stale hybrid's `set…` is refused, and `clear…` and `isRetryDeciderInstalled` see only the caller's installs. |
 | `retry/RetryPolicyEvaluatorTest`       | 21    | Linear/exp/fib + cap + equal jitter `[0.75, 1.25)` with seeded `Random`, the delay clamp and the deadline ceiling. |
 | `retry/RetryTimerTest`                 | 25    | Single-shot arming, cancel, a wake owed to the network, wakes the quality gate or a health-check backoff holds. |
 | `retry/RetryWakeTest`                  | 40    | When the timer and the kick arm, what suppresses them, the credential hold, the health-check backoff and the failure hold. |
 | `retry/OfflineRetryTest`               | 4     | No attempt is spent while offline.                                                      |
-| `config/SyncConfigStoreTest`           | 19    | Round trip of every option, damaged values, and the secret lifecycle.                   |
-| `config/SyncOptionsValidatorTest`      | 5     | The checks `configureSync` runs on the network-quality and health-check options.        |
+| `config/SyncConfigStoreTest`           | 21    | Round trip of every option, `callbackTimeoutMs` included, damaged values, and the secret lifecycle. |
+| `config/SyncOptionsValidatorTest`      | 7     | The checks `configureSync` runs on the network-quality, health-check and `callbackTimeoutMs` options. |
 | `config/KeystoreSecretStoreTest`       | 4     | Encryption behind the `SecretStore` seam.                                               |
 | `connectivity/ConnectivityMonitorTest` | 25 (27 runs: two cases run on SDK 30 and 31) | Lifecycle, idempotency, the initial StateFlow value, the default network, the offline invariant and the order of `CONNECTION_CHANGED`. |
 | `connectivity/ConnectivityMonitorQualityTest` | 23 | The latency measurement behind `networkQuality`: when it is taken, how long it is reused, what it reports. |
@@ -167,6 +172,7 @@ These `internal init(...)` overloads exist solely for tests (they do not appear 
 - `SyncDispatcher(... foregroundSession:backgroundSession:)` — `internal init` accepting injected sessions so `URLProtocolStub` can drive every request.
 - `SyncEngine(...)` — injectable stores, clock, retry timer and scheduler. `InMemorySecretStore` stands in for the Keychain, which hostless XCTest does not have, and `FakeBackgroundTasks` for `BGTaskScheduler`.
 - `NetworkQualityMonitor(connectivity:probe:clock:...)` and `HealthCheck(probe:clock:)` — take the connectivity and `HEAD` probe seams. `FakeConnectivity` stands in for `NWPathMonitor`, which a unit test cannot drive, and `FakeHeadProbe` for the `HEAD` requests.
+- `CallbackGateway(timer:)` — takes a `CallbackTimer`, so a test fires a callback's timeout by hand instead of waiting `callbackTimeoutMs`.
 
 `MockSyncEventEmitter` is a subclass that captures every emitted payload for assertion.
 
@@ -175,15 +181,15 @@ These `internal init(...)` overloads exist solely for tests (they do not appear 
 | Suite                            | Cases | Notes                                                                                              |
 | -------------------------------- | ----- | -------------------------------------------------------------------------------------------------- |
 | `SyncEngineRetryTimerTests`      | 44    | When the timer arms, offline wakes, credential holds, hybrid attach and detach, and the failure hold after a cycle that dies. |
-| `SyncEngineConfigTests`          | 35    | Configuration across engine restarts, pause lifetime, stale credentials.                           |
-| `SyncQueueStorageTests`          | 14    | enqueue / batch / QUEUE_FULL / sort / status transitions / history.                                |
+| `SyncEngineConfigTests`          | 36    | Configuration across engine restarts, pause lifetime, stale credentials, and `callbackTimeoutMs` returned only when set. |
+| `SyncQueueStorageTests`          | 19    | enqueue / batch / QUEUE_FULL / sort / status transitions / history / interceptor deferrals / decider drops. |
 | `SyncDispatcherTests`            | 19    | URLProtocolStub-driven; 200/500/408/429/400/401 paths + transport errors + paused skip + items purged before their dispatch + response classification. |
 | `SyncDispatcherCooldownTests`    | 25    | Cooldown written from the end of the attempt, skipped items, the deadline ceiling, and the settle after an outcome write that fails. |
 | `SyncRetryCooldownTests`         | 16    | Cooldowns in storage, recovery, the predicate, and deadlines that stop at the largest JavaScript `Date`. |
 | `RetryPolicyEvaluatorTests`      | 16    | linear/exp/fib + cap + jitter `[3000, 5000)` over 200 samples + perf measure baseline + the deadline ceiling. |
 | `RetryWakeTimerTests`            | 8     | Single-shot arming and cancel.                                                                     |
 | `HeldWakeTests`                  | 20    | Retry wakes the quality gate holds back: silent, re-checked with backoff, re-measured when stale.  |
-| `SyncConfigStoreTests`           | 11    | Persistence, logout, orphaned secrets.                                                             |
+| `SyncConfigStoreTests`           | 13    | Persistence, logout, orphaned secrets, and a stored `callbackTimeoutMs`, damaged ones included.    |
 | `NetworkHealthOptionsTests`      | 15    | The network-health options: checked before `configureSync` applies anything, kept as set, persisted, clamped. |
 | `BackgroundSyncManagerTests`     | 20    | Scheduling decisions and handlers, with a fake scheduler, and the refresh begin date for any `minimumIntervalMs`. |
 | `BackgroundSyncPersistenceTests` | 7     | Options and enabled state across relaunches.                                                       |
@@ -193,7 +199,7 @@ These `internal init(...)` overloads exist solely for tests (they do not appear 
 | `CoreDataStackTests`             | 5     | Store loading and failure.                                                                         |
 | `DeadLetterStoreTests`           | 19    | A permanent failure moves the item, with its request and its failure, to the dead-letter store in one transaction. |
 | `DeadLetterBridgeTests`          | 12    | Listing, replaying and discarding dead letters through the bridge.                                 |
-| `BridgePromiseTests`             | 8     | Bridge calls that answer from memory return promises that are already settled.                    |
+| `BridgePromiseTests`             | 11    | Bridge calls that answer from memory return promises that are already settled, the callback `set…` and `clear…` calls included, and the internal `answerCallback` never throws. |
 | `ConnectivityMonitorTests`       | 7     | Singleton lifecycle + replay sync + raw enum values.                                                |
 | `NetworkQualityMonitorTests`     | 29    | When the monitor measures, how long a measurement is valid, and which changes it reports.          |
 | `NetworkQualityClassifierTests`  | 10    | The shared threshold table.                                                                        |
@@ -201,14 +207,18 @@ These `internal init(...)` overloads exist solely for tests (they do not appear 
 | `NetworkQualityGateTests`        | 15    | The gate before every flush, the wakes it holds, and what `CONNECTION_CHANGED` and `getConnectionStatus()` report. |
 | `HeadProbeTests`                 | 18    | One `HEAD` request, timed from the task metrics, redirects included.                               |
 | `HealthCheckTests`               | 16    | The `HEAD` to `healthCheckUrl` before a cycle: when it is sent, its cache, and the backoff after a failure. |
-| `BackgroundTaskExpiryTests`      | 12    | A BGTask window that runs out of time: the task completes once, the request is cancelled, the item comes back with its attempt refunded. |
+| `BackgroundTaskExpiryTests`      | 18    | A BGTask window that runs out of time: the task completes once, the request is cancelled, the item comes back with its attempt refunded. An expiry during a callback wait sends nothing, or leaves the retry to the policy. |
 | `BackgroundURLSessionDelegateRoutingTests` | 2 | A background upload's completion reaches only the call that started that upload. |
 | `BackgroundUploadWaitTests`      | 4     | The wait for a background upload ends once, at its completion or at the cancellation. |
 | `ConnectivityReplayOrderTests`   | 3     | Path snapshots reach each subscriber in order, and never an older one after a newer one.           |
-| `NumericOptionTests`             | 10    | How every number from JS converts: counts, timeouts, delays, status codes, the history limit.     |
-| `NumericOptionEngineTests`       | 7     | `NaN`, `Infinity` and out-of-range numbers through `configureSync`, an engine restart and `getSyncConfig`. |
+| `NumericOptionTests`             | 11    | How every number from JS converts: counts, timeouts, `callbackTimeoutMs`, delays, status codes, the history limit. |
+| `NumericOptionEngineTests`       | 8     | `NaN`, `Infinity` and out-of-range numbers through `configureSync`, an engine restart and `getSyncConfig`, and the `callbackTimeoutMs` check. |
 | `SyncConfigStoreNumbersTests`    | 4     | Numbers saved as given, and records that earlier builds wrote or read.                             |
-| `SettleMatrixTests`              | 22    | Each cell of the abort and settle matrix: what a cycle that dies or is cancelled leaves of each claimed row, the events in order, and the next wake. |
+| `SettleMatrixTests`              | 28    | Each cell of the abort and settle matrix, a retry decider's recorded verdict included: what a cycle that dies or is cancelled leaves of each claimed row, the events in order, and the next wake. |
+| `CallbackGatewayTests`           | 22    | The one gateway every callback kind shares: answers before the timeout, late and repeated answers ignored, wrong-kind payloads, cancellations, a timer freed with its request, and JS text kept private in the logs. |
+| `CallbackLifecycleTests`         | 12    | Who owns the installs: a newer hybrid evicts older ones, a teardown retires its own, a stale hybrid's `set…` is refused, and an install never keeps the hybrid alive. |
+| `RetryDeciderTests`              | 22    | When the retry decider is consulted, `RETRY` with or without `delayMs`, `DROP`, `DEAD_LETTER`, delays counted from the decision, and every fallback to the policy, an eviction included. |
+| `DispatchInterceptorTests`       | 30    | The header resolver, `beforeDispatch` and `afterDispatch`: the order, the header merge, a failure or a `SKIP` deferring the item, purges, orphans and evictions during a wait, and the headers a background upload carries. |
 
 `URLSessionConfiguration.background` and a real `BGTaskScheduler` launch are not exercised in unit tests: they are OS-driven and cannot be run from a test host. That coverage needs a physical device: see [iOS Setup](../getting-started/ios-setup.md#7-test-the-background-handler).
 

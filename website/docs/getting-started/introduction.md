@@ -42,11 +42,12 @@ If you use `react-native-background-location` for GPS that keeps working in the 
 - **Connectivity awareness** -- `NWPathMonitor` (iOS) and `ConnectivityManager` (Android) report the network state. `useAutoSync` flushes on reconnect, and the retry timer and `drainUntilEmpty` wait for the network.
 - **Network quality and health checks** -- Every connection snapshot carries a `networkQuality` level. Opt in to `minNetworkQuality` to skip flushes on a poor link without spending attempts, and to `healthCheckUrl` to probe your backend before a batch. See [Connectivity Detection](../guides/connectivity-detection.md).
 - **Dead-letter queue** -- A request that fails permanently is kept with its last error until you replay or discard it.
-- **Declarative retry policy** -- Linear, exponential, or Fibonacci backoff with jitter, configurable retry-on-status codes, and a per-item attempt budget. Cooldowns persist across restarts, and a timer brings items back while the app runs.
+- **Declarative retry policy** -- Linear, exponential, or Fibonacci backoff with jitter, configurable retry-on-status codes, and a per-item attempt budget. Cooldowns persist across restarts, and a timer brings items back while the app runs. While JS runs, an optional [retry decider](../guides/retry-policy.md#retry-decider) can change the delay of a failed attempt, or drop or dead-letter the item.
+- **Dispatch interceptors** -- While JS runs, a header resolver supplies headers for each request, such as a fresh token, `beforeDispatch` can defer a request, and `afterDispatch` observes each outcome. A run with no JS sends the stored `defaultHeaders`. See [Dispatch Interceptors](../guides/dispatch-interceptors.md).
 - **Persisted configuration** -- A worker or BGTask with no JS honors your options, and `defaultHeaders` are encrypted at rest (Android Keystore, iOS Keychain).
 - **Per-item priority lanes** -- `HIGH` / `NORMAL` / `LOW` claim order, deterministic within a flush cycle. On Android, which sends a batch concurrently, priority decides which items a cycle takes, not the order its requests go out.
 - **At-least-once delivery** -- A request can be sent twice after a crash, so endpoints must be idempotent. See the [Idempotency guide](../guides/idempotency.md).
-- **First-class TypeScript** -- 24 facade functions, 2 listener helpers, 9 React hooks, and a complete type / enum / error surface, all strict-mode clean.
+- **First-class TypeScript** -- 33 facade functions, 2 listener helpers, 9 React hooks, and a complete type / enum / error surface, all strict-mode clean.
 - **Optional Provider** -- An optional `<SyncProvider>` Context wraps `configureSync` + `enableBackgroundSync` lifecycle for app-level setup.
 - **Unified hooks library** -- `useConnection`, `useSyncQueue`, `useSyncStatus`, `useOfflineQueue`, `useSyncEvents`, `useSyncConfig`, `useAutoSync`, `useSyncSnapshot`, `useSyncContext`.
 
@@ -57,6 +58,7 @@ If you use `react-native-background-location` for GPS that keeps working in the 
 | Queue persistence | Supported | Supported | Room (KSP) / Core Data |
 | Background sync | Supported | Supported | WorkManager / BGTaskScheduler |
 | Retry policy | Supported | Supported | Native-side (LINEAR / EXPONENTIAL / FIBONACCI + jitter) |
+| Retry decider and dispatch interceptors | Supported | Supported | JS callbacks, while JS runs |
 | Connectivity detection | Supported | Supported | ConnectivityManager / NWPathMonitor |
 | Hooks | Supported | Supported | React 18+ hooks |
 | Item ids (ULID) | Supported | Supported | Native ULID generator |
@@ -84,7 +86,7 @@ If you use `react-native-background-location` for GPS that keeps working in the 
 
 The library is layered so the JS facade is thin, the bridge is generated, and every persistence + dispatch concern lives natively:
 
-1. **TypeScript layer** -- Validates inputs, hides the channel name, and translates the `getLastSyncResult()` sentinel back into `undefined`.
+1. **TypeScript layer** -- Validates inputs, hides the channel name, translates the `getLastSyncResult()` sentinel back into `undefined`, and runs your retry decider and dispatch interceptors when native asks.
 2. **Nitro spec** -- `src/SyncProvider.nitro.ts` is the source of truth. `yarn nitrogen` regenerates the platform base classes.
 3. **Native layer** -- Each platform persists items, monitors connectivity, dispatches HTTP requests with retry, and registers an OS background task.
 
