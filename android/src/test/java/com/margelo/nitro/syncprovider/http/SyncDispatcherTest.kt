@@ -5,13 +5,18 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.google.common.truth.Truth.assertThat
 import com.google.common.truth.Truth.assertWithMessage
+import com.margelo.nitro.syncprovider.CallbackAnswer
 import com.margelo.nitro.syncprovider.HttpMethod
 import com.margelo.nitro.syncprovider.NetworkQuality
+import com.margelo.nitro.syncprovider.RetryAction
+import com.margelo.nitro.syncprovider.RetryDeciderContext
 import com.margelo.nitro.syncprovider.SyncErrorCode
 import com.margelo.nitro.syncprovider.SyncEvent
 import com.margelo.nitro.syncprovider.SyncEventType
 import com.margelo.nitro.syncprovider.SyncOptions
 import com.margelo.nitro.syncprovider.SyncResult
+import com.margelo.nitro.syncprovider.callbacks.HybridInstalls
+import com.margelo.nitro.syncprovider.callbacks.JsCallbacks
 import com.margelo.nitro.syncprovider.database.SyncDatabase
 import com.margelo.nitro.syncprovider.database.SyncDeadLetterEntity
 import com.margelo.nitro.syncprovider.database.SyncItemDao
@@ -21,8 +26,11 @@ import com.margelo.nitro.syncprovider.events.SyncEventEmitter
 import com.margelo.nitro.syncprovider.retry.RetryTimer
 import com.margelo.nitro.syncprovider.retry.RetryWake
 import com.margelo.nitro.syncprovider.storage.SyncQueueStorage
+import com.margelo.nitro.syncprovider.testutil.FakeFunction
+import com.margelo.nitro.syncprovider.testutil.FakeJs
 import com.margelo.nitro.syncprovider.testutil.MovingClock
 import com.margelo.nitro.syncprovider.testutil.TestData
+import com.margelo.nitro.syncprovider.util.JsonMap
 import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
@@ -30,10 +38,14 @@ import io.mockk.mockk
 import io.mockk.spyk
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.TestScope
@@ -55,6 +67,7 @@ import org.robolectric.annotation.Config
 import java.io.IOException
 import java.io.InterruptedIOException
 import java.net.SocketException
+import java.net.URI
 import java.net.SocketTimeoutException
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
@@ -73,6 +86,22 @@ internal class SyncDispatcherTest {
   /** The `notBefore` of every finished cycle, in order. */
   private val finishedCycles: MutableList<Long?> = Collections.synchronizedList(mutableListOf())
 
+  /** Where fake JS answers later, and where [collectEvents] collects. */
+  private val jsScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+  /** Every line the callbacks logged. */
+  private val callbackLog: MutableList<String> = Collections.synchronizedList(mutableListOf())
+
+  private val callbacks = JsCallbacks(
+    scope = jsScope,
+    notifyContext = Dispatchers.Default,
+    log = { _, message -> callbackLog += message },
+  )
+  private val js = FakeJs(callbacks.gateway, jsScope)
+
+  /** The current hybrid: what the tests install, they install through it. */
+  private val hybrid = HybridInstalls(callbacks)
+
   @Before
   fun setUp() {
     db = Room.inMemoryDatabaseBuilder(
@@ -86,6 +115,7 @@ internal class SyncDispatcherTest {
 
   @After
   fun tearDown() {
+    jsScope.cancel()
     server.shutdown()
     db.close()
   }
@@ -110,6 +140,7 @@ internal class SyncDispatcherTest {
     healthCheckBackoffMs: Double? = null,
     healthCheck: HealthCheck = this.healthCheck,
     defaultHeaders: Map<String, String>? = null,
+    callbackTimeoutMs: Double? = null,
     tweak: (SyncOptions) -> SyncOptions = { it },
   ): SyncDispatcher {
     val options = TestData.syncOptions(
@@ -126,6 +157,7 @@ internal class SyncDispatcherTest {
       healthCheckTtlMs = healthCheckTtlMs,
       healthCheckBackoffMs = healthCheckBackoffMs,
       defaultHeaders = defaultHeaders,
+      callbackTimeoutMs = callbackTimeoutMs,
     ).let(tweak)
     return SyncDispatcher(
       storage = queue,
@@ -138,6 +170,7 @@ internal class SyncDispatcherTest {
       healthCheck = healthCheck,
       onHealthCheckSkipped = { healthSkips++ },
       onCycleFinished = onCycleFinished,
+      callbacks = callbacks,
     )
   }
 
@@ -2490,5 +2523,522 @@ internal class SyncDispatcherTest {
 
     assertThat(deadLetter(id).lastErrorCode).isEqualTo(SyncErrorCode.MAX_ATTEMPTS_EXCEEDED.name)
     assertThat(deadLetter(id).lastErrorMessage).isNotEmpty()
+  }
+
+  /* ----------------------------- the retry decider ----------------------------- */
+
+  /** Every event from now on, collected as it is emitted, whatever runs the test. */
+  private fun collectEvents(): List<SyncEvent> {
+    val events: MutableList<SyncEvent> = Collections.synchronizedList(mutableListOf())
+    jsScope.launch(Dispatchers.Unconfined, start = CoroutineStart.UNDISPATCHED) {
+      emitter.events.collect { events += it }
+    }
+    return events
+  }
+
+  /** Answers every request with [code], without moving the clock. */
+  private fun answerAll(code: Int) {
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest): MockResponse = MockResponse().setResponseCode(code)
+    }
+  }
+
+  /** A decider that records each context and answers what [reply] gives, at once; null: never. */
+  private fun decider(reply: (RetryDeciderContext) -> CallbackAnswer?): FakeFunction<RetryDeciderContext> =
+    js.function { requestId, context -> reply(context)?.let { answer(requestId, it) } }
+
+  /** [decider], installed by the current hybrid. */
+  private fun installDecider(reply: (RetryDeciderContext) -> CallbackAnswer?): FakeFunction<RetryDeciderContext> =
+    decider(reply).also { assertThat(hybrid.setRetryDecider(it)).isTrue() }
+
+  private fun elapsedMs(startedNanos: Long): Long = (System.nanoTime() - startedNanos) / 1_000_000L
+
+  private fun List<SyncEvent>.of(id: String): List<SyncEvent> = filter { it.itemId == id }
+
+  @Test
+  fun `decider_unset_usesPolicy, as when no decider existed`() = runTest {
+    server.dispatcher = respondAfter(250L, 503)
+    val id = enqueue()
+    val start = clock.now()
+    val events = collectEvents()
+
+    val result = newDispatcher().flush()
+
+    val retried = row(id)
+    assertThat(retried.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(retried.attempts).isEqualTo(1)
+    assertThat(retried.lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
+    // The policy's delay for attempt 1, from the end of the attempt.
+    assertThat(retried.nextRetryAt).isEqualTo(start + 250L + 1_000L)
+    val retrying = events.of(id).single()
+    assertThat(retrying.type).isEqualTo(SyncEventType.ITEM_RETRYING)
+    assertThat(retrying.errorCode).isEqualTo(SyncErrorCode.SERVER_ERROR)
+    assertThat(retrying.statusCode).isEqualTo(503.0)
+    assertThat(result.failedIds.toList()).isEmpty()
+    assertThat(callbackLog).isEmpty()
+    assertThat(callbacks.gateway.pendingCount).isEqualTo(0)
+  }
+
+  @Test
+  fun `decider_retry_overridesDelay, as given from the decision, with no jitter and no cap`() = runTest {
+    server.dispatcher = respondAfter(250L, 503)
+    val id = enqueue()
+    val start = clock.now()
+    installDecider {
+      // The decision takes a while: the delay counts from it, not from the end of the attempt.
+      clock.advance(DECIDE_MS)
+      FakeJs.decision(RetryAction.RETRY, 12_345.9)
+    }
+    val events = collectEvents()
+
+    newDispatcher(
+      maxDelayMs = 5_000L,
+      tweak = { it.copy(retryPolicy = it.retryPolicy.copy(jitter = true)) },
+    ).flush()
+
+    val retried = row(id)
+    assertThat(retried.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(retried.attempts).isEqualTo(1)
+    assertThat(retried.lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
+    assertThat(retried.nextRetryAt).isEqualTo(start + 250L + DECIDE_MS + 12_345L)
+    // The retry keeps the attempt's real code.
+    val retrying = events.of(id).single()
+    assertThat(retrying.type).isEqualTo(SyncEventType.ITEM_RETRYING)
+    assertThat(retrying.errorCode).isEqualTo(SyncErrorCode.SERVER_ERROR)
+    assertThat(retrying.statusCode).isEqualTo(503.0)
+    assertThat(retrying.attempt).isEqualTo(1.0)
+  }
+
+  @Test
+  fun `decider_retry_withoutDelay_usesPolicyDelay, from the decision`() = runTest {
+    server.dispatcher = respondAfter(250L, 503)
+    val id = enqueue()
+    val start = clock.now()
+    installDecider {
+      clock.advance(DECIDE_MS)
+      FakeJs.decision(RetryAction.RETRY)
+    }
+
+    newDispatcher().flush()
+
+    assertThat(row(id).nextRetryAt).isEqualTo(start + 250L + DECIDE_MS + 1_000L)
+    assertThat(callbackLog).isEmpty()
+  }
+
+  @Test
+  fun `decider_retry_invalidDelay_usesPolicyDelay, for NaN, infinity and a negative delay`() = runTest {
+    answerAll(503)
+    val delays = mapOf("/nan" to Double.NaN, "/infinite" to Double.POSITIVE_INFINITY, "/negative" to -1.0)
+    val ids = delays.keys.associateWith { enqueue(it) }
+    val start = clock.now()
+    installDecider { context -> FakeJs.decision(RetryAction.RETRY, delays.getValue(URI(context.url).path)) }
+
+    newDispatcher().flush()
+
+    ids.values.forEach { id ->
+      assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+      assertThat(row(id).nextRetryAt).isEqualTo(start + 1_000L)
+    }
+    // Not a failed answer: the decision stands, with the policy's delay, and the reason is logged.
+    assertThat(callbackLog.count { it.contains("is not a usable delay; the policy's delay applies") })
+      .isEqualTo(3)
+  }
+
+  @Test
+  fun `decider_retry_hugeDelay_clampsDeadline, at the latest JS Date`() = runTest {
+    answerAll(503)
+    val delays = mapOf("/huge" to 1e300, "/above-max-delay" to 9.1e15, "/long" to 1e15)
+    val ids = delays.keys.associateWith { enqueue(it) }
+    val start = clock.now()
+    installDecider { context -> FakeJs.decision(RetryAction.RETRY, delays.getValue(URI(context.url).path)) }
+
+    newDispatcher().flush()
+
+    assertThat(row(ids.getValue("/huge")).nextRetryAt).isEqualTo(TestData.MAX_JS_DATE_MS)
+    assertThat(row(ids.getValue("/above-max-delay")).nextRetryAt).isEqualTo(TestData.MAX_JS_DATE_MS)
+    // Below the ceilings, a delay is used as given.
+    assertThat(row(ids.getValue("/long")).nextRetryAt).isEqualTo(start + 1_000_000_000_000_000L)
+  }
+
+  @Test
+  fun `decider_drop_emitsFailedAndDeletesRow, with no dead letter`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(503))
+    val id = enqueue()
+    // A DROP ignores delayMs, even one no retry could use: it is not a failed answer.
+    installDecider { FakeJs.decision(RetryAction.DROP, Double.NaN) }
+    val events = collectEvents()
+
+    val result = newDispatcher().flush()
+
+    assertThat(db.syncItemDao().findById(id)).isNull()
+    assertThat(db.syncDeadLetterDao().findById(id)).isNull()
+    val failed = events.of(id).single()
+    assertThat(failed.type).isEqualTo(SyncEventType.ITEM_FAILED)
+    assertThat(failed.errorCode).isEqualTo(SyncErrorCode.RETRY_DECIDER_REJECTED)
+    assertThat(failed.statusCode).isEqualTo(503.0)
+    assertThat(failed.attempt).isEqualTo(1.0)
+    assertThat(result.failureCount).isEqualTo(1.0)
+    assertThat(result.failedIds.toList()).containsExactly(id)
+    assertThat(result.errors).containsExactly(id, "RETRY_DECIDER_REJECTED: HTTP 503")
+    assertThat(events.last().type).isEqualTo(SyncEventType.SYNC_FAILED)
+    assertThat(callbackLog).isEmpty()
+  }
+
+  @Test
+  fun `decider_deadLetter_movesRowWithDeciderCode, and the real failure as its message`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(503))
+    val id = enqueue()
+    // A DEAD_LETTER ignores delayMs, even one no retry could use: it is not a failed answer.
+    installDecider { FakeJs.decision(RetryAction.DEAD_LETTER, -1.0) }
+    val events = collectEvents()
+
+    val result = newDispatcher().flush()
+
+    val dead = deadLetter(id)
+    assertThat(dead.attempts).isEqualTo(1)
+    assertThat(dead.lastErrorCode).isEqualTo(SyncErrorCode.RETRY_DECIDER_REJECTED.name)
+    assertThat(dead.lastErrorMessage).isEqualTo("HTTP 503 Server Error")
+    val itemEvents = events.of(id)
+    assertThat(itemEvents.map { it.type })
+      .containsExactly(SyncEventType.ITEM_FAILED, SyncEventType.ITEM_DEAD_LETTERED).inOrder()
+    assertThat(itemEvents[0].errorCode).isEqualTo(SyncErrorCode.RETRY_DECIDER_REJECTED)
+    assertThat(itemEvents[0].statusCode).isEqualTo(503.0)
+    assertThat(itemEvents[0].attempt).isEqualTo(1.0)
+    assertThat(itemEvents[1].errorCode).isEqualTo(SyncErrorCode.DEAD_LETTERED)
+    assertThat(itemEvents[1].metadata)
+      .containsExactly("lastErrorCode", SyncErrorCode.RETRY_DECIDER_REJECTED.name)
+    assertThat(result.failedIds.toList()).containsExactly(id)
+    assertThat(result.errors).containsExactly(id, "RETRY_DECIDER_REJECTED: HTTP 503")
+    assertThat(callbackLog).isEmpty()
+  }
+
+  @Test
+  fun `decider_failedAnswer_fallsBack at once to the policy, its delay from the fallback`() =
+    runBlocking<Unit> {
+      server.enqueue(MockResponse().setResponseCode(503))
+      val id = enqueue()
+      val start = clock.now()
+      installDecider {
+        clock.advance(DECIDE_MS)
+        FakeJs.failed("the decider threw")
+      }
+      val started = System.nanoTime()
+
+      newDispatcher(callbackTimeoutMs = 30_000.0).flush()
+
+      assertThat(elapsedMs(started)).isLessThan(AT_ONCE_MS)
+      assertThat(row(id).attempts).isEqualTo(1)
+      // The policy's delay, counted from the moment the fallback was decided.
+      assertThat(row(id).nextRetryAt).isEqualTo(start + DECIDE_MS + 1_000L)
+      assertThat(callbackLog.single())
+        .endsWith("answered FAILED: the decider threw; the retry policy applies")
+    }
+
+  @Test
+  fun `decider_invalidAnswer_fallsBack, a RESOLVED answer with no decision`() = runBlocking<Unit> {
+    server.enqueue(MockResponse().setResponseCode(503))
+    val id = enqueue()
+    val start = clock.now()
+    installDecider { FakeJs.headers(mapOf("X-Wrong" to "kind")) }
+
+    newDispatcher(callbackTimeoutMs = 30_000.0).flush()
+
+    assertThat(row(id).nextRetryAt).isEqualTo(start + 1_000L)
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(callbackLog.single())
+      .endsWith("the answer carried no usable decision; the retry policy applies")
+  }
+
+  @Test
+  fun `decider_neverAnswers_timesOut, and the policy applies`() = runBlocking<Unit> {
+    server.enqueue(MockResponse().setResponseCode(503))
+    val id = enqueue()
+    val start = clock.now()
+    val decider = installDecider { null }
+    val started = System.nanoTime()
+
+    newDispatcher(callbackTimeoutMs = 200.0).flush()
+
+    assertThat(elapsedMs(started)).isAtLeast(200L)
+    assertThat(decider.calls).hasSize(1)
+    assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(row(id).nextRetryAt).isEqualTo(start + 1_000L)
+    assertThat(callbackLog.single()).endsWith("no answer within 200 ms; the retry policy applies")
+    assertThat(callbacks.gateway.pendingCount).isEqualTo(0)
+  }
+
+  @Test
+  fun `decider_lateAnswer_ignored, once the policy applied`() = runBlocking<Unit> {
+    server.enqueue(MockResponse().setResponseCode(503))
+    val id = enqueue()
+    val start = clock.now()
+    val decider = js.function<RetryDeciderContext> { requestId, _ ->
+      answerLater(requestId, 500L, FakeJs.decision(RetryAction.DEAD_LETTER))
+    }
+    assertThat(hybrid.setRetryDecider(decider)).isTrue()
+
+    newDispatcher(callbackTimeoutMs = 150.0).flush()
+    delay(800L)
+
+    assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(row(id).nextRetryAt).isEqualTo(start + 1_000L)
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(callbacks.gateway.pendingCount).isEqualTo(0)
+  }
+
+  @Test
+  fun `decider_unknownId_noop, and the request keeps its own answer`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(503))
+    val id = enqueue()
+    val start = clock.now()
+    val decider = js.function<RetryDeciderContext> { requestId, _ ->
+      answer("retryDecider:999999", FakeJs.decision(RetryAction.DEAD_LETTER))
+      answer(requestId, FakeJs.decision(RetryAction.RETRY, 5_000.0))
+    }
+    assertThat(hybrid.setRetryDecider(decider)).isTrue()
+
+    newDispatcher().flush()
+
+    assertThat(row(id).nextRetryAt).isEqualTo(start + 5_000L)
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+  }
+
+  @Test
+  fun `decider_notConsulted_nonRetryable`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(404))
+    val id = enqueue()
+    val decider = installDecider { FakeJs.decision(RetryAction.RETRY) }
+
+    newDispatcher().flush()
+
+    assertThat(decider.calls).isEmpty()
+    assertThat(deadLetter(id).lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
+  }
+
+  @Test
+  fun `decider_notConsulted_budgetSpent, nor for a row whose budget was spent before`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(503))
+    val last = enqueue("/last")
+    db.syncItemDao().insert(TestData.entity(id = "spent", attempts = 1, url = server.url("/spent").toString()))
+    val decider = installDecider { FakeJs.decision(RetryAction.RETRY) }
+
+    newDispatcher(maxAttempts = 1).flush()
+
+    assertThat(decider.calls).isEmpty()
+    assertThat(deadLetter(last).lastErrorCode).isEqualTo(SyncErrorCode.MAX_ATTEMPTS_EXCEEDED.name)
+    assertThat(deadLetter("spent").lastErrorCode).isEqualTo(SyncErrorCode.MAX_ATTEMPTS_EXCEEDED.name)
+    assertThat(server.requestCount).isEqualTo(1)
+  }
+
+  @Test
+  fun `decider_notConsulted_credentialHold`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(401))
+    val id = enqueue()
+    val decider = installDecider { FakeJs.decision(RetryAction.DEAD_LETTER) }
+
+    newDispatcher(credentials = { CredentialPolicy.PERSISTED }).flush()
+
+    assertThat(decider.calls).isEmpty()
+    assertThat(row(id).attempts).isEqualTo(0)
+    assertThat(row(id).lastErrorCode).isEqualTo(SyncErrorCode.UNAUTHORIZED.name)
+  }
+
+  @Test
+  fun `decider_notConsulted_success`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(200))
+    val id = enqueue()
+    val decider = installDecider { FakeJs.decision(RetryAction.DROP) }
+
+    val result = newDispatcher().flush()
+
+    assertThat(decider.calls).isEmpty()
+    assertThat(result.succeededIds.toList()).containsExactly(id)
+  }
+
+  @Test
+  fun `decider_context_fields, for an HTTP answer`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(503))
+    val url = server.url("/orders").toString()
+    db.syncItemDao().insert(
+      TestData.entity(id = "order", method = "PUT", url = url, attempts = 2)
+        .copy(metadata = JsonMap.encode(mapOf("order" to "42"))),
+    )
+    val decider = installDecider { FakeJs.decision(RetryAction.RETRY) }
+
+    newDispatcher(maxAttempts = 5).flush()
+
+    assertThat(decider.calls).containsExactly(
+      RetryDeciderContext(
+        itemId = "order",
+        // The attempt that just failed, as ITEM_RETRYING reports it.
+        attempt = 3.0,
+        errorCode = SyncErrorCode.SERVER_ERROR,
+        statusCode = 503.0,
+        url = url,
+        method = HttpMethod.PUT,
+        metadata = mapOf("order" to "42"),
+      ),
+    )
+  }
+
+  @Test
+  fun `decider_context_fields, for a failure with no answer`() = runTest {
+    server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AT_START))
+    val id = enqueue()
+    val decider = installDecider { FakeJs.decision(RetryAction.RETRY) }
+
+    newDispatcher().flush()
+
+    val context = decider.calls.single()
+    assertThat(context.itemId).isEqualTo(id)
+    assertThat(context.attempt).isEqualTo(1.0)
+    assertThat(context.errorCode).isEqualTo(SyncErrorCode.NETWORK_ERROR)
+    assertThat(context.statusCode).isNull()
+    assertThat(context.method).isEqualTo(HttpMethod.POST)
+    assertThat(context.metadata).isNull()
+  }
+
+  @Test
+  fun `decider_replace_and_clear`() = runTest {
+    answerAll(503)
+    val first = enqueue("/first")
+    val replaced = decider { FakeJs.decision(RetryAction.DEAD_LETTER) }
+    val current = decider { FakeJs.decision(RetryAction.DROP) }
+    assertThat(hybrid.setRetryDecider(replaced)).isTrue()
+    assertThat(hybrid.setRetryDecider(current)).isTrue()
+    assertThat(hybrid.isRetryDeciderInstalled()).isTrue()
+    val d = newDispatcher()
+
+    d.flush()
+
+    assertThat(replaced.calls).isEmpty()
+    assertThat(current.calls).hasSize(1)
+    assertThat(db.syncItemDao().findById(first)).isNull()
+
+    hybrid.clearRetryDecider()
+    assertThat(hybrid.isRetryDeciderInstalled()).isFalse()
+    val second = enqueue("/second")
+    d.flush()
+
+    assertThat(current.calls).hasSize(1)
+    assertThat(row(second).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(row(second).attempts).isEqualTo(1)
+  }
+
+  @Test
+  fun `decider_purgedDuringWait_noResurrection, whatever it decides`() = runBlocking<Unit> {
+    answerAll(503)
+    val actions = mapOf(
+      "/retry" to RetryAction.RETRY,
+      "/dead-letter" to RetryAction.DEAD_LETTER,
+      "/drop" to RetryAction.DROP,
+    )
+    val ids = actions.keys.associateWith { enqueue(it) }
+    val decider = js.function<RetryDeciderContext> { requestId, context ->
+      later {
+        // A logout purges the row while the decider thinks.
+        storage.removeItem(context.itemId)
+        answer(requestId, FakeJs.decision(actions.getValue(URI(context.url).path)))
+      }
+    }
+    assertThat(hybrid.setRetryDecider(decider)).isTrue()
+    val events = collectEvents()
+
+    val result = newDispatcher().flush()
+
+    ids.values.forEach { id ->
+      assertThat(db.syncItemDao().findById(id)).isNull()
+      assertThat(db.syncDeadLetterDao().findById(id)).isNull()
+    }
+    // Each request went out, so its outcome is reported all the same; nothing is dead-lettered.
+    assertThat(events.of(ids.getValue("/retry")).map { it.type }).containsExactly(SyncEventType.ITEM_RETRYING)
+    listOf("/dead-letter", "/drop").forEach { path ->
+      val failed = events.of(ids.getValue(path)).single()
+      assertThat(failed.type).isEqualTo(SyncEventType.ITEM_FAILED)
+      assertThat(failed.errorCode).isEqualTo(SyncErrorCode.RETRY_DECIDER_REJECTED)
+    }
+    assertThat(result.failedIds.toList())
+      .containsExactly(ids.getValue("/dead-letter"), ids.getValue("/drop"))
+  }
+
+  @Test
+  fun `lifecycle_newAttach_evictsOlderInstall, so the dispatch no longer asks the old runtime`() =
+    runBlocking<Unit> {
+      server.enqueue(MockResponse().setResponseCode(503))
+      val id = enqueue()
+      val start = clock.now()
+      val old = installDecider { FakeJs.decision(RetryAction.DEAD_LETTER) }
+      // A reload: the new runtime's hybrid is created and installs nothing.
+      HybridInstalls(callbacks)
+      val started = System.nanoTime()
+
+      newDispatcher(callbackTimeoutMs = 30_000.0).flush()
+
+      assertThat(elapsedMs(started)).isLessThan(AT_ONCE_MS)
+      assertThat(old.calls).isEmpty()
+      assertThat(row(id).nextRetryAt).isEqualTo(start + 1_000L)
+      assertThat(callbackLog).isEmpty()
+    }
+
+  @Test
+  fun `lifecycle_eviction_endsOwnersWaits, and the policy applies at once`() = runBlocking<Unit> {
+    server.enqueue(MockResponse().setResponseCode(503))
+    val id = enqueue()
+    val start = clock.now()
+    val asked = CompletableDeferred<Unit>()
+    val decider = js.function<RetryDeciderContext> { _, _ -> asked.complete(Unit) }
+    assertThat(hybrid.setRetryDecider(decider)).isTrue()
+    val d = newDispatcher(callbackTimeoutMs = 60_000.0)
+    val started = System.nanoTime()
+
+    val running = async(Dispatchers.IO) { d.flush() }
+    withTimeout(AT_ONCE_MS) { asked.await() }
+    // A reload's new hybrid ends the old runtime's wait, which nothing would answer.
+    HybridInstalls(callbacks)
+    running.await()
+
+    assertThat(elapsedMs(started)).isLessThan(AT_ONCE_MS)
+    assertThat(row(id).nextRetryAt).isEqualTo(start + 1_000L)
+    assertThat(callbackLog.single())
+      .endsWith("the JS runtime that installed it is gone; the retry policy applies")
+  }
+
+  /** A callback that waits for `flush()` waits for the cycle that waits for it: never a deadlock. */
+  @Test
+  fun `android_callback_awaitingFlush_timesOut, then the fallback applies`() = runBlocking<Unit> {
+    server.enqueue(MockResponse().setResponseCode(503))
+    val id = enqueue()
+    val start = clock.now()
+    lateinit var d: SyncDispatcher
+    val nested = CompletableDeferred<SyncResult>()
+    val decider = js.function<RetryDeciderContext> { requestId, _ ->
+      later {
+        nested.complete(d.flush())
+        answer(requestId, FakeJs.decision(RetryAction.DEAD_LETTER))
+      }
+    }
+    assertThat(hybrid.setRetryDecider(decider)).isTrue()
+    d = newDispatcher(callbackTimeoutMs = 300.0)
+    val started = System.nanoTime()
+
+    withTimeout(20_000L) { d.flush() }
+    val nestedResult = withTimeout(20_000L) { nested.await() }
+
+    assertThat(elapsedMs(started)).isAtLeast(300L)
+    assertThat(decider.calls).hasSize(1)
+    // The late answer changed nothing, and the nested cycle found nothing due.
+    assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(row(id).nextRetryAt).isEqualTo(start + 1_000L)
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(nestedResult.successCount + nestedResult.failureCount).isEqualTo(0.0)
+    assertThat(callbackLog.single()).endsWith("no answer within 300 ms; the retry policy applies")
+  }
+
+  private companion object {
+    /** How long a fake decision takes, on the test clock. */
+    const val DECIDE_MS = 300L
+
+    /** Well inside every long callback timeout here: what "at once" allows on a loaded machine. */
+    const val AT_ONCE_MS = 10_000L
   }
 }

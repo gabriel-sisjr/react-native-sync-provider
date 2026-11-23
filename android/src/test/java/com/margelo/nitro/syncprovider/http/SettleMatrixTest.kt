@@ -4,9 +4,13 @@ import android.database.sqlite.SQLiteDatabaseLockedException
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.google.common.truth.Truth.assertThat
+import com.margelo.nitro.syncprovider.RetryAction
+import com.margelo.nitro.syncprovider.RetryDeciderContext
 import com.margelo.nitro.syncprovider.SyncErrorCode
 import com.margelo.nitro.syncprovider.SyncEvent
 import com.margelo.nitro.syncprovider.SyncEventType
+import com.margelo.nitro.syncprovider.callbacks.HybridInstalls
+import com.margelo.nitro.syncprovider.callbacks.JsCallbacks
 import com.margelo.nitro.syncprovider.database.SyncDatabase
 import com.margelo.nitro.syncprovider.database.SyncDeadLetterEntity
 import com.margelo.nitro.syncprovider.database.SyncItemDao
@@ -16,6 +20,8 @@ import com.margelo.nitro.syncprovider.retry.RetryPolicyEvaluator
 import com.margelo.nitro.syncprovider.retry.RetryTimer
 import com.margelo.nitro.syncprovider.retry.RetryWake
 import com.margelo.nitro.syncprovider.storage.SyncQueueStorage
+import com.margelo.nitro.syncprovider.testutil.FakeFunction
+import com.margelo.nitro.syncprovider.testutil.FakeJs
 import com.margelo.nitro.syncprovider.testutil.MovingClock
 import com.margelo.nitro.syncprovider.testutil.TestData
 import io.mockk.coEvery
@@ -23,8 +29,11 @@ import io.mockk.every
 import io.mockk.mockk
 import io.mockk.spyk
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.TestScope
@@ -63,6 +72,14 @@ import java.util.concurrent.TimeUnit
  * Every item starts attempted once, 10 s ago, with a cooldown that has passed: due now. Each
  * request takes [ATTEMPT_MS], and a failing outcome write takes [WRITE_MS] before it throws, so
  * the settle runs later than the attempt ended.
+ *
+ * With a retry decider installed:
+ * - R8: a retryable answer the decider decided, then the write of that decision fails. The settle
+ *   applies the decision as recorded, without asking JS again; when nothing was decided, an
+ *   [Error] raised while the decider was being asked say, it applies the policy's retry.
+ * - R11: the cycle is cancelled while the decider is asked, or before. The wait ends at once and
+ *   the dispatch writes the policy's retry itself; the decider is not asked once the cycle has
+ *   stopped.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [30])
@@ -84,6 +101,12 @@ internal class SettleMatrixTest {
 
   /** How each cycle ended, in order. */
   private val endings: MutableList<CycleEnding> = Collections.synchronizedList(mutableListOf())
+
+  /** The JS callbacks the cycles consult, and fake JS that answers for them. */
+  private val jsScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+  private val callbacks = JsCallbacks(scope = jsScope, notifyContext = Dispatchers.Default, log = { _, _ -> })
+  private val js = FakeJs(callbacks.gateway, jsScope)
+  private val hybrid = HybridInstalls(callbacks)
 
   @Before
   fun setUp() {
@@ -108,6 +131,7 @@ internal class SettleMatrixTest {
 
   @After
   fun tearDown() {
+    jsScope.cancel()
     server.shutdown()
     db.close()
   }
@@ -680,6 +704,264 @@ internal class SettleMatrixTest {
     assertWaitsInFlight(before, events, null, CycleEnding.CANCELLED)
   }
 
+  /* ------------------------------- the retry decider ------------------------------- */
+
+  @Test
+  fun `decider_abortSettle_appliesRecordedOutcome R8 C1 a decided dead letter whose move fails is dead-lettered by the settle`() =
+    runTest {
+      answer(503)
+      seed(ITEM)
+      val decider = installDecider(RetryAction.DEAD_LETTER)
+      val failing = spyk(storage)
+      coEvery {
+        failing.moveToDeadLetters(any(), any(), any(), any(), any(), any())
+      } answers { failWrite() }
+      val events = recordEvents()
+
+      val thrown = flushOnce(dispatcher(queue = failing))
+
+      assertThat(thrown).isInstanceOf(SQLiteDatabaseLockedException::class.java)
+      val dead = deadLetter(ITEM)
+      assertThat(dead.attempts).isEqualTo(2)
+      assertThat(dead.lastAttemptAt).isEqualTo(t0)
+      assertThat(dead.lastErrorCode).isEqualTo(SyncErrorCode.RETRY_DECIDER_REJECTED.name)
+      // The attempt's own failure, not the decision.
+      assertThat(dead.lastErrorMessage).isEqualTo("HTTP 503 Server Error")
+      assertThat(events.seen())
+        .containsExactly(
+          Seen(SyncEventType.SYNC_STARTED),
+          Seen(SyncEventType.ITEM_FAILED, ITEM, SyncErrorCode.RETRY_DECIDER_REJECTED, 503, 2),
+          Seen(SyncEventType.ITEM_DEAD_LETTERED, ITEM, SyncErrorCode.DEAD_LETTERED),
+          Seen(SyncEventType.SYNC_FAILED, errorCode = SyncErrorCode.NETWORK_ERROR),
+        )
+        .inOrder()
+      assertThat(events[2].metadata)
+        .containsExactly(SyncDispatcher.METADATA_LAST_ERROR_CODE, "RETRY_DECIDER_REJECTED")
+      assertThat(endings).containsExactly(CycleEnding.FAILED)
+      assertNoWake()
+      assertThat(nextArmForADueRow()).isEqualTo(FIRST_HOLD_MS)
+      // The settle applied what was decided: JS was asked once, by the dispatch.
+      assertThat(decider.calls).hasSize(1)
+    }
+
+  @Test
+  fun `decider_abortSettle_appliesRecordedOutcome R8 C1 a decided drop whose delete fails is dropped by the settle`() =
+    runTest {
+      answer(503)
+      seed(ITEM)
+      val decider = installDecider(RetryAction.DROP)
+      val failing = spyk(storage)
+      coEvery { failing.markDropped(any()) } answers { failWrite() }
+      val events = recordEvents()
+
+      val thrown = flushOnce(dispatcher(queue = failing))
+
+      assertThat(thrown).isInstanceOf(SQLiteDatabaseLockedException::class.java)
+      assertThat(db.syncItemDao().findById(ITEM)).isNull()
+      assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+      // Once: the drop writes before it reports, so its failed delete had reported nothing.
+      assertThat(events.seen())
+        .containsExactly(
+          Seen(SyncEventType.SYNC_STARTED),
+          Seen(SyncEventType.ITEM_FAILED, ITEM, SyncErrorCode.RETRY_DECIDER_REJECTED, 503, 2),
+          Seen(SyncEventType.SYNC_FAILED, errorCode = SyncErrorCode.NETWORK_ERROR),
+        )
+        .inOrder()
+      assertThat(endings).containsExactly(CycleEnding.FAILED)
+      assertNoWake()
+      assertThat(nextArmForADueRow()).isEqualTo(FIRST_HOLD_MS)
+      assertThat(decider.calls).hasSize(1)
+    }
+
+  @Test
+  fun `decider_abortSettle_appliesRecordedOutcome R8 C1 a decided retry whose write fails waits the decided delay`() =
+    runTest {
+      answer(503)
+      seed(ITEM)
+      val decider = installDecider(RetryAction.RETRY, delayMs = 12_345.0, decideMs = DECIDE_MS)
+      val failing = spyk(storage)
+      coEvery { failing.markRetry(any(), any(), any(), any(), any()) } answers { failWrite() }
+      val events = recordEvents()
+
+      val thrown = flushOnce(dispatcher(queue = failing))
+
+      assertThat(thrown).isInstanceOf(SQLiteDatabaseLockedException::class.java)
+      val retry = row(ITEM)
+      assertThat(retry.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+      assertThat(retry.attempts).isEqualTo(2)
+      assertThat(retry.lastAttemptAt).isEqualTo(t0)
+      assertThat(retry.lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
+      // The decided delay, from the decision: not the policy's, and not from the settle.
+      assertThat(retry.nextRetryAt).isEqualTo(t0 + ATTEMPT_MS + DECIDE_MS + 12_345L)
+      assertThat(events.seen())
+        .containsExactly(
+          Seen(SyncEventType.SYNC_STARTED),
+          Seen(SyncEventType.ITEM_RETRYING, ITEM, SyncErrorCode.SERVER_ERROR, 503, 2),
+          Seen(SyncEventType.SYNC_FAILED, errorCode = SyncErrorCode.NETWORK_ERROR),
+        )
+        .inOrder()
+      assertThat(endings).containsExactly(CycleEnding.FAILED)
+      assertWake(maxOf(retry.nextRetryAt - clock.now(), FIRST_HOLD_MS))
+      assertThat(decider.calls).hasSize(1)
+    }
+
+  @Test
+  fun `decider_abortSettle_appliesRecordedOutcome R8 C1 with nothing decided, an Error while asking, the settle applies the policy's retry`() =
+    runTest {
+      answer(503)
+      seed(ITEM)
+      val decider = js.function<RetryDeciderContext> { _, _ -> throw NoClassDefFoundError(RAISED) }
+      assertThat(hybrid.setRetryDecider(decider)).isTrue()
+      val events = recordEvents()
+
+      val thrown = flushOnce(dispatcher())
+
+      assertThat(thrown).isInstanceOf(NoClassDefFoundError::class.java)
+      val retry = row(ITEM)
+      assertThat(retry.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+      assertThat(retry.attempts).isEqualTo(2)
+      assertThat(retry.lastAttemptAt).isEqualTo(t0)
+      assertThat(retry.lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
+      // Remembered before the decider was asked: the policy's delay, from the attempt's end.
+      assertThat(retry.nextRetryAt).isEqualTo(t0 + ATTEMPT_MS + 2 * BASE_DELAY_MS)
+      assertThat(events.seen())
+        .containsExactly(
+          Seen(SyncEventType.SYNC_STARTED),
+          Seen(SyncEventType.ITEM_RETRYING, ITEM, SyncErrorCode.SERVER_ERROR, 503, 2),
+          Seen(SyncEventType.SYNC_FAILED, errorCode = SyncErrorCode.NETWORK_ERROR),
+        )
+        .inOrder()
+      assertThat(endings).containsExactly(CycleEnding.FAILED)
+      assertWake(FIRST_HOLD_MS)
+      assertThat(decider.calls).hasSize(1)
+    }
+
+  @Test
+  fun `decider_abortSettle_appliesRecordedOutcome R8 C2 a decided dead letter whose move and settle both fail waits in flight`() =
+    runTest {
+      answer(503)
+      val before = seed(ITEM)
+      installDecider(RetryAction.DEAD_LETTER)
+      val failing = spyk(storage)
+      coEvery {
+        failing.moveToDeadLetters(any(), any(), any(), any(), any(), any())
+      } answers { failWrite() }
+      settleFails(failing)
+      val events = recordEvents()
+
+      flushOnce(dispatcher(queue = failing))
+
+      assertWaitsInFlight(before, events, SyncErrorCode.NETWORK_ERROR, CycleEnding.FAILED)
+    }
+
+  @Test
+  fun `decider_stopMidWait_appliesPolicy R11 TRUSTED, a cancelled cycle ends the wait at once and writes the policy's retry`() =
+    runTest {
+      answer(503)
+      seed(ITEM)
+      val decider = neverAnswering()
+      val events = recordEvents()
+      val d = dispatcher(callbackTimeoutMs = LONG_CALLBACK_TIMEOUT_MS)
+
+      val cycle = launch(Dispatchers.IO) { d.flush() }
+      runBlocking { withTimeout(20_000L) { decider.asked.await() } }
+      val started = System.nanoTime()
+      cycle.cancel()
+      cycle.join()
+
+      // Cut short: the 60 s wait did not run out.
+      assertThat(elapsedMs(started)).isLessThan(AT_ONCE_MS)
+      assertThat(cycle.isCancelled).isTrue()
+      val retried = row(ITEM)
+      assertThat(retried.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+      assertThat(retried.attempts).isEqualTo(2)
+      assertThat(retried.lastAttemptAt).isEqualTo(t0)
+      assertThat(retried.lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
+      assertThat(retried.nextRetryAt).isEqualTo(t0 + ATTEMPT_MS + 2 * BASE_DELAY_MS)
+      assertThat(events.seen())
+        .containsExactly(
+          Seen(SyncEventType.SYNC_STARTED),
+          Seen(SyncEventType.ITEM_RETRYING, ITEM, SyncErrorCode.SERVER_ERROR, 503, 2),
+          Seen(SyncEventType.SYNC_FAILED),
+        )
+        .inOrder()
+      assertThat(endings).containsExactly(CycleEnding.CANCELLED)
+      assertWake(retried.nextRetryAt - clock.now())
+    }
+
+  @Test
+  fun `decider_stopMidWait_appliesPolicy R11 PERSISTED, a cancelled cycle ends the leading item's wait at once`() =
+    runTest {
+      answer(503)
+      seed(ITEM, createdAt = 1L)
+      val unsent = seed(REST, createdAt = 2L)
+      val decider = neverAnswering()
+      val events = recordEvents()
+      // Restored headers: the leading item is dispatched in the cycle's own coroutine.
+      val d = dispatcher(credentials = CredentialPolicy.PERSISTED, callbackTimeoutMs = LONG_CALLBACK_TIMEOUT_MS)
+
+      val cycle = launch(Dispatchers.IO) { d.flush() }
+      runBlocking { withTimeout(20_000L) { decider.asked.await() } }
+      val started = System.nanoTime()
+      cycle.cancel()
+      cycle.join()
+
+      assertThat(elapsedMs(started)).isLessThan(AT_ONCE_MS)
+      val retried = row(ITEM)
+      assertThat(retried.attempts).isEqualTo(2)
+      assertThat(retried.lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
+      assertThat(retried.nextRetryAt).isEqualTo(t0 + ATTEMPT_MS + 2 * BASE_DELAY_MS)
+      assertThat(row(REST)).isEqualTo(unsent)
+      assertThat(events.seen())
+        .containsExactly(
+          Seen(SyncEventType.SYNC_STARTED),
+          Seen(SyncEventType.ITEM_RETRYING, ITEM, SyncErrorCode.SERVER_ERROR, 503, 2),
+          Seen(SyncEventType.SYNC_FAILED),
+        )
+        .inOrder()
+      assertThat(endings).containsExactly(CycleEnding.CANCELLED)
+      // The unsent row is due.
+      assertWake(0L)
+      assertThat(decider.calls).hasSize(1)
+    }
+
+  @Test
+  fun `decider_stopMidWait_appliesPolicy R11 a cycle cancelled during the request never asks the decider`() =
+    runTest {
+      val release = CompletableDeferred<Unit>()
+      server.dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse {
+          runBlocking { withTimeout(20_000L) { release.await() } }
+          clock.advance(ATTEMPT_MS)
+          return MockResponse().setResponseCode(503)
+        }
+      }
+      seed(ITEM)
+      val decider = installDecider(RetryAction.DEAD_LETTER)
+      val events = recordEvents()
+      val d = dispatcher()
+
+      val cycle = launch(Dispatchers.IO) { d.flush() }
+      assertThat(server.takeRequest(20, TimeUnit.SECONDS)?.path).isEqualTo("/$ITEM")
+      cycle.cancel()
+      release.complete(Unit)
+      cycle.join()
+
+      assertThat(decider.calls).isEmpty()
+      val retried = row(ITEM)
+      assertThat(retried.attempts).isEqualTo(2)
+      assertThat(retried.lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
+      assertThat(retried.nextRetryAt).isEqualTo(t0 + ATTEMPT_MS + 2 * BASE_DELAY_MS)
+      assertThat(events.seen())
+        .containsExactly(
+          Seen(SyncEventType.SYNC_STARTED),
+          Seen(SyncEventType.ITEM_RETRYING, ITEM, SyncErrorCode.SERVER_ERROR, 503, 2),
+          Seen(SyncEventType.SYNC_FAILED),
+        )
+        .inOrder()
+      assertThat(endings).containsExactly(CycleEnding.CANCELLED)
+    }
+
   /* ---------------------------- the deadline ceiling ---------------------------- */
 
   @Test
@@ -782,6 +1064,36 @@ internal class SettleMatrixTest {
     return events
   }
 
+  /**
+   * A retry decider the current hybrid installs: it answers [action] with [delayMs] at once,
+   * once the decision has taken [decideMs] on the test clock.
+   */
+  private fun installDecider(
+    action: RetryAction,
+    delayMs: Double? = null,
+    decideMs: Long = 0L,
+  ): FakeFunction<RetryDeciderContext> = js.function<RetryDeciderContext> { requestId, _ ->
+    clock.advance(decideMs)
+    answer(requestId, FakeJs.decision(action, delayMs))
+  }.also { assertThat(hybrid.setRetryDecider(it)).isTrue() }
+
+  /** A retry decider the current hybrid installs, which never answers. */
+  private class NeverAnswering(
+    val asked: CompletableDeferred<Unit>,
+    private val function: FakeFunction<RetryDeciderContext>,
+  ) {
+    val calls: List<RetryDeciderContext> get() = function.calls
+  }
+
+  private fun neverAnswering(): NeverAnswering {
+    val asked = CompletableDeferred<Unit>()
+    val function = js.function<RetryDeciderContext> { _, _ -> asked.complete(Unit) }
+    assertThat(hybrid.setRetryDecider(function)).isTrue()
+    return NeverAnswering(asked, function)
+  }
+
+  private fun elapsedMs(startedNanos: Long): Long = (System.nanoTime() - startedNanos) / 1_000_000L
+
   @Suppress("LongParameterList")
   private fun dispatcher(
     queue: SyncQueueStorage = storage,
@@ -791,6 +1103,7 @@ internal class SettleMatrixTest {
     requestTimeoutMs: Long = 5_000L,
     client: OkHttpClient = OkHttpClient.Builder().retryOnConnectionFailure(false).build(),
     armsWake: Boolean = true,
+    callbackTimeoutMs: Double? = null,
   ): SyncDispatcher {
     val options = TestData.syncOptions(
       retryPolicy = TestData.retryPolicy(
@@ -800,12 +1113,14 @@ internal class SettleMatrixTest {
         jitter = false,
       ),
       requestTimeoutMs = requestTimeoutMs,
+      callbackTimeoutMs = callbackTimeoutMs,
     )
     return SyncDispatcher(
       storage = queue,
       emitter = emitter,
       getOptions = { options },
       clock = clock::now,
+      callbacks = callbacks,
       credentialPolicy = { credentials },
       onCycleFinished = { notBefore, ending ->
         if (armsWake) {
@@ -974,5 +1289,14 @@ internal class SettleMatrixTest {
     /** The failure hold's first two steps. */
     const val FIRST_HOLD_MS = 30_000L
     const val SECOND_HOLD_MS = 60_000L
+
+    /** How long a fake decision takes, on the test clock. */
+    const val DECIDE_MS = 300L
+
+    /** A `callbackTimeoutMs` no test waits out. */
+    const val LONG_CALLBACK_TIMEOUT_MS = 60_000.0
+
+    /** Well inside [LONG_CALLBACK_TIMEOUT_MS]: what "at once" allows on a loaded machine. */
+    const val AT_ONCE_MS = 10_000L
   }
 }

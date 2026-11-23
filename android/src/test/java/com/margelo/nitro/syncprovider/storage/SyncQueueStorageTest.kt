@@ -8,6 +8,7 @@ import com.margelo.nitro.syncprovider.SyncErrorCode
 import com.margelo.nitro.syncprovider.SyncPriority
 import com.margelo.nitro.syncprovider.SyncResult
 import com.margelo.nitro.syncprovider.database.SyncDatabase
+import com.margelo.nitro.syncprovider.database.SyncDeadLetterEntity
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
 import com.margelo.nitro.syncprovider.error.SyncException
 import com.margelo.nitro.syncprovider.testutil.TestData
@@ -460,7 +461,7 @@ internal class SyncQueueStorageTest {
    */
   @Test
   fun `settleAbortedClaims applies each claim only to a row still IN_FLIGHT`() = runTest {
-    val kinds = listOf("unsent", "delivered", "retry", "exhausted")
+    val kinds = listOf("unsent", "delivered", "dropped", "retry", "exhausted")
     for (kind in kinds) {
       db.syncItemDao().insert(
         TestData.entity(id = "recorded-$kind", attempts = 1, nextRetryAt = 42_000L),
@@ -472,6 +473,7 @@ internal class SyncQueueStorageTest {
     fun claimsFor(prefix: String): List<AbortedClaim> = listOf(
       AbortedClaim.Unsent("$prefix-unsent"),
       AbortedClaim.Delivered("$prefix-delivered"),
+      AbortedClaim.Dropped("$prefix-dropped"),
       AbortedClaim.Retry(
         id = "$prefix-retry",
         attempts = 2,
@@ -499,15 +501,51 @@ internal class SyncQueueStorageTest {
     }
     assertThat(db.syncDeadLetterDao().findById("recorded-exhausted")).isNull()
     assertThat(appliedToClaimed.map { it.id })
-      .containsExactly("claimed-delivered", "claimed-retry", "claimed-exhausted")
+      .containsExactly("claimed-delivered", "claimed-dropped", "claimed-retry", "claimed-exhausted")
       .inOrder()
     assertThat(db.syncItemDao().findById("claimed-unsent")?.status)
       .isEqualTo(SyncItemEntity.STATUS_PENDING)
     assertThat(db.syncItemDao().findById("claimed-delivered")).isNull()
+    // Dropped, as delivered: no dead letter.
+    assertThat(db.syncItemDao().findById("claimed-dropped")).isNull()
+    assertThat(db.syncDeadLetterDao().findById("claimed-dropped")).isNull()
     assertThat(db.syncItemDao().findById("claimed-retry")?.attempts).isEqualTo(2)
     assertThat(db.syncItemDao().findById("claimed-exhausted")).isNull()
     assertThat(db.syncDeadLetterDao().findById("claimed-exhausted")?.lastErrorCode)
       .isEqualTo(SyncErrorCode.SERVER_ERROR.name)
+  }
+
+  @Test
+  fun `markDropped deletes the queued row in any status, and never a dead letter`() = runTest {
+    db.syncItemDao().insert(TestData.entity(id = "claimed", status = SyncItemEntity.STATUS_IN_FLIGHT))
+    db.syncItemDao().insert(TestData.entity(id = "pending"))
+    db.syncDeadLetterDao().insert(
+      SyncDeadLetterEntity(
+        id = "dead",
+        method = "POST",
+        url = "https://api.example.com/v1/test",
+        headers = null,
+        body = null,
+        contentType = null,
+        priority = "NORMAL",
+        priorityWeight = SyncItemEntity.priorityWeight("NORMAL"),
+        createdAt = 1L,
+        metadata = null,
+        attempts = 1,
+        lastAttemptAt = 2L,
+        lastErrorCode = SyncErrorCode.SERVER_ERROR.name,
+        lastErrorMessage = "HTTP 400 Client Error",
+        deadLetteredAt = 3L,
+      ),
+    )
+
+    assertThat(storage.markDropped("claimed")).isTrue()
+    assertThat(storage.markDropped("pending")).isTrue()
+    // A dead letter is not a queued row: it stays, and nothing was dropped.
+    assertThat(storage.markDropped("dead")).isFalse()
+
+    assertThat(db.syncItemDao().count()).isEqualTo(0)
+    assertThat(db.syncDeadLetterDao().findById("dead")).isNotNull()
   }
 
   private fun sampleResult(

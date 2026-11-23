@@ -38,6 +38,12 @@ internal sealed interface AbortedClaim {
   data class Delivered(override val id: String) : AbortedClaim
 
   /**
+   * The retry decider dropped it after a failed attempt: the row is removed, with no dead letter,
+   * and reported as failed.
+   */
+  data class Dropped(override val id: String) : AbortedClaim
+
+  /**
    * Back to `PENDING` with these values: a retry, which counts its attempt, or a credential hold,
    * which does not. The row waits for [nextRetryAt].
    */
@@ -140,7 +146,9 @@ internal class SyncQueueStorage(
       if (claims.isEmpty()) return@withContext emptyList()
       val applied = deadLetterDao.settleAbortedClaims(
         unsent = claims.filterIsInstance<AbortedClaim.Unsent>().map { it.id },
-        delivered = claims.filterIsInstance<AbortedClaim.Delivered>().map { it.id },
+        removed = claims
+          .filter { it is AbortedClaim.Delivered || it is AbortedClaim.Dropped }
+          .map { it.id },
         retries = claims.filterIsInstance<AbortedClaim.Retry>().map {
           ScheduledRetry(
             id = it.id,
@@ -214,6 +222,16 @@ internal class SyncQueueStorage(
 
   suspend fun markSucceeded(id: String): Unit = withContext(Dispatchers.IO) {
     itemDao.deleteById(id)
+  }
+
+  /**
+   * The retry decider dropped item [id]: its queue row is deleted, whatever its status. A dead
+   * letter with that id is never touched.
+   *
+   * @return false when the queue had no such row, a purge having removed it.
+   */
+  suspend fun markDropped(id: String): Boolean = withContext(Dispatchers.IO) {
+    itemDao.deleteById(id) > 0
   }
 
   /**

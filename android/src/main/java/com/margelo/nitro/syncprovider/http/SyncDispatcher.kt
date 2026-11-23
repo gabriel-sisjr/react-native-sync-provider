@@ -1,12 +1,19 @@
 package com.margelo.nitro.syncprovider.http
 
 import android.util.Log
+import com.margelo.nitro.syncprovider.HttpMethod
 import com.margelo.nitro.syncprovider.NetworkQuality
+import com.margelo.nitro.syncprovider.RetryAction
+import com.margelo.nitro.syncprovider.RetryDecision
+import com.margelo.nitro.syncprovider.RetryDeciderContext
 import com.margelo.nitro.syncprovider.RetryPolicy
 import com.margelo.nitro.syncprovider.SyncErrorCode
 import com.margelo.nitro.syncprovider.SyncEventType
 import com.margelo.nitro.syncprovider.SyncOptions
 import com.margelo.nitro.syncprovider.SyncResult
+import com.margelo.nitro.syncprovider.callbacks.CallbackResult
+import com.margelo.nitro.syncprovider.callbacks.JsCallbacks
+import com.margelo.nitro.syncprovider.config.CallbackTimeout
 import com.margelo.nitro.syncprovider.connectivity.meetsMinimum
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
 import com.margelo.nitro.syncprovider.error.SyncException
@@ -17,6 +24,7 @@ import com.margelo.nitro.syncprovider.storage.SyncQueueStorage
 import com.margelo.nitro.syncprovider.util.JsonMap
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -53,24 +61,31 @@ import kotlin.random.Random
  *   skips it until that deadline elapses.
  * - [SyncItemEntity.attempts] is cross-cycle: it continues from whatever prior
  *   cycles persisted, so the retry budget survives process death and reboots.
+ * - With a retry decider installed by JS, a failure the policy would retry is first put to it
+ *   (see [retryOrAsk]). It never retries more than the policy does: it answers RETRY, with its
+ *   own delay or the policy's, DEAD_LETTER or DROP, and without an answer the policy applies. It
+ *   is never asked about a success, a failure the policy would not retry, a spent budget or a
+ *   credential hold.
  * - [onCycleFinished] fires after every cycle, whatever its outcome, so the next
  *   wake is always re-armed. It is told how the cycle ended ([CycleEnding]): the wake after a
  *   cycle that failed is held back, so a failure that persists cannot run cycles back to back.
  *
  * Concurrency model:
  * - [flushMutex] serializes cycles: a concurrent [flush] waits for the running one
- *   and then runs its own.
+ *   and then runs its own. A JS callback is awaited under it, so a callback that waits for
+ *   `flush()` holds the cycle until `callbackTimeoutMs`, then its fallback applies.
  * - Within a cycle, items are dispatched via [supervisorScope]: an item whose attempt fails
  *   records that outcome and leaves its siblings alone.
  * - A dispatch that started finishes even if the cycle is cancelled, and records its outcome,
  *   unless something raised around its attempt ends the cycle: a storage failure, a
  *   cancellation or an [Error] (see [dispatchRecordingOutcome]). Dispatches already started
- *   still finish then, and none starts after. Unless a cancellation ended the cycle, each row
+ *   still finish then, and none starts after. A wait for JS is the exception: the cycle's end
+ *   cuts it short, and the fallback applies. Unless a cancellation ended the cycle, each row
  *   it claimed and left without a recorded outcome is then settled with what its attempt
  *   established (see [settlements]): an answer the server gave is applied as the attempt would
- *   have applied it, a `2xx` included; a request that went out with no answer classified counts
- *   the attempt, with its cooldown. A row never sent, and every row after a cancellation, comes
- *   back as it was.
+ *   have applied it, a `2xx` included, and as the retry decider decided it; a request that went
+ *   out with no answer classified counts the attempt, with its cooldown. A row never sent, and
+ *   every row after a cancellation, comes back as it was. A settle never asks JS.
  * - Each attempt is bounded by OkHttp's call timeout: `requestTimeoutMs`, raised to 1 s and
  *   capped at `Int.MAX_VALUE` ms. Running out of it reports `TIMEOUT`, and so does one of the
  *   client's fixed socket timeouts: 10 s to connect, 30 s for a stalled read or write. See
@@ -93,6 +108,8 @@ import kotlin.random.Random
  * @param httpClient the one OkHttp client, built once, on the first cycle with items to send,
  *   before any attempt: a client that cannot be built fails that cycle, not its items. Each
  *   attempt derives its own call from it, with that cycle's `requestTimeoutMs`.
+ * @param callbacks what JS installed, read when each item needs it, and the gateway that waits
+ *   for its answers, for at most the cycle's `callbackTimeoutMs`.
  */
 @Suppress("LongParameterList")
 internal class SyncDispatcher(
@@ -110,6 +127,7 @@ internal class SyncDispatcher(
   private val onCycleFinished: suspend (notBefore: Long?, ending: CycleEnding) -> Unit =
     { _, _ -> },
   private val httpClient: Lazy<OkHttpClient> = lazy { newClient(verboseLogging()) },
+  private val callbacks: JsCallbacks = JsCallbacks(),
 ) {
   private val flushMutex = Mutex()
   private val syncing = AtomicBoolean(false)
@@ -377,6 +395,16 @@ internal class SyncDispatcher(
           attempt = settlement.attempt,
         ),
       )
+      // The drop writes before it reports, so the dispatch never reported a drop the settle writes.
+      is AbortedClaim.Dropped -> emitter.emit(
+        SyncEventEmitter.event(
+          type = SyncEventType.ITEM_FAILED,
+          itemId = claim.id,
+          errorCode = SyncErrorCode.RETRY_DECIDER_REJECTED,
+          statusCode = settlement.statusCode,
+          attempt = settlement.attempt,
+        ),
+      )
       is AbortedClaim.Retry -> emitter.emit(
         SyncEventEmitter.event(
           type = SyncEventType.ITEM_RETRYING,
@@ -469,23 +497,40 @@ internal class SyncDispatcher(
    * rows that have no recorded outcome. A failed local write is never the item's failure: an
    * answer the server gave is applied as this dispatch would have applied it, so after a `2xx`
    * the row is delivered.
+   *
+   * A wait for JS is the one thing a cancellation reaches. The dispatch gets a stop signal made
+   * before `NonCancellable`, a child of the caller's job: when the cycle is cancelled, or its
+   * scope ends after a sibling failed, the wait ends at once and its fallback applies, and the
+   * dispatch then finishes as usual. It must be completed in all cases, or the caller's job
+   * would never complete.
    */
   private suspend fun dispatchRecordingOutcome(
     entity: SyncItemEntity,
     options: SyncOptions,
     credentials: CredentialPolicy,
-  ): ItemOutcome = withContext(NonCancellable) { dispatchItem(entity, options, credentials) }
+  ): ItemOutcome {
+    val stop = Job(currentCoroutineContext()[Job])
+    try {
+      return withContext(NonCancellable) { dispatchItem(entity, options, credentials, stop) }
+    } finally {
+      stop.complete()
+    }
+  }
 
   /**
    * Dispatch a single attempt for [entity]. On a retriable failure with budget
    * remaining, the item is re-queued `PENDING` with a persisted cooldown
-   * ([ItemOutcome.Rescheduled]); otherwise it terminally succeeds or fails. The
-   * [SyncItemEntity.attempts] counter continues across cycles (never reset).
+   * ([ItemOutcome.Rescheduled]), unless the retry decider decides otherwise; otherwise it
+   * terminally succeeds or fails. The [SyncItemEntity.attempts] counter continues across cycles
+   * (never reset).
+   *
+   * @param stop cancelled when the cycle stops; it ends a wait for JS at once.
    */
   private suspend fun dispatchItem(
     entity: SyncItemEntity,
     options: SyncOptions,
     credentials: CredentialPolicy,
+    stop: Job,
   ): ItemOutcome {
     val timeoutMs = (options.requestTimeoutMs?.toLong() ?: DEFAULT_REQUEST_TIMEOUT_MS)
       .coerceIn(MIN_REQUEST_TIMEOUT_MS, MAX_REQUEST_TIMEOUT_MS)
@@ -546,31 +591,172 @@ internal class SyncDispatcher(
             outcome.code == SyncErrorCode.UNAUTHORIZED ->
             holdForCredentialRenewal(entity, attempt, startedAt, finishedAt, outcome, options)
           outcome.retryable && RetryPolicyEvaluator.hasBudget(attempt, policy) ->
-            reschedule(entity, attempt, startedAt, finishedAt, outcome, options)
+            retryOrAsk(entity, attempt, startedAt, finishedAt, outcome, options, stop)
           else -> failTerminally(entity, attempt, startedAt, outcome)
         }
       }
     }
   }
 
-  /** Persist the cooldown; the row is excluded from claims until it elapses. */
-  private suspend fun reschedule(
+  /**
+   * A failure the policy retries. With no retry decider installed, the row cools down for the
+   * policy's delay, from the end of the attempt. With one, the decider is asked first, and what
+   * it decides is applied:
+   * - RETRY: the row cools down for the decider's `delayMs`, used as given (no jitter, no
+   *   `maxDelayMs`), or for the policy's delay when it gives none or an unusable one;
+   * - DEAD_LETTER: the row becomes a dead letter with [SyncErrorCode.RETRY_DECIDER_REJECTED]
+   *   (see [rejectToDeadLetter]);
+   * - DROP: the row is deleted (see [drop]).
+   *
+   * Without a decision (a failed or wrong answer, none within `callbackTimeoutMs`, an owner
+   * gone, a stopped cycle) the policy's retry applies. Either way the delay counts from the
+   * moment the decision was taken, not from the end of the attempt.
+   *
+   * The policy's retry is remembered before the wait: should anything raise during it, the
+   * settle applies that retry. Each outcome is remembered again before its own write, so the
+   * settle applies what was decided, and never asks JS.
+   */
+  @Suppress("LongParameterList")
+  private suspend fun retryOrAsk(
     entity: SyncItemEntity,
     attempt: Int,
     startedAt: Long,
     finishedAt: Long,
     outcome: AttemptResult.Failure,
     options: SyncOptions,
+    stop: Job,
   ): ItemOutcome {
-    val nextRetryAt = RetryPolicyEvaluator.deadline(
-      from = finishedAt,
-      delayMs = RetryPolicyEvaluator.computeDelayMs(attempt, options.retryPolicy, random),
+    val policyDelayMs = RetryPolicyEvaluator.computeDelayMs(attempt, options.retryPolicy, random)
+    val policyRetry = AbortedClaim.Retry(
+      id = entity.id,
+      attempts = attempt,
+      lastAttemptAt = startedAt,
+      lastErrorCode = outcome.code,
+      nextRetryAt = RetryPolicyEvaluator.deadline(from = finishedAt, delayMs = policyDelayMs),
     )
-    val retry = AbortedClaim.Retry(entity.id, attempt, startedAt, outcome.code, nextRetryAt)
+    val decider = callbacks.registry.retryDecider.installed
+      ?: return rescheduled(entity, attempt, outcome, policyRetry)
+
+    remember(entity.id, Settlement(policyRetry, attempt, outcome.statusCode))
+    val answer = callbacks.decide(
+      decider = decider,
+      context = deciderContext(entity, attempt, outcome),
+      timeoutMs = CallbackTimeout.ms(options),
+      stop = stop,
+    )
+    val decidedAt = clock()
+    val decision = (answer as? CallbackResult.Answered)?.value
+    return when (decision?.action) {
+      RetryAction.DEAD_LETTER -> rejectToDeadLetter(entity, attempt, startedAt, outcome)
+      RetryAction.DROP -> drop(entity, attempt, outcome)
+      RetryAction.RETRY, null -> {
+        val delayMs = decision?.let { usableDelayMs(entity, it) } ?: policyDelayMs
+        val nextRetryAt = RetryPolicyEvaluator.deadline(from = decidedAt, delayMs = delayMs)
+        rescheduled(entity, attempt, outcome, policyRetry.copy(nextRetryAt = nextRetryAt))
+      }
+    }
+  }
+
+  /** Persist the cooldown [retry] names; the row is excluded from claims until it elapses. */
+  private suspend fun rescheduled(
+    entity: SyncItemEntity,
+    attempt: Int,
+    outcome: AttemptResult.Failure,
+    retry: AbortedClaim.Retry,
+  ): ItemOutcome {
     remember(entity.id, Settlement(retry, attempt, outcome.statusCode))
-    storage.markRetry(entity.id, attempt, startedAt, outcome.code, nextRetryAt)
+    storage.markRetry(
+      entity.id,
+      retry.attempts,
+      retry.lastAttemptAt,
+      retry.lastErrorCode,
+      retry.nextRetryAt,
+    )
     emitRetrying(entity, attempt, outcome)
     return ItemOutcome.Rescheduled(entity.id)
+  }
+
+  /**
+   * The retry decider rejected the item: it becomes a dead letter with
+   * [SyncErrorCode.RETRY_DECIDER_REJECTED], and the attempt's own failure as its message. A row
+   * purged during the wait is not brought back; see [deadLetter].
+   */
+  private suspend fun rejectToDeadLetter(
+    entity: SyncItemEntity,
+    attempt: Int,
+    startedAt: Long,
+    outcome: AttemptResult.Failure,
+  ): ItemOutcome {
+    deadLetter(
+      entity = entity,
+      attempts = attempt,
+      lastAttemptAt = startedAt,
+      code = SyncErrorCode.RETRY_DECIDER_REJECTED,
+      detail = outcome.detail,
+      statusCode = outcome.statusCode,
+      requestSent = true,
+    )
+    return ItemOutcome.Failed(entity.id, SyncErrorCode.RETRY_DECIDER_REJECTED, outcome.message)
+  }
+
+  /**
+   * The retry decider dropped the item: its queue row is deleted, with no dead letter, and then
+   * `ITEM_FAILED` reports [SyncErrorCode.RETRY_DECIDER_REJECTED]. The write comes first, so a
+   * settle that applies the drop after a failed delete reports it once. A row purged during the
+   * wait still gets its `ITEM_FAILED`: its request went out.
+   */
+  private suspend fun drop(
+    entity: SyncItemEntity,
+    attempt: Int,
+    outcome: AttemptResult.Failure,
+  ): ItemOutcome {
+    remember(entity.id, Settlement(AbortedClaim.Dropped(entity.id), attempt, outcome.statusCode))
+    storage.markDropped(entity.id)
+    emitter.emit(
+      SyncEventEmitter.event(
+        type = SyncEventType.ITEM_FAILED,
+        itemId = entity.id,
+        errorCode = SyncErrorCode.RETRY_DECIDER_REJECTED,
+        statusCode = outcome.statusCode,
+        attempt = attempt,
+      ),
+    )
+    return ItemOutcome.Failed(entity.id, SyncErrorCode.RETRY_DECIDER_REJECTED, outcome.message)
+  }
+
+  /** What the retry decider is told about the attempt that just failed. */
+  private fun deciderContext(
+    entity: SyncItemEntity,
+    attempt: Int,
+    outcome: AttemptResult.Failure,
+  ): RetryDeciderContext = RetryDeciderContext(
+    itemId = entity.id,
+    attempt = attempt.toDouble(),
+    errorCode = outcome.code,
+    statusCode = outcome.statusCode?.toDouble(),
+    url = entity.url,
+    method = runCatching { HttpMethod.valueOf(entity.method.uppercase()) }
+      .getOrDefault(HttpMethod.GET),
+    metadata = JsonMap.decode(entity.metadata),
+  )
+
+  /**
+   * A RETRY's own delay: finite and at least 0, its fraction dropped, at most
+   * [RetryPolicyEvaluator.MAX_DELAY_MS]; the deadline it gives stops at
+   * [RetryPolicyEvaluator.MAX_DEADLINE_MS]. Null when there is none, or none usable, which means
+   * the policy's delay: an unusable delay is not a failed answer.
+   */
+  private fun usableDelayMs(entity: SyncItemEntity, decision: RetryDecision): Long? {
+    val delayMs = decision.delayMs ?: return null
+    if (!delayMs.isFinite() || delayMs < 0.0) {
+      callbacks.log.log(
+        Log.WARN,
+        "retryDecider for item ${entity.id}: delayMs $delayMs is not a usable delay; " +
+          "the policy's delay applies",
+      )
+      return null
+    }
+    return minOf(delayMs, RetryPolicyEvaluator.MAX_DELAY_MS.toDouble()).toLong()
   }
 
   /**

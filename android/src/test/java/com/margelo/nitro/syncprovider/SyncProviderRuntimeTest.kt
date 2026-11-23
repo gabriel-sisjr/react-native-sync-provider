@@ -1223,6 +1223,29 @@ internal class SyncProviderRuntimeTest {
   }
 
   @Test
+  fun `the runtime's dispatcher asks the retry decider a hybrid installed`() = runBlocking<Unit> {
+    server.enqueue(MockResponse().setResponseCode(503))
+    insert("decided")
+    val hybrid = HybridInstalls(SyncProviderRuntime.callbacks)
+    val asked: MutableList<String> = CopyOnWriteArrayList()
+    assertThat(
+      hybrid.setRetryDecider { requestId, context ->
+        asked += context.itemId
+        SyncProviderRuntime.callbacks.gateway.answer(
+          requestId,
+          CallbackAnswer(CallbackAnswerStatus.RESOLVED, RetryDecision(RetryAction.DROP, null), null, null, null),
+        )
+      },
+    ).isTrue()
+
+    runtime.dispatcher.flush()
+
+    assertThat(asked).containsExactly("decided")
+    assertThat(row("decided")).isNull()
+    assertThat(deadLetter("decided")).isNull()
+  }
+
+  @Test
   fun `invalid health-check options are rejected before anything changes`() = runBlocking<Unit> {
     val applied = gateAndHealthCheck()
     runtime.configure(applied)

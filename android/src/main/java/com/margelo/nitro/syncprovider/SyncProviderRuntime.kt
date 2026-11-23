@@ -128,6 +128,7 @@ internal class SyncProviderRuntime private constructor(
     healthCheck = healthCheck,
     onHealthCheckSkipped = { retryWake.arm() },
     onCycleFinished = { notBefore, ending -> retryWake.arm(notBefore, ending) },
+    callbacks = callbacks,
   )
 
   private val retryTimer = RetryTimer(
