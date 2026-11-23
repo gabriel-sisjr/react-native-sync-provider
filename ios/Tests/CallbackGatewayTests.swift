@@ -210,6 +210,34 @@ final class CallbackGatewayTests: XCTestCase {
         XCTAssertEqual(gateway.pendingCount, 0)
     }
 
+    /// The production timer lets a timeout go as soon as its request ends, not
+    /// at its deadline: an answered request, even at the longest
+    /// `callbackTimeoutMs`, keeps nothing of its timeout, and a timeout that
+    /// fires lets go once it has run.
+    func test_ios_theProductionTimer_freesATimeout_whenItsRequestEnds() async throws {
+        let timer = ProbedCallbackTimer()
+        let gateway = CallbackGateway(timer: timer)
+        let longest = NumericOption.int32Max
+
+        let answered = await gateway.requestDecision(owner: 1, timeoutMs: longest) { id in
+            gateway.answer(id, .decision(.drop))
+        }
+        gateway.notifyAfterDispatch(owner: 1, timeoutMs: longest) { id in
+            gateway.answer(id, .resolvedEmpty)
+        }
+        let timedOut = await gateway.requestHeaders(owner: 1, timeoutMs: 1) { _ in }
+
+        XCTAssertEqual(answered, .answered(RetryDecisionValue(action: .drop, delayMs: nil)))
+        XCTAssertEqual(timedOut, .skipped(.timedOut(afterMs: 1)))
+        XCTAssertEqual(timer.scheduledCount, 3)
+        let deadline = Date().addingTimeInterval(livenessTimeout)
+        while timer.heldCount > 0, Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(timer.heldCount, 0, "A timeout still holds what it captured")
+        XCTAssertEqual(gateway.pendingCount, 0)
+    }
+
     // MARK: - The call
 
     func test_gateway_invokeThrows_isFailed() async {
@@ -400,5 +428,38 @@ final class CallbackGatewayTests: XCTestCase {
             return true
         }
         return false
+    }
+}
+
+/// The production timer, with one probe object added to the captures of each
+/// timeout it schedules, so a test sees when a timeout is let go.
+private final class ProbedCallbackTimer: CallbackTimer, @unchecked Sendable {
+    private final class Probe: Sendable {}
+
+    private struct Watch {
+        weak var probe: Probe?
+    }
+
+    private let base = DispatchCallbackTimer()
+    private let lock = NSLock()
+    private var watches: [Watch] = []
+
+    /// Every timeout scheduled so far.
+    var scheduledCount: Int {
+        lock.withLock { watches.count }
+    }
+
+    /// The timeouts that still hold what they captured.
+    var heldCount: Int {
+        lock.withLock { watches.filter { $0.probe != nil }.count }
+    }
+
+    func schedule(afterMs delayMs: Int, _ fire: @escaping @Sendable () -> Void) -> CallbackTimerToken {
+        let probe = Probe()
+        lock.withLock { watches.append(Watch(probe: probe)) }
+        return base.schedule(afterMs: delayMs) {
+            withExtendedLifetime(probe) {}
+            fire()
+        }
     }
 }

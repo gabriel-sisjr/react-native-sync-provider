@@ -86,23 +86,27 @@ extension CallbackOutcome: Equatable where Value: Equatable {}
 final class CallbackTimerToken: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false
-    private let workItem: DispatchWorkItem?
+    private let source: DispatchSourceTimer?
 
-    init(workItem: DispatchWorkItem? = nil) {
-        self.workItem = workItem
+    /// - Parameter source: the timer to cancel; `nil` for a test timer's
+    ///   token, which is only marked.
+    init(source: DispatchSourceTimer? = nil) {
+        self.source = source
     }
 
     var isCancelled: Bool {
         lock.withLock { cancelled }
     }
 
+    /// Cancelling the timer frees its handler, and what that captured, right
+    /// away rather than at its deadline.
     func cancel() {
         let first = lock.withLock { () -> Bool in
             defer { cancelled = true }
             return !cancelled
         }
         if first {
-            workItem?.cancel()
+            source?.cancel()
         }
     }
 }
@@ -118,13 +122,23 @@ protocol CallbackTimer: Sendable {
 /// The production ``CallbackTimer``, on one serial utility queue. The delay
 /// is uptime: it measures how long JS takes to answer, and no JS runs while
 /// the device sleeps.
+///
+/// Each timeout is a one-shot timer source, cancelled when its request ends,
+/// whichever way it ends: an answer, the timeout itself, a cancellation or
+/// its owner going away. Cancelling frees what the timeout captured right
+/// away. A cancelled `asyncAfter` block would stay in memory until its
+/// deadline, up to the 24.8 days of the longest `callbackTimeoutMs`.
 final class DispatchCallbackTimer: CallbackTimer {
     private let queue = DispatchQueue(label: "com.gabriel-sisjr.syncprovider.callback-timer", qos: .utility)
 
     func schedule(afterMs delayMs: Int, _ fire: @escaping @Sendable () -> Void) -> CallbackTimerToken {
-        let workItem = DispatchWorkItem(block: fire)
-        queue.asyncAfter(deadline: .now() + .milliseconds(max(0, delayMs)), execute: workItem)
-        return CallbackTimerToken(workItem: workItem)
+        let source = DispatchSource.makeTimerSource(queue: queue)
+        source.schedule(deadline: .now() + .milliseconds(max(0, delayMs)))
+        source.setEventHandler { fire() }
+        // The token keeps the source, so the end of the request can cancel it.
+        let token = CallbackTimerToken(source: source)
+        source.resume()
+        return token
     }
 }
 
