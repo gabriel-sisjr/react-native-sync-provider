@@ -342,6 +342,10 @@ export async function getQueueSize(): Promise<number> {
  * the item was never tried — see {@link SyncItem.attempts} and
  * {@link SyncItem.nextRetryAt}.
  *
+ * While the header resolver or `beforeDispatch` is being waited on for an
+ * item, iOS still returns that item, because it claims the row only after
+ * them, and Android does not, because its cycle claimed the row already.
+ *
  * @example
  * const pending = await getPendingItems();
  * console.log(`${pending.length} item(s) pending`);
@@ -542,7 +546,12 @@ export async function discardDeadLetter(id: string): Promise<void> {
  *
  * While a cycle is running, iOS returns the last result at once, so the gate
  * and the health check do not run and report nothing. Android waits, then runs
- * its own cycle with every check.
+ * its own cycle with every check. So never await `flush()` inside a retry
+ * decider or a dispatch interceptor: on Android the running cycle then stalls
+ * until `SyncOptions.callbackTimeoutMs`, after which the policy decides or the
+ * item is deferred. The result
+ * can also arrive before the `afterDispatch` calls for its requests, which
+ * nothing waits for.
  *
  * @example
  * const result = await flush();
@@ -788,11 +797,14 @@ export async function isSyncing(): Promise<boolean> {
  * Every call also clears a credential hold, whether or not the headers
  * changed, so the retry wake stops waiting for it. From then on the app owns
  * the token in this process, so a 401 or 403 is terminal, as under any
- * configuration set in the process: the item fails with `UNAUTHORIZED`. Every
- * call also ends a running health-check backoff (see
- * {@link SyncOptions.healthCheckBackoffMs}), and arms the retry wake again,
- * which starts the network-quality gate's re-check schedule over (see
- * {@link SyncOptions.minNetworkQuality}).
+ * configuration set in the process: the item fails with `UNAUTHORIZED`. That
+ * holds for a token from the header resolver too. Every call also ends a
+ * running health-check backoff (see {@link SyncOptions.healthCheckBackoffMs}),
+ * and arms the retry wake again, which starts the network-quality gate's
+ * re-check schedule over (see {@link SyncOptions.minNetworkQuality}). Since
+ * the wake can dispatch due items at once, install the retry decider and the
+ * dispatch interceptors before the first `configureSync`: see
+ * {@link setRetryDecider}.
  *
  * Only `minNetworkQuality`, `healthCheckUrl`, `healthCheckTtlMs`,
  * `healthCheckBackoffMs` and `callbackTimeoutMs` are validated in JS, in that
@@ -829,8 +841,9 @@ export async function configureSync(options: SyncOptions): Promise<void> {
  * Read the active sync configuration from the native singleton.
  *
  * @returns the currently active {@link SyncOptions}. `minNetworkQuality`,
- *   `healthCheckUrl`, `healthCheckTtlMs` and `healthCheckBackoffMs` are present
- *   only when they were set: their defaults are not filled in.
+ *   `healthCheckUrl`, `healthCheckTtlMs`, `healthCheckBackoffMs` and
+ *   `callbackTimeoutMs` are present only when they were set: their defaults
+ *   are not filled in.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
  *
@@ -848,10 +861,10 @@ export async function configureSync(options: SyncOptions): Promise<void> {
  * paused, or until `configureSync` runs.
  *
  * A stored `minNetworkQuality` that cannot be read, a stored `healthCheckUrl`
- * the engine cannot use, and a stored `healthCheckTtlMs` or
- * `healthCheckBackoffMs` that is negative or not finite load as unset, so the
- * result leaves them out. Only a damaged record can hold such values, since
- * `configureSync` rejects them.
+ * the engine cannot use, a stored `healthCheckTtlMs` or `healthCheckBackoffMs`
+ * that is negative or not finite, and a stored `callbackTimeoutMs` that is not
+ * finite or is below `1` load as unset, so the result leaves them out. Only a
+ * damaged record can hold such values, since `configureSync` rejects them.
  *
  * `configureSync` replaces the whole configuration, so passing such a result
  * back, for example `configureSync({ ...cfg, batchSize: 5 })`, deletes the
@@ -1152,22 +1165,57 @@ export async function removeSyncEventListener(
  * `RetryPolicy` would retry, and applies its {@link RetryDecision}: `RETRY`,
  * optionally after its own `delayMs`, `DROP` or `DEAD_LETTER`. It can veto a
  * retry or change its delay, but never retry a failure the policy would not,
- * nor add attempts.
+ * nor add attempts. Once it is consulted, the delay counts from the decision,
+ * not from the end of the attempt.
  *
- * It runs only while JS is alive. A throw, a rejection, an invalid result, or
- * no answer within `SyncOptions.callbackTimeoutMs` leaves the decision to the
- * policy, which also decides alone when no JS runs, for example in a
- * background launch. {@link clearRetryDecider} is the only way to uninstall it.
+ * A throw, a rejection, an invalid result, or no answer within
+ * `SyncOptions.callbackTimeoutMs` leaves the decision to the policy, with a
+ * native log line and no event. With no decider installed, as in a cold
+ * background worker or a BGTask launch, the policy decides silently: no log
+ * line and no event.
  *
  * @param decider — the {@link RetryDecider}, sync or async.
  * @throws {SyncError} {@link SyncErrorCode.INVALID_PAYLOAD} when `decider` is
  *   not a function, with `validationErrors` set, before any native call.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded, and for every native rejection. Native
- *   rejects the call when a newer JS runtime has attached since this one, for
- *   example after a reload, and so owns the installs now.
+ *   rejects the call when this runtime no longer owns the installs: a newer JS
+ *   runtime has attached since, for example after a reload, or this runtime's
+ *   native module was torn down.
+ *
+ * @remarks
+ * These rules hold for all four `set…` functions.
+ *
+ * - Install first. Make the `set…` calls the first library calls at startup,
+ *   before `configureSync` and before mounting `SyncProvider` or any hook. The
+ *   first library call creates the native module, which arms the retry wake,
+ *   and so does every `configureSync`: an item that is due before a `set…`
+ *   lands goes out without that callback, with the static headers only.
+ * - One runtime owns the installs. An install lasts until this runtime's
+ *   `clear…` call, or until a newer JS runtime's first library call removes
+ *   it, after a reload for example. If this runtime is torn down first, its
+ *   installs stay in place until then and fail at once without calling JS:
+ *   the decider leaves the decision to the policy, the header resolver and
+ *   `beforeDispatch` defer their items, and `afterDispatch` is only logged.
+ *   On Android a reload tears nothing down, so the old installs time out at
+ *   each call instead, with the same result. `clear…` and
+ *   {@link isRetryDeciderInstalled} see only this runtime's installs.
+ * - Each call is bounded. The function may be sync or async, and native waits
+ *   at most `SyncOptions.callbackTimeoutMs` for its answer, even when its
+ *   promise never settles. On Android up to `SyncOptions.batchSize` calls can
+ *   be in flight at once; iOS calls them one item at a time.
+ * - Failure messages reach the native log. An `Error`'s message, up to 256
+ *   characters of it, is logged natively: privately on iOS, in the app's
+ *   logcat on Android. Keep tokens and personal data out of it. Any other
+ *   thrown value is logged by its type only.
+ * - Never await `flush()` inside a callback. On Android the cycle stalls until
+ *   the timeout; on iOS it returns the last result at once.
+ * - Pass an arrow function or a bound method: the function is called without
+ *   a `this`.
+ * - The health-check and network-quality probes never call a callback.
  *
  * @example
+ * // At startup, before configureSync and before mounting SyncProvider.
  * await setRetryDecider(({ attempt, metadata }) =>
  *   metadata?.kind === 'analytics' && attempt >= 2
  *     ? { action: RetryAction.DROP }
@@ -1189,8 +1237,10 @@ export async function setRetryDecider(decider: RetryDecider): Promise<void> {
 }
 
 /**
- * Uninstall the retry decider, so the declarative `RetryPolicy` decides alone
- * again. Resolves with nothing installed too.
+ * Uninstall this runtime's retry decider, so the declarative `RetryPolicy`
+ * decides alone again. Resolves with nothing installed too. A call from a
+ * runtime that no longer owns the installs, after a reload for example,
+ * changes nothing. On web it resolves without doing anything.
  *
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
@@ -1210,14 +1260,20 @@ export async function clearRetryDecider(): Promise<void> {
 }
 
 /**
- * Check whether a retry decider is installed.
+ * Check whether this JS runtime's retry decider is installed.
  *
- * @returns `true` from {@link setRetryDecider} until {@link clearRetryDecider}.
+ * @returns `true` from this runtime's {@link setRetryDecider} until its
+ *   {@link clearRetryDecider}, or until a newer runtime's first library call
+ *   removes the install. It never reports another runtime's install, so after
+ *   a reload it is `false` until the new runtime installs its own. Do not use
+ *   it to skip the install at startup: install unconditionally.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
  *
  * @example
- * if (!(await isRetryDeciderInstalled())) await setRetryDecider(decider);
+ * if (__DEV__ && !(await isRetryDeciderInstalled())) {
+ *   console.warn('No retry decider: the RetryPolicy decides alone.');
+ * }
  *
  * @public
  */
@@ -1237,28 +1293,44 @@ export async function isRetryDeciderInstalled(): Promise<boolean> {
 /**
  * Install a JS header resolver, replacing any installed one. It supplies
  * headers right before each request, for example a fresh access token. They
- * are merged as `defaultHeaders` < resolver < the item's own headers.
+ * are merged as `defaultHeaders` < resolver < the item's own headers, with
+ * names matching case-insensitively and the winning layer's spelling kept.
  *
  * It fails closed: a throw, a rejection, an invalid result (anything but a
- * plain object whose values are all strings, or a header name or value that
- * native rejects), or no answer within `SyncOptions.callbackTimeoutMs` sends
- * nothing for that item. The item stays pending without spending an attempt,
- * becomes due again no sooner than 60 s later, and emits `ITEM_RETRYING` with
- * `INTERCEPTOR_FAILED`. With no JS running, for example in a background
- * launch, the static headers go out.
- * {@link clearHeaderResolver} is the only way to uninstall it.
+ * plain object whose names and values native accepts, see
+ * {@link HeaderResolver}), or no answer within `SyncOptions.callbackTimeoutMs`
+ * sends nothing for that item. The item stays pending without spending an
+ * attempt, becomes due again after the longer of the policy's delay for that
+ * attempt and 60 s, and emits `ITEM_RETRYING` with `INTERCEPTOR_FAILED`.
+ * Other items go on, and a resolver that keeps failing holds its items without
+ * ever dead-lettering them.
+ *
+ * It runs only in a live JS runtime. In a process where nothing is installed,
+ * such as a cold background worker or a BGTask launch, the static headers go
+ * out, so a credential the server needs there belongs in
+ * `SyncOptions.defaultHeaders`. Its headers do not change how a 401 or 403 is
+ * handled, which depends only on where `defaultHeaders` came from. On Android
+ * up to `SyncOptions.batchSize` calls can run at once, so share one token
+ * refresh between them. The install order, its lifetime and the other rules
+ * are described under {@link setRetryDecider}.
  *
  * @param resolver — the {@link HeaderResolver}, sync or async.
  * @throws {SyncError} {@link SyncErrorCode.INVALID_PAYLOAD} when `resolver` is
  *   not a function, with `validationErrors` set, before any native call.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded, and for every native rejection. Native
- *   rejects the call when a newer JS runtime has attached since this one, for
- *   example after a reload, and so owns the installs now.
+ *   rejects the call when this runtime no longer owns the installs (see
+ *   {@link setRetryDecider}).
  *
  * @example
+ * let refreshing: Promise<string> | undefined;
+ * const accessToken = () =>
+ *   (refreshing ??= session.getAccessToken().finally(() => {
+ *     refreshing = undefined;
+ *   }));
+ *
  * await setHeaderResolver(async () => ({
- *   Authorization: `Bearer ${await session.getAccessToken()}`,
+ *   Authorization: `Bearer ${await accessToken()}`,
  * }));
  *
  * @public
@@ -1278,8 +1350,10 @@ export async function setHeaderResolver(
 }
 
 /**
- * Uninstall the header resolver, so the static headers go out alone again.
- * Resolves with nothing installed too.
+ * Uninstall this runtime's header resolver, so the static headers go out alone
+ * again. Resolves with nothing installed too. A call from a runtime that no
+ * longer owns the installs changes nothing. On web it resolves without doing
+ * anything.
  *
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
@@ -1301,22 +1375,26 @@ export async function clearHeaderResolver(): Promise<void> {
 /**
  * Install a JS `beforeDispatch` hook, replacing any installed one. It sees
  * each request right before it is sent, after the header resolver, with the
- * final headers, and answers `PROCEED` or `SKIP`. Returning nothing, or any
- * value without an `action` key, proceeds.
+ * merged headers but not the body, and answers `PROCEED` or `SKIP`. Only a
+ * result with an `action` key asks for something: returning nothing, or any
+ * other value without `action`, proceeds.
  *
  * `SKIP` defers the item the way a failing header resolver does (see
  * {@link setHeaderResolver}), and so does an `action` other than `PROCEED` or
  * `SKIP`, a throw, a rejection, or no answer within
- * `SyncOptions.callbackTimeoutMs`.
- * {@link clearBeforeDispatch} is the only way to uninstall it.
+ * `SyncOptions.callbackTimeoutMs`. It is not called when the header resolver
+ * failed, nor in a process where nothing is installed. Its headers leave out
+ * the `Content-Type` the engine adds on its own: see
+ * `BeforeDispatchContext.headers`. The install order, its lifetime and
+ * the other rules are described under {@link setRetryDecider}.
  *
  * @param hook — the {@link BeforeDispatchHook}, sync or async.
  * @throws {SyncError} {@link SyncErrorCode.INVALID_PAYLOAD} when `hook` is
  *   not a function, with `validationErrors` set, before any native call.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded, and for every native rejection. Native
- *   rejects the call when a newer JS runtime has attached since this one, for
- *   example after a reload, and so owns the installs now.
+ *   rejects the call when this runtime no longer owns the installs (see
+ *   {@link setRetryDecider}).
  *
  * @example
  * await setBeforeDispatch(({ url }) =>
@@ -1342,7 +1420,9 @@ export async function setBeforeDispatch(
 }
 
 /**
- * Uninstall the `beforeDispatch` hook. Resolves with nothing installed too.
+ * Uninstall this runtime's `beforeDispatch` hook. Resolves with nothing
+ * installed too. A call from a runtime that no longer owns the installs
+ * changes nothing. On web it resolves without doing anything.
  *
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.
@@ -1363,21 +1443,24 @@ export async function clearBeforeDispatch(): Promise<void> {
 
 /**
  * Install a JS `afterDispatch` hook, replacing any installed one. It observes
- * each request that went out, after the outcome is stored and the item's
- * event emitted. It never carries headers or a body.
+ * each request that went out, once, after the outcome is stored and the
+ * item's `ITEM_*` event emitted. That it comes after the event is best effort,
+ * not a guarantee. Its context never carries headers or a body.
  *
  * Dispatch never waits for it, so `flush()` may resolve before it runs. It may
  * return any value or a promise of one, and what it returns or resolves with is
- * ignored. A throw or a rejection is only logged natively.
- * {@link clearAfterDispatch} is the only way to uninstall it.
+ * ignored. A throw, a rejection or no answer in time is only logged natively.
+ * It is not called for an item that was not sent, nor for an iOS background
+ * upload that completes after a relaunch. The install order, its lifetime and
+ * the other rules are described under {@link setRetryDecider}.
  *
  * @param hook — the {@link AfterDispatchHook}, sync or async.
  * @throws {SyncError} {@link SyncErrorCode.INVALID_PAYLOAD} when `hook` is
  *   not a function, with `validationErrors` set, before any native call.
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded, and for every native rejection. Native
- *   rejects the call when a newer JS runtime has attached since this one, for
- *   example after a reload, and so owns the installs now.
+ *   rejects the call when this runtime no longer owns the installs (see
+ *   {@link setRetryDecider}).
  *
  * @example
  * await setAfterDispatch(({ url, outcome, durationMs }) => {
@@ -1399,7 +1482,9 @@ export async function setAfterDispatch(hook: AfterDispatchHook): Promise<void> {
 }
 
 /**
- * Uninstall the `afterDispatch` hook. Resolves with nothing installed too.
+ * Uninstall this runtime's `afterDispatch` hook. Resolves with nothing
+ * installed too. A call from a runtime that no longer owns the installs
+ * changes nothing. On web it resolves without doing anything.
  *
  * @throws {SyncError} {@link SyncErrorCode.NATIVE_MODULE_UNAVAILABLE} when
  *   the native module is not loaded.

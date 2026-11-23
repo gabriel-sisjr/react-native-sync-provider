@@ -335,13 +335,16 @@ export const SyncEventType = {
    */
   ITEM_SUCCEEDED: 'ITEM_SUCCEEDED',
   /**
-   * A single item failed permanently: a non-retryable failure, or a retriable
-   * one with no attempts left. `itemId`, `errorCode` and `attempt` are set, plus
-   * `statusCode` when applicable. The item has already left the queue for the
-   * dead-letter queue, and `ITEM_DEAD_LETTERED` follows right after, unless the
-   * item was removed (`removeItem()`) or the queue cleared (`clearQueue()`)
-   * while its request was in flight: this event then still reports that
-   * request, but nothing is dead-lettered and no `ITEM_DEAD_LETTERED` follows.
+   * A single item failed permanently: a non-retryable failure, a retriable one
+   * with no attempts left, or a retry decider's `DROP` or `DEAD_LETTER`, which
+   * report `RETRY_DECIDER_REJECTED`. `itemId`, `errorCode` and `attempt` are
+   * set, plus `statusCode` when applicable. The item has already left the queue
+   * for the dead-letter queue, and `ITEM_DEAD_LETTERED` follows right after,
+   * unless the item was removed (`removeItem()`) or the queue cleared
+   * (`clearQueue()`) while its request was in flight: this event then still
+   * reports that request, but nothing is dead-lettered and no
+   * `ITEM_DEAD_LETTERED` follows. A decider's `DROP` deletes the item instead,
+   * so no `ITEM_DEAD_LETTERED` follows either.
    *
    * An item whose attempts had already reached `RetryPolicy.maxAttempts` when a
    * cycle took it, for example because the limit was lowered, fails without a
@@ -352,8 +355,15 @@ export const SyncEventType = {
    */
   ITEM_FAILED: 'ITEM_FAILED',
   /**
-   * A single item went back to wait for a retry.
-   * `itemId`, `attempt` and `errorCode` are set.
+   * A single item went back to wait for a retry. `itemId`, `attempt` and
+   * `errorCode` are set, plus `statusCode` when applicable. After a retry
+   * decider's `RETRY`, `errorCode` is still the attempt's own code, and a
+   * credential hold reports `UNAUTHORIZED`.
+   *
+   * It is also emitted for an item the header resolver or `beforeDispatch`
+   * deferred without sending it: `errorCode` is `INTERCEPTOR_FAILED`,
+   * `statusCode` is not set, and `attempt` is the attempt that would have been
+   * made. No attempt is spent.
    */
   ITEM_RETRYING: 'ITEM_RETRYING',
   /**
@@ -411,12 +421,13 @@ export const SyncEventType = {
    * A permanently failed item was moved to the dead-letter queue. Emitted
    * right after that item's `ITEM_FAILED`, except for an item removed or
    * cleared while its request was in flight, which is not dead-lettered and
-   * gets no `ITEM_DEAD_LETTERED`. `itemId` is set, `errorCode` is
-   * `DEAD_LETTERED`, and `metadata.lastErrorCode` carries the real failure
-   * code, the same one `ITEM_FAILED` reported; `statusCode` and `attempt` are
-   * not set. Android dispatches a batch concurrently, so another item's event
-   * can come between the two there: pair them by `itemId`. Read the dead
-   * letter with `listDeadLetter()`.
+   * gets no `ITEM_DEAD_LETTERED`, and for an item a retry decider dropped,
+   * which is deleted. `itemId` is set, `errorCode` is `DEAD_LETTERED`, and
+   * `metadata.lastErrorCode` carries the real failure code, the same one
+   * `ITEM_FAILED` reported: `RETRY_DECIDER_REJECTED` after a decider's
+   * `DEAD_LETTER`. `statusCode` and `attempt` are not set. Android dispatches
+   * a batch concurrently, so another item's event can come between the two
+   * there: pair them by `itemId`. Read the dead letter with `listDeadLetter()`.
    */
   ITEM_DEAD_LETTERED: 'ITEM_DEAD_LETTERED',
   // New members go at the end: nitrogen numbers the generated native enum
@@ -440,17 +451,22 @@ export type SyncEventType = (typeof SyncEventType)[keyof typeof SyncEventType];
 export const RetryAction = {
   /**
    * Retry as the policy would. A valid {@link RetryDecision.delayMs} replaces
-   * the policy's delay; without one, the policy's delay applies.
+   * the policy's delay; without one, the policy's delay applies. Either delay
+   * counts from the decision. `ITEM_RETRYING` reports the attempt's own code.
    */
   RETRY: 'RETRY',
   /**
    * Fail the item and delete it, without a dead letter: `ITEM_FAILED` with
-   * `RETRY_DECIDER_REJECTED`, and no `ITEM_DEAD_LETTERED`.
+   * `RETRY_DECIDER_REJECTED`, and no `ITEM_DEAD_LETTERED`. It counts in
+   * `SyncResult.failureCount`. This is the only case where the engine itself
+   * deletes a failed item instead of dead-lettering it.
    */
   DROP: 'DROP',
   /**
    * Fail the item and move it to the dead-letter queue: `ITEM_FAILED` with
-   * `RETRY_DECIDER_REJECTED`, then `ITEM_DEAD_LETTERED`.
+   * `RETRY_DECIDER_REJECTED`, then `ITEM_DEAD_LETTERED`. The dead letter's
+   * `lastErrorCode` is `RETRY_DECIDER_REJECTED`, and its `lastErrorMessage`
+   * describes the attempt's failure.
    */
   DEAD_LETTER: 'DEAD_LETTER',
 } as const;
@@ -462,15 +478,17 @@ export type RetryAction = (typeof RetryAction)[keyof typeof RetryAction];
  * shown.
  *
  * Returned as {@link BeforeDispatchResult.action} by the hook installed with
- * `setBeforeDispatch`. A hook that returns nothing proceeds.
+ * `setBeforeDispatch`. Only a result with an `action` key asks for something:
+ * any other value, nothing included, proceeds. An `action` that is neither
+ * value defers the item, as `SKIP` does.
  */
 export const BeforeDispatchAction = {
   /** Send the request unchanged. */
   PROCEED: 'PROCEED',
   /**
    * Defer the item without sending it. It goes back to `PENDING` with its
-   * attempt count unchanged, becomes due again after the policy's delay for
-   * that attempt and no sooner than 60 s, and emits `ITEM_RETRYING` with
+   * attempt count unchanged, becomes due again after the longer of the
+   * policy's delay for that attempt and 60 s, and emits `ITEM_RETRYING` with
    * `INTERCEPTOR_FAILED`.
    */
   SKIP: 'SKIP',
@@ -490,12 +508,13 @@ export const DispatchOutcome = {
   SUCCEEDED: 'SUCCEEDED',
   /**
    * The item went back to wait for a retry, a hold after a credential
-   * rejection included.
+   * rejection included, which reports `errorCode: UNAUTHORIZED`.
    */
   RETRYING: 'RETRYING',
   /**
    * The item failed permanently: a non-retryable failure, a retriable one with
-   * no attempts left, or a retry decider's `DROP` or `DEAD_LETTER`.
+   * no attempts left, or a retry decider's `DROP` or `DEAD_LETTER`, which
+   * report `errorCode: RETRY_DECIDER_REJECTED`.
    */
   FAILED: 'FAILED',
 } as const;

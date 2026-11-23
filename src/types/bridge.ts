@@ -25,7 +25,8 @@ export const CallbackAnswerStatus = {
   RESOLVED: 'RESOLVED',
   /**
    * The consumer's function threw, rejected or returned an invalid result.
-   * `message` says why, and native applies its fallback at once.
+   * `message` says why, and native applies its fallback at once. Also sent,
+   * with a constant message, when the first answer could not be delivered.
    */
   FAILED: 'FAILED',
 } as const;
