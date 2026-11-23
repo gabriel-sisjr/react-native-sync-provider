@@ -912,8 +912,9 @@ actor SyncDispatcher {
             case .retry:
                 guard let decidedMs = NumericOption.decidedDelayMs(decision.delayMs) else {
                     if decision.delayMs != nil {
-                        SyncLogger.debug("The retry decider's delay for \(item.id) is unusable; "
-                                         + "the policy's delay applies", category: "callbacks")
+                        // A warning, as for any answer that could not be used.
+                        SyncLogger.warning("The retry decider's delay for \(item.id) is unusable; "
+                                           + "the policy's delay applies", category: "callbacks")
                     }
                     return policy
                 }

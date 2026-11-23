@@ -210,6 +210,35 @@ final class CallbackGatewayTests: XCTestCase {
         XCTAssertEqual(gateway.pendingCount, 0)
     }
 
+    // MARK: - The log
+
+    /// Text from JS can carry a user's data, so it never reaches the public
+    /// text of a log line: a skip, as its log lines interpolate it, leaves the
+    /// text out, and hands it over as the line's private part instead, cut to
+    /// what the log keeps of a message.
+    func test_ios_textFromJS_staysOutOfTheLogsPublicText() {
+        let failed = CallbackSkip.failed(message: "refresh failed for jane@example.com")
+        let invokeFailed = CallbackSkip.invokeFailed(message: "TypeError: token abc123 expired")
+
+        XCTAssertFalse("\(failed)".contains("jane@example.com"), "\(failed)")
+        XCTAssertFalse("\(invokeFailed)".contains("abc123"), "\(invokeFailed)")
+        XCTAssertEqual("\(CallbackSkip.failed(message: nil))", "it failed (no message)")
+
+        XCTAssertEqual(failed.privateDetail, "refresh failed for jane@example.com")
+        XCTAssertEqual(invokeFailed.privateDetail, "TypeError: token abc123 expired")
+        let long = String(repeating: "é", count: kCallbackLogMessageMaxLength + 44)
+        XCTAssertEqual(CallbackSkip.failed(message: long).privateDetail,
+                       String(repeating: "é", count: kCallbackLogMessageMaxLength))
+        let withoutTextFromJS: [CallbackSkip] = [.failed(message: nil),
+                                                 .invalid(reason: "a retry decider answer must carry a decision"),
+                                                 .ownerGone,
+                                                 .timedOut(afterMs: 3_000),
+                                                 .cancelled]
+        for skip in withoutTextFromJS {
+            XCTAssertNil(skip.privateDetail, "\(skip)")
+        }
+    }
+
     /// The production timer lets a timeout go as soon as its request ends, not
     /// at its deadline: an answered request, even at the longest
     /// `callbackTimeoutMs`, keeps nothing of its timeout, and a timeout that

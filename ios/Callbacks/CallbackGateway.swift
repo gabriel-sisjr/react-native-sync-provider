@@ -43,20 +43,34 @@ enum CallbackSkip: Error, Sendable, Equatable, CustomStringConvertible {
     /// The waiting task was cancelled: a BGTask whose time expired.
     case cancelled
 
+    /// Never the text from JS, which can carry a user's data: see
+    /// ``privateDetail``.
     var description: String {
         switch self {
         case let .failed(message):
-            return "it failed (\(CallbackGateway.forLog(message ?? "no message")))"
+            return message == nil ? "it failed (no message)" : "it failed"
         case let .invalid(reason):
             return "its answer was not usable (\(reason))"
-        case let .invokeFailed(message):
-            return "the call into JS failed (\(CallbackGateway.forLog(message)))"
+        case .invokeFailed:
+            return "the call into JS failed"
         case .ownerGone:
             return "the JS runtime that installed it is gone"
         case let .timedOut(afterMs):
             return "no answer in \(afterMs) ms"
         case .cancelled:
             return "the wait was cancelled"
+        }
+    }
+
+    /// What ``description`` leaves out, cut to
+    /// ``kCallbackLogMessageMaxLength`` characters: a FAILED answer's message
+    /// from JS, or why the call into JS failed. The log keeps it private.
+    var privateDetail: String? {
+        switch self {
+        case let .failed(message?), let .invokeFailed(message):
+            return CallbackGateway.forLog(message)
+        case .failed(nil), .invalid, .ownerGone, .timedOut, .cancelled:
+            return nil
         }
     }
 
@@ -446,12 +460,14 @@ final class CallbackGateway: @unchecked Sendable {
 
     /// One line for a callback that gave nothing to use: WARN when the
     /// callback failed or never answered, INFO when its wait was stopped.
-    /// Never an answer, a context or a header.
+    /// Never an answer, a context or a header. Text from JS goes in only as
+    /// the line's private part, ``CallbackSkip/privateDetail``, which the
+    /// device log redacts.
     static func log(_ text: String, for skip: CallbackSkip) {
         if skip.isStop {
-            SyncLogger.info(text, category: "callbacks")
+            SyncLogger.info(text, private: skip.privateDetail, category: "callbacks")
         } else {
-            SyncLogger.warning(text, category: "callbacks")
+            SyncLogger.warning(text, private: skip.privateDetail, category: "callbacks")
         }
     }
 
