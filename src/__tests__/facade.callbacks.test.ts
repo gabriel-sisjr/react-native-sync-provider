@@ -571,19 +571,104 @@ describe('beforeDispatch answers', () => {
     expect(hook).toHaveBeenCalledWith(BEFORE_CONTEXT);
   });
 
+  // Only a result with an `action` key asks for something; anything else
+  // proceeds, so an observer that returns some value never defers the item.
   it.each([
     ['null', null],
+    ['true', true],
     ['false', false],
-    ['a bare action string', 'SKIP'],
-    ['a number', 0],
+    ['0', 0],
+    ['a number', 3],
+    ['an empty string', ''],
+    ['a bare action string', BeforeDispatchAction.SKIP],
+    ['an array', [BeforeDispatchAction.SKIP]],
     ['an empty object', {}],
-    ['an unknown action', { action: 'ABORT' }],
+    ['an object without an action key', { reason: 'cellular' }],
+  ])('maps %s, which has no action key, to PROCEED', async (_label, result) => {
+    await expect(beforeDispatch(() => result)).resolves.toStrictEqual(proceed);
+  });
+
+  it('maps an async number to PROCEED', async () => {
+    await expect(beforeDispatch(async () => 3)).resolves.toStrictEqual(proceed);
+  });
+
+  it('proceeds for a void-typed call that returns a number at runtime', async () => {
+    const seen: unknown[] = [];
+    const track: (x: unknown) => void = (x) => seen.push(x);
+
+    // No cast: a call typed `void` is a valid hook body.
+    await setBeforeDispatch((c) => track(c));
+
+    await expect(
+      getMock().__invokeCallback('beforeDispatch', BEFORE_CONTEXT)
+    ).resolves.toStrictEqual(proceed);
+    expect(seen).toStrictEqual([BEFORE_CONTEXT]);
+  });
+
+  it('reads an action the result inherits', async () => {
+    class Skip {
+      get action(): BeforeDispatchAction {
+        return BeforeDispatchAction.SKIP;
+      }
+    }
+
+    await expect(beforeDispatch(() => new Skip())).resolves.toStrictEqual({
+      status: RESOLVED,
+      beforeDispatch: { action: BeforeDispatchAction.SKIP },
+    });
+  });
+
+  it.each([
+    ['an unknown action', { action: 'NOPE' }],
+    ['another unknown action', { action: 'ABORT' }],
     ['a retry action', { action: 'RETRY' }],
+    ['a lowercase action', { action: 'skip' }],
+    ['an undefined action', { action: undefined }],
+    ['a null action', { action: null }],
   ])('answers FAILED for %s', async (_label, result) => {
     await expect(beforeDispatch(() => result)).resolves.toStrictEqual({
       status: FAILED,
       message:
-        'beforeDispatch hook returned an invalid result: expected undefined or { action: PROCEED | SKIP }.',
+        'beforeDispatch hook returned an invalid result: its action must be PROCEED or SKIP.',
+    });
+  });
+
+  it('answers FAILED for an async unknown action', async () => {
+    await expect(
+      beforeDispatch(async () => ({ action: 'NOPE' }))
+    ).resolves.toStrictEqual({
+      status: FAILED,
+      message:
+        'beforeDispatch hook returned an invalid result: its action must be PROCEED or SKIP.',
+    });
+  });
+
+  it('answers FAILED when looking for the action key throws', async () => {
+    const result = new Proxy(
+      {},
+      {
+        has(): boolean {
+          throw new Error('has trap');
+        },
+      }
+    );
+
+    await expect(beforeDispatch(() => result)).resolves.toStrictEqual({
+      status: FAILED,
+      message: 'beforeDispatch hook failed: has trap',
+    });
+  });
+
+  it('answers FAILED when reading the action throws', async () => {
+    await expect(
+      beforeDispatch(() => ({
+        get action(): string {
+          throw new Error('getter');
+        },
+      }))
+    ).resolves.toStrictEqual({
+      status: FAILED,
+      message: 'beforeDispatch hook failed: getter',
     });
   });
 
@@ -625,6 +710,23 @@ describe('afterDispatch answers', () => {
     await expect(afterDispatch(async () => 42)).resolves.toStrictEqual({
       status: RESOLVED,
     });
+  });
+
+  it('accepts an observer whose expression body returns a value', async () => {
+    const list: AfterDispatchContext[] = [];
+
+    // No casts: both lines typecheck only because the hook may return anything.
+    await setAfterDispatch((c) => list.push(c));
+    await expect(
+      getMock().__invokeCallback('afterDispatch', AFTER_CONTEXT)
+    ).resolves.toStrictEqual({ status: RESOLVED });
+
+    await setAfterDispatch(async (c) => list.push(c));
+    await expect(
+      getMock().__invokeCallback('afterDispatch', AFTER_CONTEXT)
+    ).resolves.toStrictEqual({ status: RESOLVED });
+
+    expect(list).toStrictEqual([AFTER_CONTEXT, AFTER_CONTEXT]);
   });
 
   it('receives the context native sent', async () => {

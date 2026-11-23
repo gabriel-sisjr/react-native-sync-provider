@@ -197,11 +197,18 @@ export type HeaderResolver = (
 
 /**
  * A `beforeDispatch` hook, installed with `setBeforeDispatch`. It may return
- * its result, nothing, or a promise of either; nothing means `PROCEED`.
+ * its result, nothing, or a promise of either.
+ *
+ * Only a result with an `action` key asks for something. Anything else means
+ * `PROCEED`: nothing, `null`, a primitive, an array, or an object without
+ * `action`. So an observer such as `(c) => track(c)` proceeds even when
+ * `track`, though typed `void`, returns a value at runtime. A bare `'SKIP'`
+ * string is a primitive too, and proceeds: return
+ * `{ action: BeforeDispatchAction.SKIP }`.
  *
  * Called after the header resolver, right before each request. `SKIP` defers
- * the item the same way a failed header resolver does, and so does a throw, a
- * rejection, an invalid result or no answer within
+ * the item the same way a failed header resolver does, and so does an `action`
+ * other than `PROCEED` or `SKIP`, a throw, a rejection or no answer within
  * {@link SyncOptions.callbackTimeoutMs}.
  *
  * @example
@@ -215,14 +222,14 @@ export type BeforeDispatchHook = (
 
 /**
  * An `afterDispatch` hook, installed with `setAfterDispatch`, that observes
- * each request that went out. Dispatch never waits for it and ignores its
- * result; a throw or a rejection is only logged.
+ * each request that went out. It may return any value or a promise of one,
+ * so an expression body such as `(c) => list.push(c)` is fine. Dispatch never
+ * waits for it and ignores what it returns or resolves with; a throw or a
+ * rejection is only logged.
  *
  * @example
  * await setAfterDispatch(({ url, outcome, durationMs }) => {
  *   metrics.record(url, outcome, durationMs);
  * });
  */
-export type AfterDispatchHook = (
-  context: AfterDispatchContext
-) => void | Promise<void>;
+export type AfterDispatchHook = (context: AfterDispatchContext) => unknown;

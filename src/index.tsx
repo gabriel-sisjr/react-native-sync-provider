@@ -1300,11 +1300,13 @@ export async function clearHeaderResolver(): Promise<void> {
 /**
  * Install a JS `beforeDispatch` hook, replacing any installed one. It sees
  * each request right before it is sent, after the header resolver, with the
- * final headers, and answers `PROCEED` or `SKIP`. Returning nothing proceeds.
+ * final headers, and answers `PROCEED` or `SKIP`. Returning nothing, or any
+ * value without an `action` key, proceeds.
  *
  * `SKIP` defers the item the way a failing header resolver does (see
- * {@link setHeaderResolver}), and so does a throw, a rejection, an invalid
- * result, or no answer within `SyncOptions.callbackTimeoutMs`.
+ * {@link setHeaderResolver}), and so does an `action` other than `PROCEED` or
+ * `SKIP`, a throw, a rejection, or no answer within
+ * `SyncOptions.callbackTimeoutMs`.
  * {@link clearBeforeDispatch} is the only way to uninstall it.
  *
  * @param hook — the {@link BeforeDispatchHook}, sync or async.
@@ -1363,8 +1365,9 @@ export async function clearBeforeDispatch(): Promise<void> {
  * each request that went out, after the outcome is stored and the item's
  * event emitted. It never carries headers or a body.
  *
- * Dispatch never waits for it, so `flush()` may resolve before it runs, and
- * its result is ignored. A throw or a rejection is only logged natively.
+ * Dispatch never waits for it, so `flush()` may resolve before it runs. It may
+ * return any value or a promise of one, and what it returns or resolves with is
+ * ignored. A throw or a rejection is only logged natively.
  * {@link clearAfterDispatch} is the only way to uninstall it.
  *
  * @param hook — the {@link AfterDispatchHook}, sync or async.

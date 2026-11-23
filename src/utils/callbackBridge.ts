@@ -146,15 +146,22 @@ export function toHeadersAnswer(result: unknown): CallbackAnswer {
   );
 }
 
-/** The action a `beforeDispatch` result asks for, before it is checked. */
+/**
+ * The action a `beforeDispatch` result asks for, before it is checked. Only an
+ * object with an `action` key, own or inherited, asks for one; anything else
+ * asks for `PROCEED`.
+ */
 function requestedAction(result: unknown): unknown {
-  if (result === undefined) return BeforeDispatchAction.PROCEED;
-  return isObject(result) ? result.action : undefined;
+  return isObject(result) && 'action' in result
+    ? result.action
+    : BeforeDispatchAction.PROCEED;
 }
 
 /**
- * Normalize a `beforeDispatch` hook's result: `undefined` means `PROCEED`, and
- * `{ action: PROCEED | SKIP }` passes. Anything else is `FAILED`.
+ * Normalize a `beforeDispatch` hook's result. A result without an `action`
+ * key means `PROCEED`: `undefined`, `null`, a primitive, an array, or an object
+ * without `action`. An `action` must be `PROCEED` or `SKIP`, and any other
+ * value is `FAILED`. The failure message never quotes the result.
  *
  * @internal
  */
@@ -167,7 +174,7 @@ export function toBeforeDispatchAnswer(result: unknown): CallbackAnswer {
     };
   }
   return failed(
-    'beforeDispatch hook returned an invalid result: expected undefined or { action: PROCEED | SKIP }.'
+    'beforeDispatch hook returned an invalid result: its action must be PROCEED or SKIP.'
   );
 }
 
