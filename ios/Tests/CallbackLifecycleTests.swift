@@ -189,7 +189,7 @@ final class CallbackLifecycleTests: XCTestCase {
     }
 
     /// An engine that shuts down ends every wait for a JS callback at once.
-    func test_shuttingTheEngineDown_endsEveryCallbackWait() async throws {
+    func test_lifecycle_shutdown_endsEveryWait() async throws {
         let hybrid = HybridSyncProvider(engine: engine)
         let owner = hybrid.callbackOwner
         let gateway = engine.gateway

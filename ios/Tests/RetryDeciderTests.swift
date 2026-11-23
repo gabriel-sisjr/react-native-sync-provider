@@ -411,9 +411,30 @@ final class RetryDeciderTests: XCTestCase {
         XCTAssertEqual(engine.gateway.pendingCount, 0)
     }
 
+    /// A newer runtime attaches while the decider is asked: the wait ends at
+    /// once, not at its timeout, and the policy's verdict applies, as when no
+    /// decision comes.
+    func test_lifecycle_eviction_endsOwnersWaits_duringTheDeciderWait_appliesThePolicyAtOnce() async throws {
+        let engine = await makeEngine()
+        let decider = FakeDecider(engine: engine) { [weak engine] _, _ in
+            _ = engine?.attachCallbacks()
+            return nil
+        }
+        let id = try await enqueue(engine)
+        answer(503)
+        let ended = clock.nowMs() + requestMs
+
+        try await flush(engine)
+
+        try await assertThePolicyRetried(id, in: engine, ended: ended)
+        XCTAssertEqual(decider.callCount, 1)
+        XCTAssertEqual(callbackTimer.delays, [3_000], "Armed, and never fired: the eviction ended the wait")
+        XCTAssertEqual(engine.gateway.pendingCount, 0)
+    }
+
     /// A decider whose hybrid a newer one replaced was evicted with it: it is
     /// never asked, and nothing waits for it.
-    func test_anEvictedDecider_isNeverAsked_andNothingWaits() async throws {
+    func test_lifecycle_eviction_endsOwnersWaits_anEvictedDeciderIsNeverAsked() async throws {
         let engine = await makeEngine()
         let evicted = FakeDecider(engine: engine) { _, _ in .decision(.drop) }
         _ = engine.attachCallbacks()

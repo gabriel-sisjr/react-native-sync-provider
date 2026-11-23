@@ -651,6 +651,48 @@ final class SettleMatrixTests: XCTestCase {
         XCTAssertEqual(timer.delayMs, 45_000, "the decided delay, later than the 30 s wait")
     }
 
+    /// The policy's delay is drawn once, for the verdict, even with jitter:
+    /// the settle gives the row the very deadline the failed write carried,
+    /// never a second draw. The decider kept the retry without a delay, and
+    /// here the failed write takes no time, so the two deadlines are equal.
+    func test_decider_abortSettle_appliesRecordedOutcome_jitteredPolicyDelay() async throws {
+        let transactions = TransactionLog()
+        fixture.tearDown()
+        fixture = EngineFixture(transactions: transactions)
+        t0 = fixture.clock.nowMs()
+        let engine = await fixture.makeEngine(emitter: emitter)
+        let jittered = RetryPolicyValue(maxAttempts: 5,
+                                        backoff: .exponential,
+                                        baseDelayMs: 20_000,
+                                        maxDelayMs: 600_000,
+                                        jitter: true,
+                                        retryOnStatusCodes: [503])
+        await engine.configure(.sample(retryPolicy: jittered))
+        let decider = FakeDecider(engine: engine) { _, _ in .decision(.retry) }
+        let id = try await seed(engine)
+        await armForTheDueRow(engine)
+        answer(503)
+        faults.fail(1, after: 1)
+        emitter.clear()
+
+        do {
+            _ = try await engine.dispatcher.flush()
+            XCTFail("the cycle was expected to die")
+        } catch {}
+
+        XCTAssertEqual(faults.failures, 1, "only the outcome's write failed")
+        // Kept on the failed transaction's queue once it returned.
+        let deadline = Date().addingTimeInterval(livenessTimeout)
+        while transactions.unsavedNextRetryAt(id) == nil, Date() < deadline {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        let carried = try XCTUnwrap(transactions.unsavedNextRetryAt(id), "the deadline the failed write carried")
+        let stored = try await engine.storage.getAll().first { $0.id == id }
+        XCTAssertEqual(stored?.nextRetryAt, carried, "The same draw, not a new one")
+        XCTAssertTrue((30_000...50_000).contains(carried - ended), "the second attempt's 40 s, jittered by 25 %")
+        XCTAssertEqual(decider.callCount, 1)
+    }
+
     /// No decision came, a FAILED answer here: the settle applies the
     /// policy's verdict, as with no decider at all.
     func test_decider_abortSettle_appliesRecordedOutcome_nothingRecorded() async throws {

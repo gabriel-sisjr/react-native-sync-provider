@@ -189,6 +189,39 @@ final class DispatchInterceptorTests: XCTestCase {
         XCTAssertEqual(engine.gateway.pendingCount, 0)
     }
 
+    /// The storage transactions of a one-item cycle with nothing installed.
+    /// Every storage call the callbacks added sits behind an installed one:
+    /// the purge check and the deferral behind an interceptor, the drop behind
+    /// the retry decider. So this is also what such a cycle cost before them.
+    private static let transactionsOfAnUnsetCycle = 5
+
+    /// With nothing installed, an item costs no storage transaction it did not
+    /// cost before the callbacks existed. Installing an interceptor adds one,
+    /// the purge check before it is asked, so the log sees a check made
+    /// without one.
+    func test_interceptor_unset_sendsStaticHeaders_withNoExtraReads() async throws {
+        let transactions = TransactionLog()
+        fixture.tearDown()
+        fixture = EngineFixture(transactions: transactions)
+        let (engine, owner) = await makeEngine()
+        _ = try await enqueue(engine, url: "https://api.test/unset")
+        answer(200)
+        transactions.reset()
+        try await flush(engine)
+        let unset = transactions.count
+
+        installBefore(engine, owner: owner) { _, _ in .before(.proceed) }
+        _ = try await enqueue(engine, url: "https://api.test/installed")
+        answer(200)
+        transactions.reset()
+        try await flush(engine)
+        let installed = transactions.count
+
+        XCTAssertEqual(unset, Self.transactionsOfAnUnsetCycle)
+        XCTAssertEqual(installed, unset + 1, "One purge check, before beforeDispatch is asked")
+        XCTAssertEqual(sentURLs, ["https://api.test/installed"])
+    }
+
     // MARK: - Order and merge
 
     func test_interceptor_order_resolver_before_dispatch_after() async throws {
@@ -1009,35 +1042,147 @@ final class DispatchInterceptorTests: XCTestCase {
         withExtendedLifetime(hybrid) {}
     }
 
+    // MARK: - Evicted during a wait
+
+    /// The hybrid that installed the resolver goes away while it is asked:
+    /// the wait ends at once, as when no answer comes, and the item is
+    /// deferred like any other the resolver gave nothing for. The cycle goes
+    /// on, and ends as usual.
+    func test_lifecycle_eviction_endsOwnersWaits_duringTheResolverWait() async throws {
+        let (engine, owner) = await makeEngine()
+        let resolver = installResolver(engine, owner: owner) { [weak engine] _, _ in
+            engine?.detachCallbacks(owner: owner)
+            return nil
+        }
+        let before = installBefore(engine, owner: owner) { _, _ in .before(.proceed) }
+        let attempted = try await enqueueAttempted(engine)
+        answer(200)
+
+        try await flush(engine)
+
+        try await assertDeferred(attempted, in: engine, delayMs: floorMs)
+        XCTAssertEqual(events, ["SYNC_STARTED", "SYNC_PROGRESS", "ITEM_RETRYING(INTERCEPTOR_FAILED)", "SYNC_SUCCEEDED"])
+        XCTAssertEqual(resolver.callCount, 1)
+        XCTAssertEqual(before.callCount, 0)
+        XCTAssertEqual(callbackTimer.delays, [3_000], "Armed, and never fired: the eviction ended the wait")
+        XCTAssertEqual(engine.gateway.pendingCount, 0)
+        XCTAssertEqual(sentURLs, [], "Nothing was sent")
+    }
+
+    /// A newer runtime attaches while `beforeDispatch` is asked: the same as
+    /// for the resolver.
+    func test_lifecycle_eviction_endsOwnersWaits_duringTheBeforeDispatchWait() async throws {
+        let (engine, owner) = await makeEngine()
+        let resolver = installResolver(engine, owner: owner) { _, _ in .headers([:]) }
+        let before = installBefore(engine, owner: owner) { [weak engine] _, _ in
+            _ = engine?.attachCallbacks()
+            return nil
+        }
+        let attempted = try await enqueueAttempted(engine)
+        answer(200)
+
+        try await flush(engine)
+
+        try await assertDeferred(attempted, in: engine, delayMs: floorMs)
+        XCTAssertEqual(events, ["SYNC_STARTED", "SYNC_PROGRESS", "ITEM_RETRYING(INTERCEPTOR_FAILED)", "SYNC_SUCCEEDED"])
+        XCTAssertEqual(resolver.callCount, 1)
+        XCTAssertEqual(before.callCount, 1)
+        XCTAssertEqual(callbackTimer.delays, [3_000, 3_000], "Both armed, and neither fired")
+        XCTAssertEqual(engine.gateway.pendingCount, 0)
+        XCTAssertEqual(sentURLs, [], "Nothing was sent")
+    }
+
+    /// Nothing waits for `afterDispatch`, but its request stays out until its
+    /// timeout. A teardown ends it at once instead.
+    func test_lifecycle_eviction_endsOwnersWaits_anAfterDispatchRequestEndsAtTheEviction() async throws {
+        let (engine, owner) = await makeEngine()
+        let after = installAfter(engine, owner: owner) { _, _ in nil }
+        _ = try await enqueue(engine)
+        answer(200)
+
+        try await flush(engine)
+
+        XCTAssertEqual(events, ["SYNC_STARTED", "SYNC_PROGRESS", "ITEM_SUCCEEDED", "SYNC_SUCCEEDED"])
+        XCTAssertEqual(after.callCount, 1)
+        XCTAssertEqual(engine.gateway.pendingCount, 1, "Out, unanswered, with nothing waiting for it")
+
+        engine.detachCallbacks(owner: owner)
+
+        XCTAssertEqual(engine.gateway.pendingCount, 0, "Ended by the teardown")
+        XCTAssertEqual(callbackTimer.delays, [3_000], "Armed, and never fired")
+    }
+
+    // MARK: - A stop after the waits
+
+    /// A pause that lands while `beforeDispatch` is asked stops the cycle
+    /// before the claim, even after a PROCEED: nothing is sent, the row is as
+    /// it was, and the cycle ends without failing.
+    func test_interceptor_stopMidWait_sendsNothing_aPauseAfterProceed() async throws {
+        let (engine, owner) = await makeEngine()
+        let hooks = engine.dispatcher.hooks
+        let before = installBefore(engine, owner: owner) { _, _ in
+            hooks.paused = true
+            return .before(.proceed)
+        }
+        let attempted = try await enqueueAttempted(engine)
+        answer(200)
+
+        let result = try await flush(engine)
+
+        let stored = try await row(attempted.id, in: engine)
+        XCTAssertEqual(stored, attempted, "No claim, no deferral")
+        XCTAssertEqual(before.callCount, 1)
+        XCTAssertEqual(sentURLs, [], "Nothing was sent")
+        XCTAssertEqual(result.itemsAttempted, 0)
+        XCTAssertEqual(events.filter { $0.hasPrefix("ITEM_") }, [])
+        XCTAssertEqual(emitter.events(ofType: "SYNC_FAILED").count, 0)
+        XCTAssertEqual(engine.gateway.pendingCount, 0)
+    }
+
     // MARK: - Probes
 
     /// The network-quality measurement and the health check send their HEADs
-    /// without asking any callback.
+    /// without asking any callback. With the real probe, every HEAD goes out
+    /// bare, without the resolver's header, and each callback is asked once,
+    /// about the item.
     func test_interceptor_probes_neverCallCallbacks() async throws {
+        fixture.probeOverride = HeadProbe(protocolClasses: [URLProtocolStub.self])
+        URLProtocolStub.setHandler { request in
+            guard request.httpMethod == "HEAD" else { return try stubResponse(503)(request) }
+            // The measurement's three HEADs leave no "last healthy", so the
+            // flush checks again: the fourth.
+            let heads = URLProtocolStub.capturedRequests.filter { $0.httpMethod == "HEAD" }.count
+            return try stubResponse(heads <= 3 ? 404 : 200)(request)
+        }
         let engine = await fixture.makeEngine(emitter: emitter)
         let owner = engine.attachCallbacks()
         let decider = FakeDecider(registry: engine.callbacks, gateway: engine.gateway, owner: owner) { _, _ in
             .decision(.retry)
         }
-        let resolver = installResolver(engine, owner: owner) { _, _ in .headers([:]) }
+        let resolver = installResolver(engine, owner: owner) { _, _ in .headers(["X-Resolved": "yes"]) }
         let before = installBefore(engine, owner: owner) { _, _ in .before(.proceed) }
         let after = installAfter(engine, owner: owner)
-        // Configuring a health check measures the link: three HEADs. A 404
-        // grades it but leaves no "last healthy", so the flush checks again.
-        fixture.probe.answer(latencyMs: 100, statusCode: 404)
         var options = SyncOptionsSnapshot.sample()
         options.healthCheckUrl = "https://api.test/health"
         await engine.configure(options)
         await engine.qualityMonitor.waitForProbe()
-        fixture.probe.answer(latencyMs: 100, statusCode: 204)
+        let id = try await enqueue(engine)
 
         let outcome = try await engine.dispatcher.flushOutcome()
 
         guard case .ran = outcome else { return XCTFail("Expected a cycle, got \(outcome)") }
-        XCTAssertEqual(fixture.probe.callCount, 4, "The measurement's three HEADs and the health check's")
-        XCTAssertEqual([decider.callCount, resolver.callCount, before.callCount, after.callCount], [0, 0, 0, 0])
-        XCTAssertEqual(callbackTimer.delays, [])
-        XCTAssertEqual(sentURLs, [])
+        let requests = URLProtocolStub.capturedRequests
+        let heads = requests.filter { $0.httpMethod == "HEAD" }
+        XCTAssertEqual(heads.count, 4, "The measurement's three HEADs and the health check's")
+        for head in heads {
+            XCTAssertNil(head.value(forHTTPHeaderField: "X-Resolved"), "A probe never asks the resolver")
+        }
+        let item = try XCTUnwrap(requests.first { $0.httpMethod == "POST" })
+        XCTAssertEqual(item.value(forHTTPHeaderField: "X-Resolved"), "yes")
+        XCTAssertEqual([decider.callCount, resolver.callCount, before.callCount, after.callCount], [1, 1, 1, 1])
+        let askedAbout = decider.requests.values.map(\.itemId) + resolver.requests.values.map(\.itemId)
+            + before.requests.values.map(\.itemId) + after.requests.values.map(\.itemId)
+        XCTAssertEqual(askedAbout, [id, id, id, id])
     }
 
     // MARK: - A deferral that cannot be written

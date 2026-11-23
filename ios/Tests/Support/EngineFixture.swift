@@ -30,10 +30,11 @@ final class EngineFixture {
     private let suite: String
     private var engines: [SyncEngine] = []
 
-    init() {
+    /// - Parameter transactions: logs every transaction of the stack, when set.
+    init(transactions: TransactionLog? = nil) {
         let faults = SaveFaults()
         saveFaults = faults
-        stack = InMemoryCoreDataStack.make(saveFaults: faults)
+        stack = InMemoryCoreDataStack.make(saveFaults: faults, transactions: transactions)
         (defaults, suite) = UserDefaults.ephemeral()
     }
 
