@@ -45,6 +45,84 @@ One-paragraph overview: what changed, why, and the blast radius (compile-time on
 
 Use the table at the bottom of each entry to enumerate every renamed, removed, or reshaped public symbol so consumers can grep for what they import.
 
+## [Unreleased] - Two new `SyncErrorCode` members for the opt-in retry decider and dispatch interceptors
+
+> **Upgrade path:** v0.3.z --> v0.4.0
+>
+> **Full migration guide:** [`docs/migration/v0-4-0`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/migration/v0-4-0)
+>
+> **Changelog:** see the [`[Unreleased]` entries in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+
+No function, hook, type or error code was removed, and the retry decider and the dispatch interceptors are opt-in. With nothing installed, dispatch, retries, events and I/O behave as in 0.3.1, so there is no runtime break. The blast radius is one compile-time change: `SyncErrorCode` gains two members.
+
+### `SyncErrorCode` gains `RETRY_DECIDER_REJECTED` and `INTERCEPTOR_FAILED`
+
+> **Category:** compile-time change (**not** a runtime behavior change). Pre-1.0.
+>
+> **Changelog:** see the [`[Unreleased]` Added and Changed entries in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+
+`SyncErrorCode` grows from 15 to 17 members. An exhaustive `switch` that ends in a `never` check stops compiling until it handles them, and so does an object typed `Record<SyncErrorCode, …>`. Code that compares against a few codes, or that has a `default` branch without a `never` check, compiles as before.
+
+No call throws the new codes, and the library reports them only once a callback is installed:
+
+- `RETRY_DECIDER_REJECTED` on `ITEM_FAILED`, when a retry decider answers `DROP` or `DEAD_LETTER`. After a `DEAD_LETTER`, it is also the dead letter's `lastErrorCode` and the `metadata.lastErrorCode` of the `ITEM_DEAD_LETTERED` that follows.
+- `INTERCEPTOR_FAILED` on `ITEM_RETRYING`, without a `statusCode`, when the header resolver or `beforeDispatch` fails or does not answer in time, or when `beforeDispatch` answers `SKIP`. Nothing was sent, and no attempt was spent.
+
+#### Before
+
+```ts
+import { SyncErrorCode } from '@gabriel-sisjr/react-native-sync-provider';
+
+function describe(code: SyncErrorCode): string {
+  switch (code) {
+    case SyncErrorCode.NETWORK_ERROR:
+      return 'No connection';
+    // ...a case for each of the other 14 v0.3 codes
+    default: {
+      const unreachable: never = code; // compiled in v0.3
+      return unreachable;
+    }
+  }
+}
+```
+
+#### After
+
+```ts
+import { SyncErrorCode } from '@gabriel-sisjr/react-native-sync-provider';
+
+function describe(code: SyncErrorCode): string {
+  switch (code) {
+    case SyncErrorCode.NETWORK_ERROR:
+      return 'No connection';
+    // ...a case for each of the other 14 v0.3 codes
+    case SyncErrorCode.RETRY_DECIDER_REJECTED:
+      return 'Dropped or dead-lettered by the retry decider';
+    case SyncErrorCode.INTERCEPTOR_FAILED:
+      return 'Held back by a dispatch interceptor, tried again later';
+    default: {
+      const unreachable: never = code;
+      return unreachable;
+    }
+  }
+}
+```
+
+#### Migration steps
+
+1. Add `RETRY_DECIDER_REJECTED` and `INTERCEPTOR_FAILED` to every exhaustive `switch` over `SyncErrorCode` and to every object typed `Record<SyncErrorCode, …>`.
+2. If you mock the library in tests with an explicit factory, add the new functions your code calls.
+
+No other change is required. To adopt the retry decider and the interceptors, follow the [migration guide](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/migration/v0-4-0).
+
+#### Affected symbols
+
+| Symbol                                 | Change                                                                                   |
+| -------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `SyncErrorCode.RETRY_DECIDER_REJECTED` | New member. Reported on `ITEM_FAILED` after a retry decider's `DROP` or `DEAD_LETTER`.   |
+| `SyncErrorCode.INTERCEPTOR_FAILED`     | New member. Reported on `ITEM_RETRYING` when an interceptor defers an item.              |
+| Every other public symbol              | Unchanged. The nine new functions, their types and `SyncOptions.callbackTimeoutMs` are additive. |
+
 ## [v0.3.0] - 2026-11-16 - Required network quality, a dead-letter queue for failed items, connection events on real changes only
 
 > **Upgrade path:** v0.2.z --> v0.3.0
