@@ -58,7 +58,7 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
     init(engine: SyncEngine) {
         self.engine = engine
         // Before anything is installed through this instance: a hybrid from
-        // before a JS reload may have left callbacks behind.
+        // before a JS reload may have left callbacks behind, orphaned.
         self.callbackOwner = engine.attachCallbacks()
         super.init()
         engine.attachHybrid()
@@ -68,8 +68,10 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
     }
 
     deinit {
-        // Only what this instance installed: after a reload, the new
-        // runtime's hybrid may have installed its own already.
+        // Retires only this instance's callbacks: their waits end, and what it
+        // installed stays, orphaned and never called, until a newer hybrid
+        // attaches. After a reload, the new runtime's hybrid may have
+        // installed its own already.
         engine.detachCallbacks(owner: callbackOwner)
         let channels = listenerLock.withLock { listenerIds }
         for (channel, ids) in channels {

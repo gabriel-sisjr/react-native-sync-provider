@@ -350,8 +350,9 @@ final class CallbackGatewayTests: XCTestCase {
         XCTAssertEqual(newOutcome, .answered(["X-A": "b"]))
     }
 
-    /// The decider's install can be read just before its hybrid goes away:
-    /// the request that follows ends at once, and JS is not called.
+    /// An install can be read just before its hybrid goes away, and it stays
+    /// readable after, orphaned, until a newer hybrid attaches: a request for
+    /// a retired owner ends at once, and JS is not called.
     func test_aRequestForARetiredOwner_neverCallsJS() async {
         let gateway = self.gateway!
         let sends = Recorder<String>()

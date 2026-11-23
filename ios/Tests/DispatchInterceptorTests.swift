@@ -774,6 +774,241 @@ final class DispatchInterceptorTests: XCTestCase {
         XCTAssertEqual(callbackTimer.delays.count, 2, "Nothing was asked after the clear")
     }
 
+    // MARK: - JS lifecycle
+
+    /// The owner of each slot: decider, resolver, before, after.
+    private func slotOwners(_ engine: SyncEngine) -> [UInt64?] {
+        [engine.callbacks.retryDecider?.owner,
+         engine.callbacks.headerResolver?.owner,
+         engine.callbacks.beforeDispatch?.owner,
+         engine.callbacks.afterDispatch?.owner]
+    }
+
+    /// Installs `kinds` through `hybrid`, as its JS would. Each one records
+    /// its call in `calls`, then answers through the gateway as the facade
+    /// does, so a call that should not happen shows up instead of hanging:
+    /// the resolver adds `X-Orphan`, `beforeDispatch` proceeds and the decider
+    /// drops. Nothing here holds the hybrid.
+    private func install(_ kinds: Set<CallbackKind>,
+                         through hybrid: HybridSyncProvider,
+                         gateway: CallbackGateway,
+                         calls: Recorder<String>) throws {
+        if kinds.contains(.retryDecider) {
+            _ = try hybrid.setRetryDecider { requestId, _ in
+                calls.record("decider")
+                gateway.answer(requestId, .decision(.drop))
+            }
+        }
+        if kinds.contains(.headerResolver) {
+            _ = try hybrid.setHeaderResolver { requestId, _ in
+                calls.record("resolver")
+                gateway.answer(requestId, .headers(["X-Orphan": "called"]))
+            }
+        }
+        if kinds.contains(.beforeDispatch) {
+            _ = try hybrid.setBeforeDispatch { requestId, _ in
+                calls.record("beforeDispatch")
+                gateway.answer(requestId, .before(.proceed))
+            }
+        }
+        if kinds.contains(.afterDispatch) {
+            _ = try hybrid.setAfterDispatch { requestId, _ in
+                calls.record("afterDispatch")
+                gateway.answer(requestId, .resolvedEmpty)
+            }
+        }
+    }
+
+    /// Returns once what the main queue held has run: the hybrid's
+    /// `afterDispatch` hops there before it calls JS.
+    private func drainTheMainQueue() async {
+        let drained = expectation(description: "the main queue ran what it held")
+        DispatchQueue.main.async { drained.fulfill() }
+        await fulfillment(of: [drained], timeout: livenessTimeout)
+    }
+
+    /// The options JS passes to `configureSync`: this class's default policy,
+    /// and `defaultHeaders`.
+    private func jsOptions(defaultHeaders: [String: String]) -> SyncOptions {
+        SyncOptions(strategy: .automatic,
+                    retryPolicy: RetryPolicy(maxAttempts: 5,
+                                             backoff: .exponential,
+                                             baseDelayMs: 1_000,
+                                             maxDelayMs: 600_000,
+                                             jitter: false,
+                                             retryOnStatusCodes: [500, 502, 503]),
+                    batchSize: nil,
+                    requestTimeoutMs: nil,
+                    maxQueueSize: nil,
+                    persistQueue: nil,
+                    defaultHeaders: defaultHeaders,
+                    minNetworkQuality: nil,
+                    healthCheckUrl: nil,
+                    healthCheckTtlMs: nil,
+                    healthCheckBackoffMs: nil,
+                    callbackTimeoutMs: nil)
+    }
+
+    /// A hybrid's teardown leaves what it installed in place, orphaned. The
+    /// dispatcher still finds an orphan, and the gateway ends each request for
+    /// it at once, without calling JS: the orphaned resolver defers its item
+    /// rather than let it go out with the static headers alone, and the
+    /// orphaned decider leaves the policy's verdict. A newer hybrid's attach
+    /// evicts the orphans: until its JS installs, items go out with the static
+    /// headers.
+    func test_lifecycle_teardown_retiresInstalls_untilNewAttach() async throws {
+        let (engine, _) = await makeEngine(defaultHeaders: ["Authorization": "Bearer static"])
+        let gateway = engine.gateway
+        let calls = Recorder<String>()
+
+        // The first runtime installs every kind, then goes away.
+        weak var firstReleased: HybridSyncProvider?
+        var first: HybridSyncProvider? = HybridSyncProvider(engine: engine)
+        firstReleased = first
+        let firstOwner = try XCTUnwrap(first).callbackOwner
+        try install([.retryDecider, .headerResolver, .beforeDispatch, .afterDispatch],
+                    through: try XCTUnwrap(first),
+                    gateway: gateway,
+                    calls: calls)
+        first = nil
+        XCTAssertNil(firstReleased, "The first hybrid was torn down")
+        XCTAssertFalse(engine.callbacks.isCurrent(firstOwner))
+        XCTAssertEqual(slotOwners(engine), Array(repeating: firstOwner, count: 4), "Orphaned, not removed")
+        XCTAssertTrue(engine.callbacks.hasInterceptors, "An orphan still counts as installed")
+
+        // An orphaned resolver: the item is deferred and nothing is sent.
+        let firstItem = try await row(try await enqueue(engine, url: "https://api.test/first"), in: engine)
+        answer(200)
+        let deferral = try await flush(engine)
+
+        try await assertDeferred(firstItem, in: engine, delayMs: floorMs)
+        XCTAssertEqual(events, ["SYNC_STARTED", "SYNC_PROGRESS", "ITEM_RETRYING(INTERCEPTOR_FAILED)", "SYNC_SUCCEEDED"])
+        XCTAssertEqual(sentURLs, [], "Nothing was sent")
+        XCTAssertEqual(deferral.itemsAttempted, 0)
+
+        // A second runtime attaches, which evicts every orphan, installs only
+        // the decider and `afterDispatch`, then goes away too.
+        weak var secondReleased: HybridSyncProvider?
+        var second: HybridSyncProvider? = HybridSyncProvider(engine: engine)
+        secondReleased = second
+        let secondOwner = try XCTUnwrap(second).callbackOwner
+        XCTAssertEqual(slotOwners(engine), [nil, nil, nil, nil], "The attach evicted the orphans")
+        try install([.retryDecider, .afterDispatch], through: try XCTUnwrap(second), gateway: gateway, calls: calls)
+        second = nil
+        XCTAssertNil(secondReleased, "The second hybrid was torn down")
+        XCTAssertEqual(slotOwners(engine), [secondOwner, nil, nil, secondOwner])
+
+        // An orphaned decider: the request goes out with the static headers,
+        // and its 503 gets the policy's retry, where the decider would drop.
+        let secondItem = try await enqueue(engine, url: "https://api.test/second")
+        answer(503)
+        let ended = clock.nowMs() + requestMs
+        try await flush(engine)
+
+        let retried = try await row(secondItem, in: engine)
+        XCTAssertEqual(retried.status, "PENDING")
+        XCTAssertEqual(retried.attempts, 1)
+        XCTAssertEqual(retried.lastErrorCode, "SERVER_ERROR")
+        XCTAssertEqual(retried.nextRetryAt, ended + 1_000, "The policy's delay")
+        XCTAssertEqual(events, ["SYNC_STARTED", "SYNC_PROGRESS", "ITEM_RETRYING(SERVER_ERROR)", "SYNC_SUCCEEDED"])
+        XCTAssertEqual(sentURLs, ["https://api.test/second"])
+        XCTAssertEqual(URLProtocolStub.capturedRequests.first?.value(forHTTPHeaderField: "Authorization"),
+                       "Bearer static")
+        XCTAssertNil(URLProtocolStub.capturedRequests.first?.value(forHTTPHeaderField: "X-Orphan"))
+
+        // A third runtime attaches and installs nothing: what the second left
+        // is evicted, and the next item goes out with the static headers.
+        let third = HybridSyncProvider(engine: engine)
+        XCTAssertEqual(slotOwners(engine), [nil, nil, nil, nil], "The attach evicted the orphans")
+        XCTAssertFalse(engine.callbacks.hasInterceptors)
+        _ = try await enqueue(engine, url: "https://api.test/third")
+        answer(200)
+        try await flush(engine)
+
+        XCTAssertEqual(sentURLs, ["https://api.test/third"])
+        XCTAssertEqual(URLProtocolStub.capturedRequests.first?.value(forHTTPHeaderField: "Authorization"),
+                       "Bearer static")
+        XCTAssertEqual(events, ["SYNC_STARTED", "SYNC_PROGRESS", "ITEM_SUCCEEDED", "SYNC_SUCCEEDED"])
+
+        // JS was never called, and nothing ever waited for it.
+        await drainTheMainQueue()
+        XCTAssertEqual(calls.values, [])
+        XCTAssertEqual(callbackTimer.delays, [], "No request was armed")
+        XCTAssertEqual(gateway.pendingCount, 0)
+        withExtendedLifetime(third) {}
+    }
+
+    /// With only `beforeDispatch` installed, its orphan still defers the item:
+    /// a SKIP it could have answered is never bypassed before a newer attach.
+    func test_lifecycle_teardown_retiresInstalls_untilNewAttach_anOrphanedBeforeDispatchDefers() async throws {
+        let (engine, _) = await makeEngine(defaultHeaders: ["Authorization": "Bearer static"])
+        let calls = Recorder<String>()
+        weak var released: HybridSyncProvider?
+        var hybrid: HybridSyncProvider? = HybridSyncProvider(engine: engine)
+        released = hybrid
+        let owner = try XCTUnwrap(hybrid).callbackOwner
+        try install([.beforeDispatch], through: try XCTUnwrap(hybrid), gateway: engine.gateway, calls: calls)
+        hybrid = nil
+        XCTAssertNil(released, "The hybrid was torn down")
+        XCTAssertFalse(engine.callbacks.isCurrent(owner))
+        XCTAssertEqual(slotOwners(engine), [nil, nil, owner, nil], "Orphaned, not removed")
+        XCTAssertTrue(engine.callbacks.hasInterceptors, "An orphan still counts as installed")
+        let pending = try await row(try await enqueue(engine), in: engine)
+        answer(200)
+
+        try await flush(engine)
+
+        try await assertDeferred(pending, in: engine, delayMs: floorMs)
+        XCTAssertEqual(sentURLs, [], "Nothing was sent")
+        XCTAssertEqual(calls.values, [])
+        XCTAssertEqual(callbackTimer.delays, [], "No request was armed")
+        XCTAssertEqual(engine.gateway.pendingCount, 0)
+    }
+
+    /// The startup order the docs ask for: the `set…` calls first, then
+    /// `configureSync`. Each `set…` is settled on return, and the next cycle
+    /// uses what it installed.
+    func test_lifecycle_setBeforeConfigure_installsAndIsUsed() async throws {
+        // Nothing has been configured in this process.
+        let engine = await fixture.makeColdEngine(emitter: emitter)
+        let hybrid = HybridSyncProvider(engine: engine)
+        let gateway = engine.gateway
+        let calls = Recorder<String>()
+        let installs = [
+            attachLikeTheBridge(try hybrid.setHeaderResolver { requestId, _ in
+                calls.record("resolver")
+                gateway.answer(requestId, .headers(["Authorization": "Bearer resolved"]))
+            }),
+            attachLikeTheBridge(try hybrid.setBeforeDispatch { requestId, _ in
+                calls.record("beforeDispatch")
+                gateway.answer(requestId, .before(.proceed))
+            }),
+        ]
+        for outcome in installs {
+            guard case .success? = outcome.value else {
+                XCTFail("Must have been accepted on return, got \(String(describing: outcome.value))")
+                continue
+            }
+        }
+
+        let configured = await settle(try hybrid.configureSync(options: jsOptions(defaultHeaders: [
+            "Authorization": "Bearer static",
+        ])))
+        guard case .success? = configured else {
+            return XCTFail("configureSync must succeed, got \(String(describing: configured))")
+        }
+        _ = try await enqueue(engine)
+        answer(200)
+        try await flush(engine)
+
+        XCTAssertEqual(calls.values, ["resolver", "beforeDispatch"])
+        XCTAssertEqual(URLProtocolStub.capturedRequests.map { $0.value(forHTTPHeaderField: "Authorization") },
+                       ["Bearer resolved"])
+        XCTAssertEqual(events, ["SYNC_STARTED", "SYNC_PROGRESS", "ITEM_SUCCEEDED", "SYNC_SUCCEEDED"])
+        XCTAssertEqual(gateway.pendingCount, 0)
+        withExtendedLifetime(hybrid) {}
+    }
+
     // MARK: - Probes
 
     /// The network-quality measurement and the health check send their HEADs

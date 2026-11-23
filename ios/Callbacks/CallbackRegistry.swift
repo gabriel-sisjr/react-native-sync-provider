@@ -4,8 +4,9 @@
 //
 //  The JS callbacks installed in this process, each tagged with the hybrid
 //  that installed it. The engine outlives every JS runtime, so an install must
-//  not outlive the runtime that made it: a newer hybrid's attach evicts the
-//  installs of older ones, and a hybrid's teardown removes its own.
+//  never call into a runtime that is gone: a hybrid's teardown leaves what it
+//  installed orphaned, which the gateway then refuses to call, and a newer
+//  hybrid's attach evicts the installs of older ones, orphans included.
 //
 
 import Foundation
@@ -26,8 +27,13 @@ struct CallbackInstall<Request: Sendable>: Sendable {
 ///   has not gone away. A set from it replaces what was installed. A set from
 ///   any other is refused.
 /// - A clear removes only what the caller installed.
-/// - Attaching evicts every install an older hybrid made. Two live JS runtimes
-///   in one process would evict each other's installs.
+/// - A hybrid that goes away leaves what it installed in place, orphaned. The
+///   dispatcher still finds an orphan, and the gateway ends each request for
+///   it at once, without calling JS: an orphaned header resolver or
+///   `beforeDispatch` defers its items instead of letting them go out without
+///   it. See ``SyncEngine/detachCallbacks(owner:)``.
+/// - Attaching evicts every install an older hybrid made, orphans included.
+///   Two live JS runtimes in one process would evict each other's installs.
 /// - An install is released outside the lock: releasing it releases a JS
 ///   function reference.
 final class CallbackRegistry: @unchecked Sendable {
@@ -57,16 +63,16 @@ final class CallbackRegistry: @unchecked Sendable {
         return owner
     }
 
-    /// The hybrid of `owner` went away. Only what it installed is removed, and
-    /// it is no longer the current owner.
+    /// The hybrid of `owner` went away, so it is no longer the current owner.
+    /// What it installed stays in place, orphaned, until a newer hybrid
+    /// attaches: the gateway, which retires `owner` too, ends every request
+    /// for an orphan at once, without calling JS.
     func detach(owner: UInt64) {
-        let removed = lock.withLock { () -> [Any] in
+        lock.withLock {
             if currentOwner == owner {
                 currentOwner = nil
             }
-            return removeLocked { $0 == owner }
         }
-        withExtendedLifetime(removed) {}
     }
 
     /// `true` while `owner` is the newest hybrid that attached and has not
@@ -94,7 +100,8 @@ final class CallbackRegistry: @unchecked Sendable {
     }
 
     /// `true` when a callback that runs before a request is installed: the
-    /// header resolver or `beforeDispatch`.
+    /// header resolver or `beforeDispatch`. An orphan counts: its items are
+    /// then deferred, never sent as if nothing were installed.
     var hasInterceptors: Bool {
         lock.withLock { resolver != nil || before != nil }
     }

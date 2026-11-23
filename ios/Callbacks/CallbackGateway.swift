@@ -222,6 +222,8 @@ final class PendingCallback: @unchecked Sendable {
 /// An owner is retired when the hybrid that installed its callbacks goes away
 /// or a newer one attaches, and every owner when the engine shuts down. Its
 /// waits then end at once, and a request made for it later never calls JS.
+/// A teardown leaves its owner's installs in place, so such requests go on
+/// until a newer hybrid attaches.
 /// Clearing or replacing a callback retires nothing: JS is alive, and the
 /// timeout still bounds a wait already out.
 final class CallbackGateway: @unchecked Sendable {

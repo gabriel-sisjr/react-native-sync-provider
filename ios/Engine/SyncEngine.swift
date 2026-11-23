@@ -298,20 +298,28 @@ final class SyncEngine: @unchecked Sendable {
 
     /// The owner token of the JS callbacks a newly created hybrid installs.
     /// That hybrid becomes their only owner: what older hybrids installed is
-    /// evicted, a hybrid from before a JS reload say, and their pending waits
-    /// end at once, as when no answer comes.
+    /// evicted, what a hybrid torn down before a JS reload left orphaned say,
+    /// and their pending waits end at once, as when no answer comes. Nothing
+    /// is installed again until this hybrid's JS calls a `set…`.
     func attachCallbacks() -> UInt64 {
         let owner = callbacks.attach()
         gateway.retireOwners(below: owner)
         return owner
     }
 
-    /// A hybrid went away: what it installed is removed, and its pending waits
-    /// end at once, as when no answer comes. A newer hybrid's installs are
-    /// left alone.
+    /// A hybrid went away. Its pending waits end at once, as when no answer
+    /// comes, and what it installed stays registered, orphaned, until a newer
+    /// hybrid attaches. Every later request for an orphan ends at once,
+    /// without calling JS: the header resolver and `beforeDispatch` defer
+    /// their items, the retry decider leaves the retry policy's verdict, and
+    /// `afterDispatch` is only logged. So from the teardown to the next attach,
+    /// no item goes out without the headers its resolver adds, or past a
+    /// `beforeDispatch` that could skip it. A newer hybrid's installs are left
+    /// alone.
     func detachCallbacks(owner: UInt64) {
-        callbacks.detach(owner: owner)
+        // The gateway first: from here on, no request for `owner` calls JS.
         gateway.retireOwner(owner)
+        callbacks.detach(owner: owner)
     }
 
     /// Returns once a flush started by connectivity coming back has finished.

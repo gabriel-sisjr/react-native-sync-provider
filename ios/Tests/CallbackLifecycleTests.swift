@@ -6,8 +6,9 @@ import NitroModules
 /// a hybrid is created per runtime and torn down in `deinit` when that runtime
 /// goes away, after a reload say, possibly once the new runtime's hybrid has
 /// installed its own callbacks. Each install carries its hybrid's generation:
-/// a newer attach evicts the older ones' installs, a teardown removes only its
-/// own, and only the current owner may install.
+/// a newer attach evicts the older ones' installs, a teardown retires only its
+/// own, which stay in place, orphaned, until that newer attach, and only the
+/// current owner may install.
 final class CallbackLifecycleTests: XCTestCase {
     private var fixture: EngineFixture!
     private var engine: SyncEngine!
@@ -91,7 +92,11 @@ final class CallbackLifecycleTests: XCTestCase {
         XCTAssertTrue(engine.callbacks.isCurrent(new.callbackOwner), "Still the current owner")
     }
 
-    func test_lifecycle_teardown_uninstallsOwnInstalls() throws {
+    /// A teardown retires what its hybrid installed without removing it: the
+    /// installs stay, orphaned, and still count as installed, until a newer
+    /// hybrid's attach evicts every one of them. The dispatcher's side is in
+    /// `DispatchInterceptorTests`.
+    func test_lifecycle_teardown_retiresInstalls_untilNewAttach_inTheRegistry() throws {
         var hybrid: HybridSyncProvider? = HybridSyncProvider(engine: engine)
         let owner = try XCTUnwrap(hybrid).callbackOwner
         try installAll(try XCTUnwrap(hybrid))
@@ -99,8 +104,16 @@ final class CallbackLifecycleTests: XCTestCase {
 
         hybrid = nil
 
-        XCTAssertEqual(owners(), [nil, nil, nil, nil])
+        XCTAssertEqual(owners(), owned(by: owner), "Orphaned, not removed")
         XCTAssertFalse(engine.callbacks.isCurrent(owner))
+        XCTAssertTrue(engine.callbacks.hasInterceptors, "An orphan still counts as installed")
+
+        let newer = HybridSyncProvider(engine: engine)
+
+        XCTAssertEqual(owners(), [nil, nil, nil, nil], "The newer attach evicted every orphan")
+        XCTAssertFalse(engine.callbacks.hasInterceptors)
+        XCTAssertEqual(try isDeciderInstalled(through: newer), false)
+        XCTAssertTrue(engine.callbacks.isCurrent(newer.callbackOwner))
     }
 
     /// A hybrid that is no longer the current owner, because a newer one
@@ -136,8 +149,9 @@ final class CallbackLifecycleTests: XCTestCase {
         XCTAssertEqual(try isDeciderInstalled(through: new), true)
     }
 
-    /// The installs a teardown or a newer attach evicts end their pending
-    /// waits at once, as when no answer comes: no timeout is needed.
+    /// A teardown, which retires its hybrid's installs, and a newer attach,
+    /// which evicts the older ones', end their pending waits at once, as when
+    /// no answer comes: no timeout is needed.
     func test_lifecycle_eviction_endsOwnersWaits() async throws {
         let gateway = engine.gateway
 
@@ -382,14 +396,17 @@ final class CallbackLifecycleTests: XCTestCase {
     /// that hybrid's `deinit`, the iOS teardown, would never run.
     func test_ios_installedCallback_doesNotRetainTheHybrid() throws {
         weak var released: HybridSyncProvider?
+        var owner: UInt64?
         do {
             let hybrid = HybridSyncProvider(engine: engine)
             released = hybrid
+            owner = hybrid.callbackOwner
             try installAll(hybrid)
             XCTAssertNotNil(engine.callbacks.retryDecider)
         }
 
         XCTAssertNil(released, "An install kept the hybrid alive")
-        XCTAssertEqual(owners(), [nil, nil, nil, nil], "Its deinit removed what it installed")
+        XCTAssertEqual(owners(), owned(by: try XCTUnwrap(owner)), "Its deinit left what it installed, orphaned")
+        XCTAssertFalse(engine.callbacks.isCurrent(try XCTUnwrap(owner)))
     }
 }
