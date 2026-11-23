@@ -40,12 +40,14 @@ struct StoredSyncItem: Sendable, Equatable {
     let attempts: Int32
     let lastAttemptAt: Int64?
     /// Epoch-ms timestamp before which the item is **not** eligible for
-    /// dispatch. `0` means "eligible now": no cooldown or credential hold is
-    /// pending. A positive value is a deadline written by
+    /// dispatch. `0` means "eligible now": no cooldown, credential hold or
+    /// deferral is pending. A positive value is a deadline written by
     /// ``SyncItemDao/markPendingForRetry(id:errorCode:retryDelayMs:)`` (retry
-    /// cooldown) or by
+    /// cooldown), by
     /// ``SyncItemDao/markCredentialRejected(id:errorCode:retryDelayMs:attempts:)``
-    /// (credential hold), never past ``RetryPolicyEvaluator/maxDeadlineMs``,
+    /// (credential hold), or by ``SyncItemDao/deferPending(id:errorCode:delayMs:)``
+    /// (an item the header resolver or `beforeDispatch` deferred, its
+    /// `attempts` untouched), never past ``RetryPolicyEvaluator/maxDeadlineMs``,
     /// the largest valid JavaScript `Date`; a row an older version wrote can
     /// hold a later one until its next attempt. `0` does not mean "never
     /// attempted": a row recovered

@@ -6,8 +6,10 @@
 //    - One `URLSession(configuration: .default)` for in-app flushes.
 //    - One `URLSession(configuration: .background(withIdentifier:))` for
 //      OS-driven sync (BGTask handlers + iOS-resumed background uploads).
-//    - The `flush` cycle: drains the queue, applies the retry policy and the
-//      JS retry decider, records results, emits events.
+//    - The `flush` cycle: drains the queue, asks the JS header resolver and
+//      `beforeDispatch` before each claim, applies the retry policy and the
+//      JS retry decider, records results, emits events, and then calls
+//      `afterDispatch` without waiting for it.
 //
 
 import Foundation
