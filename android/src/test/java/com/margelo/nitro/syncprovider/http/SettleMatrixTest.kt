@@ -1053,6 +1053,33 @@ internal class SettleMatrixTest {
       assertWake(0L)
     }
 
+  /** `dispose()` cancels its scope, then retires its callbacks: for its own cycle the stop wins. */
+  @Test
+  fun `android_dispose_stopsBeforeRetiring, so its cycle waiting on the resolver gives the row back as it was`() =
+    runTest {
+      answer(200)
+      val before = seed(ITEM)
+      val resolver = neverAnsweringResolver()
+      val events = recordEvents()
+      val d = dispatcher(callbackTimeoutMs = LONG_CALLBACK_TIMEOUT_MS)
+
+      val cycle = launch(Dispatchers.IO) { d.flush() }
+      runBlocking { withTimeout(20_000L) { resolver.asked.await() } }
+      cycle.cancel()
+      hybrid.retire()
+      cycle.join()
+
+      // Stopped, not deferred: the retirement that followed changed nothing.
+      assertThat(cycle.isCancelled).isTrue()
+      assertThat(server.requestCount).isEqualTo(0)
+      assertThat(row(ITEM)).isEqualTo(before)
+      assertThat(events.seen())
+        .containsExactly(Seen(SyncEventType.SYNC_STARTED), Seen(SyncEventType.SYNC_FAILED))
+        .inOrder()
+      assertThat(endings).containsExactly(CycleEnding.CANCELLED)
+      assertWake(0L)
+    }
+
   @Test
   fun `interceptor_stopMidWait_sendsNothing R10 C1 a PROCEED that lands as the cycle stops sends nothing`() =
     runTest {

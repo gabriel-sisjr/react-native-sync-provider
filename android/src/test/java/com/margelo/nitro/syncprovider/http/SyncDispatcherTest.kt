@@ -3792,6 +3792,113 @@ internal class SyncDispatcherTest {
     }
 
   @Test
+  fun `lifecycle_teardown_retiresInstalls_untilNewAttach, an orphaned resolver holds the item unsent`() =
+    runBlocking<Unit> {
+      answerAll(200)
+      val held = enqueue("/held")
+      val before = row(held)
+      val start = clock.now()
+      val resolver = installResolver { FakeJs.headers(mapOf("Authorization" to "Bearer resolved")) }
+      val hook = installBefore { proceed() }
+      val after = installAfter()
+      val decider = installDecider { FakeJs.decision(RetryAction.DROP) }
+      // The hybrid is disposed: what it installed stays, orphans that no runtime answers.
+      hybrid.retire()
+      val events = collectEvents()
+      val d = newDispatcher(
+        callbackTimeoutMs = 60_000.0,
+        defaultHeaders = mapOf("Authorization" to "Bearer static"),
+      )
+      val started = System.nanoTime()
+
+      d.flush()
+
+      // Deferred at once, not after the timeout, and never sent with the static headers alone.
+      assertThat(elapsedMs(started)).isLessThan(AT_ONCE_MS)
+      assertThat(server.requestCount).isEqualTo(0)
+      assertDeferred(before, until = start + 60_000L)
+      events.assertDeferredEvent(held, attempt = 1)
+      assertThat(callbackLog.single()).matches(
+        "headerResolver for item $held \\(headerResolver:\\d+\\): the JS runtime that installed it is gone; " +
+          "the item is not sent in this cycle",
+      )
+      assertThat(callbackPriorities.single()).isEqualTo(Log.INFO)
+
+      // A newer hybrid attaches and installs nothing yet: the next item goes out with the static headers.
+      HybridInstalls(callbacks)
+      val next = enqueue("/next")
+      val result = d.flush()
+
+      val sent = checkNotNull(server.takeRequest(5, TimeUnit.SECONDS))
+      assertThat(sent.path).isEqualTo("/next")
+      assertThat(sent.sentHeader("Authorization")).isEqualTo("Authorization" to "Bearer static")
+      assertThat(result.succeededIds.toList()).containsExactly(next)
+      // The held item waits out its cooldown, and no JS function was ever called.
+      assertThat(server.requestCount).isEqualTo(1)
+      assertDeferred(before, until = start + 60_000L)
+      assertThat(callbackLog).hasSize(1)
+      listOf(resolver.calls, hook.calls, after.calls, decider.calls).forEach { assertThat(it).isEmpty() }
+    }
+
+  @Test
+  fun `lifecycle_teardown_retiresInstalls_untilNewAttach, an orphaned beforeDispatch holds the item unsent too`() =
+    runTest {
+      answerAll(200)
+      val id = enqueue()
+      val before = row(id)
+      val start = clock.now()
+      val hook = installBefore { proceed() }
+      hybrid.retire()
+      val events = collectEvents()
+
+      newDispatcher(callbackTimeoutMs = 60_000.0).flush()
+
+      assertThat(server.requestCount).isEqualTo(0)
+      assertDeferred(before, until = start + 60_000L)
+      events.assertDeferredEvent(id, attempt = 1)
+      assertThat(hook.calls).isEmpty()
+      assertThat(callbackLog.single()).matches(
+        "beforeDispatch for item $id \\(beforeDispatch:\\d+\\): the JS runtime that installed it is gone; " +
+          "the item is not sent in this cycle",
+      )
+      assertThat(callbackPriorities.single()).isEqualTo(Log.INFO)
+    }
+
+  @Test
+  fun `lifecycle_teardown_retiresInstalls_untilNewAttach, an orphaned decider leaves the retry to the policy`() =
+    runBlocking<Unit> {
+      server.enqueue(MockResponse().setResponseCode(503))
+      val id = enqueue()
+      val start = clock.now()
+      val decider = installDecider { FakeJs.decision(RetryAction.DEAD_LETTER) }
+      val after = installAfter()
+      hybrid.retire()
+      val events = collectEvents()
+      val started = System.nanoTime()
+
+      newDispatcher(callbackTimeoutMs = 60_000.0).flush()
+
+      // The policy's 1 s for attempt 1, at once, and no dead letter.
+      assertThat(elapsedMs(started)).isLessThan(AT_ONCE_MS)
+      assertThat(row(id).nextRetryAt).isEqualTo(start + 1_000L)
+      assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+      assertThat(events.of(id).map { it.type }).containsExactly(SyncEventType.ITEM_RETRYING)
+      // afterDispatch is only logged, after the decider's line.
+      awaitUntil { callbackLog.size == 2 && callbacks.gateway.pendingCount == 0 }
+      assertThat(callbackLog[0]).matches(
+        "retryDecider for item $id \\(retryDecider:\\d+\\): the JS runtime that installed it is gone; " +
+          "the retry policy applies",
+      )
+      assertThat(callbackLog[1]).matches(
+        "afterDispatch for item $id \\(afterDispatch:\\d+\\): the JS runtime that installed it is gone; " +
+          "nothing changes",
+      )
+      assertThat(callbackPriorities).containsExactly(Log.INFO, Log.INFO)
+      assertThat(decider.calls).isEmpty()
+      assertThat(after.calls).isEmpty()
+    }
+
+  @Test
   fun `android_interceptor_persistedHeadDeferred_nextItemProbes, alone`() = runTest {
     server.dispatcher = object : Dispatcher() {
       override fun dispatch(request: RecordedRequest): MockResponse =

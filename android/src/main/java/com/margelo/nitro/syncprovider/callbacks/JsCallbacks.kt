@@ -17,8 +17,8 @@ import kotlin.coroutines.CoroutineContext
  *
  * It belongs to no hybrid and is not part of the runtime instance, so the bridge installs and
  * clears on the JS thread without building a runtime, and an answer still lands after its hybrid
- * was disposed. Evicting an owner, by a newer attach or a teardown, ends every wait it owns at
- * once, the way no answer would end it.
+ * was disposed. An owner that goes, evicted by a newer attach or retired at its teardown, has
+ * every wait it owns ended at once, the way no answer would end it.
  *
  * The parameters are the [JsCallbackGateway]'s.
  */
@@ -37,9 +37,12 @@ internal class JsCallbacks(
   /** A hybrid was created: its generation. Every older install is evicted, and its waits end. */
   fun attach(): Long = registry.attach().also { gateway.endWaitsOfGoneOwners() }
 
-  /** The hybrid of generation [owner] is torn down: its installs go, and its waits end. */
-  fun detach(owner: Long) {
-    registry.detach(owner)
+  /**
+   * The hybrid of generation [owner] is torn down: it is retired, and its waits end. Its installs
+   * stay as orphans, never called, until a newer hybrid attaches (see [CallbackRegistry]).
+   */
+  fun retire(owner: Long) {
+    registry.retire(owner)
     gateway.endWaitsOfGoneOwners()
   }
 

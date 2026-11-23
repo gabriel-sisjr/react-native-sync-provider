@@ -268,14 +268,22 @@ class SyncProvider : HybridSyncProviderSpec() {
   /* ------------------------------ teardown ------------------------------ */
 
   /**
-   * Uninstall this instance's callbacks, detach from the runtime and cancel the module scope.
+   * Cancel the module scope, retire this instance's callbacks and detach from the runtime.
    * Called by Nitro when the HybridObject is disposed via JS, never on a reload: a reload's new
    * instance evicts the callbacks when it is created.
+   *
+   * The scope goes first, so a cycle this instance's `flush` runs has stopped by the time the
+   * retirement ends its waits: a wait for an interceptor then sends nothing and gives the row back
+   * as it was, and a wait for the retry decider gets the policy. Retiring ends every other wait
+   * the callbacks own, at once. Their installs stay as orphans, never called, until a newer instance
+   * is created: an item that would ask the header resolver or `beforeDispatch` is not sent, the
+   * retry decider leaves the decision to the policy, and `afterDispatch` is only logged (see
+   * [com.margelo.nitro.syncprovider.callbacks.HybridInstalls.retire]).
    */
   override fun dispose() {
-    runCatching { installs.teardown() }
-    if (lazyRuntime.isInitialized()) runCatching { runtime.detachEngine() }
     runCatching { coroutineScope.coroutineContext[Job]?.cancel() }
+    runCatching { installs.retire() }
+    if (lazyRuntime.isInitialized()) runCatching { runtime.detachEngine() }
     super.dispose()
   }
 

@@ -694,6 +694,8 @@ internal class SyncDispatcher(
   ): Interception {
     val resolver = callbacks.registry.headerResolver.installed
     var hook = callbacks.registry.beforeDispatch.installed
+    // An orphan, left by a hybrid torn down, counts: its request ends at once without calling
+    // JS, and the item is deferred, never sent with the static headers alone.
     if (resolver == null && hook == null) return Interception.Send(built, awaited = false)
     val timeoutMs = CallbackTimeout.ms(options)
     val method = methodOf(entity)

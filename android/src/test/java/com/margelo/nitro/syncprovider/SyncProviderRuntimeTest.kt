@@ -1223,14 +1223,23 @@ internal class SyncProviderRuntimeTest {
   }
 
   @Test
-  fun `the runtime's dispatcher asks the retry decider a hybrid installed`() = runBlocking<Unit> {
-    server.enqueue(MockResponse().setResponseCode(503))
-    insert("decided")
+  fun `lifecycle_setBeforeConfigure_installsAndIsUsed, by the runtime's next cycle`() = runBlocking<Unit> {
+    // The hybrid's set calls come first, before any configureSync, as the startup rule asks.
+    assertThat(runtime.configSource).isEqualTo(ConfigSource.DEFAULTS)
     val hybrid = HybridInstalls(SyncProviderRuntime.callbacks)
     val asked: MutableList<String> = CopyOnWriteArrayList()
     assertThat(
+      hybrid.setHeaderResolver { requestId, context ->
+        asked += "headerResolver ${context.itemId}"
+        SyncProviderRuntime.callbacks.gateway.answer(
+          requestId,
+          CallbackAnswer(CallbackAnswerStatus.RESOLVED, null, mapOf("Authorization" to TOKEN), null, null),
+        )
+      },
+    ).isTrue()
+    assertThat(
       hybrid.setRetryDecider { requestId, context ->
-        asked += context.itemId
+        asked += "retryDecider ${context.itemId}"
         SyncProviderRuntime.callbacks.gateway.answer(
           requestId,
           CallbackAnswer(CallbackAnswerStatus.RESOLVED, RetryDecision(RetryAction.DROP, null), null, null, null),
@@ -1238,9 +1247,14 @@ internal class SyncProviderRuntimeTest {
       },
     ).isTrue()
 
+    runtime.configure(TestData.syncOptions())
+    server.enqueue(MockResponse().setResponseCode(503))
+    insert("decided")
     runtime.dispatcher.flush()
 
-    assertThat(asked).containsExactly("decided")
+    assertThat(runtime.configSource).isEqualTo(ConfigSource.LIVE)
+    assertThat(server.takeRequest(1, TimeUnit.SECONDS)!!.getHeader("Authorization")).isEqualTo(TOKEN)
+    assertThat(asked).containsExactly("headerResolver decided", "retryDecider decided").inOrder()
     assertThat(row("decided")).isNull()
     assertThat(deadLetter("decided")).isNull()
   }

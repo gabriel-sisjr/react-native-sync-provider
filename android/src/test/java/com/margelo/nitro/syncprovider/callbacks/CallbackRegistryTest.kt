@@ -26,7 +26,8 @@ import java.util.Collections
 /**
  * Who owns the installed callbacks, and what a hybrid's creation and teardown do to them. Each
  * [HybridInstalls] stands for one hybrid: on Android a JS reload creates a new hybrid and never
- * disposes the old one, and an explicit `dispose()` is a teardown.
+ * disposes the old one, and an explicit `dispose()` is a teardown, which retires the hybrid
+ * ([HybridInstalls.retire]).
  */
 internal class CallbackRegistryTest {
 
@@ -53,7 +54,7 @@ internal class CallbackRegistryTest {
     assertThat(new.installEveryKind(newDecider)).isTrue()
 
     // The old hybrid's dispose comes late, after the new one installed.
-    old.teardown()
+    old.retire()
 
     assertThat(owners()).containsExactly(new.owner, new.owner, new.owner, new.owner)
     assertThat(registry.retryDecider.installed?.function).isSameInstanceAs(newDecider)
@@ -74,13 +75,47 @@ internal class CallbackRegistryTest {
   }
 
   @Test
-  fun `lifecycle_teardown_uninstallsOwnInstalls, every kind of them`() {
+  fun `lifecycle_teardown_retiresInstalls_untilNewAttach, every kind kept and never called`() =
+    runBlocking<Unit> {
+      val hybrid = HybridInstalls(callbacks)
+      assertThat(hybrid.installEveryKind()).isTrue()
+
+      hybrid.retire()
+
+      // Still installed, so an item that would ask one is not sent with the static headers alone.
+      assertThat(owners()).containsExactly(hybrid.owner, hybrid.owner, hybrid.owner, hybrid.owner)
+      assertThat(hybrid.isRetryDeciderInstalled()).isFalse()
+      // A request for an orphan ends at once, a notification too, and JS is never called.
+      var calls = 0
+      val started = System.nanoTime()
+      assertThat(ask(hybrid.owner) { calls++ }.await()).isEqualTo(CallbackResult.Skipped(SkipReason.OWNER_GONE))
+      callbacks.gateway.notify(CallbackKind.AFTER_DISPATCH, hybrid.owner, ITEM, LONG_TIMEOUT_MS) { calls++ }
+      awaitUntil { lines.size == 2 && callbacks.gateway.pendingCount == 0 }
+      assertThat(elapsedMs(started)).isLessThan(AT_ONCE_MS)
+      assertThat(calls).isEqualTo(0)
+      assertThat(lines).containsExactly(
+        "retryDecider for item $ITEM (retryDecider:1): the JS runtime that installed it is gone; $POLICY",
+        "afterDispatch for item $ITEM (afterDispatch:2): the JS runtime that installed it is gone; nothing changes",
+      ).inOrder()
+
+      // A newer hybrid's creation evicts the orphans, and it has installed nothing yet.
+      HybridInstalls(callbacks)
+
+      assertThat(owners()).containsExactly(null, null, null, null)
+    }
+
+  @Test
+  fun `a torn-down hybrid's clear changes nothing, only a newer attach evicts its orphans`() {
     val hybrid = HybridInstalls(callbacks)
     assertThat(hybrid.installEveryKind()).isTrue()
+    hybrid.retire()
 
-    hybrid.teardown()
+    hybrid.clearRetryDecider()
+    hybrid.clearHeaderResolver()
+    hybrid.clearBeforeDispatch()
+    hybrid.clearAfterDispatch()
 
-    assertThat(owners()).containsExactly(null, null, null, null)
+    assertThat(owners()).containsExactly(hybrid.owner, hybrid.owner, hybrid.owner, hybrid.owner)
     assertThat(hybrid.isRetryDeciderInstalled()).isFalse()
   }
 
@@ -96,10 +131,13 @@ internal class CallbackRegistryTest {
     assertThat(old.setAfterDispatch { _: String, _: AfterDispatchContext -> }).isFalse()
     assertThat(owners()).containsExactly(new.owner, new.owner, new.owner, new.owner)
 
-    new.teardown()
+    val kept = registry.retryDecider.installed?.function
+    new.retire()
 
     assertThat(new.installEveryKind()).isFalse()
-    assertThat(owners()).containsExactly(null, null, null, null)
+    // Refused, so nothing changed: its installs stay, orphans until a newer hybrid attaches.
+    assertThat(owners()).containsExactly(new.owner, new.owner, new.owner, new.owner)
+    assertThat(registry.retryDecider.installed?.function).isSameInstanceAs(kept)
   }
 
   @Test
@@ -132,7 +170,7 @@ internal class CallbackRegistryTest {
     notified.await()
     val started = System.nanoTime()
 
-    hybrid.teardown()
+    hybrid.retire()
 
     assertThat(waiting.await()).isEqualTo(CallbackResult.Skipped(SkipReason.OWNER_GONE))
     awaitUntil { lines.size == 2 && callbacks.gateway.pendingCount == 0 }
@@ -157,14 +195,14 @@ internal class CallbackRegistryTest {
   @Test
   fun `a waiting request of the current hybrid outlives another one's eviction`() = runBlocking<Unit> {
     val old = HybridInstalls(callbacks)
-    old.teardown()
+    old.retire()
     val current = HybridInstalls(callbacks)
     var requestId = ""
     val waiting = ask(current.owner) { requestId = it }
     awaitUntil { requestId.isNotEmpty() }
 
     // A late teardown of the old hybrid, then the current one's answer.
-    old.teardown()
+    old.retire()
     callbacks.gateway.answer(requestId, decision())
 
     assertThat(waiting.await()).isInstanceOf(CallbackResult.Answered::class.java)
