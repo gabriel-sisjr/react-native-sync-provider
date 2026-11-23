@@ -351,6 +351,44 @@ final class RetryDeciderTests: XCTestCase {
         XCTAssertEqual(engine.gateway.pendingCount, 0)
     }
 
+    /// A `configureSync` that lands while the request is out applies from the
+    /// next item: the decider's wait for this one ends at the
+    /// `callbackTimeoutMs` its request was sent with.
+    func test_decider_neverAnswers_timesOut_aConfigureDuringTheRequestAppliesFromTheNextItem() async throws {
+        let policy = RetryPolicyValue.exact(maxAttempts: 5, baseDelayMs: 1_000, maxDelayMs: 600_000)
+        let engine = await makeEngine(policy: policy, callbackTimeoutMs: 1_500)
+        let timer = callbackTimer
+        let decider = FakeDecider(engine: engine) { _, _ in
+            timer.fireAll()
+            return nil
+        }
+        _ = try await engine.storage.enqueue(input: .sample(url: "https://api.test/first", priority: "HIGH"))
+        _ = try await engine.storage.enqueue(input: .sample(url: "https://api.test/second", priority: "LOW"))
+        let clock = self.clock
+        let requestMs = self.requestMs
+        let failure = stubResponse(503)
+        URLProtocolStub.setHandler { request in
+            clock.advance(ms: requestMs)
+            if request.url?.lastPathComponent == "first" {
+                let configured = DispatchSemaphore(value: 0)
+                Task {
+                    var options = SyncOptionsSnapshot.sample(retryPolicy: policy)
+                    options.callbackTimeoutMs = 9_000
+                    await engine.configure(options)
+                    configured.signal()
+                }
+                configured.wait()
+            }
+            return try failure(request)
+        }
+
+        try await flush(engine)
+
+        XCTAssertEqual(decider.requests.values.map(\.url), ["https://api.test/first", "https://api.test/second"])
+        XCTAssertEqual(callbackTimer.delays, [1_500, 9_000], "The first wait kept the timeout its request was sent with")
+        XCTAssertEqual(engine.gateway.pendingCount, 0)
+    }
+
     func test_decider_lateAnswer_ignored() async throws {
         let engine = await makeEngine()
         let timer = callbackTimer

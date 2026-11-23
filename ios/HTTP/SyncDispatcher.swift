@@ -870,7 +870,10 @@ actor SyncDispatcher {
     ///
     /// While the cycle waits for the decider, other calls can land on this
     /// actor: a pause, a configuration, a flush that joins the cycle. None of
-    /// them changes this verdict, whose policy half is fixed before the wait.
+    /// them changes this verdict, whose policy half is fixed before the wait,
+    /// nor the wait, which ends at the `callbackTimeoutMs` of `sentWith`: a
+    /// configuration that lands while the request is out applies from the
+    /// next item.
     /// The row itself is read again by the write that follows, and the loop
     /// checks for a cancellation and a pause before the next item.
     ///
@@ -899,7 +902,7 @@ actor SyncDispatcher {
                                           method: item.method,
                                           metadata: item.metadata)
         let answer = await gateway.requestDecision(owner: decider.owner,
-                                                   timeoutMs: config.callbackTimeoutMs) { requestId in
+                                                   timeoutMs: sentWith.callbackTimeoutMs) { requestId in
             decider.invoke(requestId, request)
         }
         switch answer {
