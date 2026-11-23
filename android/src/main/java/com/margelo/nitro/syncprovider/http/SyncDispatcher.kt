@@ -672,9 +672,9 @@ internal class SyncDispatcher(
    * installed, nothing is asked or read, and [built] goes out as it is.
    *
    * - The resolver's headers are merged between `defaultHeaders` and the item's own headers: one
-   *   entry per name, whatever its case, with the spelling and value of the layer that wins.
-   *   Anything but headers OkHttp sends as they are defers the item, and `beforeDispatch` is then
-   *   not asked.
+   *   entry per name, whatever its case, with the spelling and value of the layer that wins (see
+   *   [withResolvedHeaders]). Anything but headers OkHttp sends as they are defers the item, and
+   *   `beforeDispatch` is then not asked.
    * - `beforeDispatch` sees the headers of the request built that way, the one that goes out. The
    *   `Content-Type` OkHttp takes from the body is not among them: the stored content type has
    *   its own field. A `Content-Type` that a layer sets is. PROCEED sends the request unchanged;
@@ -717,10 +717,9 @@ internal class SyncDispatcher(
       ensureNotStopped(entity, stop)
       if (!storage.isQueued(entity.id)) return Interception.Gone
       if (headers.isNotEmpty()) {
-        // In name order, as on iOS: of two names that differ only by case, the one sorted last
-        // wins, whatever the order of the map. Never null: OkHttp took the rest of the
-        // request, and the gateway checked these headers.
-        request = buildRequest(entity, options.defaultHeaders, headers.toSortedMap())
+        // Never null in practice: OkHttp took the rest of the request, and the gateway checked
+        // these headers.
+        request = withResolvedHeaders(built, entity, headers)
           ?: return Interception.Deferred(skipped = false)
       }
       // Read again after the wait: each install is read when the item needs it.
@@ -1254,18 +1253,17 @@ internal class SyncDispatcher(
   }
 
   /**
-   * The request [entity] makes, or null when OkHttp refuses it: its URL, or a header name or
-   * value. Its headers are [defaultHeaders], then [resolved], the header resolver's, then the
-   * item's own: each later layer replaces a name an earlier one set, whatever its case.
+   * The request [entity] makes with its static headers, or null when OkHttp refuses it: its URL,
+   * or a header name or value. Its headers are [defaultHeaders], then the item's own, which
+   * replace a name `defaultHeaders` set, whatever its case. The header resolver's go between the
+   * two (see [withResolvedHeaders]).
    */
   private fun buildRequest(
     entity: SyncItemEntity,
     defaultHeaders: Map<String, String>?,
-    resolved: Map<String, String>? = null,
   ): Request? = runCatching {
     val builder = Request.Builder().url(entity.url)
     defaultHeaders?.forEach { (k, v) -> builder.header(k, v) }
-    resolved?.forEach { (k, v) -> builder.header(k, v) }
     JsonMap.decode(entity.headers)?.forEach { (k, v) -> builder.header(k, v) }
 
     val body: RequestBody? = when (entity.method.uppercase()) {
@@ -1280,6 +1278,33 @@ internal class SyncDispatcher(
   }.getOrElse {
     // Only the type: OkHttp puts header values in these messages.
     Log.e(TAG, "Failed to build OkHttp request for ${entity.id}: ${it.javaClass.simpleName}")
+    null
+  }
+
+  /**
+   * [built], the request with the static headers, with the header resolver's [resolved] merged
+   * in, or null when OkHttp refuses one of them. They replace a name `defaultHeaders` set,
+   * whatever its case. The item's own headers are then applied again, so they win over the
+   * resolver's and go last, as if the request were built from the three layers. Its URL, method
+   * and body are [built]'s: the body is not copied again.
+   *
+   * Only this layer is applied in name order: of two of its names that differ only by case, the
+   * one sorted last wins, as on iOS. The static layers keep their map order, so that a request
+   * goes out as it always has when nothing is installed. Inside one of them, two names that
+   * differ only by case have no defined winner.
+   */
+  private fun withResolvedHeaders(
+    built: Request,
+    entity: SyncItemEntity,
+    resolved: Map<String, String>,
+  ): Request? = runCatching {
+    val builder = built.newBuilder()
+    resolved.toSortedMap().forEach { (k, v) -> builder.header(k, v) }
+    JsonMap.decode(entity.headers)?.forEach { (k, v) -> builder.header(k, v) }
+    builder.build()
+  }.getOrElse {
+    // Only the type: OkHttp puts header values in these messages.
+    Log.e(TAG, "Failed to add the resolved headers for ${entity.id}: ${it.javaClass.simpleName}")
     null
   }
 

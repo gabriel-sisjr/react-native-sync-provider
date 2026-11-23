@@ -3092,6 +3092,10 @@ internal class SyncDispatcherTest {
   private fun RecordedRequest.sentHeader(name: String): Pair<String, String> =
     headers.filter { it.first.equals(name, ignoreCase = true) }.single()
 
+  /** The headers that went out in wire order, but for the ones OkHttp sets itself. */
+  private fun RecordedRequest.layeredHeaders(): List<Pair<String, String>> =
+    headers.filter { (name, _) -> OKHTTP_HEADERS.none { it.equals(name, ignoreCase = true) } }
+
   /** Every request the server got, by path. */
   private fun requestsByPath(): Map<String?, RecordedRequest> =
     List(server.requestCount) { checkNotNull(server.takeRequest(5, TimeUnit.SECONDS)) }.associateBy { it.path }
@@ -3176,7 +3180,8 @@ internal class SyncDispatcherTest {
           "authorization" to "Bearer resolved",
           "x-layer" to "resolver",
           "X-Resolver" to "r",
-          // Two names that differ only by case: in name order, as on iOS, the lower-case one wins.
+          // Two of this layer's names that differ only by case: in name order, as on iOS, the
+          // lower-case one wins. Only the resolver's layer is sorted.
           "x-dup" to "lower",
           "X-Dup" to "upper",
         ),
@@ -3195,6 +3200,54 @@ internal class SyncDispatcherTest {
     assertThat(sent.sentHeader("X-Resolver")).isEqualTo("X-Resolver" to "r")
     assertThat(sent.sentHeader("X-Item")).isEqualTo("X-Item" to "i")
     assertThat(sent.sentHeader("X-Dup")).isEqualTo("x-dup" to "lower")
+  }
+
+  @Test
+  fun `android_headerWireOrder, with nothing installed the static layers go in their map order`() = runTest {
+    answerAll(200)
+    storage.enqueue(
+      TestData.input(url = server.url("/x").toString(), headers = mapOf("X-Item" to "i", "x-layer" to "item")),
+    )
+
+    newDispatcher(
+      defaultHeaders = mapOf("X-Default" to "d", "X-Layer" to "default", "Authorization" to "Bearer static"),
+    ).flush()
+
+    // An item header replaces the default one of that name, whatever its case, and goes last.
+    assertThat(checkNotNull(server.takeRequest(5, TimeUnit.SECONDS)).layeredHeaders()).containsExactly(
+      "X-Default" to "d",
+      "Authorization" to "Bearer static",
+      "X-Item" to "i",
+      "x-layer" to "item",
+    ).inOrder()
+  }
+
+  @Test
+  fun `android_headerWireOrder, the resolver's layer in name order between the static ones`() = runTest {
+    answerAll(200)
+    storage.enqueue(
+      TestData.input(
+        url = server.url("/x").toString(),
+        headers = mapOf("X-Item" to "i", "x-layer" to "item", "X-Shared" to "item"),
+      ),
+    )
+    installResolver {
+      FakeJs.headers(mapOf("X-Shared" to "resolver", "X-Resolver" to "r", "authorization" to "Bearer resolved"))
+    }
+
+    newDispatcher(
+      defaultHeaders = mapOf("X-Default" to "d", "X-Layer" to "default", "Authorization" to "Bearer static"),
+    ).flush()
+
+    // What each layer keeps, in its own order: the defaults, the resolver's sorted, the item's.
+    assertThat(checkNotNull(server.takeRequest(5, TimeUnit.SECONDS)).layeredHeaders()).containsExactly(
+      "X-Default" to "d",
+      "X-Resolver" to "r",
+      "authorization" to "Bearer resolved",
+      "X-Item" to "i",
+      "x-layer" to "item",
+      "X-Shared" to "item",
+    ).inOrder()
   }
 
   @Test
@@ -3962,5 +4015,8 @@ internal class SyncDispatcherTest {
 
     /** Well inside every long callback timeout here: what "at once" allows on a loaded machine. */
     const val AT_ONCE_MS = 10_000L
+
+    /** The headers OkHttp sets on its own, from the body or the connection. */
+    val OKHTTP_HEADERS = listOf("Content-Type", "Content-Length", "Host", "Connection", "Accept-Encoding", "User-Agent")
   }
 }
