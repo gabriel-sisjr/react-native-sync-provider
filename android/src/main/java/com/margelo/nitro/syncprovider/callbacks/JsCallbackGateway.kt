@@ -89,6 +89,10 @@ internal fun interface CallbackLog {
  * No lock is held while JS is called or awaited. [answer], which runs on the JS thread, only
  * looks its request up and completes it.
  *
+ * Every request without a usable answer is logged once: at WARN, or at INFO when the work it
+ * served stopped or the runtime that installed its function went away, neither being a failure
+ * of the callback.
+ *
  * @param isOwnerLive whether the hybrid that installed a function is still the current one. A
  *   request of an owner that is gone ends at once, without calling JS, and
  *   [endWaitsOfGoneOwners] ends those already waiting.
@@ -223,8 +227,10 @@ internal class JsCallbackGateway(
     Completion.Stopped -> skip(
       kind, itemId, id, SkipReason.STOPPED, "the cycle stopped", consequence, Log.INFO,
     )
+    // Not a failure of the callback, as a stop is not: its runtime went away.
     Completion.OwnerGone -> skip(
       kind, itemId, id, SkipReason.OWNER_GONE, "the JS runtime that installed it is gone", consequence,
+      Log.INFO,
     )
     is Completion.Answer -> {
       val answer = completion.answer

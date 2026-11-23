@@ -4,6 +4,10 @@ import android.database.sqlite.SQLiteDatabaseLockedException
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.google.common.truth.Truth.assertThat
+import com.margelo.nitro.syncprovider.BeforeDispatchAction
+import com.margelo.nitro.syncprovider.BeforeDispatchContext
+import com.margelo.nitro.syncprovider.CallbackAnswer
+import com.margelo.nitro.syncprovider.HeaderResolverContext
 import com.margelo.nitro.syncprovider.RetryAction
 import com.margelo.nitro.syncprovider.RetryDeciderContext
 import com.margelo.nitro.syncprovider.SyncErrorCode
@@ -32,6 +36,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
@@ -80,6 +85,13 @@ import java.util.concurrent.TimeUnit
  * - R11: the cycle is cancelled while the decider is asked, or before. The wait ends at once and
  *   the dispatch writes the policy's retry itself; the decider is not asked once the cycle has
  *   stopped.
+ *
+ * With a header resolver or `beforeDispatch` installed:
+ * - R9: an interceptor gives nothing to use, then the write that defers the item fails. Nothing
+ *   was sent and nothing recorded, so the settle gives the row back as it was.
+ * - R10: the cycle is cancelled while an interceptor is asked, or as its answer lands. The wait
+ *   ends at once, nothing is sent, and no deferral is written: the row comes back as it was,
+ *   with no event of its own.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [30])
@@ -962,6 +974,164 @@ internal class SettleMatrixTest {
       assertThat(endings).containsExactly(CycleEnding.CANCELLED)
     }
 
+  /* --------------------------- the dispatch interceptors --------------------------- */
+
+  @Test
+  fun `interceptor_deferWriteFails_rowComesBackAsItWas R9 C1 a deferral whose write fails is given back and its wake waits the hold`() =
+    runTest {
+      answer(200)
+      val before = seed(ITEM)
+      val failing = spyk(storage)
+      coEvery { failing.markDeferred(any(), any(), any()) } answers { failWrite() }
+      installResolver(FakeJs.failed("no token"))
+      val events = recordEvents()
+
+      val thrown = flushOnce(dispatcher(queue = failing))
+
+      assertThat(thrown).isInstanceOf(SQLiteDatabaseLockedException::class.java)
+      assertThat(server.requestCount).isEqualTo(0)
+      // The cooldown and the code are lost for this cycle only: nothing else changed.
+      assertThat(row(ITEM)).isEqualTo(before)
+      assertThat(events.seen())
+        .containsExactly(
+          Seen(SyncEventType.SYNC_STARTED),
+          Seen(SyncEventType.SYNC_FAILED, errorCode = SyncErrorCode.NETWORK_ERROR),
+        )
+        .inOrder()
+      assertThat(endings).containsExactly(CycleEnding.FAILED)
+      // The row is due, yet the wake waits for the failure hold, so the failure cannot loop.
+      assertWake(FIRST_HOLD_MS)
+    }
+
+  @Test
+  fun `interceptor_deferWriteFails_rowComesBackAsItWas R9 C2 a deferral whose write and release both fail waits in flight`() =
+    runTest {
+      answer(200)
+      val before = seed(ITEM)
+      val failing = spyk(storage)
+      coEvery { failing.markDeferred(any(), any(), any()) } answers { failWrite() }
+      settleFails(failing)
+      installResolver(FakeJs.failed("no token"))
+      val events = recordEvents()
+
+      val thrown = flushOnce(dispatcher(queue = failing))
+
+      assertThat(thrown).isInstanceOf(SQLiteDatabaseLockedException::class.java)
+      assertThat(server.requestCount).isEqualTo(0)
+      assertWaitsInFlight(before, events, SyncErrorCode.NETWORK_ERROR, CycleEnding.FAILED)
+    }
+
+  @Test
+  fun `interceptor_stopMidWait_sendsNothing R10 C1 TRUSTED, a cycle cancelled during the resolver's wait gives the row back as it was`() =
+    runTest {
+      answer(200)
+      val before = seed(ITEM)
+      val resolver = neverAnsweringResolver()
+      val hook = js.function<BeforeDispatchContext> { requestId, _ ->
+        answer(requestId, FakeJs.before(BeforeDispatchAction.PROCEED))
+      }
+      assertThat(hybrid.setBeforeDispatch(hook)).isTrue()
+      val events = recordEvents()
+      val d = dispatcher(callbackTimeoutMs = LONG_CALLBACK_TIMEOUT_MS)
+
+      val cycle = launch(Dispatchers.IO) { d.flush() }
+      runBlocking { withTimeout(20_000L) { resolver.asked.await() } }
+      val started = System.nanoTime()
+      cycle.cancel()
+      cycle.join()
+
+      // Cut short: the 60 s wait did not run out. Not a failure of the resolver: no deferral.
+      assertThat(elapsedMs(started)).isLessThan(AT_ONCE_MS)
+      assertThat(cycle.isCancelled).isTrue()
+      assertThat(server.requestCount).isEqualTo(0)
+      assertThat(row(ITEM)).isEqualTo(before)
+      assertThat(hook.calls).isEmpty()
+      assertThat(events.seen())
+        .containsExactly(Seen(SyncEventType.SYNC_STARTED), Seen(SyncEventType.SYNC_FAILED))
+        .inOrder()
+      assertThat(endings).containsExactly(CycleEnding.CANCELLED)
+      assertWake(0L)
+    }
+
+  @Test
+  fun `interceptor_stopMidWait_sendsNothing R10 C1 a PROCEED that lands as the cycle stops sends nothing`() =
+    runTest {
+      answer(200)
+      val before = seed(ITEM)
+      val running = CompletableDeferred<Job>()
+      val hook = js.function<BeforeDispatchContext> { requestId, _ ->
+        // The answer lands first, then the cycle stops, before the request can go out.
+        answer(requestId, FakeJs.before(BeforeDispatchAction.PROCEED))
+        runBlocking { withTimeout(20_000L) { running.await() } }.cancel()
+      }
+      assertThat(hybrid.setBeforeDispatch(hook)).isTrue()
+      val events = recordEvents()
+      val d = dispatcher(callbackTimeoutMs = LONG_CALLBACK_TIMEOUT_MS)
+
+      val cycle = launch(Dispatchers.IO) { d.flush() }
+      running.complete(cycle)
+      cycle.join()
+
+      assertThat(cycle.isCancelled).isTrue()
+      assertThat(hook.calls).hasSize(1)
+      assertThat(server.requestCount).isEqualTo(0)
+      assertThat(row(ITEM)).isEqualTo(before)
+      assertThat(events.seen())
+        .containsExactly(Seen(SyncEventType.SYNC_STARTED), Seen(SyncEventType.SYNC_FAILED))
+        .inOrder()
+      assertThat(endings).containsExactly(CycleEnding.CANCELLED)
+      assertWake(0L)
+    }
+
+  @Test
+  fun `interceptor_stopMidWait_sendsNothing R10 C1 PERSISTED, the leading item's wait ends at once and the batch goes back`() =
+    runTest {
+      answer(200)
+      val first = seed(ITEM, createdAt = 1L)
+      val rest = seed(REST, createdAt = 2L)
+      val resolver = neverAnsweringResolver()
+      val events = recordEvents()
+      // Restored headers: the leading item is dispatched in the cycle's own coroutine.
+      val d = dispatcher(credentials = CredentialPolicy.PERSISTED, callbackTimeoutMs = LONG_CALLBACK_TIMEOUT_MS)
+
+      val cycle = launch(Dispatchers.IO) { d.flush() }
+      runBlocking { withTimeout(20_000L) { resolver.asked.await() } }
+      val started = System.nanoTime()
+      cycle.cancel()
+      cycle.join()
+
+      assertThat(elapsedMs(started)).isLessThan(AT_ONCE_MS)
+      assertThat(server.requestCount).isEqualTo(0)
+      assertThat(row(ITEM)).isEqualTo(first)
+      assertThat(row(REST)).isEqualTo(rest)
+      assertThat(resolver.calls).hasSize(1)
+      assertThat(events.seen())
+        .containsExactly(Seen(SyncEventType.SYNC_STARTED), Seen(SyncEventType.SYNC_FAILED))
+        .inOrder()
+      assertThat(endings).containsExactly(CycleEnding.CANCELLED)
+      assertWake(0L)
+    }
+
+  @Test
+  fun `interceptor_stopMidWait_sendsNothing R10 C2 a cycle cancelled during the wait whose release fails waits in flight`() =
+    runTest {
+      answer(200)
+      val before = seed(ITEM)
+      val failing = spyk(storage)
+      settleFails(failing)
+      val resolver = neverAnsweringResolver()
+      val events = recordEvents()
+      val d = dispatcher(queue = failing, callbackTimeoutMs = LONG_CALLBACK_TIMEOUT_MS)
+
+      val cycle = launch(Dispatchers.IO) { d.flush() }
+      runBlocking { withTimeout(20_000L) { resolver.asked.await() } }
+      cycle.cancel()
+      cycle.join()
+
+      assertThat(server.requestCount).isEqualTo(0)
+      assertWaitsInFlight(before, events, null, CycleEnding.CANCELLED)
+    }
+
   /* ---------------------------- the deadline ceiling ---------------------------- */
 
   @Test
@@ -1077,20 +1247,34 @@ internal class SettleMatrixTest {
     answer(requestId, FakeJs.decision(action, delayMs))
   }.also { assertThat(hybrid.setRetryDecider(it)).isTrue() }
 
-  /** A retry decider the current hybrid installs, which never answers. */
-  private class NeverAnswering(
+  /** A JS function the current hybrid installed, which never answers. */
+  private class NeverAnswering<C>(
     val asked: CompletableDeferred<Unit>,
-    private val function: FakeFunction<RetryDeciderContext>,
+    private val function: FakeFunction<C>,
   ) {
-    val calls: List<RetryDeciderContext> get() = function.calls
+    val calls: List<C> get() = function.calls
   }
 
-  private fun neverAnswering(): NeverAnswering {
+  /** A retry decider the current hybrid installs, which never answers. */
+  private fun neverAnswering(): NeverAnswering<RetryDeciderContext> {
     val asked = CompletableDeferred<Unit>()
     val function = js.function<RetryDeciderContext> { _, _ -> asked.complete(Unit) }
     assertThat(hybrid.setRetryDecider(function)).isTrue()
     return NeverAnswering(asked, function)
   }
+
+  /** A header resolver the current hybrid installs, which never answers. */
+  private fun neverAnsweringResolver(): NeverAnswering<HeaderResolverContext> {
+    val asked = CompletableDeferred<Unit>()
+    val function = js.function<HeaderResolverContext> { _, _ -> asked.complete(Unit) }
+    assertThat(hybrid.setHeaderResolver(function)).isTrue()
+    return NeverAnswering(asked, function)
+  }
+
+  /** A header resolver the current hybrid installs: it answers [reply] at once. */
+  private fun installResolver(reply: CallbackAnswer): FakeFunction<HeaderResolverContext> =
+    js.function<HeaderResolverContext> { requestId, _ -> answer(requestId, reply) }
+      .also { assertThat(hybrid.setHeaderResolver(it)).isTrue() }
 
   private fun elapsedMs(startedNanos: Long): Long = (System.nanoTime() - startedNanos) / 1_000_000L
 

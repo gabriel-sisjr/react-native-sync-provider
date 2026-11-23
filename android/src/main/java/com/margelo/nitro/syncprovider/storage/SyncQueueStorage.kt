@@ -256,6 +256,21 @@ internal class SyncQueueStorage(
   }
 
   /**
+   * A JS interceptor kept claimed item [id]'s request from going out: the row goes back to
+   * `PENDING` until [nextRetryAt], with [lastErrorCode]. Its `attempts` and `lastAttemptAt` are
+   * left as they were, since no attempt was made.
+   *
+   * @return false when the queue had no such row, a purge having removed it.
+   */
+  suspend fun markDeferred(
+    id: String,
+    lastErrorCode: SyncErrorCode,
+    nextRetryAt: Long,
+  ): Boolean = withContext(Dispatchers.IO) {
+    itemDao.deferById(id, lastErrorCode.name, nextRetryAt) > 0
+  }
+
+  /**
    * A terminal failure: move the claimed row to the dead letters, in one transaction, with
    * the outcome of its final attempt. A row purged since the claim (`clearQueue()`,
    * `removeItem(id)`) is not written back.

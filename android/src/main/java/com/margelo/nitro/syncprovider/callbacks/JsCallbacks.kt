@@ -1,5 +1,9 @@
 package com.margelo.nitro.syncprovider.callbacks
 
+import com.margelo.nitro.syncprovider.AfterDispatchContext
+import com.margelo.nitro.syncprovider.BeforeDispatchAction
+import com.margelo.nitro.syncprovider.BeforeDispatchContext
+import com.margelo.nitro.syncprovider.HeaderResolverContext
 import com.margelo.nitro.syncprovider.RetryDecision
 import com.margelo.nitro.syncprovider.RetryDeciderContext
 import kotlinx.coroutines.CoroutineScope
@@ -64,4 +68,66 @@ internal class JsCallbacks(
     consequence = "the retry policy applies",
     parse = CallbackAnswers::decision,
   ) { requestId -> decider.function(requestId, context) }
+
+  /**
+   * Ask [resolver] for the headers of the attempt [context] describes, for at most [timeoutMs]
+   * and no longer than [stop] stays active. Anything but headers OkHttp sends as they are, none
+   * included, is a [CallbackResult.Skipped], already logged: the item is then not sent.
+   */
+  suspend fun resolveHeaders(
+    resolver: CallbackRegistry.Installed<(String, HeaderResolverContext) -> Unit>,
+    context: HeaderResolverContext,
+    timeoutMs: Long,
+    stop: Job?,
+  ): CallbackResult<Map<String, String>> = gateway.request(
+    kind = CallbackKind.HEADER_RESOLVER,
+    owner = resolver.owner,
+    itemId = context.itemId,
+    timeoutMs = timeoutMs,
+    stop = stop,
+    consequence = NOT_SENT,
+    parse = CallbackAnswers::headers,
+  ) { requestId -> resolver.function(requestId, context) }
+
+  /**
+   * Ask [hook] whether the request [context] describes may go out, for at most [timeoutMs] and no
+   * longer than [stop] stays active. Anything but PROCEED or SKIP is a [CallbackResult.Skipped],
+   * already logged: the item is then not sent.
+   */
+  suspend fun beforeDispatch(
+    hook: CallbackRegistry.Installed<(String, BeforeDispatchContext) -> Unit>,
+    context: BeforeDispatchContext,
+    timeoutMs: Long,
+    stop: Job?,
+  ): CallbackResult<BeforeDispatchAction> = gateway.request(
+    kind = CallbackKind.BEFORE_DISPATCH,
+    owner = hook.owner,
+    itemId = context.itemId,
+    timeoutMs = timeoutMs,
+    stop = stop,
+    consequence = NOT_SENT,
+    parse = CallbackAnswers::beforeDispatch,
+  ) { requestId -> hook.function(requestId, context) }
+
+  /**
+   * Tell [hook] how the request [context] describes ended, and return at once: nothing waits for
+   * it. An answer of FAILED, or none within [timeoutMs], is only logged.
+   */
+  fun afterDispatch(
+    hook: CallbackRegistry.Installed<(String, AfterDispatchContext) -> Unit>,
+    context: AfterDispatchContext,
+    timeoutMs: Long,
+  ) {
+    gateway.notify(
+      kind = CallbackKind.AFTER_DISPATCH,
+      owner = hook.owner,
+      itemId = context.itemId,
+      timeoutMs = timeoutMs,
+    ) { requestId -> hook.function(requestId, context) }
+  }
+
+  private companion object {
+    /** What follows an interceptor that gave nothing to use, a stop included. */
+    const val NOT_SENT = "the item is not sent in this cycle"
+  }
 }

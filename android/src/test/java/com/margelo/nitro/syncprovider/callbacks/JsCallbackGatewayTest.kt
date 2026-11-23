@@ -26,6 +26,7 @@ import okhttp3.Headers
 import org.junit.After
 import org.junit.Test
 import java.util.Collections
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * The gateway against fake JS: functions that take their request id and answer through
@@ -227,6 +228,42 @@ internal class JsCallbackGatewayTest {
     assertThat(result).isEqualTo(CallbackResult.Skipped(SkipReason.STOPPED))
     assertThat(calls).isEqualTo(0)
     assertThat(gateway.pendingCount).isEqualTo(0)
+  }
+
+  /** As on iOS: a runtime that went away is not a failure of the callback, as a stop is not. */
+  @Test
+  fun `an owner gone ends a wait at once and logs at INFO, a notification's too`() = runBlocking<Unit> {
+    val live = AtomicBoolean(true)
+    val owned = JsCallbackGateway(
+      isOwnerLive = { live.get() },
+      scope = watchers,
+      waitContext = Dispatchers.Default,
+      notifyContext = Dispatchers.Default,
+      log = { priority, message -> lines += priority to message },
+    )
+    val asked = CompletableDeferred<Unit>()
+    val waiting = async {
+      owned.request(
+        CallbackKind.HEADER_RESOLVER, OWNER, ITEM, LONG_TIMEOUT_MS, null, DEFER, CallbackAnswers::headers,
+      ) { asked.complete(Unit) }
+    }
+    asked.await()
+    val started = System.nanoTime()
+
+    live.set(false)
+    owned.endWaitsOfGoneOwners()
+
+    assertThat(waiting.await()).isEqualTo(CallbackResult.Skipped(SkipReason.OWNER_GONE))
+    assertThat(elapsedMs(started)).isLessThan(AT_ONCE_MS)
+    // An owner already gone is not called, and the line says why.
+    val notified = AtomicBoolean(false)
+    owned.notify(CallbackKind.AFTER_DISPATCH, OWNER, ITEM, LONG_TIMEOUT_MS) { notified.set(true) }
+    awaitUntil { lines.size == 2 && owned.pendingCount == 0 }
+    assertThat(notified.get()).isFalse()
+    assertThat(lines).containsExactly(
+      Log.INFO to "headerResolver for item $ITEM (headerResolver:1): $GONE; $DEFER",
+      Log.INFO to "afterDispatch for item $ITEM (afterDispatch:2): $GONE; nothing changes",
+    ).inOrder()
   }
 
   @Test
@@ -436,6 +473,7 @@ internal class JsCallbackGatewayTest {
     const val ITEM = "01ITEM"
     const val POLICY = "the retry policy applies"
     const val DEFER = "the item is not sent and waits"
+    const val GONE = "the JS runtime that installed it is gone"
 
     /** A timeout no test waits out. */
     const val LONG_TIMEOUT_MS = 30_000L

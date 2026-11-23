@@ -1,6 +1,11 @@
 package com.margelo.nitro.syncprovider.http
 
 import android.util.Log
+import com.margelo.nitro.syncprovider.AfterDispatchContext
+import com.margelo.nitro.syncprovider.BeforeDispatchAction
+import com.margelo.nitro.syncprovider.BeforeDispatchContext
+import com.margelo.nitro.syncprovider.DispatchOutcome
+import com.margelo.nitro.syncprovider.HeaderResolverContext
 import com.margelo.nitro.syncprovider.HttpMethod
 import com.margelo.nitro.syncprovider.NetworkQuality
 import com.margelo.nitro.syncprovider.RetryAction
@@ -13,6 +18,7 @@ import com.margelo.nitro.syncprovider.SyncOptions
 import com.margelo.nitro.syncprovider.SyncResult
 import com.margelo.nitro.syncprovider.callbacks.CallbackResult
 import com.margelo.nitro.syncprovider.callbacks.JsCallbacks
+import com.margelo.nitro.syncprovider.callbacks.SkipReason
 import com.margelo.nitro.syncprovider.config.CallbackTimeout
 import com.margelo.nitro.syncprovider.connectivity.meetsMinimum
 import com.margelo.nitro.syncprovider.database.SyncItemEntity
@@ -66,6 +72,11 @@ import kotlin.random.Random
  *   own delay or the policy's, DEAD_LETTER or DROP, and without an answer the policy applies. It
  *   is never asked about a success, a failure the policy would not retry, a spent budget or a
  *   credential hold.
+ * - With a header resolver or `beforeDispatch` installed by JS, each item asks them before its
+ *   request goes out (see [intercept]). One that fails, or a SKIP, defers the item without
+ *   spending an attempt (see [deferForInterceptor]). `afterDispatch` is told how each request
+ *   that went out ended, and never awaited (see [notifyAfterDispatch]). With none installed,
+ *   nothing is asked and each request carries the static headers, as before they existed.
  * - [onCycleFinished] fires after every cycle, whatever its outcome, so the next
  *   wake is always re-armed. It is told how the cycle ended ([CycleEnding]): the wake after a
  *   cycle that failed is held back, so a failure that persists cannot run cycles back to back.
@@ -75,17 +86,19 @@ import kotlin.random.Random
  *   and then runs its own. A JS callback is awaited under it, so a callback that waits for
  *   `flush()` holds the cycle until `callbackTimeoutMs`, then its fallback applies.
  * - Within a cycle, items are dispatched via [supervisorScope]: an item whose attempt fails
- *   records that outcome and leaves its siblings alone.
+ *   records that outcome and leaves its siblings alone. Each item asks JS on its own, so up to
+ *   `batchSize` callbacks can be waited for at once.
  * - A dispatch that started finishes even if the cycle is cancelled, and records its outcome,
  *   unless something raised around its attempt ends the cycle: a storage failure, a
  *   cancellation or an [Error] (see [dispatchRecordingOutcome]). Dispatches already started
  *   still finish then, and none starts after. A wait for JS is the exception: the cycle's end
- *   cuts it short, and the fallback applies. Unless a cancellation ended the cycle, each row
- *   it claimed and left without a recorded outcome is then settled with what its attempt
- *   established (see [settlements]): an answer the server gave is applied as the attempt would
- *   have applied it, a `2xx` included, and as the retry decider decided it; a request that went
- *   out with no answer classified counts the attempt, with its cooldown. A row never sent, and
- *   every row after a cancellation, comes back as it was. A settle never asks JS.
+ *   cuts it short. The retry decider's fallback then applies, while an item waiting on an
+ *   interceptor sends nothing and leaves its row to the settle. Unless a cancellation ended the
+ *   cycle, each row it claimed and left without a recorded outcome is then settled with what its
+ *   attempt established (see [settlements]): an answer the server gave is applied as the attempt
+ *   would have applied it, a `2xx` included, and as the retry decider decided it; a request that
+ *   went out with no answer classified counts the attempt, with its cooldown. A row never sent,
+ *   and every row after a cancellation, comes back as it was. A settle never asks JS.
  * - Each attempt is bounded by OkHttp's call timeout: `requestTimeoutMs`, raised to 1 s and
  *   capped at `Int.MAX_VALUE` ms. Running out of it reports `TIMEOUT`, and so does one of the
  *   client's fixed socket timeouts: 10 s to connect, 30 s for a stalled read or write. See
@@ -449,7 +462,8 @@ internal class SyncDispatcher(
    * With headers restored from disk, one item goes first. If the server rejects the
    * credential, the rest of the batch is released untouched, so an expired token
    * costs one request per wake rather than a burst of `batchSize`. An item purged before
-   * its turn is skipped, and the next one goes first in its place.
+   * its turn is skipped, and the next one goes first in its place. So is an item a JS
+   * interceptor deferred: it sent nothing, so it tested no credential.
    */
   private suspend fun dispatchClaimed(
     claimed: List<SyncItemEntity>,
@@ -470,7 +484,7 @@ internal class SyncDispatcher(
         storage.settleAbortedClaims(claimed.drop(leading.size).map { AbortedClaim.Unsent(it.id) })
         return leading
       }
-      if (outcome !is ItemOutcome.Gone) break
+      if (outcome !is ItemOutcome.Gone && outcome !is ItemOutcome.Deferred) break
     }
     return leading + dispatchConcurrently(claimed.drop(leading.size), options, credentials)
   }
@@ -500,9 +514,11 @@ internal class SyncDispatcher(
    *
    * A wait for JS is the one thing a cancellation reaches. The dispatch gets a stop signal made
    * before `NonCancellable`, a child of the caller's job: when the cycle is cancelled, or its
-   * scope ends after a sibling failed, the wait ends at once and its fallback applies, and the
-   * dispatch then finishes as usual. It must be completed in all cases, or the caller's job
-   * would never complete.
+   * scope ends after a sibling failed, the wait ends at once. A wait for the retry decider then
+   * gets its fallback, and the dispatch finishes as usual. A wait for an interceptor, before the
+   * request, ends the dispatch with a [CancellationException] instead, nothing sent, even when JS
+   * had answered: the row has no outcome, and the settle gives it back as it was. The signal
+   * must be completed in all cases, or the caller's job would never complete.
    */
   private suspend fun dispatchRecordingOutcome(
     entity: SyncItemEntity,
@@ -523,6 +539,13 @@ internal class SyncDispatcher(
    * ([ItemOutcome.Rescheduled]), unless the retry decider decides otherwise; otherwise it
    * terminally succeeds or fails. The [SyncItemEntity.attempts] counter continues across cycles
    * (never reset).
+   *
+   * In order: the purge check, the spent-budget guard, the request built with the static
+   * headers, the JS interceptors installed (see [intercept]), the request, its outcome written
+   * and reported (see [recordOutcome]), then `afterDispatch` (see [notifyAfterDispatch]). An item
+   * that cannot be sent, a spent budget or a request OkHttp refuses, never reaches an
+   * interceptor, and an interceptor can defer the item ([ItemOutcome.Deferred]) without spending
+   * the attempt. With no interceptor installed, nothing waits between the guard and the request.
    *
    * @param stop cancelled when the cycle stops; it ends a wait for JS at once.
    */
@@ -565,7 +588,44 @@ internal class SyncDispatcher(
       return ItemOutcome.Failed(entity.id, SyncErrorCode.MAX_ATTEMPTS_EXCEEDED, message)
     }
 
-    return when (val outcome = runOnce(entity, timeoutMs, options.defaultHeaders, startedAt)) {
+    // Built before any interceptor is asked: a request OkHttp refuses fails as it always has.
+    val built = buildRequest(entity, options.defaultHeaders)
+      ?: return recordOutcome(
+        entity, attempt, startedAt, unbuildable(entity), credentials, options, stop,
+      )
+    val ready = when (val interception = intercept(entity, attempt, built, options, stop)) {
+      is Interception.Send -> interception
+      is Interception.Deferred ->
+        return deferForInterceptor(entity, attempt, policy, interception.skipped)
+      Interception.Gone -> return ItemOutcome.Gone(entity.id)
+    }
+    // After a wait for JS, the attempt starts when its request is ready.
+    val attemptStartedAt = if (ready.awaited) clock() else startedAt
+    val sent = runOnce(entity.id, ready.request, timeoutMs, attemptStartedAt)
+    val outcome = recordOutcome(
+      entity, attempt, attemptStartedAt, sent.result, credentials, options, stop,
+    )
+    sent.durationMs?.let { notifyAfterDispatch(entity, attempt, sent.result, outcome, it, options) }
+    return outcome
+  }
+
+  /**
+   * Write and report what [entity]'s attempt [result] comes to, as described at [dispatchItem].
+   *
+   * @param startedAt epoch ms the attempt started, its `lastAttemptAt`.
+   */
+  @Suppress("LongParameterList")
+  private suspend fun recordOutcome(
+    entity: SyncItemEntity,
+    attempt: Int,
+    startedAt: Long,
+    result: AttemptResult,
+    credentials: CredentialPolicy,
+    options: SyncOptions,
+    stop: Job,
+  ): ItemOutcome {
+    val policy = options.retryPolicy
+    return when (val outcome = result) {
       is AttemptResult.Success -> {
         remember(
           entity.id,
@@ -597,6 +657,213 @@ internal class SyncDispatcher(
       }
     }
   }
+
+  /** What an attempt whose request cannot be built comes to: a permanent failure, nothing sent. */
+  private fun unbuildable(entity: SyncItemEntity): AttemptResult.Failure = AttemptResult.Failure(
+    code = SyncErrorCode.INVALID_PAYLOAD,
+    message = "Failed to build request for item ${entity.id}",
+    statusCode = null,
+    retryable = false,
+  )
+
+  /**
+   * Ask the JS interceptors installed about the [attempt] that [built] is about to make: the
+   * header resolver, then `beforeDispatch`, each read when the item needs it. With neither
+   * installed, nothing is asked or read, and [built] goes out as it is.
+   *
+   * - The resolver's headers are merged between `defaultHeaders` and the item's own headers: one
+   *   entry per name, whatever its case, with the spelling and value of the layer that wins.
+   *   Anything but headers OkHttp sends as they are defers the item, and `beforeDispatch` is then
+   *   not asked.
+   * - `beforeDispatch` sees the headers of the request built that way, the one that goes out. The
+   *   `Content-Type` OkHttp takes from the body is not among them: the stored content type has
+   *   its own field. A `Content-Type` that a layer sets is. PROCEED sends the request unchanged;
+   *   SKIP, or anything but an answer, defers the item.
+   * - After each wait, the row must still be queued: a row purged meanwhile is not sent.
+   * - A cycle that stopped during a wait, or after its answer, sends nothing: this throws a
+   *   [CancellationException], and the settle gives the row back as it was.
+   *
+   * None of it changes the credential policy, which depends on `defaultHeaders` alone.
+   */
+  private suspend fun intercept(
+    entity: SyncItemEntity,
+    attempt: Int,
+    built: Request,
+    options: SyncOptions,
+    stop: Job,
+  ): Interception {
+    val resolver = callbacks.registry.headerResolver.installed
+    var hook = callbacks.registry.beforeDispatch.installed
+    if (resolver == null && hook == null) return Interception.Send(built, awaited = false)
+    val timeoutMs = CallbackTimeout.ms(options)
+    val method = methodOf(entity)
+    val metadata = JsonMap.decode(entity.metadata)
+    var request = built
+    if (resolver != null) {
+      val context = HeaderResolverContext(
+        itemId = entity.id,
+        attempt = attempt.toDouble(),
+        url = entity.url,
+        method = method,
+        metadata = metadata,
+      )
+      val answer = callbacks.resolveHeaders(resolver, context, timeoutMs, stop)
+      val headers = when (answer) {
+        is CallbackResult.Answered -> answer.value
+        is CallbackResult.Skipped -> return notAnswered(entity, answer.reason, stop)
+      }
+      ensureNotStopped(entity, stop)
+      if (!storage.isQueued(entity.id)) return Interception.Gone
+      if (headers.isNotEmpty()) {
+        // In name order, as on iOS: of two names that differ only by case, the one sorted last
+        // wins, whatever the order of the map. Never null: OkHttp took the rest of the
+        // request, and the gateway checked these headers.
+        request = buildRequest(entity, options.defaultHeaders, headers.toSortedMap())
+          ?: return Interception.Deferred(skipped = false)
+      }
+      // Read again after the wait: each install is read when the item needs it.
+      hook = callbacks.registry.beforeDispatch.installed
+    }
+    if (hook != null) {
+      val context = BeforeDispatchContext(
+        itemId = entity.id,
+        attempt = attempt.toDouble(),
+        url = entity.url,
+        method = method,
+        headers = headersOf(request),
+        contentType = entity.contentType,
+        metadata = metadata,
+      )
+      val action = when (val answer = callbacks.beforeDispatch(hook, context, timeoutMs, stop)) {
+        is CallbackResult.Answered -> answer.value
+        is CallbackResult.Skipped -> return notAnswered(entity, answer.reason, stop)
+      }
+      ensureNotStopped(entity, stop)
+      if (action == BeforeDispatchAction.SKIP) return Interception.Deferred(skipped = true)
+      if (!storage.isQueued(entity.id)) return Interception.Gone
+    }
+    // The last check before the request: a stop during the one above sends nothing either.
+    ensureNotStopped(entity, stop)
+    return Interception.Send(request, awaited = true)
+  }
+
+  /** An interceptor gave nothing to use: the item is deferred, unless the cycle stopped. */
+  private fun notAnswered(entity: SyncItemEntity, reason: SkipReason, stop: Job): Interception {
+    // The gateway logged the stop.
+    if (reason == SkipReason.STOPPED) throw CancellationException(stoppedBefore(entity))
+    ensureNotStopped(entity, stop)
+    return Interception.Deferred(skipped = false)
+  }
+
+  /** A stopped cycle sends nothing more: throws once [stop] is cancelled. */
+  private fun ensureNotStopped(entity: SyncItemEntity, stop: Job) {
+    if (!stop.isCancelled) return
+    val message = stoppedBefore(entity)
+    callbacks.log.log(Log.INFO, "$message; it is not sent in this cycle")
+    throw CancellationException(message)
+  }
+
+  private fun stoppedBefore(entity: SyncItemEntity): String =
+    "The cycle stopped before the request of item ${entity.id} went out"
+
+  /**
+   * A JS interceptor kept [entity]'s request from going out: the header resolver or
+   * `beforeDispatch` gave nothing to use, or `beforeDispatch` answered SKIP ([skipped]). No
+   * attempt was made, so none is spent: the row goes back to `PENDING` with its `attempts` and
+   * `lastAttemptAt` as they were, [SyncErrorCode.INTERCEPTOR_FAILED] as its code, and a cooldown
+   * of the would-be [attempt]'s backoff or [MIN_INTERCEPTOR_DEFER_MS], whichever is longer.
+   * `ITEM_RETRYING` then reports it with that code, no status, and the would-be attempt.
+   *
+   * Only this item waits: it counts in neither total, it sets no hold, and the cycle goes on. A
+   * row purged during the wait stays purged, with no event. When the write fails, nothing was
+   * remembered for the row, so the cycle's settle gives it back as it was.
+   */
+  private suspend fun deferForInterceptor(
+    entity: SyncItemEntity,
+    attempt: Int,
+    policy: RetryPolicy,
+    skipped: Boolean,
+  ): ItemOutcome {
+    val backoffMs = RetryPolicyEvaluator.computeDelayMs(attempt, policy, random)
+    val nextRetryAt = RetryPolicyEvaluator.deadline(
+      from = clock(),
+      delayMs = maxOf(backoffMs, MIN_INTERCEPTOR_DEFER_MS),
+    )
+    val deferred = storage.markDeferred(entity.id, SyncErrorCode.INTERCEPTOR_FAILED, nextRetryAt)
+    if (skipped) {
+      val consequence =
+        if (deferred) "it is not sent until $nextRetryAt" else "it was removed meanwhile"
+      callbacks.log.log(
+        Log.INFO,
+        "beforeDispatch answered SKIP for item ${entity.id}; $consequence",
+      )
+    }
+    if (!deferred) return ItemOutcome.Gone(entity.id)
+    emitter.emit(
+      SyncEventEmitter.event(
+        type = SyncEventType.ITEM_RETRYING,
+        itemId = entity.id,
+        errorCode = SyncErrorCode.INTERCEPTOR_FAILED,
+        attempt = attempt,
+      ),
+    )
+    return ItemOutcome.Deferred(entity.id)
+  }
+
+  /**
+   * Tell `afterDispatch`, when JS installed it, how [entity]'s request ended, once its [outcome]
+   * is written and reported. Nothing waits for it, and its answer changes nothing. It is called
+   * on the gateway's notify context, Main, after the item event reached the listeners, so it
+   * follows that event as a rule, not as a guarantee.
+   *
+   * It is told the [attempt] made; `SUCCEEDED`, `RETRYING` (a retry or a credential hold) or
+   * `FAILED` (a dead letter, a spent budget, or the retry decider's DEAD_LETTER or DROP) with the
+   * code the item event carried; the status; [durationMs], the request's own time; and the item's
+   * URL, method and metadata. Never its headers or its body.
+   */
+  @Suppress("LongParameterList")
+  private fun notifyAfterDispatch(
+    entity: SyncItemEntity,
+    attempt: Int,
+    result: AttemptResult,
+    outcome: ItemOutcome,
+    durationMs: Long,
+    options: SyncOptions,
+  ) {
+    val hook = callbacks.registry.afterDispatch.installed ?: return
+    val (reported, errorCode) = when (outcome) {
+      is ItemOutcome.Succeeded -> DispatchOutcome.SUCCEEDED to null
+      is ItemOutcome.Rescheduled, is ItemOutcome.CredentialRejected ->
+        DispatchOutcome.RETRYING to (result as? AttemptResult.Failure)?.code
+      is ItemOutcome.Failed -> DispatchOutcome.FAILED to outcome.code
+      // Neither follows a request that went out.
+      is ItemOutcome.Gone, is ItemOutcome.Deferred -> return
+    }
+    val context = AfterDispatchContext(
+      itemId = entity.id,
+      attempt = attempt.toDouble(),
+      outcome = reported,
+      statusCode = result.statusCode?.toDouble(),
+      errorCode = errorCode,
+      url = entity.url,
+      method = methodOf(entity),
+      metadata = JsonMap.decode(entity.metadata),
+      durationMs = durationMs.toDouble(),
+    )
+    callbacks.afterDispatch(hook, context, CallbackTimeout.ms(options))
+  }
+
+  /** [request]'s headers, one entry per name, each with the spelling it was set with. */
+  private fun headersOf(request: Request): Map<String, String> {
+    val headers = request.headers
+    return buildMap<String, String>(headers.size) {
+      for (i in 0 until headers.size) put(headers.name(i), headers.value(i))
+    }
+  }
+
+  /** The item's method as JS knows it: GET when the stored one is unknown. */
+  private fun methodOf(entity: SyncItemEntity): HttpMethod =
+    runCatching { HttpMethod.valueOf(entity.method.uppercase()) }.getOrDefault(HttpMethod.GET)
 
   /**
    * A failure the policy retries. With no retry decider installed, the row cools down for the
@@ -735,8 +1002,7 @@ internal class SyncDispatcher(
     errorCode = outcome.code,
     statusCode = outcome.statusCode?.toDouble(),
     url = entity.url,
-    method = runCatching { HttpMethod.valueOf(entity.method.uppercase()) }
-      .getOrDefault(HttpMethod.GET),
+    method = methodOf(entity),
     metadata = JsonMap.decode(entity.metadata),
   )
 
@@ -878,25 +1144,25 @@ internal class SyncDispatcher(
     )
   }
 
-  /** @param attemptStartedAt epoch ms; recorded in [requestsSent] when the request goes out. */
+  /**
+   * Send [request], item [id]'s attempt, and classify how it ended.
+   *
+   * @param attemptStartedAt epoch ms; recorded in [requestsSent] when the request goes out.
+   * @return the outcome, with the request's own duration when it went out: from just before it
+   *   was sent to its end, on the monotonic clock, so no wait for JS is in it.
+   */
   private suspend fun runOnce(
-    entity: SyncItemEntity,
+    id: String,
+    request: Request,
     timeoutMs: Long,
-    defaultHeaders: Map<String, String>?,
     attemptStartedAt: Long,
-  ): AttemptResult = withContext(Dispatchers.IO) {
-    val request = buildRequest(entity, defaultHeaders) ?: return@withContext AttemptResult.Failure(
-      code = SyncErrorCode.INVALID_PAYLOAD,
-      message = "Failed to build request for item ${entity.id}",
-      statusCode = null,
-      retryable = false,
-    )
-
+  ): Attempt = withContext(Dispatchers.IO) {
     // Built by the cycle before any attempt, so reading it here cannot fail an item.
     val shared = httpClient.value
     var call: Call? = null
     var startedAt = System.nanoTime()
-    try {
+    var sent = false
+    val result = try {
       // The call is derived here, so that one that cannot be built fails the attempt, as a
       // request that cannot be built does. The call timeout bounds the whole call: connecting,
       // sending the request and reading the response. It is the attempt's only time limit
@@ -908,7 +1174,8 @@ internal class SyncDispatcher(
       call = built
       startedAt = System.nanoTime()
       // From here the server may get the request: an abort counts this attempt.
-      requestsSent[entity.id] = SentRequest(attemptStartedAt)
+      requestsSent[id] = SentRequest(attemptStartedAt)
+      sent = true
       built.execute().use { response -> responseOutcome(response) }
     } catch (e: IOException) {
       val ranOutOfTime = System.nanoTime() - startedAt >= TimeUnit.MILLISECONDS.toNanos(timeoutMs)
@@ -927,6 +1194,8 @@ internal class SyncDispatcher(
         retryable = false,
       )
     }
+    val durationMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt).coerceAtLeast(0L)
+    Attempt(result, durationMs.takeIf { sent })
   }
 
   /** The outcome of an attempt the server answered, from its status line. */
@@ -981,12 +1250,19 @@ internal class SyncDispatcher(
     )
   }
 
+  /**
+   * The request [entity] makes, or null when OkHttp refuses it: its URL, or a header name or
+   * value. Its headers are [defaultHeaders], then [resolved], the header resolver's, then the
+   * item's own: each later layer replaces a name an earlier one set, whatever its case.
+   */
   private fun buildRequest(
     entity: SyncItemEntity,
     defaultHeaders: Map<String, String>?,
+    resolved: Map<String, String>? = null,
   ): Request? = runCatching {
     val builder = Request.Builder().url(entity.url)
     defaultHeaders?.forEach { (k, v) -> builder.header(k, v) }
+    resolved?.forEach { (k, v) -> builder.header(k, v) }
     JsonMap.decode(entity.headers)?.forEach { (k, v) -> builder.header(k, v) }
 
     val body: RequestBody? = when (entity.method.uppercase()) {
@@ -1007,7 +1283,7 @@ internal class SyncDispatcher(
   /**
    * Rescheduled and held items count as neither success nor failure: they are still
    * queued, and their outcome belongs to a later cycle. Nor do items purged before their
-   * dispatch started: they were never sent.
+   * request went out, or deferred by a JS interceptor: they were never sent.
    */
   private fun buildResult(startedAt: Long, outcomes: List<ItemOutcome>): SyncResult {
     val succeeded = outcomes.filterIsInstance<ItemOutcome.Succeeded>().map { it.itemId }
@@ -1024,7 +1300,10 @@ internal class SyncDispatcher(
   }
 
   private sealed interface AttemptResult {
-    data class Success(val statusCode: Int) : AttemptResult
+    /** The status the server answered, when it answered. */
+    val statusCode: Int?
+
+    data class Success(override val statusCode: Int) : AttemptResult
     /**
      * @property detail what a dead letter records: the status line, reason phrase included,
      *   or the exception message. Never a header or a body.
@@ -1032,10 +1311,29 @@ internal class SyncDispatcher(
     data class Failure(
       val code: SyncErrorCode,
       val message: String,
-      val statusCode: Int?,
+      override val statusCode: Int?,
       val retryable: Boolean,
       val detail: String = message,
     ) : AttemptResult
+  }
+
+  /**
+   * What [runOnce] came to: the attempt's [result], and [durationMs], how long its request took
+   * in whole ms. [durationMs] is null exactly when no request went out, [requestsSent] then
+   * having no entry for it.
+   */
+  private data class Attempt(val result: AttemptResult, val durationMs: Long?)
+
+  /** What the JS interceptors made of an item's request (see [intercept]). */
+  private sealed interface Interception {
+    /** Send [request]. [awaited]: JS was asked first. */
+    data class Send(val request: Request, val awaited: Boolean) : Interception
+
+    /** Send nothing in this cycle: an interceptor gave nothing to use, or [skipped] it. */
+    data class Deferred(val skipped: Boolean) : Interception
+
+    /** Purged during a wait: nothing is sent, and nothing reported. */
+    data object Gone : Interception
   }
 
   /**
@@ -1073,8 +1371,11 @@ internal class SyncDispatcher(
     /** Restored credential rejected: the item waits, without spending an attempt. */
     data class CredentialRejected(override val itemId: String, val nextRetryAt: Long) : ItemOutcome
 
-    /** Purged before its dispatch started: never sent, and nothing reported for it. */
+    /** Purged before its request went out: never sent, and nothing reported for it. */
     data class Gone(override val itemId: String) : ItemOutcome
+
+    /** Kept from going out by a JS interceptor: it waits, without spending the attempt. */
+    data class Deferred(override val itemId: String) : ItemOutcome
     data class Failed(
       override val itemId: String,
       val code: SyncErrorCode,
@@ -1099,6 +1400,12 @@ internal class SyncDispatcher(
 
     /** Floor for the wait after a restored credential is rejected. */
     const val MIN_CREDENTIAL_HOLD_MS: Long = 60_000L
+
+    /**
+     * Floor for the wait of an item a JS interceptor deferred, the credential hold's: a failing
+     * interceptor does not spend attempts, so the backoff alone would never grow.
+     */
+    const val MIN_INTERCEPTOR_DEFER_MS: Long = MIN_CREDENTIAL_HOLD_MS
 
     /** Where `ITEM_DEAD_LETTERED` carries the real failure code. */
     const val METADATA_LAST_ERROR_CODE = "lastErrorCode"

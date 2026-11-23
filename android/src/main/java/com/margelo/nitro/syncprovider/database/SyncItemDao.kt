@@ -161,6 +161,23 @@ internal interface SyncItemDao {
   ): Int
 
   /**
+   * Put row [id] back to `PENDING` until [nextRetryAt], with [lastErrorCode], without counting an
+   * attempt: its `attempts` and `lastAttemptAt` stay as they are, since no request went out.
+   *
+   * @return the rows changed: 0 when no row has that id.
+   */
+  @Query(
+    """
+      UPDATE sync_items
+      SET status = '${SyncItemEntity.STATUS_PENDING}',
+          lastErrorCode = :lastErrorCode,
+          nextRetryAt = :nextRetryAt
+      WHERE id = :id
+    """,
+  )
+  suspend fun deferById(id: String, lastErrorCode: String, nextRetryAt: Long): Int
+
+  /**
    * Atomically reset every row currently marked `IN_FLIGHT` back to `PENDING`.
    * Used by the recovery flow after process death or device reboot.
    */

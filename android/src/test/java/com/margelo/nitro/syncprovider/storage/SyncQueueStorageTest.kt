@@ -215,6 +215,38 @@ internal class SyncQueueStorageTest {
   }
 
   @Test
+  fun `markDeferred gives a claimed row back as PENDING without counting an attempt`() = runTest {
+    db.syncItemDao().insert(
+      TestData.entity(id = "claimed", attempts = 2, status = SyncItemEntity.STATUS_IN_FLIGHT, nextRetryAt = 5L)
+        .copy(lastAttemptAt = 1_234L, lastErrorCode = SyncErrorCode.SERVER_ERROR.name),
+    )
+    val before = db.syncItemDao().findById("claimed")!!
+
+    assertThat(storage.markDeferred("claimed", SyncErrorCode.INTERCEPTOR_FAILED, 9_876L)).isTrue()
+
+    // Only the status, the code and the cooldown change: no request went out.
+    assertThat(db.syncItemDao().findById("claimed")).isEqualTo(
+      before.copy(
+        status = SyncItemEntity.STATUS_PENDING,
+        lastErrorCode = SyncErrorCode.INTERCEPTOR_FAILED.name,
+        nextRetryAt = 9_876L,
+      ),
+    )
+  }
+
+  @Test
+  fun `markDeferred writes nothing for a row a purge removed, and says so`() = runTest {
+    val id = storage.enqueue(TestData.input())
+    storage.claimPending(1)
+    assertThat(storage.removeItem(id)).isTrue()
+
+    assertThat(storage.markDeferred(id, SyncErrorCode.INTERCEPTOR_FAILED, 9_876L)).isFalse()
+
+    assertThat(db.syncItemDao().count()).isEqualTo(0)
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+  }
+
+  @Test
   fun `claimPending excludes rows whose cooldown has not elapsed`() = runTest {
     val dao = db.syncItemDao()
     val now = 5_000L
