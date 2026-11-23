@@ -66,8 +66,9 @@ Nothing to add. The manifest merger brings in `INTERNET`, `ACCESS_NETWORK_STATE`
 - Before a cycle starts, the flush checks, in this order: the pause, the stored credentials, on iOS a cycle already running, the network-quality gate (`minNetworkQuality`) and the health check (`healthCheckUrl`). When one fails, no cycle runs.
 - A cycle takes one batch of eligible items, up to `batchSize`, ordered by priority and then age, and makes at most one attempt per item. Android sends a batch concurrently, except that with `defaultHeaders` restored from disk the first item goes alone; iOS sends one item at a time.
 - An item is eligible when it is `PENDING` and `nextRetryAt <= now`.
-- On a retriable failure with attempts left, the item goes back to `PENDING` with `nextRetryAt` measured from the end of the attempt.
-- A permanent failure moves the item to the dead-letter queue, in one transaction: `ITEM_FAILED`, then `ITEM_DEAD_LETTERED`. `getPendingItems()` no longer returns it, and nothing retries it until `replayDeadLetter(id)`.
+- For each item the engine runs, in order: the check that it was not purged, the header resolver, the header merge, `beforeDispatch`, a re-check that it is still queued (on iOS the claim is that check), the request, the outcome (with the retry decider when it applies), the item's event, then `afterDispatch`, which nothing waits for. The callbacks run only when JS installed them; an item that cannot be sent (spent budget, invalid URL) reaches none.
+- On a retriable failure with attempts left, the item goes back to `PENDING` with `nextRetryAt` measured from the end of the attempt, or from the decision when a retry decider was consulted.
+- A permanent failure moves the item to the dead-letter queue, in one transaction: `ITEM_FAILED`, then `ITEM_DEAD_LETTERED`. `getPendingItems()` no longer returns it, and nothing retries it until `replayDeadLetter(id)`. The only case where the engine itself deletes a failed item is a retry decider's `DROP`: `ITEM_FAILED` with `RETRY_DECIDER_REJECTED`, and no dead letter.
 - `AUTOMATIC` means the engine retries on its own: an in-process timer flushes when the soonest cooldown ends. It does not flush on enqueue, and a reconnect alone does not flush.
 - The timer never flushes offline. It remembers the wake and flushes when connectivity returns. With `minNetworkQuality` set, it also holds a wake the gate blocks, without an event, and checks it again after 30 s, 60 s, 120 s, 240 s and 480 s, then every 15 min. It does not flush during a health-check backoff.
 - A failure around an attempt, as opposed to one of the attempt itself, such as a storage write that fails, ends the cycle: its `SYNC_FAILED` carries the library error's own code or `NETWORK_ERROR`, and `flush()` rejects. Each item the cycle claimed is first settled with what its attempt established: removed as delivered after a `2xx`, retried or dead-lettered after a failure, held after a rejected restored credential. An item whose request never went out comes back unchanged. Only when that write fails too does an item wait `IN_FLIGHT` for the next recovery.
@@ -296,9 +297,9 @@ function isSyncing(): Promise<boolean>;
 function configureSync(options: SyncOptions): Promise<void>;
 ```
 
-`configureSync` replaces the whole configuration and persists it, so a worker or BGTask with no JS honors it. On Android a running cycle keeps the options it started with, except `retryOnStatusCodes`, which is read again for each response, including one to a request already in flight; `maxQueueSize` applies from the next enqueue, and `strategy` from the retry wake the call re-arms, which waits for a running failure hold. iOS applies them once the call resolves, inside a running cycle too: the cycle keeps only its batch and its gate and health-check outcome, and a request in flight keeps its headers and timeout, but its response is classified under the new `retryPolicy`. Omitting `defaultHeaders` deletes the stored copy: that is the logout path. Call it whenever the token changes: the library does not refresh tokens.
+`configureSync` replaces the whole configuration and persists it, so a worker or BGTask with no JS honors it. On Android a running cycle keeps the options it started with, except `retryOnStatusCodes`, which is read again for each response, including one to a request already in flight; `maxQueueSize` applies from the next enqueue, and `strategy` from the retry wake the call re-arms, which waits for a running failure hold. iOS applies them once the call resolves, inside a running cycle too: the cycle keeps only its batch and its gate and health-check outcome, and a request in flight keeps its headers and timeout, but its response is classified under the new `retryPolicy`. Omitting `defaultHeaders` deletes the stored copy: that is the logout path. Call it whenever the token changes, or install a header resolver that supplies the token per request while JS runs: the library does not refresh tokens itself.
 
-Every call also clears a credential hold and ends a running health-check backoff. `minNetworkQuality`, `healthCheckUrl`, `healthCheckTtlMs` and `healthCheckBackoffMs` are validated in JS, in that order and only when present, before any native call: `INVALID_URL` for `healthCheckUrl`, `INVALID_PAYLOAD` for the others, with every issue in `validationErrors`. The other fields go to native as they are.
+Every call also clears a credential hold, ends a running health-check backoff and arms the retry wake, so install the retry decider and the interceptors before the first call. `minNetworkQuality`, `healthCheckUrl`, `healthCheckTtlMs`, `healthCheckBackoffMs` and `callbackTimeoutMs` are validated in JS, in that order and only when present, before any native call: `INVALID_URL` for `healthCheckUrl`, `INVALID_PAYLOAD` for the others, with every issue in `validationErrors`. Native checks `callbackTimeoutMs` again before it applies or stores anything. The other fields go to native as they are.
 
 ### getSyncConfig
 
@@ -306,7 +307,7 @@ Every call also clears a credential hold and ends a running health-check backoff
 function getSyncConfig(): Promise<SyncOptions>;
 ```
 
-Returns the active configuration. `minNetworkQuality`, `healthCheckUrl`, `healthCheckTtlMs` and `healthCheckBackoffMs` are present only when they were set: their defaults are not filled in. Numbers come back as configured, NaN and `±Infinity` included: both platforms store them as given and convert them at each use. In a process that has not called `configureSync`, it returns what an earlier process persisted. While the stored headers cannot be read, it carries none (`undefined` on Android, `{}` on iOS), so passing it back to `configureSync` deletes them: take `defaultHeaders` from the app's session.
+Returns the active configuration. `minNetworkQuality`, `healthCheckUrl`, `healthCheckTtlMs`, `healthCheckBackoffMs` and `callbackTimeoutMs` are present only when they were set: their defaults are not filled in. A stored value of theirs that only a damaged record can hold loads as unset. Numbers come back as configured, NaN and `±Infinity` included: both platforms store them as given and convert them at each use. In a process that has not called `configureSync`, it returns what an earlier process persisted. While the stored headers cannot be read, it carries none (`undefined` on Android, `{}` on iOS), so passing it back to `configureSync` deletes them: take `defaultHeaders` from the app's session.
 
 ## History Functions
 
@@ -374,6 +375,129 @@ function isBackgroundSyncEnabled(): Promise<boolean>;
 ```
 
 Reports intent, not OS state: it stays `true` with `foregroundOnly`.
+
+## How callbacks run
+
+The retry decider and the three dispatch interceptors share these rules:
+
+- They run only in a live JS runtime that installed them. Make the `set…` calls the first library calls at startup, before `configureSync` and before mounting `SyncProvider` or any hook: the first library call creates the native module, which arms the retry wake, and so does every `configureSync`, so an item due before a `set…` lands goes out without that callback, with the static headers only. Installing first narrows that window; it does not close it after a reload.
+- A repeated `set…` replaces the previous function. A `clear…` from the installing runtime uninstalls at once. A `set…` with a non-function rejects with `INVALID_PAYLOAD` and `validationErrors`, before any native call.
+- The newest JS runtime wins: its first library call removes every older runtime's installs, and their pending waits end at once. A runtime torn down first leaves its installs in place until then, failing at once without calling JS: the decider leaves the decision to the policy, the resolver and `beforeDispatch` defer their items, and `afterDispatch` is only logged. On Android a reload tears nothing down, so the old installs time out at each call instead.
+- `clear…` and `isRetryDeciderInstalled()` see only the calling runtime's installs. A `set…` from a runtime that no longer owns them rejects with `NATIVE_MODULE_UNAVAILABLE`.
+- With no JS at all (a cold worker, a BGTask launch), nothing is installed: requests go out with the persisted `defaultHeaders`, and the `RetryPolicy` decides retries.
+- The function may be sync or async. Native waits at most `callbackTimeoutMs` (default 3000) for its answer, even if a promise never settles. A throw, a rejection or an invalid result becomes a failed answer at once; nothing is thrown into React Native.
+- An `Error` keeps its message, and native logs up to 256 characters of it: privately on iOS, in the app's logcat on Android. Keep secrets out of it. Any other thrown value is described by its type only. Headers, bodies and contexts are never logged.
+- Android dispatches a batch concurrently, so up to `batchSize` callback calls can be in flight at once. iOS dispatches one item at a time, so with the JS thread hung each awaited callback adds up to `callbackTimeoutMs` per item.
+- Never await `flush()` inside a callback: on Android it stalls the cycle until `callbackTimeoutMs`; on iOS it returns the last result at once.
+- The function is called without a `this`: pass an arrow function or a bound method.
+- The health-check and network-quality probes never call a callback.
+
+## Retry Decider Functions
+
+### setRetryDecider
+
+```typescript
+function setRetryDecider(decider: RetryDecider): Promise<void>;
+type RetryDecider = (context: RetryDeciderContext) => RetryDecision | Promise<RetryDecision>;
+```
+
+Consulted only after an attempt fails with an error the `RetryPolicy` would retry, while attempts are left. Never for a success, a failure that is not retried (a status missing from `retryOnStatusCodes`, or a 401 or 403 under a configuration set in the process), a spent budget, a credential hold, or an item that was not sent. It can veto a retry or change its delay, but never retry a failure the policy would not, nor add attempts.
+
+- `RETRY` reschedules the item. A valid `delayMs` (finite, at least 0, truncated) replaces the policy's delay and is used as given: no jitter, no `maxDelayMs` cap, still at most 2^53 - 1 ms and never past the largest JavaScript `Date`. A missing or invalid `delayMs` means the policy's delay; an invalid one is logged as a warning. `ITEM_RETRYING` keeps the attempt's own code.
+- `DEAD_LETTER` moves the item to the dead letters with `lastErrorCode: RETRY_DECIDER_REJECTED`, while `lastErrorMessage` keeps the real failure (for example `HTTP 503 …`, worded per platform). It emits `ITEM_FAILED` (`RETRY_DECIDER_REJECTED`, with the attempt's `statusCode` and `attempt`), then `ITEM_DEAD_LETTERED` with `metadata.lastErrorCode: RETRY_DECIDER_REJECTED`. It counts in `failureCount`.
+- `DROP` deletes the item: no dead letter and no `ITEM_DEAD_LETTERED`. It emits `ITEM_FAILED` (`RETRY_DECIDER_REJECTED`) and counts in `failureCount`. Android also lists it in `failedIds` and `errors`; on iOS those stay empty.
+- Once consulted, the delay counts from the decision, not from the end of the attempt.
+- With no decider installed, the policy decides silently: no log line and no event. An installed decider that answers a failure, something invalid or nothing in time, whose runtime is gone, or whose wait a BGTask expiry or a cycle cancellation ends, also leaves the decision to the policy, with a native log line and no event. On such a stop the policy's retry is written at once.
+- A purge during the wait is never undone. `ITEM_FAILED` still goes out for a `DROP` or `DEAD_LETTER`, because the request was sent.
+
+### clearRetryDecider
+
+```typescript
+function clearRetryDecider(): Promise<void>;
+```
+
+Uninstalls this runtime's decider, so the policy decides alone again. Resolves with nothing installed too. A no-op on web.
+
+### isRetryDeciderInstalled
+
+```typescript
+function isRetryDeciderInstalled(): Promise<boolean>;
+```
+
+Whether this runtime's decider is installed. It never reports another runtime's install, so after a reload it is `false` until the new runtime installs its own. Do not use it to skip the install at startup: after a Fast Refresh it would keep an edited decider out. The interceptors have no such query.
+
+## Dispatch Interceptor Functions
+
+### setHeaderResolver
+
+```typescript
+function setHeaderResolver(resolver: HeaderResolver): Promise<void>;
+type HeaderResolver = (context: HeaderResolverContext) => Record<string, string> | Promise<Record<string, string>>;
+```
+
+Called right before each request, retries included. Merge precedence: `defaultHeaders` < the resolver's headers < item `headers`. Names match case-insensitively, and the winning layer's spelling is kept; two names that differ only by case inside one layer have an unspecified winner, so do not do this. The result must be a plain object whose values are all strings, each name using only the characters `!` to `~`, and each value only tab and the characters from space to `~`; anything else is a failure.
+
+Fail closed: a throw, a rejection, an invalid result, no answer within `callbackTimeoutMs`, or an install left by a torn-down runtime sends nothing for that item. `attempts` and the last attempt time are unchanged, `nextRetryAt` becomes now plus the longer of the policy's delay for that attempt and 60 s, and `ITEM_RETRYING` carries `INTERCEPTOR_FAILED`, no `statusCode`, and the would-be `attempt`. The item counts in neither total, and other items go on. Deferrals never escalate: a broken resolver holds its items, never dead-letters them, and the cycles end `SYNC_SUCCEEDED` 0/0.
+
+A cancellation or a BGTask expiry during the wait is not a failure: nothing is sent, the item is unchanged and no event is emitted. A purge during the wait means the item is not sent and gets no event. During the wait, iOS still lists the item in `getPendingItems()` and Android does not, and a `configureSync` applies from the next item on iOS and from the next cycle on Android. On iOS, a background upload task carries the headers resolved when it was created.
+
+Its headers do not change the credential rules: a 401 or 403 is still a hold under stored `defaultHeaders` in a process that has not called `configureSync`, and terminal under a configuration set in the process. A credential needed without JS must be in `defaultHeaders`. On Android up to `batchSize` calls can run at once, so share one token refresh between them. In an Android batch sent on restored `defaultHeaders`, the item that probes the credential goes alone; when it is deferred, the next one probes alone, so with the JS thread hung a cycle can take about `batchSize` × `callbackTimeoutMs`.
+
+```typescript
+let refreshing: Promise<string> | undefined;
+const accessToken = () =>
+  (refreshing ??= session.getAccessToken().finally(() => {
+    refreshing = undefined;
+  }));
+
+await setHeaderResolver(async () => ({
+  Authorization: `Bearer ${await accessToken()}`,
+}));
+```
+
+### clearHeaderResolver
+
+```typescript
+function clearHeaderResolver(): Promise<void>;
+```
+
+Uninstalls this runtime's resolver, so the static headers go out alone again. A no-op on web.
+
+### setBeforeDispatch
+
+```typescript
+function setBeforeDispatch(hook: BeforeDispatchHook): Promise<void>;
+type BeforeDispatchHook = (context: BeforeDispatchContext) => BeforeDispatchResult | void | Promise<BeforeDispatchResult | void>;
+```
+
+Called after the header resolver, right before each request, and not at all when the resolver failed. It receives the merged headers without the `Content-Type` the engine adds when no layer sets one, and `contentType` as stored; never the body. On Android the body's media type replaces a layer's `Content-Type` on the wire, so the map can show a `Content-Type` the request does not carry.
+
+`{ action: 'PROCEED' }` sends the request. `{ action: 'SKIP' }` defers the item exactly as a failing resolver does. A result with no `action` key proceeds: `undefined`, `null`, primitives, arrays, objects without `action`. An `action` with an unknown value, a throw, a rejection or no answer in time is a failure, which defers the item.
+
+### clearBeforeDispatch
+
+```typescript
+function clearBeforeDispatch(): Promise<void>;
+```
+
+Uninstalls this runtime's hook. A no-op on web.
+
+### setAfterDispatch
+
+```typescript
+function setAfterDispatch(hook: AfterDispatchHook): Promise<void>;
+type AfterDispatchHook = (context: AfterDispatchContext) => unknown;
+```
+
+Called once for each request that went out, after its outcome is saved and its `ITEM_*` event is emitted; that ordering is best effort. Never awaited: `flush()` may resolve before it runs, and its errors or timeouts are only logged. Never called for an item not sent, nor for an iOS background upload that completes after a relaunch. `outcome` is `SUCCEEDED` (2xx), `RETRYING` (a reschedule or a credential hold, which reports `UNAUTHORIZED`) or `FAILED` (a dead letter, exhaustion, or a decider `DROP` or `DEAD_LETTER` with `RETRY_DECIDER_REJECTED`). `durationMs` is the request's own duration in whole ms, excluding every callback wait. The payload never contains headers or a body.
+
+### clearAfterDispatch
+
+```typescript
+function clearAfterDispatch(): Promise<void>;
+```
+
+Uninstalls this runtime's hook. A no-op on web.
 
 ## Event Listeners
 
@@ -539,11 +663,11 @@ const SyncProviderContext: React.Context<SyncProviderContextValue>;
 interface SyncItemInput {
   method: HttpMethod;
   url: string;                       // absolute http(s)
-  headers?: Record<string, string>;  // stored in plain text
+  headers?: Record<string, string>;  // stored in plain text; override the resolver's and defaultHeaders
   body?: string;                     // sent as UTF-8; stored in plain text
   contentType?: string;              // set here, not in headers
   priority?: SyncPriority;           // default NORMAL
-  metadata?: Record<string, string>; // not sent, not echoed on events
+  metadata?: Record<string, string>; // not sent, not echoed on events; passed to the callbacks
 }
 ```
 
@@ -565,7 +689,7 @@ interface SyncItem {
 }
 ```
 
-Android records an attempt with its outcome, iOS when the dispatch starts. A credential hold spends none, so a held item can show `attempts: 0` with `nextRetryAt > 0`, and on iOS a request that a BGTask expiry cancels gets its attempt back. `nextRetryAt` never passes 8,640,000,000,000,000, the largest valid JavaScript `Date`.
+Android records an attempt with its outcome, iOS when the dispatch starts. A credential hold spends none, and neither does an interceptor deferral, so a held or deferred item can show `attempts: 0` with `nextRetryAt > 0`, and on iOS a request that a BGTask expiry cancels gets its attempt back. `nextRetryAt` never passes 8,640,000,000,000,000, the largest valid JavaScript `Date`.
 
 ### SyncDeadLetterItem
 
@@ -588,7 +712,7 @@ interface SyncDeadLetterItem {
 }
 ```
 
-After a retriable failure with no attempts left, `lastErrorCode` is `MAX_ATTEMPTS_EXCEEDED`, and so is a stored code that is empty or unknown to this version.
+After a retriable failure with no attempts left, `lastErrorCode` is `MAX_ATTEMPTS_EXCEEDED`, and so is a stored code that is empty or unknown to this version. After a retry decider's `DEAD_LETTER` it is `RETRY_DECIDER_REJECTED`, and `lastErrorMessage` describes the failure the decider judged. A decider's `DROP` leaves no dead letter at all.
 
 `lastErrorMessage` never holds request or response headers or bodies, but it can hold the URL or host, so log it as carefully as the URL. After an HTTP response it reads `HTTP` and the status code: iOS adds the system's reason phrase (`HTTP 404 Not Found`), Android the server's, which HTTP/2 does not carry (`HTTP 404`). Branch on the code, not on this text. Items moved here by the upgrade have no `lastErrorMessage`.
 
@@ -607,6 +731,7 @@ interface SyncOptions {
   healthCheckUrl?: string;                 // unset: no health check, no measurement
   healthCheckTtlMs?: number;               // default 60000; 0 checks before every cycle
   healthCheckBackoffMs?: number;           // default 30000
+  callbackTimeoutMs?: number;              // default 3000; finite and >= 1
 }
 ```
 
@@ -617,6 +742,9 @@ interface SyncOptions {
 - `healthCheckUrl`: before a cycle claims its first item, the engine sends one `HEAD` to it, with a 2 s timeout, unless it gave a healthy result younger than `healthCheckTtlMs`. A final `2xx`, after redirects, is healthy. Any other status, a transport error or a timeout is not. The request carries neither `defaultHeaders` nor item headers and sends `Cache-Control: no-cache`, so point it at an endpoint that answers without authentication. The same URL is the only target of the network-quality measurement, and the two share one cache: a `2xx` answer to a measurement also counts as a healthy check.
 - After a failed check the cycle is skipped with `SYNC_FAILED` and `HEALTH_CHECK_FAILED`, and a backoff of `healthCheckBackoffMs` starts, counted from the end of the failed request. Every flush during it is skipped the same way, without a request. Automatic retries never come back sooner than 1 s after a failed check, even with a backoff of `0`; a `flush()` call is not held to that floor. Every `configureSync` call ends the backoff.
 - The four network-quality and health-check options are persisted for background workers, and `getSyncConfig()` returns them only when they were set. The TTL and the backoff are ignored without `healthCheckUrl`.
+- `defaultHeaders`: the header resolver's headers override them, and item `headers` override both, names matching case-insensitively. The resolver runs only with JS, so a credential a worker or BGTask needs belongs here.
+- `batchSize`: on Android up to this many JS callbacks can be waiting for an answer at once.
+- `callbackTimeoutMs`: how long native waits for the retry decider, the header resolver, `beforeDispatch` and `afterDispatch`, which share it. It must be finite and at least 1, or `configureSync` rejects with `INVALID_PAYLOAD` and `validationErrors`, checked in JS and natively before anything is applied or stored. Fractions truncate, and it is capped at 2147483647 when used. `getSyncConfig()` returns it only when it was set, as given. It is persisted for cold starts, and a stored value that is not finite or is below 1 loads as unset. Without an answer in time the decider leaves the decision to the policy, the resolver and `beforeDispatch` defer the item with `INTERCEPTOR_FAILED`, and `afterDispatch` is only logged.
 
 ### RetryPolicy
 
@@ -633,6 +761,8 @@ interface RetryPolicy {
 
 Transport failures and timeouts are retried whatever `retryOnStatusCodes` says. An attempt that fails with an error that is neither an I/O failure nor an HTTP answer is a permanent `INVALID_PAYLOAD` failure on both platforms. A status that is not listed is a permanent failure. An item whose attempts already reach `maxAttempts` when a cycle takes it, for example because the limit was lowered, is dead-lettered without a request: `ITEM_FAILED` with `MAX_ATTEMPTS_EXCEEDED`, then `ITEM_DEAD_LETTERED`.
 
+A retry decider, when one is installed, comes first: for a failed attempt this policy would retry, it can retry with the policy's delay or its own, drop the item or dead-letter it, but never retry a failure the policy would not. The policy decides alone when no decider is installed or none answers in time, and always in a process with no JS.
+
 The numbers convert at each use. `maxAttempts` NaN or below 1 means 1, and `+Infinity` or 2^31 and up means 2147483647. A `baseDelayMs` of NaN or `-Infinity` gives no delay, and `+Infinity` counts as 2^53 - 1 ms, the ceiling every computed delay stops at. A NaN `maxDelayMs` makes every delay 0. Below `baseDelayMs`, Android caps at `baseDelayMs`; on iOS, a `maxDelayMs` of 0 or less means no cap. A `retryOnStatusCodes` entry truncates, and one that is not finite or falls outside the 32-bit range matches no status.
 
 ### SyncResult
@@ -642,14 +772,14 @@ interface SyncResult {
   startedAt: number;              // 0 on Android when flush() ran no cycle
   finishedAt: number;             // 0 on Android when flush() ran no cycle
   successCount: number;
-  failureCount: number;           // permanent failures, now dead letters
+  failureCount: number;           // permanent failures, now dead letters, except a decider DROP
   succeededIds: string[];         // always empty on iOS
   failedIds: string[];            // always empty on iOS
   errors: Record<string, string>; // "<CODE>: <detail>"; always empty on iOS
 }
 ```
 
-A `flush()` that runs no cycle (paused, unreadable stored headers, the quality gate, the health check) resolves 0/0 and writes no history row. Android sets both timestamps to `0`. iOS sets both to the time the check stopped the flush, so only the missing `SYNC_STARTED` and history row tell it from an empty cycle. `failureCount` also counts an item removed or cleared while its request was in flight, which is not dead-lettered.
+A `flush()` that runs no cycle (paused, unreadable stored headers, the quality gate, the health check) resolves 0/0 and writes no history row. Android sets both timestamps to `0`. iOS sets both to the time the check stopped the flush, so only the missing `SYNC_STARTED` and history row tell it from an empty cycle. `failureCount` also counts an item removed or cleared while its request was in flight, which is not dead-lettered, and an item a retry decider dropped, which is deleted. An item a dispatch interceptor deferred counts in neither total.
 
 ### DrainOptions / DrainResult
 
@@ -729,11 +859,64 @@ class SyncError extends Error {
 }
 
 type ValidationIssue = {
-  field: string;      // e.g. "url", "headers.Authorization", "healthCheckUrl"
+  field: string;      // e.g. "url", "headers.Authorization", "healthCheckUrl", "resolver"
   reason: string;
-  value?: unknown;    // only for method, priority, contentType, minNetworkQuality, healthCheckTtlMs and healthCheckBackoffMs
+  value?: unknown;    // only for method, priority, contentType, minNetworkQuality, healthCheckTtlMs, healthCheckBackoffMs and callbackTimeoutMs
   itemIndex?: number; // enqueueBatch only
 };
+```
+
+### Callback types
+
+```typescript
+interface RetryDeciderContext {
+  itemId: string;
+  attempt: number;                   // the 1-based attempt that just failed
+  errorCode: SyncErrorCode;          // that attempt's code
+  statusCode?: number;               // only when an HTTP answer came back
+  url: string;
+  method: HttpMethod;
+  metadata?: Record<string, string>; // the item's metadata
+}
+
+interface RetryDecision {
+  action: RetryAction;               // RETRY | DROP | DEAD_LETTER
+  delayMs?: number;                  // RETRY only; counts from the decision
+}
+
+interface HeaderResolverContext {
+  itemId: string;
+  attempt: number;                   // the 1-based attempt about to be made
+  url: string;
+  method: HttpMethod;
+  metadata?: Record<string, string>;
+}
+
+interface BeforeDispatchContext {
+  itemId: string;
+  attempt: number;                   // the 1-based attempt about to be made
+  url: string;
+  method: HttpMethod;
+  headers: Record<string, string>;   // merged; without the implicit Content-Type
+  contentType?: string;              // as stored
+  metadata?: Record<string, string>; // no body
+}
+
+interface BeforeDispatchResult {
+  action: BeforeDispatchAction;      // PROCEED | SKIP
+}
+
+interface AfterDispatchContext {
+  itemId: string;
+  attempt: number;                   // the 1-based attempt that was made
+  outcome: DispatchOutcome;          // SUCCEEDED | RETRYING | FAILED
+  statusCode?: number;
+  errorCode?: SyncErrorCode;         // the code the item's event carried; absent for SUCCEEDED
+  url: string;
+  method: HttpMethod;
+  metadata?: Record<string, string>;
+  durationMs: number;                // the request's own time, without callback waits
+}
 ```
 
 ## Enums
@@ -776,15 +959,15 @@ A measurement starts 1 s after a network change, and when the URL changes. It be
 - `SYNC_SUCCEEDED` — The cycle finished with no permanent failure, including a 0/0 cycle and one whose items all went back to wait for a retry.
 - `SYNC_FAILED` — The cycle finished with a permanent failure or died, or a check at the start of the flush skipped it. `errorCode` is set only when the cycle died, to the library error's own code or `NETWORK_ERROR` for any other cause, with none for a cycle a cancellation stopped, or to `NETWORK_QUALITY_TOO_LOW` or `HEALTH_CHECK_FAILED` for a skip.
 - `ITEM_SUCCEEDED` — `itemId`, `statusCode` and `attempt` are set.
-- `ITEM_FAILED` — A permanent failure: `itemId`, `errorCode` and `attempt`, plus `statusCode` when applicable. `ITEM_DEAD_LETTERED` follows, unless the item was removed or cleared while its request was in flight.
-- `ITEM_RETRYING` — The item went back to wait for a retry: `itemId`, `attempt` and `errorCode`, plus `statusCode` when applicable.
+- `ITEM_FAILED` — A permanent failure: `itemId`, `errorCode` and `attempt`, plus `statusCode` when applicable. `ITEM_DEAD_LETTERED` follows, unless the item was removed or cleared while its request was in flight, or a retry decider dropped it. A decider's `DROP` or `DEAD_LETTER` reports `RETRY_DECIDER_REJECTED`, with the attempt's `statusCode` and `attempt`.
+- `ITEM_RETRYING` — The item went back to wait for a retry: `itemId`, `attempt` and `errorCode`, plus `statusCode` when applicable. After a decider's `RETRY`, `errorCode` is the attempt's own code; a credential hold reports `UNAUTHORIZED`. An item the header resolver or `beforeDispatch` deferred reports `INTERCEPTOR_FAILED`, with no `statusCode` and the would-be `attempt`.
 - `QUEUE_CLEARED` — Once per `clearQueue()` call, dead letters included.
 - `CONNECTION_CHANGED` — A `ConnectionState` field changed, `networkQuality` alone included. `connectionStatus` is set. Never emitted for the state the engine starts with: iOS starts from `UNKNOWN`, so its first network report emits one. Both platforms deliver it asynchronously, in the order of the changes; its order relative to other event types is not promised.
 - `PAUSED` — From `pauseSync()`.
 - `RESUMED` — From `resumeSync()`. iOS also emits it at launch when recovery put interrupted items back, with `metadata.recovered` set to their count.
 - `BACKGROUND_SYNC_STARTED` — An OS window started: a BGTask on iOS, the periodic worker on Android. The Android retry kick emits neither background event.
 - `BACKGROUND_SYNC_COMPLETED` — The same window finished. iOS emits it whether the window's flush succeeded or not, with `metadata.ok` set to `"false"` when the flush throws or the window's time runs out; the expiry cancels the request in flight and refunds its attempt. Android emits it only after the flush returns, so a worker whose flush throws, a cancelled one included, emits none.
-- `ITEM_DEAD_LETTERED` — A permanently failed item moved to the dead-letter queue, right after its `ITEM_FAILED`. `itemId` is set, `errorCode` is `DEAD_LETTERED`, and `metadata.lastErrorCode` holds the real failure code. `statusCode` and `attempt` are not set. Android dispatches a batch concurrently, so pair it with its `ITEM_FAILED` by `itemId`.
+- `ITEM_DEAD_LETTERED` — A permanently failed item moved to the dead-letter queue, right after its `ITEM_FAILED`. `itemId` is set, `errorCode` is `DEAD_LETTERED`, and `metadata.lastErrorCode` holds the real failure code, `RETRY_DECIDER_REJECTED` after a decider's `DEAD_LETTER`. `statusCode` and `attempt` are not set. Android dispatches a batch concurrently, so pair it with its `ITEM_FAILED` by `itemId`.
 
 ### ConnectionStatus
 `CONNECTED`, `DISCONNECTED`, `METERED`, `UNKNOWN`. `useConnection().isOnline` treats `CONNECTED` and `METERED` as online.
@@ -792,23 +975,39 @@ A measurement starts 1 s after a network change, and when the URL changes. It be
 ### ConnectionType
 `WIFI`, `CELLULAR`, `ETHERNET`, `BLUETOOTH`, `VPN`, `OTHER`, `NONE`, `UNKNOWN`. `BLUETOOTH` and `VPN` are Android only: iOS reports `WIFI`, `CELLULAR`, `ETHERNET`, `OTHER`, `NONE` or `UNKNOWN`.
 
+### RetryAction
+- `RETRY` — Retry as the policy would, with a valid `delayMs` replacing the policy's delay. The delay counts from the decision.
+- `DROP` — Fail and delete the item: `ITEM_FAILED` with `RETRY_DECIDER_REJECTED`, no dead letter, no `ITEM_DEAD_LETTERED`. Counts in `failureCount`.
+- `DEAD_LETTER` — Fail and dead-letter the item: `ITEM_FAILED` with `RETRY_DECIDER_REJECTED`, then `ITEM_DEAD_LETTERED`.
+
+### BeforeDispatchAction
+- `PROCEED` — Send the request unchanged. Any result without an `action` key means this too.
+- `SKIP` — Defer the item without sending it: `PENDING`, attempts unchanged, due again after the longer of the policy's delay and 60 s, `ITEM_RETRYING` with `INTERCEPTOR_FAILED`.
+
+### DispatchOutcome
+- `SUCCEEDED` — A 2xx.
+- `RETRYING` — A reschedule or a credential hold (`UNAUTHORIZED`).
+- `FAILED` — A dead letter, exhausted attempts, or a decider's `DROP` or `DEAD_LETTER` (`RETRY_DECIDER_REJECTED`).
+
 ### SyncErrorCode
-15 codes:
+17 codes:
 - `NETWORK_ERROR` — Transport failure, on item events. Retried while attempts remain. Also the code of a cycle that dies of a cause other than the library's own errors, on its `SYNC_FAILED`, and what `flush` rejects with when its cycle dies.
 - `SERVER_ERROR` — A response outside 2xx, other than 401/403, on item events. Retried when listed in `retryOnStatusCodes`.
 - `TIMEOUT` — A request timed out, on item events. Always retried. Both platforms report `requestTimeoutMs` running out as `TIMEOUT`, and Android also its fixed socket timeouts: connecting takes over 10 s, or a read or write stalls 30 s.
-- `UNAUTHORIZED` — 401 or 403, on item events. The item becomes a dead letter, except in a process running on stored `defaultHeaders`.
+- `UNAUTHORIZED` — 401 or 403, on item events. The item becomes a dead letter, except in a process running on stored `defaultHeaders`. Headers from the header resolver change neither rule, and the retry decider is never consulted for it.
 - `MAX_ATTEMPTS_EXCEEDED` — A retriable failure with no attempts left, on `ITEM_FAILED`. Also the `lastErrorCode` of a dead letter whose stored code is empty or unknown.
-- `INVALID_PAYLOAD` — Validation failure with `validationErrors`, or a native rejection without them in most functions. Also, on item events, an attempt that failed with an error that is neither an I/O failure nor an HTTP answer: permanent, so the item is dead-lettered.
+- `INVALID_PAYLOAD` — Validation failure with `validationErrors` (including a `set…` callback function given a non-function, and an invalid `callbackTimeoutMs`), or a native rejection without them in most functions. Also, on item events, an attempt that failed with an error that is neither an I/O failure nor an HTTP answer: permanent, so the item is dead-lettered.
 - `INVALID_URL` — From `enqueue`, and from `configureSync` for `healthCheckUrl`. `enqueueBatch` reports it under `INVALID_PAYLOAD`.
 - `QUEUE_FULL` — Raised by native, but reaches JS as `INVALID_PAYLOAD` for now, from `enqueue`, `enqueueBatch` and `replayDeadLetter`.
 - `DUPLICATE_ITEM` — Reserved. Neither platform raises it.
 - `BACKGROUND_TASK_REGISTRATION_FAILED` — From the background functions.
-- `NATIVE_MODULE_UNAVAILABLE` — Web, SSR, or the native module is not linked.
+- `NATIVE_MODULE_UNAVAILABLE` — Web, SSR, or the native module is not linked. Also the fallback for every native rejection of the four `set…` callback functions, which native rejects when a newer JS runtime has attached since the calling one.
 - `DRAIN_ALREADY_ACTIVE` — A drain is already running or settling.
 - `NETWORK_QUALITY_TOO_LOW` — A cycle skipped below `minNetworkQuality`, on `SYNC_FAILED`.
 - `HEALTH_CHECK_FAILED` — A cycle skipped by a failed health check or during its backoff, on `SYNC_FAILED`.
 - `DEAD_LETTERED` — On `ITEM_DEAD_LETTERED`. Never a dead letter's `lastErrorCode`.
+- `RETRY_DECIDER_REJECTED` — The retry decider answered `DROP` or `DEAD_LETTER`, on `ITEM_FAILED`. After a `DEAD_LETTER`, also the dead letter's `lastErrorCode` and `metadata.lastErrorCode` on `ITEM_DEAD_LETTERED`. Counts in `failureCount`; on Android, in `failedIds` and `errors` too.
+- `INTERCEPTOR_FAILED` — The header resolver or `beforeDispatch` failed, or `beforeDispatch` answered `SKIP`, on `ITEM_RETRYING`. Nothing was sent and no attempt was spent; the item is due again after the longer of the policy's delay and 60 s. Deferrals never escalate to a dead letter.
 
 ## Credentials in a process with no JS
 
@@ -816,6 +1015,7 @@ A measurement starts 1 s after a network change, and when the URL changes. It be
 - On a 401 or 403 to a request sent with `defaultHeaders` restored from storage, in a process that has not called `configureSync`, the item stays `PENDING`, no attempt is spent, the next try waits at least 60 seconds, and the cycle stops. The hold lives in memory, so a process restart drops it. The periodic worker and the iOS BGTasks do not wait for it, so a window that opens during one can spend one request.
 - Otherwise a 401 or 403 fails the item with `UNAUTHORIZED`, and it becomes a dead letter: once `configureSync` has run in the process, or when no `defaultHeaders` were stored.
 - If stored headers cannot be read, nothing is dispatched and items wait. `configureSync` ends the wait. While they are unreadable, `getSyncConfig()` returns none, so re-applying it deletes them.
+- The header resolver runs only with JS. A credential the server needs from a worker or a BGTask with no JS must be in `defaultHeaders`: with no stored `defaultHeaders`, a 401 or 403 to a request sent without JS fails the item, which is dead-lettered. Headers from the resolver do not change any rule above, which depends only on where `defaultHeaders` came from.
 
 ## Platform Support
 
@@ -828,7 +1028,12 @@ A measurement starts 1 s after a network change, and when the URL changes. It be
 | Recovery of interrupted items | `RecoveryWorker`, on boot (after the first unlock), on app update and each time a JS engine attaches | `RecoveryManager`, once per process, when the engine starts |
 | Connectivity | `ConnectivityManager` default-network callback | `NWPathMonitor` |
 | `ConnectionType` values | Every value, `BLUETOOTH` and `VPN` included | Never `BLUETOOTH` or `VPN` |
-| `SyncResult.succeededIds`, `failedIds`, `errors` | Filled | Always empty |
+| `SyncResult.succeededIds`, `failedIds`, `errors` | Filled, a retry decider's `DROP` included | Always empty |
+| JS callbacks in one cycle | Awaited concurrently, up to `batchSize` | One item at a time |
+| A JS reload with callbacks installed | The old installs time out at each call until the new JS first uses the library | The old runtime's teardown makes its installs fail at once, without calling JS, until the new JS first uses the library |
+| `getPendingItems()` during an interceptor wait | Excludes the item | Includes the item |
+| `configureSync` during an interceptor wait | Applies from the next cycle | Applies from the next item |
+| JS failure text in the native log | logcat, which is per-app | Logged as private |
 | `SYNC_PROGRESS` | Never emitted | Emitted once per batch item, before that item's `ITEM_*` event |
 | Persisted configuration | SharedPreferences; `defaultHeaders` encrypted under an Android Keystore key | UserDefaults suite; `defaultHeaders` in the Keychain |
 | Host-app setup | None: the permissions and the boot receiver merge from the library manifest | Background Modes, two `Info.plist` identifiers and one `AppDelegate` call |
