@@ -235,7 +235,7 @@ describe('callback setters', () => {
 
     await expect(
       getMock().__invokeCallback('retryDecider', DECIDER_CONTEXT)
-    ).resolves.toEqual({
+    ).resolves.toStrictEqual({
       status: RESOLVED,
       decision: { action: RetryAction.DEAD_LETTER },
     });
@@ -400,7 +400,11 @@ describe('retry decider answers', () => {
   it('answers FAILED for an invalid async result', async () => {
     await expect(
       decide(async () => ({ action: 'NOPE' }))
-    ).resolves.toMatchObject({ status: FAILED });
+    ).resolves.toStrictEqual({
+      status: FAILED,
+      message:
+        'retry decider returned an invalid result: expected { action: RETRY | DROP | DEAD_LETTER, delayMs? }.',
+    });
   });
 
   it('answers FAILED when the decider throws', async () => {
@@ -435,6 +439,20 @@ describe('retry decider answers', () => {
     ).resolves.toStrictEqual({
       status: FAILED,
       message: 'retry decider failed: getter',
+    });
+  });
+
+  it('answers FAILED when looking up then on the result throws', async () => {
+    // Awaiting a result reads its `then`, as for any possible thenable.
+    await expect(
+      decide(() => ({
+        get then(): never {
+          throw new Error('then getter');
+        },
+      }))
+    ).resolves.toStrictEqual({
+      status: FAILED,
+      message: 'retry decider failed: then getter',
     });
   });
 });
@@ -551,7 +569,11 @@ describe('header resolver answers', () => {
       Authorization: { token: 's3cr3t' },
     }));
 
-    expect(answer).toMatchObject({ status: FAILED });
+    expect(answer).toStrictEqual({
+      status: FAILED,
+      message:
+        'header resolver returned an invalid result: expected a plain object whose values are all strings.',
+    });
     expect(JSON.stringify(answer)).not.toContain('s3cr3t');
     expect(JSON.stringify(answer)).not.toContain('Authorization');
   });
@@ -613,6 +635,56 @@ describe('header resolver answers', () => {
       message: 'header resolver failed: a thrown object',
     });
     expect(toString).not.toHaveBeenCalled();
+  });
+
+  it('answers FAILED when reading a header throws', async () => {
+    await expect(
+      resolveHeaders(() => ({
+        get Authorization(): string {
+          throw new Error('getter');
+        },
+      }))
+    ).resolves.toStrictEqual({
+      status: FAILED,
+      message: 'header resolver failed: getter',
+    });
+  });
+
+  it('answers FAILED when listing the keys of a Proxy throws', async () => {
+    const result = new Proxy(
+      {},
+      {
+        ownKeys(): never {
+          throw new Error('ownKeys trap');
+        },
+      }
+    );
+
+    await expect(resolveHeaders(() => result)).resolves.toStrictEqual({
+      status: FAILED,
+      message: 'header resolver failed: ownKeys trap',
+    });
+  });
+
+  it('reads each header of a Proxy once, so the value it checks is the value it sends', async () => {
+    let reads = 0;
+    const result = new Proxy(
+      { 'X-A': 'x' },
+      {
+        get(target, key, receiver): unknown {
+          if (key !== 'X-A') return Reflect.get(target, key, receiver);
+          reads += 1;
+          // A second read would get a value that native cannot take.
+          return reads === 1 ? 'first' : 42;
+        },
+      }
+    );
+
+    await expect(resolveHeaders(() => result)).resolves.toStrictEqual({
+      status: RESOLVED,
+      headers: headerCopy({ 'X-A': 'first' }),
+    });
+    expect(reads).toBe(1);
   });
 });
 
@@ -857,10 +929,12 @@ describe('the native-facing wrapper', () => {
     await flushAsync();
 
     expect(getMock().answerCallback).toHaveBeenCalledTimes(1);
-    expect(getMock().answerCallback).toHaveBeenCalledWith('retryDecider:1', {
-      status: FAILED,
-      message: 'retry decider failed: sync boom',
-    });
+    expect(getMock().answerCallback.mock.calls).toStrictEqual([
+      [
+        'retryDecider:1',
+        { status: FAILED, message: 'retry decider failed: sync boom' },
+      ],
+    ]);
   });
 
   it('answers each request id native sent, also when requests overlap', async () => {
@@ -883,11 +957,11 @@ describe('the native-facing wrapper', () => {
       }),
     ]);
 
-    expect(first).toEqual({
+    expect(first).toStrictEqual({
       status: RESOLVED,
       decision: { action: RetryAction.DROP },
     });
-    expect(second).toEqual({
+    expect(second).toStrictEqual({
       status: RESOLVED,
       decision: { action: RetryAction.DEAD_LETTER },
     });
@@ -992,6 +1066,47 @@ describe('the native-facing wrapper', () => {
       expect.any(Function),
       expect.any(Function)
     );
+  });
+
+  it('leaves no rejection unhandled when the consumer and both deliveries reject', async () => {
+    // Jest fails the running test on an unhandled rejection, so this test
+    // fails if any rejection below is left unhandled. A `process` listener
+    // would prove nothing: the test sandbox's `process` never gets the event.
+    const mock = getMock();
+    mock.answerCallback.mockImplementation(() =>
+      Promise.reject(new Error('always'))
+    );
+    await setAfterDispatch(() => Promise.reject(new Error('hook')));
+    await setBeforeDispatch(() => {
+      throw Symbol('s');
+    });
+
+    installedCallback('afterDispatch')('afterDispatch:1', AFTER_CONTEXT);
+    installedCallback('beforeDispatch')('beforeDispatch:1', BEFORE_CONTEXT);
+    await flushAsync();
+    await flushAsync();
+
+    const answersTo = (requestId: string): unknown[] =>
+      mock.answerCallback.mock.calls
+        .filter(([id]) => id === requestId)
+        .map(([, answer]) => answer as unknown);
+    expect(answersTo('afterDispatch:1')).toStrictEqual([
+      { status: FAILED, message: 'afterDispatch hook failed: hook' },
+      {
+        status: FAILED,
+        message: 'afterDispatch hook: the answer could not be delivered',
+      },
+    ]);
+    expect(answersTo('beforeDispatch:1')).toStrictEqual([
+      {
+        status: FAILED,
+        message: 'beforeDispatch hook failed: a thrown symbol',
+      },
+      {
+        status: FAILED,
+        message: 'beforeDispatch hook: the answer could not be delivered',
+      },
+    ]);
   });
 
   it('does not answer while the consumer promise is pending, leaving the timeout to native', async () => {
