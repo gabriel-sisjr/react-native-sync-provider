@@ -67,28 +67,70 @@ function isBeforeDispatchAction(value: unknown): value is BeforeDispatchAction {
   return BEFORE_DISPATCH_ACTIONS.has(value);
 }
 
-/** A `FAILED` answer, its message cut to {@link MAX_MESSAGE_LENGTH}. */
-function failed(message: string): CallbackAnswer {
-  return {
-    status: CallbackAnswerStatus.FAILED,
-    message: message.slice(0, MAX_MESSAGE_LENGTH),
-  };
+/** Whether `code` is the first half of a UTF-16 surrogate pair. */
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
 }
 
 /**
- * Describe a thrown or rejected value for a native log line: an `Error`'s
- * `message` (its `name` when the message is empty), or `String(value)` for
- * anything else. Never throws, even for a value that cannot become a string.
+ * A `FAILED` answer, its message cut to {@link MAX_MESSAGE_LENGTH} characters.
+ * A cut that would end on the first half of a surrogate pair drops that half
+ * too, so the message never ends in half a character.
+ */
+function failed(message: string): CallbackAnswer {
+  let kept = message.slice(0, MAX_MESSAGE_LENGTH);
+  if (
+    kept.length < message.length &&
+    isHighSurrogate(kept.charCodeAt(kept.length - 1))
+  ) {
+    kept = kept.slice(0, -1);
+  }
+  return { status: CallbackAnswerStatus.FAILED, message: kept };
+}
+
+/** The type a thrown value is described by: its `typeof`, with `null` apart. */
+function typeName(value: unknown): string {
+  return value === null ? 'null' : typeof value;
+}
+
+/** Whether `value` is an `Error`. A Proxy whose `instanceof` throws is not. */
+function isError(value: unknown): value is Error {
+  try {
+    return value instanceof Error;
+  } catch {
+    return false;
+  }
+}
+
+/** `value` when it is a string that is not empty. */
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value !== '' ? value : undefined;
+}
+
+/**
+ * Describe a thrown or rejected value for a native log line.
+ *
+ * - An `Error` is described by its `message`, or by its `name` when the
+ *   message is empty or not a string, or as `a thrown Error` when neither is
+ *   usable or reading them throws.
+ * - Anything else is described by its type only, for example
+ *   `a thrown string` or `a thrown object`. Its content can be a token or a
+ *   server response, so it is never quoted, nor converted to a string.
+ *
+ * Never throws.
  *
  * @internal
  */
 export function describeError(error: unknown): string {
+  if (!isError(error)) return `a thrown ${typeName(error)}`;
   try {
-    return error instanceof Error
-      ? String(error.message || error.name)
-      : String(error);
+    return (
+      nonEmptyString(error.message) ??
+      nonEmptyString(error.name) ??
+      'a thrown Error'
+    );
   } catch {
-    return 'a value that could not be converted to a string';
+    return 'a thrown Error';
   }
 }
 
@@ -109,7 +151,8 @@ export function toRetryDecisionAnswer(result: unknown): CallbackAnswer {
         Number.isFinite(delayMs) &&
         delayMs >= 0
       ) {
-        decision.delayMs = Math.trunc(delayMs);
+        // `|| 0` turns a `-0` into `0`.
+        decision.delayMs = Math.trunc(delayMs) || 0;
       }
       return { status: CallbackAnswerStatus.RESOLVED, decision };
     }
@@ -120,9 +163,31 @@ export function toRetryDecisionAnswer(result: unknown): CallbackAnswer {
 }
 
 /**
+ * Copy header entries onto an object without a prototype. Native reads every
+ * enumerable key, inherited ones included, so a copy that kept
+ * `Object.prototype` would also send what was added to it. Each entry is
+ * defined, not assigned, so even a `__proto__` key stays a header.
+ */
+function copyHeaders(
+  entries: ReadonlyArray<[string, string]>
+): Record<string, string> {
+  const headers: Record<string, string> = Object.create(null);
+  for (const [name, value] of entries) {
+    Object.defineProperty(headers, name, {
+      value,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  }
+  return headers;
+}
+
+/**
  * Normalize a header resolver's result. It must be a plain object whose
- * values are all strings; the answer carries a copy of it. The failure message
- * never quotes a header, because headers can carry credentials.
+ * values are all strings. The answer carries a copy of its own entries,
+ * without a prototype. The failure message never quotes a header, because
+ * headers can carry credentials.
  *
  * @internal
  */
@@ -133,16 +198,14 @@ export function toHeadersAnswer(result: unknown): CallbackAnswer {
       (entry): entry is [string, string] => typeof entry[1] === 'string'
     );
     if (strings.length === entries.length) {
-      // `fromEntries` defines own properties, so even a `__proto__` key stays
-      // a header instead of replacing the copy's prototype.
       return {
         status: CallbackAnswerStatus.RESOLVED,
-        headers: Object.fromEntries(strings),
+        headers: copyHeaders(strings),
       };
     }
   }
   return failed(
-    'header resolver returned an invalid result: expected an object whose values are all strings.'
+    'header resolver returned an invalid result: expected a plain object whose values are all strings.'
   );
 }
 
@@ -224,23 +287,20 @@ async function settle(
   }
 }
 
-/**
- * Send one answer. Resolves with `null` once delivered, or with what the
- * delivery threw or rejected with. Never rejects.
- */
+/** Send one answer. Resolves with whether it was delivered. Never rejects. */
 async function deliver(
   target: AnswerTarget,
   requestId: string,
   answer: CallbackAnswer
-): Promise<{ error: unknown } | null> {
+): Promise<boolean> {
   try {
     // `answerCallback` is synchronous in the spec. Awaiting its result also
     // covers a variant that returns a promise: a rejection then lands in this
     // catch, like a synchronous throw, and is never left unhandled.
     await target.answerCallback(requestId, answer);
-    return null;
-  } catch (error) {
-    return { error };
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -252,17 +312,15 @@ async function answerRequest(
   invoke: () => unknown
 ): Promise<void> {
   const answer = await settle(kind, invoke);
-  const failure = await deliver(target, requestId, answer);
-  if (failure === null) return;
-  // The answer did not convert, for example. A bare FAILED lets native fall
+  if (await deliver(target, requestId, answer)) return;
+  // The answer did not convert, for example. A FAILED answer lets native fall
   // back at once instead of at its timeout; if that fails too, native times
-  // out on its own.
+  // out on its own. Its message is constant: the native error could quote the
+  // answer, and the answer can carry headers.
   await deliver(
     target,
     requestId,
-    failed(
-      `${kind.label}: the answer could not be delivered: ${describeError(failure.error)}`
-    )
+    failed(`${kind.label}: the answer could not be delivered`)
   );
 }
 
@@ -273,7 +331,8 @@ async function answerRequest(
  * context, normalizes the result with `kind`, and answers `requestId` through
  * `target.answerCallback`. A throw or a rejection of `run`, or an invalid
  * result, is answered `FAILED` with a message. If the answer cannot be
- * delivered, it retries once with a bare `FAILED`, then gives up silently.
+ * delivered, it retries once with a `FAILED` answer whose message is constant,
+ * then gives up silently.
  *
  * @param target — the hybrid whose `answerCallback` receives the answers.
  * @param kind — the callback kind, which decides how results normalize.

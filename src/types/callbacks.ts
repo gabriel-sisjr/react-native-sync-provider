@@ -178,7 +178,9 @@ export type RetryDecider = (
 
 /**
  * A header resolver, installed with `setHeaderResolver`. It may return the
- * headers or a promise of them, and every value must be a string.
+ * headers, as a plain object whose values are all strings, or a promise of
+ * them. A plain object is an object literal or one without a prototype; a
+ * class instance, a `Map` or an array is an invalid result.
  *
  * Called right before each request, retries included. Its headers override
  * `SyncOptions.defaultHeaders`, and the item's own headers override them. A

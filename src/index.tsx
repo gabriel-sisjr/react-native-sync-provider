@@ -1239,12 +1239,13 @@ export async function isRetryDeciderInstalled(): Promise<boolean> {
  * headers right before each request, for example a fresh access token. They
  * are merged as `defaultHeaders` < resolver < the item's own headers.
  *
- * It fails closed: a throw, a rejection, an invalid result (a value that is
- * not a string, or a header name or value that native rejects), or no answer
- * within `SyncOptions.callbackTimeoutMs` sends nothing for that item. The item
- * stays pending without spending an attempt, becomes due again no sooner than
- * 60 s later, and emits `ITEM_RETRYING` with `INTERCEPTOR_FAILED`. With no JS
- * running, for example in a background launch, the static headers go out.
+ * It fails closed: a throw, a rejection, an invalid result (anything but a
+ * plain object whose values are all strings, or a header name or value that
+ * native rejects), or no answer within `SyncOptions.callbackTimeoutMs` sends
+ * nothing for that item. The item stays pending without spending an attempt,
+ * becomes due again no sooner than 60 s later, and emits `ITEM_RETRYING` with
+ * `INTERCEPTOR_FAILED`. With no JS running, for example in a background
+ * launch, the static headers go out.
  * {@link clearHeaderResolver} is the only way to uninstall it.
  *
  * @param resolver — the {@link HeaderResolver}, sync or async.

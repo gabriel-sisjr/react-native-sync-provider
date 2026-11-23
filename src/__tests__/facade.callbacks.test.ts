@@ -27,6 +27,7 @@ import type {
   RetryDecider,
   RetryDeciderContext,
 } from '../index';
+import { toHeadersAnswer } from '../utils/callbackBridge';
 
 type CallbackKind =
   | 'retryDecider'
@@ -62,6 +63,14 @@ const flushAsync = () =>
   new Promise<void>((resolve) => {
     setTimeout(resolve, 0);
   });
+
+/**
+ * The headers an answer must carry: a copy without a prototype. Since
+ * `toStrictEqual` compares constructors, a copy that kept `Object.prototype`
+ * fails against it.
+ */
+const headerCopy = (headers: Record<string, string>): Record<string, string> =>
+  Object.assign(Object.create(null) as Record<string, string>, headers);
 
 /** The callback native would call for `kind`, which the test must have set. */
 function installedCallback(kind: CallbackKind): NativeCallback {
@@ -322,6 +331,7 @@ describe('retry decider answers', () => {
 
   it.each([
     [0, 0],
+    [-0, 0],
     [1_500, 1_500],
     [1_500.9, 1_500],
     [0.4, 0],
@@ -435,8 +445,46 @@ describe('header resolver answers', () => {
 
     const answer = await resolveHeaders(() => headers);
 
-    expect(answer).toStrictEqual({ status: RESOLVED, headers });
+    expect(answer).toStrictEqual({
+      status: RESOLVED,
+      headers: headerCopy(headers),
+    });
     expect((answer as { headers: unknown }).headers).not.toBe(headers);
+    expect(
+      Object.getPrototypeOf((answer as { headers: unknown }).headers)
+    ).toBe(null);
+  });
+
+  it('keeps a __proto__ key as an own header of the copy', async () => {
+    const answer = (await resolveHeaders(
+      () => JSON.parse('{"__proto__":"x","X-A":"1"}') as unknown
+    )) as { headers: Record<string, string> };
+
+    expect(Object.getPrototypeOf(answer.headers)).toBe(null);
+    expect(Object.keys(answer.headers)).toStrictEqual(['__proto__', 'X-A']);
+    expect(
+      Object.getOwnPropertyDescriptor(answer.headers, '__proto__')?.value
+    ).toBe('x');
+  });
+
+  it('sends no header that a polluted Object.prototype adds', () => {
+    // Native reads every enumerable key, inherited ones included, as `for…in`
+    // does. The pollution lasts only for this synchronous block.
+    const names: string[] = [];
+    // eslint-disable-next-line no-extend-native -- polluted on purpose, and removed below
+    Object.defineProperty(Object.prototype, 'X-Polluted', {
+      value: 'leak',
+      enumerable: true,
+      configurable: true,
+    });
+    try {
+      const answer = toHeadersAnswer({ 'X-Tenant': 'acme' });
+      for (const name in answer.headers ?? {}) names.push(name);
+    } finally {
+      delete (Object.prototype as Record<string, unknown>)['X-Polluted'];
+    }
+
+    expect(names).toStrictEqual(['X-Tenant']);
   });
 
   it('passes async headers', async () => {
@@ -444,14 +492,14 @@ describe('header resolver answers', () => {
       resolveHeaders(async () => ({ 'X-Tenant': 'acme' }))
     ).resolves.toStrictEqual({
       status: RESOLVED,
-      headers: { 'X-Tenant': 'acme' },
+      headers: headerCopy({ 'X-Tenant': 'acme' }),
     });
   });
 
   it('passes an empty object, which adds no header', async () => {
     await expect(resolveHeaders(() => ({}))).resolves.toStrictEqual({
       status: RESOLVED,
-      headers: {},
+      headers: headerCopy({}),
     });
   });
 
@@ -462,7 +510,7 @@ describe('header resolver answers', () => {
 
     await expect(resolveHeaders(() => headers)).resolves.toStrictEqual({
       status: RESOLVED,
-      headers: { 'X-Tenant': 'acme' },
+      headers: headerCopy({ 'X-Tenant': 'acme' }),
     });
   });
 
@@ -494,7 +542,7 @@ describe('header resolver answers', () => {
     await expect(resolveHeaders(() => result)).resolves.toStrictEqual({
       status: FAILED,
       message:
-        'header resolver returned an invalid result: expected an object whose values are all strings.',
+        'header resolver returned an invalid result: expected a plain object whose values are all strings.',
     });
   });
 
@@ -526,6 +574,45 @@ describe('header resolver answers', () => {
       status: FAILED,
       message: 'header resolver failed: refresh failed',
     });
+  });
+
+  it.each([
+    ['a string', () => '{"refresh_token":"rt-SECRET"}', 'string'],
+    ['an object', () => ({ refresh_token: 'rt-SECRET' }), 'object'],
+    [
+      'an object with a message',
+      () => ({ message: 'rt-SECRET', status: 401 }),
+      'object',
+    ],
+  ])(
+    'never quotes %s that the resolver throws or rejects with',
+    async (_label, make, type) => {
+      const expected = {
+        status: FAILED,
+        message: `header resolver failed: a thrown ${type}`,
+      };
+
+      const thrown = await resolveHeaders(() => {
+        throw make();
+      });
+      const rejected = await resolveHeaders(() => Promise.reject(make()));
+
+      expect(thrown).toStrictEqual(expected);
+      expect(rejected).toStrictEqual(expected);
+      expect(JSON.stringify([thrown, rejected])).not.toContain('rt-SECRET');
+    }
+  );
+
+  it('never converts a thrown object to a string', async () => {
+    const toString = jest.fn(() => 'rt-SECRET');
+
+    const answer = await resolveHeaders(() => Promise.reject({ toString }));
+
+    expect(answer).toStrictEqual({
+      status: FAILED,
+      message: 'header resolver failed: a thrown object',
+    });
+    expect(toString).not.toHaveBeenCalled();
   });
 });
 
@@ -748,12 +835,12 @@ describe('afterDispatch answers', () => {
     });
   });
 
-  it('answers FAILED with String(reason) when the hook rejects with a non-Error', async () => {
+  it('answers FAILED with the type only when the hook rejects with a non-Error', async () => {
     await expect(
       afterDispatch(() => Promise.reject('boom'))
     ).resolves.toStrictEqual({
       status: FAILED,
-      message: 'afterDispatch hook failed: boom',
+      message: 'afterDispatch hook failed: a thrown string',
     });
   });
 });
@@ -825,7 +912,7 @@ describe('the native-facing wrapper', () => {
     expect(receivers[0]).toBe(mock);
   });
 
-  it('retries once with a bare FAILED when answerCallback throws', async () => {
+  it('retries once with a constant FAILED message when answerCallback throws', async () => {
     const mock = getMock();
     mock.answerCallback.mockImplementationOnce(() => {
       throw new TypeError('Value is not a string');
@@ -841,10 +928,10 @@ describe('the native-facing wrapper', () => {
     expect(mock.answerCallback.mock.calls[1]?.[0]).toBe(
       mock.answerCallback.mock.calls[0]?.[0]
     );
+    // The native error is never quoted: it could quote the answer.
     expect(answer).toStrictEqual({
       status: FAILED,
-      message:
-        'retry decider: the answer could not be delivered: Value is not a string',
+      message: 'retry decider: the answer could not be delivered',
     });
   });
 
@@ -859,7 +946,7 @@ describe('the native-facing wrapper', () => {
     expect(mock.answerCallback).toHaveBeenCalledTimes(2);
     expect(answer).toStrictEqual({
       status: FAILED,
-      message: 'retry decider: the answer could not be delivered: rejected',
+      message: 'retry decider: the answer could not be delivered',
     });
   });
 
@@ -878,8 +965,7 @@ describe('the native-facing wrapper', () => {
     expect(mock.answerCallback).toHaveBeenCalledTimes(2);
     expect(mock.answerCallback.mock.calls[1]?.[1]).toStrictEqual({
       status: FAILED,
-      message:
-        'retry decider: the answer could not be delivered: converter gone',
+      message: 'retry decider: the answer could not be delivered',
     });
   });
 
@@ -917,8 +1003,23 @@ describe('the native-facing wrapper', () => {
     expect(getMock().answerCallback).not.toHaveBeenCalled();
   });
 
+  // A thrown value that is not an Error can be a token or a server response,
+  // so only its type reaches the message, and nothing converts it.
   it.each([
-    ['an object without a prototype', () => Object.create(null) as unknown],
+    ['a string', () => 's3cr3t', 'string'],
+    ['a number', () => 42, 'number'],
+    ['a boolean', () => false, 'boolean'],
+    ['a bigint', () => BigInt(7), 'bigint'],
+    ['a symbol', () => Symbol('s3cr3t'), 'symbol'],
+    ['undefined', () => undefined, 'undefined'],
+    ['null', () => null, 'null'],
+    ['an object with a message', () => ({ message: 's3cr3t' }), 'object'],
+    ['an array', () => ['s3cr3t'], 'object'],
+    [
+      'an object without a prototype',
+      () => Object.create(null) as unknown,
+      'object',
+    ],
     [
       'an object whose toString throws',
       () => ({
@@ -926,18 +1027,31 @@ describe('the native-facing wrapper', () => {
           throw new Error('nope');
         },
       }),
+      'object',
     ],
-  ])('answers FAILED when the consumer throws %s', async (_label, make) => {
-    await expect(
-      decide(() => {
-        throw make();
-      })
-    ).resolves.toStrictEqual({
-      status: FAILED,
-      message:
-        'retry decider failed: a value that could not be converted to a string',
-    });
-  });
+    ['a function', () => () => 's3cr3t', 'function'],
+    [
+      'a revoked Proxy',
+      () => {
+        const { proxy, revoke } = Proxy.revocable({}, {});
+        revoke();
+        return proxy;
+      },
+      'object',
+    ],
+  ])(
+    'describes %s the consumer throws by its type only',
+    async (_label, make, type) => {
+      await expect(
+        decide(() => {
+          throw make();
+        })
+      ).resolves.toStrictEqual({
+        status: FAILED,
+        message: `retry decider failed: a thrown ${type}`,
+      });
+    }
+  );
 
   it('names an Error with an empty message by its name', async () => {
     await expect(
@@ -950,6 +1064,42 @@ describe('the native-facing wrapper', () => {
     });
   });
 
+  it('names an Error whose message is not a string by its name', async () => {
+    await expect(
+      decide(() => {
+        throw Object.assign(new RangeError('x'), { message: 42 });
+      })
+    ).resolves.toStrictEqual({
+      status: FAILED,
+      message: 'retry decider failed: RangeError',
+    });
+  });
+
+  it.each([
+    [
+      'neither its message nor its name is a usable string',
+      () => Object.assign(new Error(''), { name: '' }),
+    ],
+    [
+      'reading its message throws',
+      () =>
+        Object.defineProperty(new Error('x'), 'message', {
+          get(): string {
+            throw new Error('getter');
+          },
+        }),
+    ],
+  ])('describes an Error as "a thrown Error" when %s', async (_label, make) => {
+    await expect(
+      decide(() => {
+        throw make();
+      })
+    ).resolves.toStrictEqual({
+      status: FAILED,
+      message: 'retry decider failed: a thrown Error',
+    });
+  });
+
   it('cuts a long message to 1024 characters', async () => {
     const answer = (await decide(() => {
       throw new Error('x'.repeat(5_000));
@@ -957,5 +1107,29 @@ describe('the native-facing wrapper', () => {
 
     expect(answer.message).toHaveLength(1_024);
     expect(answer.message.startsWith('retry decider failed: xxx')).toBe(true);
+  });
+
+  it('never ends a cut message in half a surrogate pair', async () => {
+    const prefix = 'retry decider failed: ';
+    // The emoji's first half lands on the last character the cut keeps.
+    const pad = 'x'.repeat(1_024 - prefix.length - 1);
+
+    const answer = (await decide(() => {
+      throw new Error(`${pad}\u{1F600}tail`);
+    })) as { message: string };
+
+    expect(answer.message).toBe(`${prefix}${pad}`);
+  });
+
+  it('keeps a surrogate pair that ends at the cut', async () => {
+    const prefix = 'retry decider failed: ';
+    const pad = 'x'.repeat(1_024 - prefix.length - 2);
+
+    const answer = (await decide(() => {
+      throw new Error(`${pad}\u{1F600}tail`);
+    })) as { message: string };
+
+    expect(answer.message).toBe(`${prefix}${pad}\u{1F600}`);
+    expect(answer.message).toHaveLength(1_024);
   });
 });
