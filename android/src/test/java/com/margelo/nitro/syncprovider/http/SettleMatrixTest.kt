@@ -4,6 +4,7 @@ import android.database.sqlite.SQLiteDatabaseLockedException
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.google.common.truth.Truth.assertThat
+import com.margelo.nitro.syncprovider.AfterDispatchContext
 import com.margelo.nitro.syncprovider.BeforeDispatchAction
 import com.margelo.nitro.syncprovider.BeforeDispatchContext
 import com.margelo.nitro.syncprovider.CallbackAnswer
@@ -39,6 +40,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.TestScope
@@ -83,15 +85,20 @@ import java.util.concurrent.TimeUnit
  *   applies the decision as recorded, without asking JS again; when nothing was decided, an
  *   [Error] raised while the decider was being asked say, it applies the policy's retry.
  * - R11: the cycle is cancelled while the decider is asked, or before. The wait ends at once and
- *   the dispatch writes the policy's retry itself; the decider is not asked once the cycle has
- *   stopped.
+ *   the dispatch writes the policy's retry itself, its delay counted from the stop; the decider is
+ *   not asked once the cycle has stopped.
  *
  * With a header resolver or `beforeDispatch` installed:
- * - R9: an interceptor gives nothing to use, then the write that defers the item fails. Nothing
- *   was sent and nothing recorded, so the settle gives the row back as it was.
+ * - R9: an interceptor gives nothing to use, then the write that defers the item fails; or, on
+ *   Android only, an [Error] is raised while it is asked, which fails the cycle and stops a
+ *   sibling still waiting. Nothing was sent and nothing recorded, so the settle gives the row
+ *   back as it was.
  * - R10: the cycle is cancelled while an interceptor is asked, or as its answer lands. The wait
  *   ends at once, nothing is sent, and no deferral is written: the row comes back as it was,
  *   with no event of its own.
+ *
+ * With `afterDispatch` installed, R1's settle delivers the row and reports it to no one: only the
+ * normal dispatch path calls `afterDispatch`.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [30])
@@ -871,7 +878,7 @@ internal class SettleMatrixTest {
     runTest {
       answer(503)
       seed(ITEM)
-      val decider = neverAnswering()
+      val decider = neverAnswering(decideMs = DECIDE_MS)
       val events = recordEvents()
       val d = dispatcher(callbackTimeoutMs = LONG_CALLBACK_TIMEOUT_MS)
 
@@ -889,7 +896,8 @@ internal class SettleMatrixTest {
       assertThat(retried.attempts).isEqualTo(2)
       assertThat(retried.lastAttemptAt).isEqualTo(t0)
       assertThat(retried.lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
-      assertThat(retried.nextRetryAt).isEqualTo(t0 + ATTEMPT_MS + 2 * BASE_DELAY_MS)
+      // The policy's delay counts from the stop, not from the attempt's end.
+      assertThat(retried.nextRetryAt).isEqualTo(t0 + ATTEMPT_MS + DECIDE_MS + 2 * BASE_DELAY_MS)
       assertThat(events.seen())
         .containsExactly(
           Seen(SyncEventType.SYNC_STARTED),
@@ -907,7 +915,7 @@ internal class SettleMatrixTest {
       answer(503)
       seed(ITEM, createdAt = 1L)
       val unsent = seed(REST, createdAt = 2L)
-      val decider = neverAnswering()
+      val decider = neverAnswering(decideMs = DECIDE_MS)
       val events = recordEvents()
       // Restored headers: the leading item is dispatched in the cycle's own coroutine.
       val d = dispatcher(credentials = CredentialPolicy.PERSISTED, callbackTimeoutMs = LONG_CALLBACK_TIMEOUT_MS)
@@ -922,7 +930,8 @@ internal class SettleMatrixTest {
       val retried = row(ITEM)
       assertThat(retried.attempts).isEqualTo(2)
       assertThat(retried.lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
-      assertThat(retried.nextRetryAt).isEqualTo(t0 + ATTEMPT_MS + 2 * BASE_DELAY_MS)
+      // From the stop, as above.
+      assertThat(retried.nextRetryAt).isEqualTo(t0 + ATTEMPT_MS + DECIDE_MS + 2 * BASE_DELAY_MS)
       assertThat(row(REST)).isEqualTo(unsent)
       assertThat(events.seen())
         .containsExactly(
@@ -1159,6 +1168,75 @@ internal class SettleMatrixTest {
       assertWaitsInFlight(before, events, null, CycleEnding.CANCELLED)
     }
 
+  @Test
+  fun `android_interceptor_raisesError R9 C1 an Error while the resolver is asked fails the cycle and stops a waiting sibling unsent`() =
+    runTest {
+      answer(200)
+      val first = seed(ITEM, createdAt = 1L)
+      val sibling = seed(REST, createdAt = 2L)
+      val siblingAsked = CompletableDeferred<Unit>()
+      val resolver = js.function<HeaderResolverContext> { _, context ->
+        if (context.itemId == REST) {
+          // Never answered: it waits until the cycle stops it.
+          siblingAsked.complete(Unit)
+        } else {
+          // Raised once the sibling is waiting.
+          runBlocking { withTimeout(20_000L) { siblingAsked.await() } }
+          throw NoClassDefFoundError(RAISED)
+        }
+      }
+      assertThat(hybrid.setHeaderResolver(resolver)).isTrue()
+      val events = recordEvents()
+
+      val thrown = flushOnce(dispatcher(callbackTimeoutMs = LONG_CALLBACK_TIMEOUT_MS))
+
+      assertThat(thrown).isInstanceOf(NoClassDefFoundError::class.java)
+      assertThat(server.requestCount).isEqualTo(0)
+      // Nothing was sent or recorded, for either: both rows come back as they were.
+      assertThat(row(ITEM)).isEqualTo(first)
+      assertThat(row(REST)).isEqualTo(sibling)
+      assertThat(resolver.calls.map { it.itemId }).containsExactly(ITEM, REST)
+      assertThat(events.seen())
+        .containsExactly(
+          Seen(SyncEventType.SYNC_STARTED),
+          Seen(SyncEventType.SYNC_FAILED, errorCode = SyncErrorCode.NETWORK_ERROR),
+        )
+        .inOrder()
+      assertThat(endings).containsExactly(CycleEnding.FAILED)
+      assertWake(FIRST_HOLD_MS)
+      assertThat(callbacks.gateway.pendingCount).isEqualTo(0)
+    }
+
+  @Test
+  fun `interceptor_after_calledOncePerSentRequest R1 C1 never from the settle, for a 2xx whose removal fails`() =
+    runTest {
+      answer(200)
+      seed(ITEM)
+      val failing = spyk(storage)
+      coEvery { failing.markSucceeded(any()) } answers { failWrite() }
+      // The gateway numbers its requests from 1, and nothing else is installed to take a number.
+      val notified: MutableList<Pair<String, String>> = Collections.synchronizedList(mutableListOf())
+      val after = js.function<AfterDispatchContext> { requestId, context ->
+        notified += requestId to context.itemId
+        answer(requestId, FakeJs.resolved())
+      }
+      assertThat(hybrid.setAfterDispatch(after)).isTrue()
+
+      val thrown = flushOnce(dispatcher(queue = failing))
+
+      // The settle delivers the row, as with nothing installed.
+      assertThat(thrown).isInstanceOf(SQLiteDatabaseLockedException::class.java)
+      assertThat(db.syncItemDao().findById(ITEM)).isNull()
+      assertThat(endings).containsExactly(CycleEnding.FAILED)
+      // The next request, in the normal path, is the first one ever reported.
+      seed(REST)
+      dispatcher(armsWake = false).flush()
+      runBlocking {
+        withTimeout(20_000L) { while (notified.isEmpty() || callbacks.gateway.pendingCount > 0) delay(10L) }
+      }
+      assertThat(notified).containsExactly("afterDispatch:1" to REST)
+    }
+
   /* ---------------------------- the deadline ceiling ---------------------------- */
 
   @Test
@@ -1282,10 +1360,13 @@ internal class SettleMatrixTest {
     val calls: List<C> get() = function.calls
   }
 
-  /** A retry decider the current hybrid installs, which never answers. */
-  private fun neverAnswering(): NeverAnswering<RetryDeciderContext> {
+  /** A retry decider the current hybrid installs, which never answers. Asking it takes [decideMs]. */
+  private fun neverAnswering(decideMs: Long = 0L): NeverAnswering<RetryDeciderContext> {
     val asked = CompletableDeferred<Unit>()
-    val function = js.function<RetryDeciderContext> { _, _ -> asked.complete(Unit) }
+    val function = js.function<RetryDeciderContext> { _, _ ->
+      clock.advance(decideMs)
+      asked.complete(Unit)
+    }
     assertThat(hybrid.setRetryDecider(function)).isTrue()
     return NeverAnswering(asked, function)
   }

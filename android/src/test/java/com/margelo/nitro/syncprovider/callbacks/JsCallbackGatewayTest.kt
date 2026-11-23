@@ -286,8 +286,11 @@ internal class JsCallbackGatewayTest {
 
   @Test
   fun `a late answer changes nothing`() = runBlocking<Unit> {
-    val result = askDecider(timeoutMs = 100L) { id -> later(300L, id, decision(RetryAction.DEAD_LETTER)) }
-    delay(500L)
+    var requestId = ""
+    val result = askDecider(timeoutMs = 100L) { id -> requestId = id }
+
+    // Late whatever the scheduler does: the request has already timed out and ended.
+    gateway.answer(requestId, decision(RetryAction.DEAD_LETTER))
 
     assertThat(result).isEqualTo(CallbackResult.Skipped(SkipReason.TIMED_OUT))
     assertThat(gateway.pendingCount).isEqualTo(0)

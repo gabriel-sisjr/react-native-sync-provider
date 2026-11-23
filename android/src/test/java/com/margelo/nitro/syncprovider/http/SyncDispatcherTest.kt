@@ -2640,22 +2640,29 @@ internal class SyncDispatcherTest {
   }
 
   @Test
-  fun `decider_retry_invalidDelay_usesPolicyDelay, for NaN, infinity and a negative delay`() = runTest {
+  fun `decider_retry_invalidDelay_usesPolicyDelay, for NaN, either infinity and any negative delay`() = runTest {
     answerAll(503)
-    val delays = mapOf("/nan" to Double.NaN, "/infinite" to Double.POSITIVE_INFINITY, "/negative" to -1.0)
+    val delays = mapOf(
+      "/nan" to Double.NaN,
+      "/infinite" to Double.POSITIVE_INFINITY,
+      "/minus-infinite" to Double.NEGATIVE_INFINITY,
+      "/negative" to -1.0,
+      "/negative-fraction" to -0.5,
+    )
     val ids = delays.keys.associateWith { enqueue(it) }
     val start = clock.now()
     installDecider { context -> FakeJs.decision(RetryAction.RETRY, delays.getValue(URI(context.url).path)) }
 
     newDispatcher().flush()
 
-    ids.values.forEach { id ->
-      assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
-      assertThat(row(id).nextRetryAt).isEqualTo(start + 1_000L)
+    ids.forEach { (path, id) ->
+      assertWithMessage(path).that(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+      assertWithMessage(path).that(row(id).nextRetryAt).isEqualTo(start + 1_000L)
     }
     // Not a failed answer: the decision stands, with the policy's delay, and the reason is logged.
     assertThat(callbackLog.count { it.contains("is not a usable delay; the policy's delay applies") })
-      .isEqualTo(3)
+      .isEqualTo(delays.size)
+    assertThat(callbackPriorities.distinct()).containsExactly(Log.WARN)
   }
 
   @Test
@@ -2749,26 +2756,39 @@ internal class SyncDispatcherTest {
     }
 
   @Test
-  fun `decider_invalidAnswer_fallsBack, a RESOLVED answer with no decision`() = runBlocking<Unit> {
-    server.enqueue(MockResponse().setResponseCode(503))
-    val id = enqueue()
-    val start = clock.now()
-    installDecider { FakeJs.headers(mapOf("X-Wrong" to "kind")) }
+  fun `decider_invalidAnswer_fallsBack, a RESOLVED answer with no decision, whatever it carries instead`() =
+    runBlocking<Unit> {
+      answerAll(503)
+      // Another kind's payload, or none at all.
+      val replies = mapOf(
+        "/headers" to FakeJs.headers(mapOf("X-Wrong" to "kind")),
+        "/before" to FakeJs.before(BeforeDispatchAction.PROCEED),
+        "/empty" to FakeJs.resolved(),
+      )
+      val ids = replies.keys.associateWith { enqueue(it) }
+      val start = clock.now()
+      installDecider { context -> replies.getValue(URI(context.url).path) }
 
-    newDispatcher(callbackTimeoutMs = 30_000.0).flush()
+      newDispatcher(callbackTimeoutMs = 30_000.0).flush()
 
-    assertThat(row(id).nextRetryAt).isEqualTo(start + 1_000L)
-    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
-    assertThat(callbackLog.single())
-      .endsWith("the answer carried no usable decision; the retry policy applies")
-  }
+      ids.forEach { (path, id) -> assertWithMessage(path).that(row(id).nextRetryAt).isEqualTo(start + 1_000L) }
+      assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+      assertThat(callbackLog).hasSize(replies.size)
+      callbackLog.forEach {
+        assertThat(it).endsWith("the answer carried no usable decision; the retry policy applies")
+      }
+    }
 
   @Test
   fun `decider_neverAnswers_timesOut, and the policy applies`() = runBlocking<Unit> {
     server.enqueue(MockResponse().setResponseCode(503))
     val id = enqueue()
     val start = clock.now()
-    val decider = installDecider { null }
+    val decider = installDecider {
+      // Time passes during the wait: the delay counts from the timeout, not from the attempt.
+      clock.advance(DECIDE_MS)
+      null
+    }
     val started = System.nanoTime()
 
     newDispatcher(callbackTimeoutMs = 200.0).flush()
@@ -2776,7 +2796,8 @@ internal class SyncDispatcherTest {
     assertThat(elapsedMs(started)).isAtLeast(200L)
     assertThat(decider.calls).hasSize(1)
     assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
-    assertThat(row(id).nextRetryAt).isEqualTo(start + 1_000L)
+    assertThat(row(id).lastAttemptAt).isEqualTo(start)
+    assertThat(row(id).nextRetryAt).isEqualTo(start + DECIDE_MS + 1_000L)
     assertThat(callbackLog.single()).endsWith("no answer within 200 ms; the retry policy applies")
     assertThat(callbacks.gateway.pendingCount).isEqualTo(0)
   }
@@ -2818,15 +2839,20 @@ internal class SyncDispatcherTest {
   }
 
   @Test
-  fun `decider_notConsulted_nonRetryable`() = runTest {
-    server.enqueue(MockResponse().setResponseCode(404))
-    val id = enqueue()
+  fun `decider_notConsulted_nonRetryable, a 4xx or a 401 with this process's credential`() = runTest {
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest): MockResponse =
+        MockResponse().setResponseCode(if (request.path == "/secure") 401 else 404)
+    }
+    val missing = enqueue("/missing")
+    val secure = enqueue("/secure")
     val decider = installDecider { FakeJs.decision(RetryAction.RETRY) }
 
-    newDispatcher().flush()
+    newDispatcher(credentials = { CredentialPolicy.TRUSTED }).flush()
 
     assertThat(decider.calls).isEmpty()
-    assertThat(deadLetter(id).lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
+    assertThat(deadLetter(missing).lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
+    assertThat(deadLetter(secure).lastErrorCode).isEqualTo(SyncErrorCode.UNAUTHORIZED.name)
   }
 
   @Test
@@ -3167,6 +3193,31 @@ internal class SyncDispatcherTest {
       .containsExactly("resolver", "before", "request", SyncEventType.ITEM_SUCCEEDED.name, "after")
       .inOrder()
   }
+
+  @Test
+  fun `interceptor_order_resolver_before_dispatch_after, the attempt starting once its request is ready`() =
+    runTest {
+      answerAll(503)
+      val id = enqueue()
+      val start = clock.now()
+      // Each wait takes a while on the test clock.
+      installResolver {
+        clock.advance(DECIDE_MS)
+        FakeJs.headers(mapOf("X-Resolved" to "r"))
+      }
+      installBefore {
+        clock.advance(DECIDE_MS)
+        proceed()
+      }
+
+      newDispatcher().flush()
+
+      // The attempt is when the request went out, after both waits, and its cooldown counts from it.
+      val retried = row(id)
+      assertThat(retried.attempts).isEqualTo(1)
+      assertThat(retried.lastAttemptAt).isEqualTo(start + 2 * DECIDE_MS)
+      assertThat(retried.nextRetryAt).isEqualTo(start + 2 * DECIDE_MS + 1_000L)
+    }
 
   @Test
   fun `interceptor_headerMergeOrder, defaults then the resolver then the item, whatever the case`() = runTest {
@@ -3648,6 +3699,26 @@ internal class SyncDispatcherTest {
   }
 
   @Test
+  fun `interceptor_after_calledOncePerSentRequest, its durationMs leaving out the resolver's wait`() =
+    runBlocking<Unit> {
+      answerAll(200)
+      enqueue()
+      val resolver = js.function<HeaderResolverContext> { requestId, _ ->
+        answerLater(requestId, RESOLVER_WAIT_MS, FakeJs.headers(mapOf("X-Resolved" to "r")))
+      }
+      assertThat(hybrid.setHeaderResolver(resolver)).isTrue()
+      val after = installAfter()
+      val started = System.nanoTime()
+
+      newDispatcher(callbackTimeoutMs = 30_000.0).flush()
+      awaitUntil { after.calls.isNotEmpty() }
+
+      // The cycle waited for the resolver, but the request itself, answered at once, did not.
+      assertThat(elapsedMs(started)).isAtLeast(RESOLVER_WAIT_MS)
+      assertThat(after.calls.single().durationMs).isLessThan(RESOLVER_WAIT_MS.toDouble())
+    }
+
+  @Test
   fun `interceptor_after_calledOncePerSentRequest, for a credential hold before the cycle stops`() =
     runBlocking<Unit> {
       answerAll(401)
@@ -4015,6 +4086,9 @@ internal class SyncDispatcherTest {
 
     /** Well inside every long callback timeout here: what "at once" allows on a loaded machine. */
     const val AT_ONCE_MS = 10_000L
+
+    /** How long a resolver takes to answer, in real time, where a duration must leave it out. */
+    const val RESOLVER_WAIT_MS = 1_000L
 
     /** The headers OkHttp sets on its own, from the body or the connection. */
     val OKHTTP_HEADERS = listOf("Content-Type", "Content-Length", "Host", "Connection", "Accept-Encoding", "User-Agent")

@@ -17,7 +17,11 @@ import androidx.work.testing.WorkManagerTestInitHelper
 import com.google.common.collect.Range
 import com.google.common.truth.Truth.assertThat
 import com.google.common.truth.Truth.assertWithMessage
+import com.margelo.nitro.syncprovider.callbacks.CallbackAnswers
+import com.margelo.nitro.syncprovider.callbacks.CallbackKind
+import com.margelo.nitro.syncprovider.callbacks.CallbackResult
 import com.margelo.nitro.syncprovider.callbacks.HybridInstalls
+import com.margelo.nitro.syncprovider.callbacks.SkipReason
 import com.margelo.nitro.syncprovider.config.ConfigSource
 import com.margelo.nitro.syncprovider.config.SecretStore
 import com.margelo.nitro.syncprovider.connectivity.ConnectivityMonitor
@@ -38,6 +42,7 @@ import io.mockk.coEvery
 import io.mockk.every
 import io.mockk.mockkConstructor
 import io.mockk.unmockkConstructor
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -47,6 +52,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.onSubscription
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
@@ -1220,6 +1226,29 @@ internal class SyncProviderRuntimeTest {
 
     assertThat(SyncProviderRuntime.callbacks.registry.retryDecider.installed).isNull()
     assertThat(SyncProviderRuntime.callbacks.registry.afterDispatch.installed).isNull()
+  }
+
+  @Test
+  fun `lifecycle_shutdown_endsEveryWait, the current hybrid's too, at once`() = runBlocking<Unit> {
+    val hybrid = HybridInstalls(SyncProviderRuntime.callbacks)
+    val gateway = SyncProviderRuntime.callbacks.gateway
+    val asked = CompletableDeferred<Unit>()
+    val waiting = async(Dispatchers.Default) {
+      gateway.request(
+        CallbackKind.RETRY_DECIDER, hybrid.owner, "waiting", AWAIT_TIMEOUT_MS * 3, null,
+        "the retry policy applies", CallbackAnswers::decision,
+      ) { asked.complete(Unit) }
+    }
+    withTimeout(AWAIT_TIMEOUT_MS) { asked.await() }
+    val started = System.nanoTime()
+
+    // A live owner's wait, which no retirement would end.
+    runtime.shutdown()
+
+    assertThat(withTimeout(AWAIT_TIMEOUT_MS) { waiting.await() })
+      .isEqualTo(CallbackResult.Skipped(SkipReason.OWNER_GONE))
+    assertThat((System.nanoTime() - started) / 1_000_000L).isLessThan(AWAIT_TIMEOUT_MS)
+    assertThat(gateway.pendingCount).isEqualTo(0)
   }
 
   @Test
