@@ -215,6 +215,42 @@ final class CallbackLifecycleTests: XCTestCase {
         XCTAssertEqual(try isDeciderInstalled(through: hybrid), false)
     }
 
+    /// A `clear…` or a replacing `set…` ends no wait already out: the request
+    /// runs on, its answer still counts, and its timeout still bounds it.
+    func test_lifecycle_clearOrReplace_keepsPendingWait() async throws {
+        let hybrid = HybridSyncProvider(engine: engine)
+        let owner = hybrid.callbackOwner
+        let gateway = engine.gateway
+        _ = try hybrid.setHeaderResolver { _, _ in }
+        _ = try hybrid.setBeforeDispatch { _, _ in }
+        let beforeIds = Recorder<String>()
+        let resolverAsked = expectation(description: "the resolver was called")
+        let beforeAsked = expectation(description: "beforeDispatch was called")
+        let resolverWait = Task {
+            await gateway.requestHeaders(owner: owner, timeoutMs: 3_000) { _ in resolverAsked.fulfill() }
+        }
+        let beforeWait = Task {
+            await gateway.requestBeforeDispatch(owner: owner, timeoutMs: 3_000) { requestId in
+                beforeIds.record(requestId)
+                beforeAsked.fulfill()
+            }
+        }
+        await fulfillment(of: [resolverAsked, beforeAsked], timeout: livenessTimeout)
+
+        _ = try hybrid.clearHeaderResolver()
+        _ = try hybrid.setBeforeDispatch { _, _ in }
+
+        XCTAssertEqual(gateway.pendingCount, 2, "Neither wait ended")
+        gateway.answer(try XCTUnwrap(beforeIds.values.first), .before(.skip))
+        let before = await beforeWait.value
+        XCTAssertEqual(before, .answered(.skip), "The replaced hook's answer still counts")
+        fixture.callbackTimer.fireAll()
+        let resolver = await resolverWait.value
+        XCTAssertEqual(resolver, .skipped(.timedOut(afterMs: 3_000)), "The cleared resolver's wait ends at its timeout")
+        XCTAssertEqual(gateway.pendingCount, 0)
+        withExtendedLifetime(hybrid) {}
+    }
+
     // MARK: - Answers
 
     func test_decider_unknownId_noop() async throws {

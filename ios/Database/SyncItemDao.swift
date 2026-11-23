@@ -305,6 +305,14 @@ final class SyncItemDao {
         }
     }
 
+    /// `true` while the queue row `id` is `PENDING`: neither purged nor
+    /// claimed. A read: the claim that follows it is the check that holds.
+    func isPending(id: String) async throws -> Bool {
+        try await stack.performBackgroundTask { context in
+            try Self.fetchEntity(id: id, in: context)?.status == SyncItemStatus.pending.rawValue
+        }
+    }
+
     // MARK: - Updates
 
     /// Claims an item for dispatch and counts the attempt. Counting here, before
@@ -530,6 +538,28 @@ final class SyncItemDao {
             if let lastAttemptAt {
                 entity.lastAttemptAt = lastAttemptAt
             }
+        }
+    }
+
+    /// Defers a queued item that the header resolver or `beforeDispatch`
+    /// stopped before its claim: it stays `PENDING`, with `errorCode` as its
+    /// `lastErrorCode`, and waits `delayMs` from now. `attempts` and
+    /// `lastAttemptAt` are left alone: no request went out, so no attempt was
+    /// made.
+    ///
+    /// Runs one at a time with the purges and the claim (see
+    /// ``CoreDataStack/performSerializedTask(_:)``). A row purged during the
+    /// wait, a logout say, or no longer `PENDING`, is left alone.
+    ///
+    /// - Returns: the new `nextRetryAt`, or `nil` when nothing was written.
+    func deferPending(id: String, errorCode: String, delayMs: Int) async throws -> Int64? {
+        try await stack.performSerializedTask { [clock] context in
+            guard let entity = try Self.fetchEntity(id: id, in: context),
+                  entity.status == SyncItemStatus.pending.rawValue else { return nil }
+            let deferredUntil = RetryPolicyEvaluator.deadline(fromMs: clock.nowMs(), delayMs: delayMs)
+            entity.lastErrorCode = errorCode
+            entity.nextRetryAt = deferredUntil
+            return deferredUntil
         }
     }
 

@@ -272,4 +272,72 @@ final class SyncQueueStorageTests: XCTestCase {
         let letters = try await storage.getDeadLetters()
         XCTAssertTrue(letters.isEmpty)
     }
+
+    // MARK: - An interceptor's deferral
+
+    /// A deferral writes the code and the wait, counted from its own write,
+    /// and leaves the attempts and the last attempt's time as they were: no
+    /// request went out.
+    func test_deferPending_writesTheCodeAndTheWait_andKeepsTheAttempt() async throws {
+        let clock = ManualClock()
+        let storage = SyncQueueStorage(dao: SyncItemDao(stack: stack, clock: clock), capacity: 5)
+        let id = try await storage.enqueue(input: makeInput())
+        try await storage.markInFlight(id: id)
+        let attemptedAt = clock.nowMs()
+        try await storage.markPendingForRetry(id: id, errorCode: "SERVER_ERROR", retryDelayMs: 100)
+        clock.advance(ms: 5_000)
+
+        let deferredUntil = try await storage.deferPending(id: id, errorCode: "INTERCEPTOR_FAILED", delayMs: 60_000)
+
+        XCTAssertEqual(deferredUntil, clock.nowMs() + 60_000)
+        let queue = try await storage.getAll()
+        let row = try XCTUnwrap(queue.first)
+        XCTAssertEqual(row.status, "PENDING")
+        XCTAssertEqual(row.attempts, 1, "Not counted")
+        XCTAssertEqual(row.lastAttemptAt, attemptedAt, "No request went out")
+        XCTAssertEqual(row.lastErrorCode, "INTERCEPTOR_FAILED")
+        XCTAssertEqual(row.nextRetryAt, deferredUntil)
+    }
+
+    /// Only a `PENDING` row is deferred: a row purged during the wait stays
+    /// gone, and a claimed row or a dead letter is left alone.
+    func test_deferPending_leavesAnyRowThatIsNotPendingAlone() async throws {
+        let purged = try await storage.enqueue(input: makeInput(url: "https://example.com/purged"))
+        try await storage.remove(id: purged)
+        let claimed = try await storage.enqueue(input: makeInput(url: "https://example.com/claimed"))
+        try await storage.markInFlight(id: claimed)
+        let before = try await storage.getAll().first { $0.id == claimed }
+        let lettered = try await storage.enqueue(input: makeInput(url: "https://example.com/lettered"))
+        try await storage.moveToDeadLetters(id: lettered, errorCode: "SERVER_ERROR", errorMessage: "HTTP 404")
+
+        let deferredPurged = try await storage.deferPending(id: purged, errorCode: "INTERCEPTOR_FAILED", delayMs: 60_000)
+        let deferredClaimed = try await storage.deferPending(id: claimed, errorCode: "INTERCEPTOR_FAILED", delayMs: 60_000)
+        let deferredLetter = try await storage.deferPending(id: lettered, errorCode: "INTERCEPTOR_FAILED", delayMs: 60_000)
+
+        XCTAssertNil(deferredPurged)
+        XCTAssertNil(deferredClaimed)
+        XCTAssertNil(deferredLetter)
+        let queue = try await storage.getAll()
+        XCTAssertEqual(queue.map(\.id), [claimed], "Nothing is brought back")
+        XCTAssertEqual(queue.first, before, "The claimed row is untouched")
+        let letters = try await storage.getDeadLetters()
+        XCTAssertEqual(letters.map(\.id), [lettered])
+        XCTAssertEqual(letters.first?.lastErrorCode, "SERVER_ERROR")
+    }
+
+    func test_isPending_onlyForAQueuedRowNotClaimed() async throws {
+        let pending = try await storage.enqueue(input: makeInput(url: "https://example.com/pending"))
+        let claimed = try await storage.enqueue(input: makeInput(url: "https://example.com/claimed"))
+        try await storage.markInFlight(id: claimed)
+        let purged = try await storage.enqueue(input: makeInput(url: "https://example.com/purged"))
+        try await storage.remove(id: purged)
+
+        let isPending = try await storage.isPending(id: pending)
+        let isClaimedPending = try await storage.isPending(id: claimed)
+        let isPurgedPending = try await storage.isPending(id: purged)
+
+        XCTAssertTrue(isPending)
+        XCTAssertFalse(isClaimedPending)
+        XCTAssertFalse(isPurgedPending)
+    }
 }

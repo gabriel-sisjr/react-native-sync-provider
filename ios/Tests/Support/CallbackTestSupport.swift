@@ -123,11 +123,52 @@ final class FakeDecider: @unchecked Sendable {
         self.init(registry: registry, gateway: gateway, owner: registry.attach(), reply: reply)
     }
 
-    private init(registry: CallbackRegistry, gateway: CallbackGateway, owner: UInt64, reply: @escaping Reply) {
+    /// Installed under `owner`, which must be `registry`'s current owner: a
+    /// test that installs several callbacks attaches once and installs them
+    /// all under that owner, since each attach evicts the older installs.
+    init(registry: CallbackRegistry, gateway: CallbackGateway, owner: UInt64, reply: @escaping Reply) {
         self.owner = owner
         let requests = self.requests
         let requestIds = self.requestIds
         installed = registry.setRetryDecider(CallbackInstall(owner: owner) { requestId, request in
+            requestIds.record(requestId)
+            requests.record(request)
+            if let answer = reply(requestId, request) {
+                gateway.answer(requestId, answer)
+            }
+        })
+    }
+}
+
+/// A header resolver, `beforeDispatch` or `afterDispatch`, installed straight
+/// into a registry under `owner` as a hybrid installs one, through `install`:
+/// `registry.setHeaderResolver`, say. Like ``FakeDecider``, it records each
+/// request, then answers with what `reply` returns, through the gateway; `nil`
+/// sends no answer. `reply` runs on the thread that asks, before the wait.
+///
+/// Nothing here hops to the main queue: the hybrid's `afterDispatch` install
+/// does, so a test of that ordering installs through the hybrid instead.
+final class FakeCallback<Request: Sendable>: @unchecked Sendable {
+    typealias Reply = @Sendable (_ requestId: String, _ request: Request) -> CallbackReply?
+
+    let requests = Recorder<Request>()
+    let requestIds = Recorder<String>()
+    let owner: UInt64
+    /// `false` when the registry refused the install.
+    private(set) var installed = false
+
+    var callCount: Int {
+        requests.values.count
+    }
+
+    init(owner: UInt64,
+         gateway: CallbackGateway,
+         install: (CallbackInstall<Request>) -> Bool,
+         reply: @escaping Reply) {
+        self.owner = owner
+        let requests = self.requests
+        let requestIds = self.requestIds
+        installed = install(CallbackInstall(owner: owner) { requestId, request in
             requestIds.record(requestId)
             requests.record(request)
             if let answer = reply(requestId, request) {

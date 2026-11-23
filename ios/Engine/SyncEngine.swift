@@ -169,7 +169,8 @@ final class SyncEngine: @unchecked Sendable {
                                         backgroundSession: sessions.background,
                                         paused: loaded.paused,
                                         callbacks: callbacks,
-                                        gateway: gateway)
+                                        gateway: gateway,
+                                        clock: clock)
         } else {
             dispatcher = SyncDispatcher(storage: storage,
                                         emitter: emitter,
@@ -177,7 +178,8 @@ final class SyncEngine: @unchecked Sendable {
                                         config: config,
                                         paused: loaded.paused,
                                         callbacks: callbacks,
-                                        gateway: gateway)
+                                        gateway: gateway,
+                                        clock: clock)
         }
 
         self.clock = clock

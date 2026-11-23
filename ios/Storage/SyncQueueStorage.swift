@@ -184,6 +184,19 @@ actor SyncQueueStorage {
         try await dao.releaseClaim(id: id, attempts: attempts, lastAttemptAt: lastAttemptAt)
     }
 
+    /// `true` while the queue row `id` is `PENDING`. See ``SyncItemDao/isPending(id:)``.
+    func isPending(id: String) async throws -> Bool {
+        try await dao.isPending(id: id)
+    }
+
+    /// Defer a queued item an interceptor stopped before its claim, keeping
+    /// its attempts. See ``SyncItemDao/deferPending(id:errorCode:delayMs:)``.
+    /// - Returns: the new `nextRetryAt`, or `nil` when the row is gone or not
+    ///   `PENDING`.
+    func deferPending(id: String, errorCode: String, delayMs: Int) async throws -> Int64? {
+        try await dao.deferPending(id: id, errorCode: errorCode, delayMs: delayMs)
+    }
+
     /// Write the outcome of a claimed row whose own write failed, only while
     /// the row is still in flight. See ``SyncItemDao/settleClaim(id:_:)``.
     func settleClaim(id: String, _ settlement: ClaimSettlement) async throws -> SettledClaim {

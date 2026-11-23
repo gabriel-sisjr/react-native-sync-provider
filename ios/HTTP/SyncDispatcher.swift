@@ -28,6 +28,15 @@ let kMinCredentialHoldMs = 60_000
 /// of its `ITEM_DEAD_LETTERED`.
 let kRetryDeciderRejectedCode = "RETRY_DECIDER_REJECTED"
 
+/// The code of an item the header resolver or `beforeDispatch` deferred: on
+/// its `ITEM_RETRYING`, and as its row's `lastErrorCode`.
+let kInterceptorFailedCode = "INTERCEPTOR_FAILED"
+
+/// The least an item an interceptor deferred waits: `attempts` does not
+/// advance on a deferral, so backoff alone would stay at its first value. The
+/// credential hold's floor, for the same reason.
+let kMinInterceptorDeferMs = kMinCredentialHoldMs
+
 /// How long a flush behind a network-quality gate waits for the process's
 /// first path update. A BGTask launch flushes before it has one, and judging
 /// that unknown path would gate it as offline.
@@ -83,6 +92,9 @@ struct ItemDispatchOutcome: Sendable {
     /// cycle that dies before such an outcome is written gives the row back
     /// as it was before its claim.
     var requestSent = true
+    /// The request's own duration, in whole milliseconds, from the moment
+    /// `URLSession` had it to its answer: no wait for a JS callback counts.
+    var durationMs: Int64 = 0
 }
 
 /// What ``SyncDispatcher/recordFailureOutcome(item:outcome:sentWith:)`` decided to do
@@ -231,6 +243,8 @@ actor SyncDispatcher {
     private let callbacks: CallbackRegistry
     /// Where a cycle waits for the answers of those callbacks.
     private let gateway: CallbackGateway
+    /// Times each request, for `afterDispatch`.
+    private let clock: SyncClock
 
     /// See ``DispatcherHooks``.
     nonisolated let hooks = DispatcherHooks()
@@ -251,7 +265,8 @@ actor SyncDispatcher {
          config: DispatcherConfig = .default,
          paused: Bool = false,
          callbacks: CallbackRegistry = CallbackRegistry(),
-         gateway: CallbackGateway = CallbackGateway()) {
+         gateway: CallbackGateway = CallbackGateway(),
+         clock: SyncClock = SystemClock()) {
         self.storage = storage
         self.emitter = emitter
         self.connectivity = connectivity
@@ -260,6 +275,7 @@ actor SyncDispatcher {
         self.isAppActive = Self.applicationIsActive
         self.callbacks = callbacks
         self.gateway = gateway
+        self.clock = clock
 
         let foreground = URLSessionConfiguration.default
         foreground.timeoutIntervalForRequest = TimeInterval(config.requestTimeoutMs) / 1000.0
@@ -296,7 +312,8 @@ actor SyncDispatcher {
                   paused: Bool = false,
                   isAppActive: (@Sendable () async -> Bool)? = nil,
                   callbacks: CallbackRegistry = CallbackRegistry(),
-                  gateway: CallbackGateway = CallbackGateway()) {
+                  gateway: CallbackGateway = CallbackGateway(),
+                  clock: SyncClock = SystemClock()) {
         self.storage = storage
         self.emitter = emitter
         self.connectivity = connectivity
@@ -308,6 +325,7 @@ actor SyncDispatcher {
         self.isAppActive = isAppActive ?? Self.applicationIsActive
         self.callbacks = callbacks
         self.gateway = gateway
+        self.clock = clock
     }
 
     // MARK: - Configuration
@@ -376,7 +394,10 @@ actor SyncDispatcher {
     /// `errorCode` or `metadata`: nothing failed, and no history row is kept.
     /// A response that arrived before the cancellation is recorded as usual,
     /// and a cancellation while the retry decider is asked about it ends that
-    /// wait at once: the retry policy's verdict is recorded.
+    /// wait at once: the retry policy's verdict is recorded. A cancellation
+    /// while the header resolver or `beforeDispatch` is asked sends nothing
+    /// and fails nothing: they run before the claim, so the row stays exactly
+    /// as it was, with no event of its own.
     /// A `CancellationError` thrown while the caller's task is not cancelled,
     /// by a callee say, also ends the cycle with `SYNC_FAILED` without a code,
     /// but counts as a cycle that died for the wait after it.
@@ -553,8 +574,44 @@ actor SyncDispatcher {
                 continue
             }
 
-            // A purge since the batch was read, a logout say, leaves this item
-            // nothing to send: no request and no event of its own.
+            // The header resolver and `beforeDispatch`, when one is installed,
+            // run before the claim. An item they defer was never claimed, so
+            // nothing is given back, and an app killed while they are asked
+            // has spent no attempt. With neither installed, nothing here runs.
+            var resolvedHeaders: [String: String]?
+            var interceptedWith: DispatcherConfig?
+            if callbacks.hasInterceptors, Self.dispatchURL(for: item) != nil {
+                // Purged since the batch was read: nothing to ask about.
+                guard try await storage.isPending(id: item.id) else {
+                    emitProgress(index: index, total: total)
+                    continue
+                }
+                switch await runInterceptors(item: item) {
+                case let .proceed(headers, snapshot):
+                    resolvedHeaders = headers
+                    interceptedWith = snapshot
+                case let .deferred(kind, skip):
+                    emitProgress(index: index, total: total)
+                    try await deferItem(item, by: kind, skip: skip)
+                    continue
+                case let .stopped(kind):
+                    // Cancelled while JS was asked, a BGTask that expired say:
+                    // no failure. Nothing was claimed or sent, the row stays
+                    // as it was, and no event is emitted for it.
+                    CallbackGateway.log("\(Self.interceptorName(kind)) was not answered for \(item.id): "
+                                        + "\(CallbackSkip.cancelled). Nothing was sent.",
+                                        for: .cancelled)
+                    throw CancellationError()
+                }
+                // As at the top of the loop: either can land during the waits.
+                try Task.checkCancellation()
+                if isPaused { break dispatchLoop }
+            }
+
+            // The claim is the last check that the row is still queued: a
+            // purge since the batch was read, or while an interceptor was
+            // asked, a logout say, leaves this item nothing to send, and no
+            // event of its own.
             guard try await storage.markInFlight(id: item.id) else {
                 emitProgress(index: index, total: total)
                 continue
@@ -563,9 +620,11 @@ actor SyncDispatcher {
 
             // `configureSync` can land while the request is out. Its answer is
             // about the credential it carried, not the one configured since.
-            let sentWith = config
+            // With interceptors, that is the configuration they merged and
+            // showed `beforeDispatch`.
+            let sentWith = interceptedWith ?? config
             let outcome: ItemDispatchOutcome
-            switch await dispatchOne(item: item) {
+            switch await dispatchOne(item: item, sentWith: sentWith, resolvedHeaders: resolvedHeaders) {
             case let .answered(answered):
                 outcome = answered
             case let .cancelled(requestSent):
@@ -599,34 +658,42 @@ actor SyncDispatcher {
                 verdict = .failed(await decideFailure(item: item, outcome: outcome, sentWith: sentWith))
             }
 
+            let disposition: FailureDisposition?
             do {
                 switch verdict {
                 case .delivered:
                     succeededIds.append(item.id)
                     try await storage.remove(id: item.id)
                     emitSucceeded(item: item, outcome: outcome)
+                    disposition = nil
                 case let .failed(decision):
                     // Persists the cooldown, the hold, the dead letter or the
                     // drop, and emits the events.
-                    switch try await recordFailureOutcome(item: item, outcome: outcome, decision: decision) {
-                    case .retrying:
-                        break // kept PENDING with a cooldown; not counted as failed
-                    case let .failed(_, message):
-                        failedIds.append(item.id)
-                        if firstError == nil {
-                            firstError = message
-                        }
-                    case let .credentialRejected(heldUntil):
-                        // The next item would carry the same rejected credential.
-                        credentialHeldUntil = heldUntil
-                        break dispatchLoop
-                    }
+                    disposition = try await recordFailureOutcome(item: item, outcome: outcome, decision: decision)
                 }
             } catch {
                 // The outcome could not be written, and the cycle dies with
                 // `error`. Its row must not wait IN_FLIGHT for the next launch.
                 await settleUnrecorded(item: item, outcome: outcome, verdict: verdict)
                 throw error
+            }
+
+            // Once the outcome is written and its event emitted, before the
+            // cycle can stop on a held credential.
+            notifyAfterDispatch(item: item, outcome: outcome, verdict: verdict)
+
+            switch disposition {
+            case nil, .retrying?:
+                break // delivered, or kept PENDING with a cooldown; not counted as failed
+            case let .failed(_, message)?:
+                failedIds.append(item.id)
+                if firstError == nil {
+                    firstError = message
+                }
+            case let .credentialRejected(heldUntil)?:
+                // The next item would carry the same rejected credential.
+                credentialHeldUntil = heldUntil
+                break dispatchLoop
             }
         }
 
@@ -1029,9 +1096,186 @@ actor SyncDispatcher {
         return true
     }
 
+    // MARK: - Interceptors
+
+    /// What the header resolver and `beforeDispatch` came to for one item.
+    private enum InterceptorVerdict {
+        /// Send the request, with the headers the resolver supplied and the
+        /// configuration they were merged against.
+        case proceed(resolvedHeaders: [String: String]?, sentWith: DispatcherConfig)
+        /// Send nothing this cycle. `skip` is why `kind` gave nothing to use;
+        /// `nil` when `beforeDispatch` answered SKIP.
+        case deferred(kind: CallbackKind, skip: CallbackSkip?)
+        /// The cycle was cancelled while `kind` was asked: send nothing.
+        case stopped(kind: CallbackKind)
+    }
+
+    /// How the log names an interceptor.
+    private static func interceptorName(_ kind: CallbackKind) -> String {
+        kind == .headerResolver ? "The header resolver" : "beforeDispatch"
+    }
+
+    /// Asks the header resolver, then `beforeDispatch`, about the attempt
+    /// `item` is about to make, as installed. A resolver that fails defers the
+    /// item, and `beforeDispatch` is then not asked.
+    ///
+    /// The configuration read after the resolver's wait is the one the
+    /// headers are merged against, that `beforeDispatch` sees, and that the
+    /// request is built from and judged by: a `configureSync` during the
+    /// hook's wait applies from the next item. Resolver-supplied credentials
+    /// do not change the credential policy, which looks at `defaultHeaders`.
+    ///
+    /// Anything from JS that is not a usable answer defers the item, as when
+    /// no answer comes: a FAILED answer, an answer of another kind, a header
+    /// HTTP does not allow, no answer within `callbackTimeoutMs`, or the
+    /// installing hybrid going away. Only a cancellation does not: it sends
+    /// nothing and leaves the row as it was.
+    private func runInterceptors(item: StoredSyncItem) async -> InterceptorVerdict {
+        let attempt = item.attempts + 1
+        var resolved: [String: String]?
+        if let resolver = callbacks.headerResolver {
+            let request = HeaderResolverRequest(itemId: item.id,
+                                                attempt: attempt,
+                                                url: item.url,
+                                                method: item.method,
+                                                metadata: item.metadata)
+            let answer = await gateway.requestHeaders(owner: resolver.owner,
+                                                      timeoutMs: config.callbackTimeoutMs) { requestId in
+                resolver.invoke(requestId, request)
+            }
+            switch answer {
+            case let .answered(headers):
+                resolved = headers
+            case .skipped(.cancelled):
+                return .stopped(kind: .headerResolver)
+            case let .skipped(skip):
+                return .deferred(kind: .headerResolver, skip: skip)
+            }
+        }
+        let snapshot = config
+        if let before = callbacks.beforeDispatch {
+            let request = BeforeDispatchRequest(itemId: item.id,
+                                                attempt: attempt,
+                                                url: item.url,
+                                                method: item.method,
+                                                headers: HeaderMerge.merge(snapshot.defaultHeaders, resolved, item.headers),
+                                                contentType: item.contentType,
+                                                metadata: item.metadata)
+            let answer = await gateway.requestBeforeDispatch(owner: before.owner,
+                                                             timeoutMs: snapshot.callbackTimeoutMs) { requestId in
+                before.invoke(requestId, request)
+            }
+            switch answer {
+            case .answered(.proceed):
+                break
+            case .answered(.skip):
+                return .deferred(kind: .beforeDispatch, skip: nil)
+            case .skipped(.cancelled):
+                return .stopped(kind: .beforeDispatch)
+            case let .skipped(skip):
+                return .deferred(kind: .beforeDispatch, skip: skip)
+            }
+        }
+        return .proceed(resolvedHeaders: resolved, sentWith: snapshot)
+    }
+
+    /// Defers an item an interceptor stopped before its claim. Nothing is
+    /// sent, so the row stays `PENDING` with its attempts and `lastAttemptAt`:
+    /// no attempt was made. It waits the longer of the would-be attempt's
+    /// backoff and ``kMinInterceptorDeferMs``, with `INTERCEPTOR_FAILED` as
+    /// its code, and `ITEM_RETRYING` reports it with that code, no status and
+    /// the would-be attempt. Only this item waits: the cycle goes on, and no
+    /// hold is set. A row purged during the wait stays gone, with no event.
+    /// When the write fails, the cycle dies and the row stays as it was: the
+    /// cooldown and the code are lost for this cycle only.
+    ///
+    /// One log line says why: a warning when the interceptor failed or never
+    /// answered, info when its hybrid went away or `beforeDispatch` answered
+    /// SKIP.
+    private func deferItem(_ item: StoredSyncItem, by kind: CallbackKind, skip: CallbackSkip?) async throws {
+        let attempt = item.attempts + 1
+        let delayMs = max(RetryPolicyEvaluator.nextDelayMs(attempt: Int(attempt), policy: config.retryPolicy),
+                          kMinInterceptorDeferMs)
+        let report = { (consequence: String) in
+            if let skip {
+                CallbackGateway.log("\(Self.interceptorName(kind)) gave nothing to use for \(item.id): \(skip). "
+                                    + "Nothing was sent. \(consequence)",
+                                    for: skip)
+            } else {
+                SyncLogger.info("beforeDispatch answered SKIP for \(item.id). Nothing was sent. \(consequence)",
+                                category: "callbacks")
+            }
+        }
+        let deferredUntil: Int64?
+        do {
+            deferredUntil = try await storage.deferPending(id: item.id,
+                                                           errorCode: kInterceptorFailedCode,
+                                                           delayMs: delayMs)
+        } catch {
+            report("The deferral could not be written: \(error.localizedDescription)")
+            throw error
+        }
+        guard let deferredUntil else {
+            report("It was removed meanwhile: nothing to defer.")
+            return
+        }
+        report("Deferred until \(deferredUntil).")
+        emitter.emit(.now(type: "ITEM_RETRYING",
+                          itemId: item.id,
+                          errorCode: kInterceptorFailedCode,
+                          attempt: Double(attempt)))
+    }
+
+    /// Calls `afterDispatch`, when installed, for a request that went out,
+    /// once its outcome is written and its event emitted. Nothing waits for
+    /// it, and nothing it answers changes anything: a FAILED answer, or none
+    /// within `callbackTimeoutMs`, is only logged. It is told the attempt,
+    /// how the request ended (`RETRYING` for a retry or a credential hold,
+    /// `FAILED` for a dead letter or a drop, with its code), the status, the
+    /// request's own duration, and the item's URL, method and metadata;
+    /// never its headers or its body.
+    private func notifyAfterDispatch(item: StoredSyncItem, outcome: ItemDispatchOutcome, verdict: ItemVerdict) {
+        guard outcome.requestSent, let hook = callbacks.afterDispatch else { return }
+        let kind: DispatchOutcomeKind
+        let errorCode: String?
+        switch verdict {
+        case .delivered:
+            kind = .succeeded
+            errorCode = nil
+        case .failed(.retry), .failed(.credentialHold):
+            kind = .retrying
+            errorCode = outcome.errorCode
+        case let .failed(.deadLetter(code, _)):
+            kind = .failed
+            errorCode = code
+        case .failed(.drop):
+            kind = .failed
+            errorCode = kRetryDeciderRejectedCode
+        }
+        let report = AfterDispatchReport(itemId: item.id,
+                                         attempt: item.attempts + 1,
+                                         outcome: kind,
+                                         statusCode: outcome.statusCode,
+                                         errorCode: errorCode,
+                                         url: item.url,
+                                         method: item.method,
+                                         metadata: item.metadata,
+                                         durationMs: outcome.durationMs)
+        gateway.notifyAfterDispatch(owner: hook.owner, timeoutMs: config.callbackTimeoutMs) { requestId in
+            hook.invoke(requestId, report)
+        }
+    }
+
     // MARK: - Single-item dispatch
 
-    /// What one ``dispatchOne(item:)`` came to.
+    /// The URL `item` goes to, or `nil` when it is not http(s): such an item
+    /// is never sent, and no interceptor is asked about it.
+    private static func dispatchURL(for item: StoredSyncItem) -> URL? {
+        guard let url = URL(string: item.url), url.scheme?.hasPrefix("http") == true else { return nil }
+        return url
+    }
+
+    /// What one ``dispatchOne(item:sentWith:resolvedHeaders:)`` came to.
     private enum DispatchResult {
         /// The outcome to record: an answer, a transport error, or a request
         /// that could not be sent (see ``ItemDispatchOutcome/requestSent``).
@@ -1041,8 +1285,19 @@ actor SyncDispatcher {
         case cancelled(requestSent: Bool)
     }
 
-    private func dispatchOne(item: StoredSyncItem) async -> DispatchResult {
-        guard let url = URL(string: item.url), url.scheme?.hasPrefix("http") == true else {
+    /// Sends `item` once. The request is built from `sentWith` alone, never
+    /// from `config`, which can change during the awaits around it: its
+    /// timeout, and its headers, ``HeaderMerge/merge(_:)`` of
+    /// `sentWith.defaultHeaders`, `resolvedHeaders` and the item's own, plus
+    /// the item's `contentType` when no layer sets a `Content-Type`.
+    ///
+    /// A background upload carries the headers its task was created with. One
+    /// the OS finishes after a relaunch keeps them, and gets no
+    /// `afterDispatch`: no JS is there to tell.
+    private func dispatchOne(item: StoredSyncItem,
+                             sentWith: DispatcherConfig,
+                             resolvedHeaders: [String: String]?) async -> DispatchResult {
+        guard let url = Self.dispatchURL(for: item) else {
             return .answered(ItemDispatchOutcome(itemId: item.id,
                                                  succeeded: false,
                                                  statusCode: nil,
@@ -1054,16 +1309,12 @@ actor SyncDispatcher {
         var request = URLRequest(url: url)
         request.httpMethod = item.method
         request.cachePolicy = .reloadIgnoringLocalCacheData
-        request.timeoutInterval = TimeInterval(config.requestTimeoutMs) / 1000.0
+        request.timeoutInterval = TimeInterval(sentWith.requestTimeoutMs) / 1000.0
 
-        // Default headers first, item headers can override.
-        for (key, value) in config.defaultHeaders {
-            request.setValue(value, forHTTPHeaderField: key)
-        }
-        if let headers = item.headers {
-            for (key, value) in headers {
-                request.setValue(value, forHTTPHeaderField: key)
-            }
+        // `defaultHeaders`, then the resolver's, then the item's: a later
+        // layer wins, whatever the case of the name.
+        for (name, value) in HeaderMerge.merge(sentWith.defaultHeaders, resolvedHeaders, item.headers) {
+            request.setValue(value, forHTTPHeaderField: name)
         }
         if let contentType = item.contentType,
            request.value(forHTTPHeaderField: "Content-Type") == nil {
@@ -1089,17 +1340,28 @@ actor SyncDispatcher {
             requestCopy.httpBody = body
         }
 
+        let startedAt = clock.nowMs()
         do {
             let (_, response) = try await foregroundSession.data(for: requestCopy)
             let statusCode = (response as? HTTPURLResponse)?.statusCode
-            return .answered(classifyResponse(itemId: item.id, statusCode: statusCode, transportError: nil))
+            var outcome = classifyResponse(itemId: item.id, statusCode: statusCode, transportError: nil)
+            outcome.durationMs = elapsedMs(since: startedAt)
+            return .answered(outcome)
         } catch {
             // Cancelling the caller cancels the request: that is no answer,
             // and must not spend an attempt as a NETWORK_ERROR. URLSession had
             // the request, which may have reached the server.
             if Task.isCancelled { return .cancelled(requestSent: true) }
-            return .answered(classifyResponse(itemId: item.id, statusCode: nil, transportError: error))
+            var outcome = classifyResponse(itemId: item.id, statusCode: nil, transportError: error)
+            outcome.durationMs = elapsedMs(since: startedAt)
+            return .answered(outcome)
         }
+    }
+
+    /// Whole milliseconds on `clock` since `startedAt`, never below 0: a wall
+    /// clock can step back.
+    private func elapsedMs(since startedAt: Int64) -> Int64 {
+        max(0, clock.nowMs() - startedAt)
     }
 
     private func dispatchOnBackground(request: URLRequest,
@@ -1123,6 +1385,7 @@ actor SyncDispatcher {
         // The wait ends once, at the session's completion or at a
         // cancellation of the caller, whichever comes first. A cancellation
         // also cancels the upload: its completion, when it comes, is dropped.
+        let startedAt = clock.nowMs()
         let completed = await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<BackgroundDispatchOutcome?, Never>) in
                 guard wait.install(continuation) else { return }
@@ -1135,15 +1398,18 @@ actor SyncDispatcher {
             wait.cancel()
             task.cancel()
         }
+        let durationMs = elapsedMs(since: startedAt)
         backgroundDelegate.unregisterCompletion(for: task)
         // Best-effort cleanup of the body file.
         try? FileManager.default.removeItem(at: tmpURL)
 
         // A wait the cancellation ended first never started its upload.
         guard let completed else { return .cancelled(requestSent: wait.started) }
-        return .answered(classifyResponseSync(itemId: completed.itemId,
-                                              statusCode: completed.statusCode,
-                                              transportError: completed.error))
+        var outcome = classifyResponseSync(itemId: completed.itemId,
+                                           statusCode: completed.statusCode,
+                                           transportError: completed.error)
+        outcome.durationMs = durationMs
+        return .answered(outcome)
     }
 
     /// `true` when an upload must survive the app leaving the foreground. A
