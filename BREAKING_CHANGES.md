@@ -45,13 +45,13 @@ One-paragraph overview: what changed, why, and the blast radius (compile-time on
 
 Use the table at the bottom of each entry to enumerate every renamed, removed, or reshaped public symbol so consumers can grep for what they import.
 
-## [Unreleased] - Two new `SyncErrorCode` members for the opt-in retry decider and dispatch interceptors
+## [v0.4.0] - 2026-11-24 - Two new `SyncErrorCode` members for the opt-in retry decider and dispatch interceptors
 
 > **Upgrade path:** v0.3.z --> v0.4.0
 >
 > **Full migration guide:** [`docs/migration/v0-4-0`](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/migration/v0-4-0)
 >
-> **Changelog:** see the [`[Unreleased]` entries in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+> **Changelog:** see the [`[0.4.0]` entries in `CHANGELOG.md`](./CHANGELOG.md#040---2026-11-24).
 
 No function, hook, type or error code was removed, and the retry decider and the dispatch interceptors are opt-in. With nothing installed, dispatch, retries, events and I/O behave as in 0.3.1, so there is no runtime break. The blast radius is one compile-time change: `SyncErrorCode` gains two members.
 
@@ -59,7 +59,7 @@ No function, hook, type or error code was removed, and the retry decider and the
 
 > **Category:** compile-time change (**not** a runtime behavior change). Pre-1.0.
 >
-> **Changelog:** see the [`[Unreleased]` Added and Changed entries in `CHANGELOG.md`](./CHANGELOG.md#unreleased).
+> **Changelog:** see the [`[0.4.0]` Added and Changed entries in `CHANGELOG.md`](./CHANGELOG.md#040---2026-11-24).
 
 `SyncErrorCode` grows from 15 to 17 members. An exhaustive `switch` that ends in a `never` check stops compiling until it handles them, and so does an object typed `Record<SyncErrorCode, …>`. Code that compares against a few codes, or that has a `default` branch without a `never` check, compiles as before.
 

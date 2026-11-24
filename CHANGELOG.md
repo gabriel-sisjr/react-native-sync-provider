@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 > **Pre-1.0 notice:** while the library is on `0.x`, minor version bumps (`0.x.0`) may include breaking changes. Every breaking change is summarized in [`BREAKING_CHANGES.md`](./BREAKING_CHANGES.md) and ships with a dedicated migration guide under `website/docs/migration/`.
 
-## [Unreleased]
+## [0.4.0] - 2026-11-24
 
 <!-- v0.4 entries: start -->
 
