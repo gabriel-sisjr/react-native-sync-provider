@@ -19,11 +19,15 @@ function isNonNegativeFinite(value: unknown): boolean {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0;
 }
 
+function isFiniteAtLeastOne(value: unknown): boolean {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 1;
+}
+
 /**
  * Collect every violation in the {@link SyncOptions} fields the facade checks,
- * in field order. Only the network-quality and health-check options are
- * checked, and only when present: the other fields are left to native, as
- * before these options existed.
+ * in field order. Only the network-quality, health-check and callback-timeout
+ * options are checked, and only when present: the other fields are left to
+ * native, as before these options existed.
  *
  * `value` is recorded for every field except `healthCheckUrl`, which can carry
  * a token in its query string.
@@ -79,11 +83,25 @@ function collectSyncOptionsIssues(options: SyncOptions): CollectedIssue[] {
     }
   }
 
+  const { callbackTimeoutMs } = options;
+  if (
+    callbackTimeoutMs !== undefined &&
+    !isFiniteAtLeastOne(callbackTimeoutMs)
+  ) {
+    issues.push({
+      code: SyncErrorCode.INVALID_PAYLOAD,
+      field: 'callbackTimeoutMs',
+      reason:
+        'SyncOptions.callbackTimeoutMs must be a finite number of at least 1.',
+      value: callbackTimeoutMs,
+    });
+  }
+
   return issues;
 }
 
 /**
- * Validate the network-quality and health-check fields of a
+ * Validate the network-quality, health-check and callback-timeout fields of a
  * {@link SyncOptions} before it crosses the JS↔native bridge.
  *
  * - `minNetworkQuality`, when present, must be one of {@link NetworkQuality}.
@@ -91,6 +109,8 @@ function collectSyncOptionsIssues(options: SyncOptions): CollectedIssue[] {
  *   `https://` URL, the same check item URLs pass.
  * - `healthCheckTtlMs` / `healthCheckBackoffMs`, when present, must be finite
  *   numbers of at least `0`.
+ * - `callbackTimeoutMs`, when present, must be a finite number of at least
+ *   `1`. Fractions are allowed: native truncates them.
  *
  * Throws on the first violation, carrying every one in
  * {@link SyncError.validationErrors}.

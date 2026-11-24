@@ -46,6 +46,7 @@ describe('validateSyncOptions — accepted options', () => {
         healthCheckUrl: undefined,
         healthCheckTtlMs: undefined,
         healthCheckBackoffMs: undefined,
+        callbackTimeoutMs: undefined,
       })
     ).toBeUndefined();
   });
@@ -179,10 +180,42 @@ describe.each(['healthCheckTtlMs', 'healthCheckBackoffMs'] as const)(
   }
 );
 
+describe('validateSyncOptions — callbackTimeoutMs', () => {
+  it.each([1, 1.5, 3_000, 3_000.7, 2_147_483_647, 2_147_483_648])(
+    'accepts %p, leaving truncation and the cap to native',
+    (ms) => {
+      expect(thrownBy({ ...BASE, callbackTimeoutMs: ms })).toBeUndefined();
+    }
+  );
+
+  it.each([
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.NEGATIVE_INFINITY,
+    0,
+    -1,
+    0.5,
+    0.999,
+    '3000',
+    null,
+  ])('rejects %p with INVALID_PAYLOAD and records the value', (value) => {
+    const error = thrownBy({ ...BASE, callbackTimeoutMs: value });
+
+    expect(error?.code).toBe(SyncErrorCode.INVALID_PAYLOAD);
+    expect(error?.message).toBe(
+      'SyncOptions.callbackTimeoutMs must be a finite number of at least 1.'
+    );
+    expect(error?.validationErrors).toEqual([
+      { field: 'callbackTimeoutMs', reason: error?.message, value },
+    ]);
+  });
+});
+
 describe('validateSyncOptions — several issues', () => {
   it('lists every issue in field order and throws the first one', () => {
     const error = thrownBy({
       ...BASE,
+      callbackTimeoutMs: 0,
       healthCheckBackoffMs: -1,
       healthCheckTtlMs: Number.NaN,
       healthCheckUrl: 'nope',
@@ -196,6 +229,7 @@ describe('validateSyncOptions — several issues', () => {
       'healthCheckUrl',
       'healthCheckTtlMs',
       'healthCheckBackoffMs',
+      'callbackTimeoutMs',
     ]);
   });
 

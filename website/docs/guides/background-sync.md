@@ -132,6 +132,8 @@ While the app is not active, uploads go through a background `URLSession`, so th
 
 > **Warning — A relaunch can lose the outcome of an upload:** A background upload that finishes after a relaunch is not recorded. Launch recovery puts the item back to `PENDING` with its attempt spent and no cooldown, and the server may already have accepted the request. Delivery is at least once, so endpoints must be idempotent. See the [Idempotency guide](./idempotency.md).
 
+The [header resolver and `beforeDispatch`](./dispatch-interceptors.md) run before the upload task is created, so the upload carries the headers resolved at that moment. An upload that completes after a relaunch gets no `afterDispatch` call: no JS runs then.
+
 The [Crash Recovery](./crash-recovery.md) guide covers launch recovery in full.
 
 ### When a Window Runs Out of Time {#when-a-window-runs-out-of-time}
@@ -228,7 +230,7 @@ A stored value that cannot be used, such as an unusable `healthCheckUrl` or a ne
 
 `configureSync` replaces the whole configuration, so:
 
-- **Call it when the token changes.** The library does not refresh tokens, and a process with no JS cannot renew one.
+- **Call it when the token changes.** The library does not refresh tokens, and a process with no JS cannot renew one. While JS runs, a [header resolver](./dispatch-interceptors.md#header-resolver) can supply a fresh token for each request, but a run with no JS calls no resolver: it sends the stored `defaultHeaders`.
 - **Pass `defaultHeaders` on every call** that should keep them, including through `<SyncProvider options>`.
 - **Call it without `defaultHeaders` on logout.** That deletes the stored copy.
 
@@ -244,11 +246,15 @@ await configureSync({
 await configureSync({ strategy: SyncStrategy.AUTOMATIC, retryPolicy });
 ```
 
+> **Warning — A header resolver adds to `defaultHeaders`, it does not replace them:** A credential needed without JS must be in `defaultHeaders`. With no stored `defaultHeaders`, a 401 in a run with no JS is terminal, and the item is dead-lettered with `UNAUTHORIZED`. Keep calling `configureSync` with the current token, and let the resolver's value win while JS runs. See [When No JS Runs](./dispatch-interceptors.md#when-no-js-runs).
+
 ### When a Stored Token Expires
 
 A token read back from storage can be stale, and only the app can renew it. So in a process that has not called `configureSync`, a 401 or 403 does not fail the item. It stays `PENDING`, no attempt is spent, the next try waits at least 60 seconds, and the cycle stops, so an expired token costs one request per wake. You see `ITEM_RETRYING` with `UNAUTHORIZED`, if anything is listening.
 
 In a process that has called `configureSync`, the app owns the token, and a 401 stays terminal.
+
+A header resolver does not change either rule. When its token is rejected, the outcome still depends on where `defaultHeaders` came from: terminal in a process that called `configureSync`, a hold in one running on stored headers. The retry decider is not consulted for either.
 
 Every retry wake in the process waits for that hold to end, on both platforms, even when other items are already due: the end of a cycle, `resumeSync()`, a JS attach or reload and the recovery re-arm, for both the retry timer and the Android retry kick. Every `configureSync` call clears the hold.
 
@@ -269,7 +275,7 @@ Calling `configureSync` ends the wait in every case. While headers are unreadabl
 
 ### What Needs a Running App
 
-A process with no JS-facing hybrid, such as a worker, a boot broadcast or an iOS background launch where JS never reaches the library, runs no retry timer: it would dispatch outside the constraints you set. Android relies on the kick there. Events are not delivered either, since nothing is listening.
+A process with no JS-facing hybrid, such as a worker, a boot broadcast or an iOS background launch where JS never reaches the library, runs no retry timer: it would dispatch outside the constraints you set. Android relies on the kick there. Events are not delivered either, since nothing is listening. Nor does it run the [retry decider or the dispatch interceptors](./dispatch-interceptors.md#when-no-js-runs): its requests carry the stored `defaultHeaders` alone, and the `RetryPolicy` decides its retries.
 
 With `healthCheckUrl` set, such a process can still send requests of its own. On Android, a `SyncWorker` run, periodic or retry kick, starts a latency measurement only when `minNetworkQuality` is above `OFFLINE`, `healthCheckUrl` is set, and the last measurement of that network is missing or 30 s old or older. It starts 1 s after the gate check and runs alongside the flush, which does not wait for it. In a new process the gate decides from the link signals (`GOOD` unmetered, `MODERATE` metered, at most `POOR` unvalidated), so `EXCELLENT` never passes there. The worker also sends the health check's one `HEAD` before the cycle, unless a `2xx` younger than `healthCheckTtlMs` exists in that process.
 
@@ -353,7 +359,7 @@ For predictable cadence in development, use `useAutoSync({ enabled: true, flushO
 
 1. **Do not depend on a cadence.** The OS decides when a window runs: `minimumIntervalMs` only sets the earliest start of the iOS refresh task, and has a 15-minute floor on Android. For predictable flushes while the app runs, mount [`useAutoSync`](../api-reference/hooks/useAutoSync.md).
 
-2. **Call `configureSync` at launch and whenever the token changes.** A window runs from the persisted configuration, so pass `defaultHeaders` on every call that should keep them. See [Tokens and Logout](#tokens-and-logout).
+2. **Call `configureSync` at launch and whenever the token changes.** A window runs from the persisted configuration, so pass `defaultHeaders` on every call that should keep them. A header resolver cannot help a window with no JS. See [Tokens and Logout](#tokens-and-logout).
 
 3. **Turn background dispatch off with `foregroundOnly`, not `MANUAL`.** `MANUAL` does not stop background windows. See [What Stops What](#what-stops-what).
 
@@ -390,12 +396,14 @@ See [WorkManager flushes deferred for hours during normal phone use](../troubles
 2. Check that the engine is not paused: workers and BGTasks stay inert while a pause is in force.
 3. Check that stored headers can be read. See [When Stored Headers Cannot Be Read](#when-stored-headers-cannot-be-read).
 4. On iOS, a `SYNC_FAILED` without a code followed by `BACKGROUND_SYNC_COMPLETED` with `metadata.ok: "false"` means the window [ran out of time](#when-a-window-runs-out-of-time). An item that never fits a window holds the others back until a foreground `flush()` delivers it.
+5. If JS installed a header resolver or `beforeDispatch` in that process, an `ITEM_RETRYING` with `INTERCEPTOR_FAILED` means one of them deferred the item. See [When an Interceptor Fails](./dispatch-interceptors.md#when-an-interceptor-fails).
 
 See [Items stay pending and `flush()` returns 0/0](../troubleshooting.md#symptom-items-stay-pending-and-flush-returns-00) in Troubleshooting.
 
 ## Next Steps
 
 - [Connectivity Detection](./connectivity-detection.md) -- Trigger flushes on reconnect
+- [Dispatch Interceptors](./dispatch-interceptors.md) -- Per-request headers while JS runs, and what a run with no JS sends
 - [Crash Recovery](./crash-recovery.md) -- How items left in flight come back after a kill or a reboot
 - [Battery Optimization](./battery-optimization.md) -- What wakes the device and uses the network, and the option that controls each
 - [iOS Setup](../getting-started/ios-setup.md) -- Background Modes + Info.plist

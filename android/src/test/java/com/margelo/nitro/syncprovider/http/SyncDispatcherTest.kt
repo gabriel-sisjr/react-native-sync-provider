@@ -1,17 +1,29 @@
 package com.margelo.nitro.syncprovider.http
 
 import android.database.sqlite.SQLiteDatabaseLockedException
+import android.util.Log
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.google.common.truth.Truth.assertThat
 import com.google.common.truth.Truth.assertWithMessage
+import com.margelo.nitro.syncprovider.AfterDispatchContext
+import com.margelo.nitro.syncprovider.BeforeDispatchAction
+import com.margelo.nitro.syncprovider.BeforeDispatchContext
+import com.margelo.nitro.syncprovider.CallbackAnswer
+import com.margelo.nitro.syncprovider.DispatchOutcome
+import com.margelo.nitro.syncprovider.HeaderResolverContext
 import com.margelo.nitro.syncprovider.HttpMethod
 import com.margelo.nitro.syncprovider.NetworkQuality
+import com.margelo.nitro.syncprovider.RetryAction
+import com.margelo.nitro.syncprovider.RetryDeciderContext
 import com.margelo.nitro.syncprovider.SyncErrorCode
 import com.margelo.nitro.syncprovider.SyncEvent
 import com.margelo.nitro.syncprovider.SyncEventType
 import com.margelo.nitro.syncprovider.SyncOptions
 import com.margelo.nitro.syncprovider.SyncResult
+import com.margelo.nitro.syncprovider.callbacks.HybridInstalls
+import com.margelo.nitro.syncprovider.callbacks.JsCallbacks
+import com.margelo.nitro.syncprovider.connectivity.LatencyProbe
 import com.margelo.nitro.syncprovider.database.SyncDatabase
 import com.margelo.nitro.syncprovider.database.SyncDeadLetterEntity
 import com.margelo.nitro.syncprovider.database.SyncItemDao
@@ -21,8 +33,11 @@ import com.margelo.nitro.syncprovider.events.SyncEventEmitter
 import com.margelo.nitro.syncprovider.retry.RetryTimer
 import com.margelo.nitro.syncprovider.retry.RetryWake
 import com.margelo.nitro.syncprovider.storage.SyncQueueStorage
+import com.margelo.nitro.syncprovider.testutil.FakeFunction
+import com.margelo.nitro.syncprovider.testutil.FakeJs
 import com.margelo.nitro.syncprovider.testutil.MovingClock
 import com.margelo.nitro.syncprovider.testutil.TestData
+import com.margelo.nitro.syncprovider.util.JsonMap
 import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
@@ -30,10 +45,14 @@ import io.mockk.mockk
 import io.mockk.spyk
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.TestScope
@@ -55,10 +74,12 @@ import org.robolectric.annotation.Config
 import java.io.IOException
 import java.io.InterruptedIOException
 import java.net.SocketException
+import java.net.URI
 import java.net.SocketTimeoutException
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [30])
@@ -73,6 +94,28 @@ internal class SyncDispatcherTest {
   /** The `notBefore` of every finished cycle, in order. */
   private val finishedCycles: MutableList<Long?> = Collections.synchronizedList(mutableListOf())
 
+  /** Where fake JS answers later, and where [collectEvents] collects. */
+  private val jsScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+  /** Every line the callbacks logged, and the priority of each, in the same order. */
+  private val callbackLog: MutableList<String> = Collections.synchronizedList(mutableListOf())
+  private val callbackPriorities: MutableList<Int> = Collections.synchronizedList(mutableListOf())
+
+  private val callbacks = JsCallbacks(
+    scope = jsScope,
+    notifyContext = Dispatchers.Default,
+    log = { priority, message ->
+      synchronized(callbackLog) {
+        callbackLog += message
+        callbackPriorities += priority
+      }
+    },
+  )
+  private val js = FakeJs(callbacks.gateway, jsScope)
+
+  /** The current hybrid: what the tests install, they install through it. */
+  private val hybrid = HybridInstalls(callbacks)
+
   @Before
   fun setUp() {
     db = Room.inMemoryDatabaseBuilder(
@@ -86,6 +129,7 @@ internal class SyncDispatcherTest {
 
   @After
   fun tearDown() {
+    jsScope.cancel()
     server.shutdown()
     db.close()
   }
@@ -110,6 +154,7 @@ internal class SyncDispatcherTest {
     healthCheckBackoffMs: Double? = null,
     healthCheck: HealthCheck = this.healthCheck,
     defaultHeaders: Map<String, String>? = null,
+    callbackTimeoutMs: Double? = null,
     tweak: (SyncOptions) -> SyncOptions = { it },
   ): SyncDispatcher {
     val options = TestData.syncOptions(
@@ -126,6 +171,7 @@ internal class SyncDispatcherTest {
       healthCheckTtlMs = healthCheckTtlMs,
       healthCheckBackoffMs = healthCheckBackoffMs,
       defaultHeaders = defaultHeaders,
+      callbackTimeoutMs = callbackTimeoutMs,
     ).let(tweak)
     return SyncDispatcher(
       storage = queue,
@@ -138,6 +184,7 @@ internal class SyncDispatcherTest {
       healthCheck = healthCheck,
       onHealthCheckSkipped = { healthSkips++ },
       onCycleFinished = onCycleFinished,
+      callbacks = callbacks,
     )
   }
 
@@ -2490,5 +2537,1560 @@ internal class SyncDispatcherTest {
 
     assertThat(deadLetter(id).lastErrorCode).isEqualTo(SyncErrorCode.MAX_ATTEMPTS_EXCEEDED.name)
     assertThat(deadLetter(id).lastErrorMessage).isNotEmpty()
+  }
+
+  /* ----------------------------- the retry decider ----------------------------- */
+
+  /** Every event from now on, collected as it is emitted, whatever runs the test. */
+  private fun collectEvents(): List<SyncEvent> {
+    val events: MutableList<SyncEvent> = Collections.synchronizedList(mutableListOf())
+    jsScope.launch(Dispatchers.Unconfined, start = CoroutineStart.UNDISPATCHED) {
+      emitter.events.collect { events += it }
+    }
+    return events
+  }
+
+  /** Answers every request with [code], without moving the clock. */
+  private fun answerAll(code: Int) {
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest): MockResponse = MockResponse().setResponseCode(code)
+    }
+  }
+
+  /** A decider that records each context and answers what [reply] gives, at once; null: never. */
+  private fun decider(reply: (RetryDeciderContext) -> CallbackAnswer?): FakeFunction<RetryDeciderContext> =
+    js.function { requestId, context -> reply(context)?.let { answer(requestId, it) } }
+
+  /** [decider], installed by the current hybrid. */
+  private fun installDecider(reply: (RetryDeciderContext) -> CallbackAnswer?): FakeFunction<RetryDeciderContext> =
+    decider(reply).also { assertThat(hybrid.setRetryDecider(it)).isTrue() }
+
+  private fun elapsedMs(startedNanos: Long): Long = (System.nanoTime() - startedNanos) / 1_000_000L
+
+  private fun List<SyncEvent>.of(id: String): List<SyncEvent> = filter { it.itemId == id }
+
+  @Test
+  fun `decider_unset_usesPolicy, as when no decider existed`() = runTest {
+    server.dispatcher = respondAfter(250L, 503)
+    val id = enqueue()
+    val start = clock.now()
+    val events = collectEvents()
+
+    val result = newDispatcher().flush()
+
+    val retried = row(id)
+    assertThat(retried.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(retried.attempts).isEqualTo(1)
+    assertThat(retried.lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
+    // The policy's delay for attempt 1, from the end of the attempt.
+    assertThat(retried.nextRetryAt).isEqualTo(start + 250L + 1_000L)
+    val retrying = events.of(id).single()
+    assertThat(retrying.type).isEqualTo(SyncEventType.ITEM_RETRYING)
+    assertThat(retrying.errorCode).isEqualTo(SyncErrorCode.SERVER_ERROR)
+    assertThat(retrying.statusCode).isEqualTo(503.0)
+    assertThat(result.failedIds.toList()).isEmpty()
+    assertThat(callbackLog).isEmpty()
+    assertThat(callbacks.gateway.pendingCount).isEqualTo(0)
+  }
+
+  @Test
+  fun `decider_retry_overridesDelay, as given from the decision, with no jitter and no cap`() = runTest {
+    server.dispatcher = respondAfter(250L, 503)
+    val id = enqueue()
+    val start = clock.now()
+    installDecider {
+      // The decision takes a while: the delay counts from it, not from the end of the attempt.
+      clock.advance(DECIDE_MS)
+      FakeJs.decision(RetryAction.RETRY, 12_345.9)
+    }
+    val events = collectEvents()
+
+    newDispatcher(
+      maxDelayMs = 5_000L,
+      tweak = { it.copy(retryPolicy = it.retryPolicy.copy(jitter = true)) },
+    ).flush()
+
+    val retried = row(id)
+    assertThat(retried.status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(retried.attempts).isEqualTo(1)
+    assertThat(retried.lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
+    assertThat(retried.nextRetryAt).isEqualTo(start + 250L + DECIDE_MS + 12_345L)
+    // The retry keeps the attempt's real code.
+    val retrying = events.of(id).single()
+    assertThat(retrying.type).isEqualTo(SyncEventType.ITEM_RETRYING)
+    assertThat(retrying.errorCode).isEqualTo(SyncErrorCode.SERVER_ERROR)
+    assertThat(retrying.statusCode).isEqualTo(503.0)
+    assertThat(retrying.attempt).isEqualTo(1.0)
+  }
+
+  @Test
+  fun `decider_retry_withoutDelay_usesPolicyDelay, from the decision`() = runTest {
+    server.dispatcher = respondAfter(250L, 503)
+    val id = enqueue()
+    val start = clock.now()
+    installDecider {
+      clock.advance(DECIDE_MS)
+      FakeJs.decision(RetryAction.RETRY)
+    }
+
+    newDispatcher().flush()
+
+    assertThat(row(id).nextRetryAt).isEqualTo(start + 250L + DECIDE_MS + 1_000L)
+    assertThat(callbackLog).isEmpty()
+  }
+
+  @Test
+  fun `decider_retry_invalidDelay_usesPolicyDelay, for NaN, either infinity and any negative delay`() = runTest {
+    answerAll(503)
+    val delays = mapOf(
+      "/nan" to Double.NaN,
+      "/infinite" to Double.POSITIVE_INFINITY,
+      "/minus-infinite" to Double.NEGATIVE_INFINITY,
+      "/negative" to -1.0,
+      "/negative-fraction" to -0.5,
+    )
+    val ids = delays.keys.associateWith { enqueue(it) }
+    val start = clock.now()
+    installDecider { context -> FakeJs.decision(RetryAction.RETRY, delays.getValue(URI(context.url).path)) }
+
+    newDispatcher().flush()
+
+    ids.forEach { (path, id) ->
+      assertWithMessage(path).that(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+      assertWithMessage(path).that(row(id).nextRetryAt).isEqualTo(start + 1_000L)
+    }
+    // Not a failed answer: the decision stands, with the policy's delay, and the reason is logged.
+    assertThat(callbackLog.count { it.contains("is not a usable delay; the policy's delay applies") })
+      .isEqualTo(delays.size)
+    assertThat(callbackPriorities.distinct()).containsExactly(Log.WARN)
+  }
+
+  @Test
+  fun `decider_retry_hugeDelay_clampsDeadline, at the latest JS Date`() = runTest {
+    answerAll(503)
+    val delays = mapOf("/huge" to 1e300, "/above-max-delay" to 9.1e15, "/long" to 1e15)
+    val ids = delays.keys.associateWith { enqueue(it) }
+    val start = clock.now()
+    installDecider { context -> FakeJs.decision(RetryAction.RETRY, delays.getValue(URI(context.url).path)) }
+
+    newDispatcher().flush()
+
+    assertThat(row(ids.getValue("/huge")).nextRetryAt).isEqualTo(TestData.MAX_JS_DATE_MS)
+    assertThat(row(ids.getValue("/above-max-delay")).nextRetryAt).isEqualTo(TestData.MAX_JS_DATE_MS)
+    // Below the ceilings, a delay is used as given.
+    assertThat(row(ids.getValue("/long")).nextRetryAt).isEqualTo(start + 1_000_000_000_000_000L)
+  }
+
+  @Test
+  fun `decider_drop_emitsFailedAndDeletesRow, with no dead letter`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(503))
+    val id = enqueue()
+    // A DROP ignores delayMs, even one no retry could use: it is not a failed answer.
+    installDecider { FakeJs.decision(RetryAction.DROP, Double.NaN) }
+    val events = collectEvents()
+
+    val result = newDispatcher().flush()
+
+    assertThat(db.syncItemDao().findById(id)).isNull()
+    assertThat(db.syncDeadLetterDao().findById(id)).isNull()
+    val failed = events.of(id).single()
+    assertThat(failed.type).isEqualTo(SyncEventType.ITEM_FAILED)
+    assertThat(failed.errorCode).isEqualTo(SyncErrorCode.RETRY_DECIDER_REJECTED)
+    assertThat(failed.statusCode).isEqualTo(503.0)
+    assertThat(failed.attempt).isEqualTo(1.0)
+    assertThat(result.failureCount).isEqualTo(1.0)
+    assertThat(result.failedIds.toList()).containsExactly(id)
+    assertThat(result.errors).containsExactly(id, "RETRY_DECIDER_REJECTED: HTTP 503")
+    assertThat(events.last().type).isEqualTo(SyncEventType.SYNC_FAILED)
+    assertThat(callbackLog).isEmpty()
+  }
+
+  @Test
+  fun `decider_deadLetter_movesRowWithDeciderCode, and the real failure as its message`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(503))
+    val id = enqueue()
+    // A DEAD_LETTER ignores delayMs, even one no retry could use: it is not a failed answer.
+    installDecider { FakeJs.decision(RetryAction.DEAD_LETTER, -1.0) }
+    val events = collectEvents()
+
+    val result = newDispatcher().flush()
+
+    val dead = deadLetter(id)
+    assertThat(dead.attempts).isEqualTo(1)
+    assertThat(dead.lastErrorCode).isEqualTo(SyncErrorCode.RETRY_DECIDER_REJECTED.name)
+    assertThat(dead.lastErrorMessage).isEqualTo("HTTP 503 Server Error")
+    val itemEvents = events.of(id)
+    assertThat(itemEvents.map { it.type })
+      .containsExactly(SyncEventType.ITEM_FAILED, SyncEventType.ITEM_DEAD_LETTERED).inOrder()
+    assertThat(itemEvents[0].errorCode).isEqualTo(SyncErrorCode.RETRY_DECIDER_REJECTED)
+    assertThat(itemEvents[0].statusCode).isEqualTo(503.0)
+    assertThat(itemEvents[0].attempt).isEqualTo(1.0)
+    assertThat(itemEvents[1].errorCode).isEqualTo(SyncErrorCode.DEAD_LETTERED)
+    assertThat(itemEvents[1].metadata)
+      .containsExactly("lastErrorCode", SyncErrorCode.RETRY_DECIDER_REJECTED.name)
+    assertThat(result.failedIds.toList()).containsExactly(id)
+    assertThat(result.errors).containsExactly(id, "RETRY_DECIDER_REJECTED: HTTP 503")
+    assertThat(callbackLog).isEmpty()
+  }
+
+  @Test
+  fun `decider_failedAnswer_fallsBack at once to the policy, its delay from the fallback`() =
+    runBlocking<Unit> {
+      server.enqueue(MockResponse().setResponseCode(503))
+      val id = enqueue()
+      val start = clock.now()
+      installDecider {
+        clock.advance(DECIDE_MS)
+        FakeJs.failed("the decider threw")
+      }
+      val started = System.nanoTime()
+
+      newDispatcher(callbackTimeoutMs = 30_000.0).flush()
+
+      assertThat(elapsedMs(started)).isLessThan(AT_ONCE_MS)
+      assertThat(row(id).attempts).isEqualTo(1)
+      // The policy's delay, counted from the moment the fallback was decided.
+      assertThat(row(id).nextRetryAt).isEqualTo(start + DECIDE_MS + 1_000L)
+      assertThat(callbackLog.single())
+        .endsWith("answered FAILED: the decider threw; the retry policy applies")
+    }
+
+  @Test
+  fun `decider_invalidAnswer_fallsBack, a RESOLVED answer with no decision, whatever it carries instead`() =
+    runBlocking<Unit> {
+      answerAll(503)
+      // Another kind's payload, or none at all.
+      val replies = mapOf(
+        "/headers" to FakeJs.headers(mapOf("X-Wrong" to "kind")),
+        "/before" to FakeJs.before(BeforeDispatchAction.PROCEED),
+        "/empty" to FakeJs.resolved(),
+      )
+      val ids = replies.keys.associateWith { enqueue(it) }
+      val start = clock.now()
+      installDecider { context -> replies.getValue(URI(context.url).path) }
+
+      newDispatcher(callbackTimeoutMs = 30_000.0).flush()
+
+      ids.forEach { (path, id) -> assertWithMessage(path).that(row(id).nextRetryAt).isEqualTo(start + 1_000L) }
+      assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+      assertThat(callbackLog).hasSize(replies.size)
+      callbackLog.forEach {
+        assertThat(it).endsWith("the answer carried no usable decision; the retry policy applies")
+      }
+    }
+
+  @Test
+  fun `decider_neverAnswers_timesOut, and the policy applies`() = runBlocking<Unit> {
+    server.enqueue(MockResponse().setResponseCode(503))
+    val id = enqueue()
+    val start = clock.now()
+    val decider = installDecider {
+      // Time passes during the wait: the delay counts from the timeout, not from the attempt.
+      clock.advance(DECIDE_MS)
+      null
+    }
+    val started = System.nanoTime()
+
+    newDispatcher(callbackTimeoutMs = 200.0).flush()
+
+    assertThat(elapsedMs(started)).isAtLeast(200L)
+    assertThat(decider.calls).hasSize(1)
+    assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(row(id).lastAttemptAt).isEqualTo(start)
+    assertThat(row(id).nextRetryAt).isEqualTo(start + DECIDE_MS + 1_000L)
+    assertThat(callbackLog.single()).endsWith("no answer within 200 ms; the retry policy applies")
+    assertThat(callbacks.gateway.pendingCount).isEqualTo(0)
+  }
+
+  @Test
+  fun `decider_lateAnswer_ignored, once the policy applied`() = runBlocking<Unit> {
+    server.enqueue(MockResponse().setResponseCode(503))
+    val id = enqueue()
+    val start = clock.now()
+    val decider = js.function<RetryDeciderContext> { requestId, _ ->
+      answerLater(requestId, 500L, FakeJs.decision(RetryAction.DEAD_LETTER))
+    }
+    assertThat(hybrid.setRetryDecider(decider)).isTrue()
+
+    newDispatcher(callbackTimeoutMs = 150.0).flush()
+    delay(800L)
+
+    assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(row(id).nextRetryAt).isEqualTo(start + 1_000L)
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(callbacks.gateway.pendingCount).isEqualTo(0)
+  }
+
+  @Test
+  fun `decider_unknownId_noop, and the request keeps its own answer`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(503))
+    val id = enqueue()
+    val start = clock.now()
+    val decider = js.function<RetryDeciderContext> { requestId, _ ->
+      answer("retryDecider:999999", FakeJs.decision(RetryAction.DEAD_LETTER))
+      answer(requestId, FakeJs.decision(RetryAction.RETRY, 5_000.0))
+    }
+    assertThat(hybrid.setRetryDecider(decider)).isTrue()
+
+    newDispatcher().flush()
+
+    assertThat(row(id).nextRetryAt).isEqualTo(start + 5_000L)
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+  }
+
+  @Test
+  fun `decider_notConsulted_nonRetryable, a 4xx or a 401 with this process's credential`() = runTest {
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest): MockResponse =
+        MockResponse().setResponseCode(if (request.path == "/secure") 401 else 404)
+    }
+    val missing = enqueue("/missing")
+    val secure = enqueue("/secure")
+    val decider = installDecider { FakeJs.decision(RetryAction.RETRY) }
+
+    newDispatcher(credentials = { CredentialPolicy.TRUSTED }).flush()
+
+    assertThat(decider.calls).isEmpty()
+    assertThat(deadLetter(missing).lastErrorCode).isEqualTo(SyncErrorCode.SERVER_ERROR.name)
+    assertThat(deadLetter(secure).lastErrorCode).isEqualTo(SyncErrorCode.UNAUTHORIZED.name)
+  }
+
+  @Test
+  fun `decider_notConsulted_budgetSpent, nor for a row whose budget was spent before`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(503))
+    val last = enqueue("/last")
+    db.syncItemDao().insert(TestData.entity(id = "spent", attempts = 1, url = server.url("/spent").toString()))
+    val decider = installDecider { FakeJs.decision(RetryAction.RETRY) }
+
+    newDispatcher(maxAttempts = 1).flush()
+
+    assertThat(decider.calls).isEmpty()
+    assertThat(deadLetter(last).lastErrorCode).isEqualTo(SyncErrorCode.MAX_ATTEMPTS_EXCEEDED.name)
+    assertThat(deadLetter("spent").lastErrorCode).isEqualTo(SyncErrorCode.MAX_ATTEMPTS_EXCEEDED.name)
+    assertThat(server.requestCount).isEqualTo(1)
+  }
+
+  @Test
+  fun `decider_notConsulted_credentialHold`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(401))
+    val id = enqueue()
+    val decider = installDecider { FakeJs.decision(RetryAction.DEAD_LETTER) }
+
+    newDispatcher(credentials = { CredentialPolicy.PERSISTED }).flush()
+
+    assertThat(decider.calls).isEmpty()
+    assertThat(row(id).attempts).isEqualTo(0)
+    assertThat(row(id).lastErrorCode).isEqualTo(SyncErrorCode.UNAUTHORIZED.name)
+  }
+
+  @Test
+  fun `decider_notConsulted_success`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(200))
+    val id = enqueue()
+    val decider = installDecider { FakeJs.decision(RetryAction.DROP) }
+
+    val result = newDispatcher().flush()
+
+    assertThat(decider.calls).isEmpty()
+    assertThat(result.succeededIds.toList()).containsExactly(id)
+  }
+
+  @Test
+  fun `decider_context_fields, for an HTTP answer`() = runTest {
+    server.enqueue(MockResponse().setResponseCode(503))
+    val url = server.url("/orders").toString()
+    db.syncItemDao().insert(
+      TestData.entity(id = "order", method = "PUT", url = url, attempts = 2)
+        .copy(metadata = JsonMap.encode(mapOf("order" to "42"))),
+    )
+    val decider = installDecider { FakeJs.decision(RetryAction.RETRY) }
+
+    newDispatcher(maxAttempts = 5).flush()
+
+    assertThat(decider.calls).containsExactly(
+      RetryDeciderContext(
+        itemId = "order",
+        // The attempt that just failed, as ITEM_RETRYING reports it.
+        attempt = 3.0,
+        errorCode = SyncErrorCode.SERVER_ERROR,
+        statusCode = 503.0,
+        url = url,
+        method = HttpMethod.PUT,
+        metadata = mapOf("order" to "42"),
+      ),
+    )
+  }
+
+  @Test
+  fun `decider_context_fields, for a failure with no answer`() = runTest {
+    server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AT_START))
+    val id = enqueue()
+    val decider = installDecider { FakeJs.decision(RetryAction.RETRY) }
+
+    newDispatcher().flush()
+
+    val context = decider.calls.single()
+    assertThat(context.itemId).isEqualTo(id)
+    assertThat(context.attempt).isEqualTo(1.0)
+    assertThat(context.errorCode).isEqualTo(SyncErrorCode.NETWORK_ERROR)
+    assertThat(context.statusCode).isNull()
+    assertThat(context.method).isEqualTo(HttpMethod.POST)
+    assertThat(context.metadata).isNull()
+  }
+
+  @Test
+  fun `decider_replace_and_clear`() = runTest {
+    answerAll(503)
+    val first = enqueue("/first")
+    val replaced = decider { FakeJs.decision(RetryAction.DEAD_LETTER) }
+    val current = decider { FakeJs.decision(RetryAction.DROP) }
+    assertThat(hybrid.setRetryDecider(replaced)).isTrue()
+    assertThat(hybrid.setRetryDecider(current)).isTrue()
+    assertThat(hybrid.isRetryDeciderInstalled()).isTrue()
+    val d = newDispatcher()
+
+    d.flush()
+
+    assertThat(replaced.calls).isEmpty()
+    assertThat(current.calls).hasSize(1)
+    assertThat(db.syncItemDao().findById(first)).isNull()
+
+    hybrid.clearRetryDecider()
+    assertThat(hybrid.isRetryDeciderInstalled()).isFalse()
+    val second = enqueue("/second")
+    d.flush()
+
+    assertThat(current.calls).hasSize(1)
+    assertThat(row(second).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(row(second).attempts).isEqualTo(1)
+  }
+
+  @Test
+  fun `decider_purgedDuringWait_noResurrection, whatever it decides`() = runBlocking<Unit> {
+    answerAll(503)
+    val actions = mapOf(
+      "/retry" to RetryAction.RETRY,
+      "/dead-letter" to RetryAction.DEAD_LETTER,
+      "/drop" to RetryAction.DROP,
+    )
+    val ids = actions.keys.associateWith { enqueue(it) }
+    val decider = js.function<RetryDeciderContext> { requestId, context ->
+      later {
+        // A logout purges the row while the decider thinks.
+        storage.removeItem(context.itemId)
+        answer(requestId, FakeJs.decision(actions.getValue(URI(context.url).path)))
+      }
+    }
+    assertThat(hybrid.setRetryDecider(decider)).isTrue()
+    val events = collectEvents()
+
+    val result = newDispatcher().flush()
+
+    ids.values.forEach { id ->
+      assertThat(db.syncItemDao().findById(id)).isNull()
+      assertThat(db.syncDeadLetterDao().findById(id)).isNull()
+    }
+    // Each request went out, so its outcome is reported all the same; nothing is dead-lettered.
+    assertThat(events.of(ids.getValue("/retry")).map { it.type }).containsExactly(SyncEventType.ITEM_RETRYING)
+    listOf("/dead-letter", "/drop").forEach { path ->
+      val failed = events.of(ids.getValue(path)).single()
+      assertThat(failed.type).isEqualTo(SyncEventType.ITEM_FAILED)
+      assertThat(failed.errorCode).isEqualTo(SyncErrorCode.RETRY_DECIDER_REJECTED)
+    }
+    assertThat(result.failedIds.toList())
+      .containsExactly(ids.getValue("/dead-letter"), ids.getValue("/drop"))
+  }
+
+  @Test
+  fun `lifecycle_newAttach_evictsOlderInstall, so the dispatch no longer asks the old runtime`() =
+    runBlocking<Unit> {
+      server.enqueue(MockResponse().setResponseCode(503))
+      val id = enqueue()
+      val start = clock.now()
+      val old = installDecider { FakeJs.decision(RetryAction.DEAD_LETTER) }
+      // A reload: the new runtime's hybrid is created and installs nothing.
+      HybridInstalls(callbacks)
+      val started = System.nanoTime()
+
+      newDispatcher(callbackTimeoutMs = 30_000.0).flush()
+
+      assertThat(elapsedMs(started)).isLessThan(AT_ONCE_MS)
+      assertThat(old.calls).isEmpty()
+      assertThat(row(id).nextRetryAt).isEqualTo(start + 1_000L)
+      assertThat(callbackLog).isEmpty()
+    }
+
+  @Test
+  fun `lifecycle_eviction_endsOwnersWaits, and the policy applies at once`() = runBlocking<Unit> {
+    server.enqueue(MockResponse().setResponseCode(503))
+    val id = enqueue()
+    val start = clock.now()
+    val asked = CompletableDeferred<Unit>()
+    val decider = js.function<RetryDeciderContext> { _, _ -> asked.complete(Unit) }
+    assertThat(hybrid.setRetryDecider(decider)).isTrue()
+    val d = newDispatcher(callbackTimeoutMs = 60_000.0)
+    val started = System.nanoTime()
+
+    val running = async(Dispatchers.IO) { d.flush() }
+    withTimeout(AT_ONCE_MS) { asked.await() }
+    // A reload's new hybrid ends the old runtime's wait, which nothing would answer.
+    HybridInstalls(callbacks)
+    running.await()
+
+    assertThat(elapsedMs(started)).isLessThan(AT_ONCE_MS)
+    assertThat(row(id).nextRetryAt).isEqualTo(start + 1_000L)
+    assertThat(callbackLog.single())
+      .endsWith("the JS runtime that installed it is gone; the retry policy applies")
+  }
+
+  /** A callback that waits for `flush()` waits for the cycle that waits for it: never a deadlock. */
+  @Test
+  fun `android_callback_awaitingFlush_timesOut, then the fallback applies`() = runBlocking<Unit> {
+    server.enqueue(MockResponse().setResponseCode(503))
+    val id = enqueue()
+    val start = clock.now()
+    lateinit var d: SyncDispatcher
+    val nested = CompletableDeferred<SyncResult>()
+    val decider = js.function<RetryDeciderContext> { requestId, _ ->
+      later {
+        nested.complete(d.flush())
+        answer(requestId, FakeJs.decision(RetryAction.DEAD_LETTER))
+      }
+    }
+    assertThat(hybrid.setRetryDecider(decider)).isTrue()
+    d = newDispatcher(callbackTimeoutMs = 300.0)
+    val started = System.nanoTime()
+
+    withTimeout(20_000L) { d.flush() }
+    val nestedResult = withTimeout(20_000L) { nested.await() }
+
+    assertThat(elapsedMs(started)).isAtLeast(300L)
+    assertThat(decider.calls).hasSize(1)
+    // The late answer changed nothing, and the nested cycle found nothing due.
+    assertThat(row(id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(row(id).nextRetryAt).isEqualTo(start + 1_000L)
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(nestedResult.successCount + nestedResult.failureCount).isEqualTo(0.0)
+    assertThat(callbackLog.single()).endsWith("no answer within 300 ms; the retry policy applies")
+  }
+
+  /* --------------------------- the dispatch interceptors --------------------------- */
+
+  /** A header resolver the current hybrid installs: it answers what [reply] gives, at once; null: never. */
+  private fun installResolver(
+    reply: (HeaderResolverContext) -> CallbackAnswer?,
+  ): FakeFunction<HeaderResolverContext> =
+    js.function<HeaderResolverContext> { requestId, context -> reply(context)?.let { answer(requestId, it) } }
+      .also { assertThat(hybrid.setHeaderResolver(it)).isTrue() }
+
+  /** A `beforeDispatch` the current hybrid installs: it answers what [reply] gives, at once; null: never. */
+  private fun installBefore(
+    reply: (BeforeDispatchContext) -> CallbackAnswer?,
+  ): FakeFunction<BeforeDispatchContext> =
+    js.function<BeforeDispatchContext> { requestId, context -> reply(context)?.let { answer(requestId, it) } }
+      .also { assertThat(hybrid.setBeforeDispatch(it)).isTrue() }
+
+  /** An `afterDispatch` the current hybrid installs: it runs [onCall], then answers RESOLVED at once. */
+  private fun installAfter(onCall: (AfterDispatchContext) -> Unit = {}): FakeFunction<AfterDispatchContext> =
+    js.function<AfterDispatchContext> { requestId, context ->
+      onCall(context)
+      answer(requestId, FakeJs.resolved())
+    }.also { assertThat(hybrid.setAfterDispatch(it)).isTrue() }
+
+  private fun proceed(): CallbackAnswer = FakeJs.before(BeforeDispatchAction.PROCEED)
+
+  /** `afterDispatch` runs after the dispatch, on another thread: wait for it, never assume it. */
+  private suspend fun awaitUntil(condition: () -> Boolean) {
+    withTimeout(AT_ONCE_MS) {
+      while (!condition()) delay(10L)
+    }
+  }
+
+  /** A due row with an explicit claim order, attempted [attempts] times before. */
+  private suspend fun seed(id: String, createdAt: Long = 1L, attempts: Int = 0): SyncItemEntity {
+    db.syncItemDao().insert(
+      TestData.entity(id = id, url = server.url("/$id").toString(), createdAt = createdAt, attempts = attempts),
+    )
+    return row(id)
+  }
+
+  /** Header [name] as it went out, whatever its case: its one entry, with its spelling. */
+  private fun RecordedRequest.sentHeader(name: String): Pair<String, String> =
+    headers.filter { it.first.equals(name, ignoreCase = true) }.single()
+
+  /** The headers that went out in wire order, but for the ones OkHttp sets itself. */
+  private fun RecordedRequest.layeredHeaders(): List<Pair<String, String>> =
+    headers.filter { (name, _) -> OKHTTP_HEADERS.none { it.equals(name, ignoreCase = true) } }
+
+  /** Every request the server got, by path. */
+  private fun requestsByPath(): Map<String?, RecordedRequest> =
+    List(server.requestCount) { checkNotNull(server.takeRequest(5, TimeUnit.SECONDS)) }.associateBy { it.path }
+
+  /**
+   * [before] deferred by an interceptor: nothing else changed, its attempt kept, waiting until
+   * [until] with INTERCEPTOR_FAILED.
+   */
+  private suspend fun assertDeferred(before: SyncItemEntity, until: Long) {
+    assertThat(row(before.id)).isEqualTo(
+      before.copy(lastErrorCode = SyncErrorCode.INTERCEPTOR_FAILED.name, nextRetryAt = until),
+    )
+  }
+
+  /** A deferred item's one event: ITEM_RETRYING with INTERCEPTOR_FAILED, no status, the would-be attempt. */
+  private fun List<SyncEvent>.assertDeferredEvent(id: String, attempt: Int) {
+    val retrying = of(id).single()
+    assertThat(retrying.type).isEqualTo(SyncEventType.ITEM_RETRYING)
+    assertThat(retrying.errorCode).isEqualTo(SyncErrorCode.INTERCEPTOR_FAILED)
+    assertThat(retrying.statusCode).isNull()
+    assertThat(retrying.attempt).isEqualTo(attempt.toDouble())
+  }
+
+  @Test
+  fun `interceptor_unset_sendsStaticHeaders, with no wait, no extra query and nothing asked`() = runTest {
+    answerAll(200)
+    val queue = spyk(storage)
+    val id = storage.enqueue(TestData.input(url = server.url("/x").toString(), headers = mapOf("X-Item" to "i")))
+
+    val result = newDispatcher(queue = queue, defaultHeaders = mapOf("Authorization" to "Bearer static")).flush()
+
+    val sent = checkNotNull(server.takeRequest(5, TimeUnit.SECONDS))
+    assertThat(sent.sentHeader("Authorization")).isEqualTo("Authorization" to "Bearer static")
+    assertThat(sent.sentHeader("X-Item")).isEqualTo("X-Item" to "i")
+    assertThat(result.succeededIds.toList()).containsExactly(id)
+    // The purge check before the request, and no other.
+    coVerify(exactly = 1) { queue.isQueued(id) }
+    assertThat(callbackLog).isEmpty()
+    assertThat(callbacks.gateway.pendingCount).isEqualTo(0)
+  }
+
+  @Test
+  fun `interceptor_order_resolver_before_dispatch_after, each once`() = runBlocking<Unit> {
+    val timeline: MutableList<String> = Collections.synchronizedList(mutableListOf())
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest): MockResponse {
+        timeline += "request"
+        return MockResponse().setResponseCode(200)
+      }
+    }
+    val id = enqueue()
+    installResolver {
+      timeline += "resolver"
+      FakeJs.headers(mapOf("X-Resolved" to "r"))
+    }
+    installBefore {
+      timeline += "before"
+      proceed()
+    }
+    installAfter { timeline += "after" }
+    jsScope.launch(Dispatchers.Unconfined, start = CoroutineStart.UNDISPATCHED) {
+      emitter.events.collect { if (it.itemId == id) timeline += it.type.name }
+    }
+
+    newDispatcher().flush()
+    awaitUntil { "after" in timeline }
+
+    assertThat(timeline)
+      .containsExactly("resolver", "before", "request", SyncEventType.ITEM_SUCCEEDED.name, "after")
+      .inOrder()
+  }
+
+  @Test
+  fun `interceptor_order_resolver_before_dispatch_after, the attempt starting once its request is ready`() =
+    runTest {
+      answerAll(503)
+      val id = enqueue()
+      val start = clock.now()
+      // Each wait takes a while on the test clock.
+      installResolver {
+        clock.advance(DECIDE_MS)
+        FakeJs.headers(mapOf("X-Resolved" to "r"))
+      }
+      installBefore {
+        clock.advance(DECIDE_MS)
+        proceed()
+      }
+
+      newDispatcher().flush()
+
+      // The attempt is when the request went out, after both waits, and its cooldown counts from it.
+      val retried = row(id)
+      assertThat(retried.attempts).isEqualTo(1)
+      assertThat(retried.lastAttemptAt).isEqualTo(start + 2 * DECIDE_MS)
+      assertThat(retried.nextRetryAt).isEqualTo(start + 2 * DECIDE_MS + 1_000L)
+    }
+
+  @Test
+  fun `interceptor_headerMergeOrder, defaults then the resolver then the item, whatever the case`() = runTest {
+    answerAll(200)
+    storage.enqueue(
+      TestData.input(url = server.url("/x").toString(), headers = mapOf("X-LAYER" to "item", "X-Item" to "i")),
+    )
+    installResolver {
+      FakeJs.headers(
+        mapOf(
+          "authorization" to "Bearer resolved",
+          "x-layer" to "resolver",
+          "X-Resolver" to "r",
+          // Two of this layer's names that differ only by case: in name order, as on iOS, the
+          // lower-case one wins. Only the resolver's layer is sorted.
+          "x-dup" to "lower",
+          "X-Dup" to "upper",
+        ),
+      )
+    }
+
+    newDispatcher(
+      defaultHeaders = mapOf("Authorization" to "Bearer static", "X-Layer" to "default", "X-Default" to "d"),
+    ).flush()
+
+    // One entry per name, with the spelling and the value of the layer that wins.
+    val sent = checkNotNull(server.takeRequest(5, TimeUnit.SECONDS))
+    assertThat(sent.sentHeader("Authorization")).isEqualTo("authorization" to "Bearer resolved")
+    assertThat(sent.sentHeader("X-Layer")).isEqualTo("X-LAYER" to "item")
+    assertThat(sent.sentHeader("X-Default")).isEqualTo("X-Default" to "d")
+    assertThat(sent.sentHeader("X-Resolver")).isEqualTo("X-Resolver" to "r")
+    assertThat(sent.sentHeader("X-Item")).isEqualTo("X-Item" to "i")
+    assertThat(sent.sentHeader("X-Dup")).isEqualTo("x-dup" to "lower")
+  }
+
+  @Test
+  fun `android_headerWireOrder, with nothing installed the static layers go in their map order`() = runTest {
+    answerAll(200)
+    storage.enqueue(
+      TestData.input(url = server.url("/x").toString(), headers = mapOf("X-Item" to "i", "x-layer" to "item")),
+    )
+
+    newDispatcher(
+      defaultHeaders = mapOf("X-Default" to "d", "X-Layer" to "default", "Authorization" to "Bearer static"),
+    ).flush()
+
+    // An item header replaces the default one of that name, whatever its case, and goes last.
+    assertThat(checkNotNull(server.takeRequest(5, TimeUnit.SECONDS)).layeredHeaders()).containsExactly(
+      "X-Default" to "d",
+      "Authorization" to "Bearer static",
+      "X-Item" to "i",
+      "x-layer" to "item",
+    ).inOrder()
+  }
+
+  @Test
+  fun `android_headerWireOrder, the resolver's layer in name order between the static ones`() = runTest {
+    answerAll(200)
+    storage.enqueue(
+      TestData.input(
+        url = server.url("/x").toString(),
+        headers = mapOf("X-Item" to "i", "x-layer" to "item", "X-Shared" to "item"),
+      ),
+    )
+    installResolver {
+      FakeJs.headers(mapOf("X-Shared" to "resolver", "X-Resolver" to "r", "authorization" to "Bearer resolved"))
+    }
+
+    newDispatcher(
+      defaultHeaders = mapOf("X-Default" to "d", "X-Layer" to "default", "Authorization" to "Bearer static"),
+    ).flush()
+
+    // What each layer keeps, in its own order: the defaults, the resolver's sorted, the item's.
+    assertThat(checkNotNull(server.takeRequest(5, TimeUnit.SECONDS)).layeredHeaders()).containsExactly(
+      "X-Default" to "d",
+      "X-Resolver" to "r",
+      "authorization" to "Bearer resolved",
+      "X-Item" to "i",
+      "x-layer" to "item",
+      "X-Shared" to "item",
+    ).inOrder()
+  }
+
+  @Test
+  fun `interceptor_resolverFails_failsClosed_keepsAttempt, and the cycle goes on`() = runBlocking<Unit> {
+    answerAll(200)
+    db.syncItemDao().insert(
+      TestData.entity(id = FAILING, url = server.url("/failing").toString(), attempts = 1)
+        .copy(lastAttemptAt = clock.now() - 10_000L, lastErrorCode = SyncErrorCode.NETWORK_ERROR.name),
+    )
+    val failing = row(FAILING)
+    val sent = enqueue("/sent")
+    val start = clock.now()
+    val resolver = installResolver { context ->
+      if (context.itemId == FAILING) {
+        // The answer takes a while: the cooldown counts from it.
+        clock.advance(DECIDE_MS)
+        FakeJs.failed("token refresh failed")
+      } else {
+        FakeJs.headers(emptyMap())
+      }
+    }
+    val before = installBefore { proceed() }
+    val after = installAfter()
+    val decider = installDecider { FakeJs.decision(RetryAction.DROP) }
+    val events = collectEvents()
+
+    val result = newDispatcher().flush()
+
+    // Nothing went out for it, and the attempt it was about to make is not spent.
+    assertThat(requestsByPath().keys).containsExactly("/sent")
+    // The policy's 2 s for attempt 2 is below the floor: it waits 60 s from the answer.
+    assertDeferred(failing, until = start + DECIDE_MS + 60_000L)
+    events.assertDeferredEvent(FAILING, attempt = 2)
+    assertThat(resolver.calls.map { it.attempt }).containsExactly(2.0, 1.0)
+    assertThat(result.succeededIds.toList()).containsExactly(sent)
+    assertThat(result.failedIds.toList()).isEmpty()
+    assertThat(finishedCycles).containsExactly(null)
+    awaitUntil { after.calls.isNotEmpty() }
+    assertThat(before.calls.map { it.itemId }).containsExactly(sent)
+    assertThat(after.calls.map { it.itemId }).containsExactly(sent)
+    assertThat(decider.calls).isEmpty()
+    assertThat(callbackLog.single()).matches(
+      "headerResolver for item $FAILING \\(headerResolver:\\d+\\): answered FAILED: token refresh failed; " +
+        "the item is not sent in this cycle",
+    )
+    assertThat(callbackPriorities.single()).isEqualTo(Log.WARN)
+  }
+
+  @Test
+  fun `interceptor_resolverTimeout_failsClosed, after its timeout and not before`() = runBlocking<Unit> {
+    answerAll(200)
+    val id = enqueue()
+    val before = row(id)
+    val start = clock.now()
+    installResolver { null }
+    val events = collectEvents()
+    val started = System.nanoTime()
+
+    newDispatcher(callbackTimeoutMs = 300.0).flush()
+
+    assertThat(elapsedMs(started)).isAtLeast(300L)
+    assertThat(server.requestCount).isEqualTo(0)
+    assertDeferred(before, until = start + 60_000L)
+    events.assertDeferredEvent(id, attempt = 1)
+    assertThat(callbackLog.single()).endsWith("no answer within 300 ms; the item is not sent in this cycle")
+  }
+
+  @Test
+  fun `interceptor_resolverTimeout_failsClosed at once when its runtime is gone, logged as INFO`() =
+    runBlocking<Unit> {
+      answerAll(200)
+      val id = enqueue()
+      val before = row(id)
+      val start = clock.now()
+      val asked = CompletableDeferred<Unit>()
+      installResolver {
+        asked.complete(Unit)
+        null
+      }
+      val started = System.nanoTime()
+
+      val running = async(Dispatchers.IO) { newDispatcher(callbackTimeoutMs = 60_000.0).flush() }
+      withTimeout(AT_ONCE_MS) { asked.await() }
+      // A reload's new hybrid ends the old runtime's wait, which nothing would answer.
+      HybridInstalls(callbacks)
+      running.await()
+
+      assertThat(elapsedMs(started)).isLessThan(AT_ONCE_MS)
+      assertThat(server.requestCount).isEqualTo(0)
+      assertDeferred(before, until = start + 60_000L)
+      assertThat(callbackLog.single())
+        .endsWith("the JS runtime that installed it is gone; the item is not sent in this cycle")
+      assertThat(callbackPriorities.single()).isEqualTo(Log.INFO)
+    }
+
+  @Test
+  fun `interceptor_resolverInvalid_failsClosed, a RESOLVED answer with no headers`() = runTest {
+    answerAll(200)
+    val id = enqueue()
+    val before = row(id)
+    val start = clock.now()
+    val hook = installBefore { proceed() }
+    installResolver { FakeJs.resolved() }
+    val events = collectEvents()
+
+    newDispatcher().flush()
+
+    assertThat(server.requestCount).isEqualTo(0)
+    assertDeferred(before, until = start + 60_000L)
+    events.assertDeferredEvent(id, attempt = 1)
+    assertThat(hook.calls).isEmpty()
+    assertThat(callbackLog.single())
+      .endsWith("the answer carried no usable headers; the item is not sent in this cycle")
+  }
+
+  @Test
+  fun `interceptor_resolverInvalid_failsClosed, a header value OkHttp refuses, never logged`() = runTest {
+    answerAll(200)
+    val id = enqueue()
+    val before = row(id)
+    val start = clock.now()
+    installResolver { FakeJs.headers(mapOf("Authorization" to "Bearer secret\r\nX-Injected: 1")) }
+    val events = collectEvents()
+
+    val result = newDispatcher().flush()
+
+    // Not a dead letter: the item is not at fault.
+    assertThat(server.requestCount).isEqualTo(0)
+    assertDeferred(before, until = start + 60_000L)
+    events.assertDeferredEvent(id, attempt = 1)
+    assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+    assertThat(result.failedIds.toList()).isEmpty()
+    assertThat(callbackLog.single()).doesNotContain("secret")
+  }
+
+  @Test
+  fun `interceptor_beforeSkip_defers, for the policy's delay when it passes the floor`() = runTest {
+    answerAll(200)
+    val id = enqueue()
+    val before = row(id)
+    val start = clock.now()
+    installBefore { FakeJs.before(BeforeDispatchAction.SKIP) }
+    val events = collectEvents()
+
+    val result = newDispatcher(baseDelayMs = 100_000L, maxDelayMs = 600_000L).flush()
+
+    assertThat(server.requestCount).isEqualTo(0)
+    assertDeferred(before, until = start + 100_000L)
+    events.assertDeferredEvent(id, attempt = 1)
+    assertThat(result.successCount + result.failureCount).isEqualTo(0.0)
+    assertThat(callbackLog.single())
+      .isEqualTo("beforeDispatch answered SKIP for item $id; it is not sent until ${start + 100_000L}")
+    assertThat(callbackPriorities.single()).isEqualTo(Log.INFO)
+  }
+
+  @Test
+  fun `interceptor_beforeFails_failsClosed`() = runTest {
+    answerAll(200)
+    val id = enqueue()
+    val before = row(id)
+    val start = clock.now()
+    installResolver { FakeJs.headers(mapOf("X-Token" to "t")) }
+    installBefore { FakeJs.failed("hook threw") }
+    val events = collectEvents()
+
+    newDispatcher().flush()
+
+    assertThat(server.requestCount).isEqualTo(0)
+    assertDeferred(before, until = start + 60_000L)
+    events.assertDeferredEvent(id, attempt = 1)
+    assertThat(callbackLog.single())
+      .endsWith("answered FAILED: hook threw; the item is not sent in this cycle")
+    assertThat(callbackPriorities.single()).isEqualTo(Log.WARN)
+  }
+
+  @Test
+  fun `interceptor_beforeContext_hasMergedHeaders, with the stored content type apart`() = runTest {
+    answerAll(200)
+    val explicit = storage.enqueue(
+      TestData.input(
+        url = server.url("/explicit").toString(),
+        headers = mapOf("content-type" to "application/vnd.layer+json", "X-Item" to "i"),
+        contentType = "text/plain",
+        metadata = mapOf("k" to "v"),
+      ),
+    )
+    val implicit = storage.enqueue(
+      TestData.input(url = server.url("/implicit").toString(), headers = null, contentType = null),
+    )
+    installResolver { FakeJs.headers(mapOf("authorization" to "Bearer resolved")) }
+    val hook = installBefore { proceed() }
+
+    newDispatcher(defaultHeaders = mapOf("Authorization" to "Bearer static", "X-Default" to "d")).flush()
+
+    val contexts = hook.calls.associateBy { it.itemId }
+    with(contexts.getValue(explicit)) {
+      // A layer's Content-Type stays among the headers.
+      assertThat(headers).containsExactly(
+        "authorization", "Bearer resolved",
+        "X-Default", "d",
+        "content-type", "application/vnd.layer+json",
+        "X-Item", "i",
+      )
+      assertThat(contentType).isEqualTo("text/plain")
+      assertThat(attempt).isEqualTo(1.0)
+      assertThat(url).isEqualTo(server.url("/explicit").toString())
+      assertThat(method).isEqualTo(HttpMethod.POST)
+      assertThat(metadata).containsExactly("k", "v")
+    }
+    with(contexts.getValue(implicit)) {
+      // The Content-Type OkHttp takes from the body is not a header here.
+      assertThat(headers).containsExactly("authorization", "Bearer resolved", "X-Default", "d")
+      assertThat(contentType).isNull()
+      assertThat(metadata).isNull()
+    }
+    // On the wire, the body's media type replaces a layer's Content-Type, as before.
+    val sent = requestsByPath()
+    assertThat(sent.getValue("/explicit").getHeader("Content-Type")).startsWith("text/plain")
+    assertThat(sent.getValue("/implicit").getHeader("Content-Type")).startsWith("application/json")
+  }
+
+  @Test
+  fun `interceptor_failure_isPerItem, the batch's waits all out at once`() = runBlocking<Unit> {
+    answerAll(200)
+    val ids = listOf("/a", "/b", "/c").associateWith { enqueue(it) }
+    val asked: MutableList<Pair<String, HeaderResolverContext>> = Collections.synchronizedList(mutableListOf())
+    val count = AtomicInteger(0)
+    val resolver = js.function<HeaderResolverContext> { requestId, context ->
+      asked += requestId to context
+      // Answers only once the whole batch is waiting: one wait at a time would time out.
+      if (count.incrementAndGet() == ids.size) {
+        later {
+          synchronized(asked) { asked.toList() }.forEach { (pending, asking) ->
+            val reply = if (URI(asking.url).path == "/b") {
+              FakeJs.failed("refresh failed")
+            } else {
+              FakeJs.headers(mapOf("X-Token" to "t"))
+            }
+            answer(pending, reply)
+          }
+        }
+      }
+    }
+    assertThat(hybrid.setHeaderResolver(resolver)).isTrue()
+    val b = row(ids.getValue("/b"))
+    val events = collectEvents()
+    val started = System.nanoTime()
+
+    val result = newDispatcher(callbackTimeoutMs = 30_000.0).flush()
+
+    assertThat(elapsedMs(started)).isLessThan(AT_ONCE_MS)
+    val sent = requestsByPath()
+    assertThat(sent.keys).containsExactly("/a", "/c")
+    sent.values.forEach { assertThat(it.getHeader("X-Token")).isEqualTo("t") }
+    assertThat(result.succeededIds.toList()).containsExactly(ids.getValue("/a"), ids.getValue("/c"))
+    assertThat(result.failedIds.toList()).isEmpty()
+    assertThat(row(b.id).status).isEqualTo(SyncItemEntity.STATUS_PENDING)
+    assertThat(row(b.id).lastErrorCode).isEqualTo(SyncErrorCode.INTERCEPTOR_FAILED.name)
+    events.assertDeferredEvent(b.id, attempt = 1)
+  }
+
+  @Test
+  fun `interceptor_purgedDuringResolver_notSent, answered or failed, and nothing reported`() =
+    runBlocking<Unit> {
+      answerAll(200)
+      val answered = enqueue("/answered")
+      val failed = enqueue("/failed")
+      val resolver = js.function<HeaderResolverContext> { requestId, context ->
+        later {
+          // A logout purges the row while the resolver works.
+          storage.removeItem(context.itemId)
+          val reply = if (context.itemId == failed) FakeJs.failed("gone") else FakeJs.headers(emptyMap())
+          answer(requestId, reply)
+        }
+      }
+      assertThat(hybrid.setHeaderResolver(resolver)).isTrue()
+      val hook = installBefore { proceed() }
+      val events = collectEvents()
+
+      val result = newDispatcher().flush()
+
+      assertThat(server.requestCount).isEqualTo(0)
+      assertThat(resolver.calls).hasSize(2)
+      assertThat(hook.calls).isEmpty()
+      listOf(answered, failed).forEach { id ->
+        assertThat(db.syncItemDao().findById(id)).isNull()
+        assertThat(events.of(id)).isEmpty()
+      }
+      assertThat(result.successCount + result.failureCount).isEqualTo(0.0)
+    }
+
+  @Test
+  fun `interceptor_purgedDuringBefore_notSent, on PROCEED or SKIP, and nothing reported`() =
+    runBlocking<Unit> {
+      answerAll(200)
+      val proceeding = enqueue("/proceed")
+      val skipping = enqueue("/skip")
+      val hook = js.function<BeforeDispatchContext> { requestId, context ->
+        later {
+          storage.removeItem(context.itemId)
+          val action = if (context.itemId == skipping) BeforeDispatchAction.SKIP else BeforeDispatchAction.PROCEED
+          answer(requestId, FakeJs.before(action))
+        }
+      }
+      assertThat(hybrid.setBeforeDispatch(hook)).isTrue()
+      val events = collectEvents()
+
+      val result = newDispatcher().flush()
+
+      assertThat(server.requestCount).isEqualTo(0)
+      assertThat(hook.calls).hasSize(2)
+      listOf(proceeding, skipping).forEach { id ->
+        assertThat(db.syncItemDao().findById(id)).isNull()
+        assertThat(events.of(id)).isEmpty()
+      }
+      assertThat(result.successCount + result.failureCount).isEqualTo(0.0)
+      assertThat(callbackLog.single())
+        .isEqualTo("beforeDispatch answered SKIP for item $skipping; it was removed meanwhile")
+    }
+
+  @Test
+  fun `android_interceptor_releasedDuringWait_leftAsItIs, no longer in flight and nothing reported`() =
+    runBlocking<Unit> {
+      answerAll(200)
+      val id = enqueue()
+      val before = row(id)
+      val resolver = js.function<HeaderResolverContext> { requestId, _ ->
+        later {
+          // The claim is given back meanwhile, as another process's recovery would give it back.
+          db.syncItemDao().resetInFlight()
+          answer(requestId, FakeJs.failed("no token"))
+        }
+      }
+      assertThat(hybrid.setHeaderResolver(resolver)).isTrue()
+      val events = collectEvents()
+
+      val result = newDispatcher().flush()
+
+      // Not deferred: the row is as the release left it, and nothing reports it.
+      assertThat(server.requestCount).isEqualTo(0)
+      assertThat(resolver.calls).hasSize(1)
+      assertThat(row(id)).isEqualTo(before)
+      assertThat(events.of(id)).isEmpty()
+      assertThat(result.successCount + result.failureCount).isEqualTo(0.0)
+    }
+
+  @Test
+  fun `interceptor_after_calledOncePerSentRequest, with how each request ended`() = runBlocking<Unit> {
+    val purged = enqueue("/purged")
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+        "/ok" -> MockResponse().setResponseCode(200).setHeadersDelay(200L, TimeUnit.MILLISECONDS)
+        "/purged" -> {
+          // Purged while its request is out: it still went out.
+          runBlocking { storage.removeItem(purged) }
+          MockResponse().setResponseCode(200)
+        }
+        "/retry", "/drop", "/exhausted" -> MockResponse().setResponseCode(503)
+        else -> MockResponse().setResponseCode(400)
+      }
+    }
+    val ok = enqueue("/ok")
+    val retry = enqueue("/retry")
+    val drop = enqueue("/drop")
+    val permanent = enqueue("/permanent")
+    seed("exhausted", attempts = 2)
+    installDecider { context ->
+      FakeJs.decision(if (URI(context.url).path == "/drop") RetryAction.DROP else RetryAction.RETRY)
+    }
+    val after = installAfter()
+
+    newDispatcher(maxAttempts = 3).flush()
+    awaitUntil { after.calls.size == 6 }
+    delay(200L)
+
+    val calls = after.calls.associateBy { it.itemId }
+    assertThat(calls).hasSize(6)
+    assertThat(after.calls).hasSize(6)
+    fun assertCall(id: String, outcome: DispatchOutcome, statusCode: Int, errorCode: SyncErrorCode?, attempt: Int) {
+      val call = calls.getValue(id)
+      assertWithMessage(id).that(call.outcome).isEqualTo(outcome)
+      assertWithMessage(id).that(call.statusCode).isEqualTo(statusCode.toDouble())
+      assertWithMessage(id).that(call.errorCode).isEqualTo(errorCode)
+      assertWithMessage(id).that(call.attempt).isEqualTo(attempt.toDouble())
+      assertWithMessage(id).that(call.method).isEqualTo(HttpMethod.POST)
+      assertWithMessage(id).that(call.metadata).isNull()
+      assertWithMessage(id).that(call.durationMs).isAtLeast(0.0)
+    }
+    assertCall(ok, DispatchOutcome.SUCCEEDED, 200, null, attempt = 1)
+    assertCall(purged, DispatchOutcome.SUCCEEDED, 200, null, attempt = 1)
+    assertCall(retry, DispatchOutcome.RETRYING, 503, SyncErrorCode.SERVER_ERROR, attempt = 1)
+    assertCall(drop, DispatchOutcome.FAILED, 503, SyncErrorCode.RETRY_DECIDER_REJECTED, attempt = 1)
+    assertCall(permanent, DispatchOutcome.FAILED, 400, SyncErrorCode.SERVER_ERROR, attempt = 1)
+    assertCall("exhausted", DispatchOutcome.FAILED, 503, SyncErrorCode.MAX_ATTEMPTS_EXCEEDED, attempt = 3)
+    // The request's own time: at least the server's delay before its answer.
+    assertThat(calls.getValue(ok).durationMs).isAtLeast(200.0)
+    assertThat(calls.getValue(ok).url).isEqualTo(server.url("/ok").toString())
+  }
+
+  @Test
+  fun `interceptor_after_calledOncePerSentRequest, its durationMs leaving out the resolver's wait`() =
+    runBlocking<Unit> {
+      answerAll(200)
+      enqueue()
+      val resolver = js.function<HeaderResolverContext> { requestId, _ ->
+        answerLater(requestId, RESOLVER_WAIT_MS, FakeJs.headers(mapOf("X-Resolved" to "r")))
+      }
+      assertThat(hybrid.setHeaderResolver(resolver)).isTrue()
+      val after = installAfter()
+      val started = System.nanoTime()
+
+      newDispatcher(callbackTimeoutMs = 30_000.0).flush()
+      awaitUntil { after.calls.isNotEmpty() }
+
+      // The cycle waited for the resolver, but the request itself, answered at once, did not.
+      assertThat(elapsedMs(started)).isAtLeast(RESOLVER_WAIT_MS)
+      assertThat(after.calls.single().durationMs).isLessThan(RESOLVER_WAIT_MS.toDouble())
+    }
+
+  @Test
+  fun `interceptor_after_calledOncePerSentRequest, for a credential hold before the cycle stops`() =
+    runBlocking<Unit> {
+      answerAll(401)
+      seed("head", createdAt = 1L)
+      val rest = seed("rest", createdAt = 2L)
+      // Never answers: its entry stays out, so it shows the call was made within the cycle.
+      val after = js.function<AfterDispatchContext> { _, _ -> }
+      assertThat(hybrid.setAfterDispatch(after)).isTrue()
+
+      newDispatcher(credentials = { CredentialPolicy.PERSISTED }, callbackTimeoutMs = 60_000.0).flush()
+
+      assertThat(callbacks.gateway.pendingCount).isEqualTo(1)
+      awaitUntil { after.calls.isNotEmpty() }
+      val call = after.calls.single()
+      assertThat(call.itemId).isEqualTo("head")
+      assertThat(call.outcome).isEqualTo(DispatchOutcome.RETRYING)
+      assertThat(call.errorCode).isEqualTo(SyncErrorCode.UNAUTHORIZED)
+      assertThat(call.statusCode).isEqualTo(401.0)
+      assertThat(call.attempt).isEqualTo(1.0)
+      // The rest of the batch went back unsent, and no call is made for it.
+      assertThat(server.requestCount).isEqualTo(1)
+      assertThat(row("rest")).isEqualTo(rest)
+    }
+
+  @Test
+  fun `interceptor_after_notCalledWhenNotSent, and an item that cannot be sent asks nothing`() =
+    runBlocking<Unit> {
+      answerAll(200)
+      val sent = enqueue("/sent")
+      val purged = enqueue("/purged")
+      val deferred = enqueue("/deferred")
+      val skipped = enqueue("/skipped")
+      seed("spent", attempts = 3)
+      db.syncItemDao().insert(TestData.entity(id = "unbuildable", url = "ftp://example.com/unbuildable"))
+      val resolver = js.function<HeaderResolverContext> { requestId, context ->
+        when (context.itemId) {
+          purged -> later {
+            storage.removeItem(purged)
+            answer(requestId, FakeJs.headers(emptyMap()))
+          }
+          deferred -> answer(requestId, FakeJs.failed("no token"))
+          else -> answer(requestId, FakeJs.headers(emptyMap()))
+        }
+      }
+      assertThat(hybrid.setHeaderResolver(resolver)).isTrue()
+      val hook = installBefore { context ->
+        FakeJs.before(if (context.itemId == skipped) BeforeDispatchAction.SKIP else BeforeDispatchAction.PROCEED)
+      }
+      val after = installAfter()
+
+      newDispatcher(maxAttempts = 3).flush()
+      // The one request that went out gets its call: once it has, any other would have too.
+      awaitUntil { after.calls.isNotEmpty() }
+      delay(200L)
+
+      assertThat(after.calls.map { it.itemId }).containsExactly(sent)
+      assertThat(requestsByPath().keys).containsExactly("/sent")
+      // A spent budget and a request OkHttp refuses fail as before, and reach no interceptor.
+      assertThat(deadLetter("spent").lastErrorCode).isEqualTo(SyncErrorCode.MAX_ATTEMPTS_EXCEEDED.name)
+      assertThat(deadLetter("unbuildable").lastErrorCode).isEqualTo(SyncErrorCode.INVALID_PAYLOAD.name)
+      assertThat(resolver.calls.map { it.itemId }).containsExactly(sent, purged, deferred, skipped)
+      assertThat(hook.calls.map { it.itemId }).containsExactly(sent, skipped)
+    }
+
+  @Test
+  fun `interceptor_after_neverAwaited, its call or its answer`() = runBlocking<Unit> {
+    answerAll(200)
+    val id = enqueue()
+    val release = CountDownLatch(1)
+    // Holds its thread until the test lets it go, and never answers.
+    val after = js.function<AfterDispatchContext> { _, _ -> release.await(20, TimeUnit.SECONDS) }
+    assertThat(hybrid.setAfterDispatch(after)).isTrue()
+    val started = System.nanoTime()
+
+    val result = newDispatcher(callbackTimeoutMs = 60_000.0).flush()
+
+    assertThat(elapsedMs(started)).isLessThan(AT_ONCE_MS)
+    assertThat(result.succeededIds.toList()).containsExactly(id)
+    awaitUntil { after.calls.isNotEmpty() }
+    release.countDown()
+    // Asked and unanswered: only its own timeout ends its entry.
+    assertThat(callbacks.gateway.pendingCount).isEqualTo(1)
+    assertThat(after.calls.single().itemId).isEqualTo(id)
+  }
+
+  @Test
+  fun `interceptor_after_followsItsItemEvent, for each item`() = runBlocking<Unit> {
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest): MockResponse =
+        MockResponse().setResponseCode(if (request.path == "/retry") 503 else 200)
+    }
+    val ok = enqueue("/ok")
+    val retry = enqueue("/retry")
+    val timeline: MutableList<String> = Collections.synchronizedList(mutableListOf())
+    jsScope.launch(Dispatchers.Unconfined, start = CoroutineStart.UNDISPATCHED) {
+      emitter.events.collect { event -> event.itemId?.let { timeline += "${event.type.name}:$it" } }
+    }
+    installAfter { timeline += "after:${it.itemId}" }
+
+    newDispatcher().flush()
+    awaitUntil { timeline.count { it.startsWith("after:") } == 2 }
+
+    val seen = synchronized(timeline) { timeline.toList() }
+    val succeeded = seen.indexOf("${SyncEventType.ITEM_SUCCEEDED.name}:$ok")
+    val retrying = seen.indexOf("${SyncEventType.ITEM_RETRYING.name}:$retry")
+    assertThat(succeeded).isAtLeast(0)
+    assertThat(retrying).isAtLeast(0)
+    assertThat(seen.indexOf("after:$ok")).isGreaterThan(succeeded)
+    assertThat(seen.indexOf("after:$retry")).isGreaterThan(retrying)
+  }
+
+  @Test
+  fun `interceptor_clear_restoresStaticHeaders, and asks nothing more`() = runTest {
+    answerAll(200)
+    enqueue("/first")
+    val resolver = installResolver { FakeJs.headers(mapOf("Authorization" to "Bearer resolved")) }
+    val hook = installBefore { proceed() }
+    val d = newDispatcher(defaultHeaders = mapOf("Authorization" to "Bearer static"))
+
+    d.flush()
+    hybrid.clearHeaderResolver()
+    hybrid.clearBeforeDispatch()
+    enqueue("/second")
+    d.flush()
+
+    val sent = requestsByPath()
+    assertThat(sent.getValue("/first").getHeader("Authorization")).isEqualTo("Bearer resolved")
+    assertThat(sent.getValue("/second").getHeader("Authorization")).isEqualTo("Bearer static")
+    assertThat(resolver.calls).hasSize(1)
+    assertThat(hook.calls).hasSize(1)
+  }
+
+  @Test
+  fun `interceptor_probes_neverCallCallbacks, the health check's or the latency probe's`() = runBlocking<Unit> {
+    val healthStatus = AtomicInteger(503)
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest): MockResponse =
+        MockResponse().setResponseCode(if (request.method == "HEAD") healthStatus.get() else 200)
+    }
+    val id = enqueue()
+    val resolver = installResolver { FakeJs.headers(mapOf("X-Resolved" to "r")) }
+    val hook = installBefore { proceed() }
+    val after = installAfter()
+    val decider = installDecider { FakeJs.decision(RetryAction.DROP) }
+    val healthUrl = server.url("/health").toString()
+
+    // A failed check skips the cycle: nothing is asked.
+    newDispatcher(healthCheckUrl = healthUrl).flush()
+    LatencyProbe(HeadProbe(lazyOf(HeadProbe.newClient()))).measure(server.url("/latency").toString())
+    assertThat(resolver.calls + hook.calls + after.calls + decider.calls).isEmpty()
+    // A healthy check: only the item's own request is asked about.
+    healthStatus.set(200)
+    newDispatcher(healthCheckUrl = healthUrl, healthCheck = healthCheck()).flush()
+    awaitUntil { after.calls.isNotEmpty() }
+
+    val requests = List(server.requestCount) { checkNotNull(server.takeRequest(5, TimeUnit.SECONDS)) }
+    assertThat(requests.map { it.method }).containsExactly("HEAD", "HEAD", "HEAD", "HEAD", "HEAD", "POST").inOrder()
+    requests.filter { it.method == "HEAD" }.forEach { assertThat(it.getHeader("X-Resolved")).isNull() }
+    assertThat(requests.last().getHeader("X-Resolved")).isEqualTo("r")
+    assertThat(resolver.calls.map { it.itemId }).containsExactly(id)
+    assertThat(hook.calls.map { it.itemId }).containsExactly(id)
+    assertThat(after.calls.map { it.itemId }).containsExactly(id)
+    assertThat(decider.calls).isEmpty()
+  }
+
+  @Test
+  fun `lifecycle_clearOrReplace_keepsPendingWait, a clear during the wait keeps its answer`() =
+    runBlocking<Unit> {
+      answerAll(200)
+      enqueue("/first")
+      val resolver = js.function<HeaderResolverContext> { requestId, _ ->
+        // JS clears the resolver while this wait is out; the answer still comes.
+        hybrid.clearHeaderResolver()
+        answerLater(requestId, 300L, FakeJs.headers(mapOf("X-Token" to "from the wait")))
+      }
+      assertThat(hybrid.setHeaderResolver(resolver)).isTrue()
+      val d = newDispatcher(callbackTimeoutMs = 30_000.0)
+      val started = System.nanoTime()
+
+      d.flush()
+
+      assertThat(elapsedMs(started)).isAtLeast(300L)
+      enqueue("/second")
+      d.flush()
+      val sent = requestsByPath()
+      assertThat(sent.getValue("/first").getHeader("X-Token")).isEqualTo("from the wait")
+      assertThat(sent.getValue("/second").getHeader("X-Token")).isNull()
+      assertThat(resolver.calls).hasSize(1)
+    }
+
+  @Test
+  fun `lifecycle_clearOrReplace_keepsPendingWait, a replacing set leaves the wait to its timeout`() =
+    runBlocking<Unit> {
+      answerAll(200)
+      val id = enqueue()
+      val before = row(id)
+      val start = clock.now()
+      val replacement = js.function<HeaderResolverContext> { requestId, _ ->
+        answer(requestId, FakeJs.headers(mapOf("X-Token" to "new")))
+      }
+      val replaced = js.function<HeaderResolverContext> { _, _ ->
+        // Replaced while this wait is out, and never answered.
+        hybrid.setHeaderResolver(replacement)
+      }
+      assertThat(hybrid.setHeaderResolver(replaced)).isTrue()
+      val d = newDispatcher(callbackTimeoutMs = 300.0)
+      val started = System.nanoTime()
+
+      d.flush()
+
+      // Bounded by its timeout, not cut short by the replacement.
+      assertThat(elapsedMs(started)).isAtLeast(300L)
+      assertDeferred(before, until = start + 60_000L)
+      assertThat(callbackLog.single()).endsWith("no answer within 300 ms; the item is not sent in this cycle")
+      // Once the item is due, the new resolver is the one asked.
+      clock.advance(60_000L)
+      d.flush()
+      assertThat(checkNotNull(server.takeRequest(5, TimeUnit.SECONDS)).getHeader("X-Token")).isEqualTo("new")
+      assertThat(replaced.calls).hasSize(1)
+      assertThat(replacement.calls).hasSize(1)
+    }
+
+  @Test
+  fun `lifecycle_teardown_retiresInstalls_untilNewAttach, an orphaned resolver holds the item unsent`() =
+    runBlocking<Unit> {
+      answerAll(200)
+      val held = enqueue("/held")
+      val before = row(held)
+      val start = clock.now()
+      val resolver = installResolver { FakeJs.headers(mapOf("Authorization" to "Bearer resolved")) }
+      val hook = installBefore { proceed() }
+      val after = installAfter()
+      val decider = installDecider { FakeJs.decision(RetryAction.DROP) }
+      // The hybrid is disposed: what it installed stays, orphans that no runtime answers.
+      hybrid.retire()
+      val events = collectEvents()
+      val d = newDispatcher(
+        callbackTimeoutMs = 60_000.0,
+        defaultHeaders = mapOf("Authorization" to "Bearer static"),
+      )
+      val started = System.nanoTime()
+
+      d.flush()
+
+      // Deferred at once, not after the timeout, and never sent with the static headers alone.
+      assertThat(elapsedMs(started)).isLessThan(AT_ONCE_MS)
+      assertThat(server.requestCount).isEqualTo(0)
+      assertDeferred(before, until = start + 60_000L)
+      events.assertDeferredEvent(held, attempt = 1)
+      assertThat(callbackLog.single()).matches(
+        "headerResolver for item $held \\(headerResolver:\\d+\\): the JS runtime that installed it is gone; " +
+          "the item is not sent in this cycle",
+      )
+      assertThat(callbackPriorities.single()).isEqualTo(Log.INFO)
+
+      // A newer hybrid attaches and installs nothing yet: the next item goes out with the static headers.
+      HybridInstalls(callbacks)
+      val next = enqueue("/next")
+      val result = d.flush()
+
+      val sent = checkNotNull(server.takeRequest(5, TimeUnit.SECONDS))
+      assertThat(sent.path).isEqualTo("/next")
+      assertThat(sent.sentHeader("Authorization")).isEqualTo("Authorization" to "Bearer static")
+      assertThat(result.succeededIds.toList()).containsExactly(next)
+      // The held item waits out its cooldown, and no JS function was ever called.
+      assertThat(server.requestCount).isEqualTo(1)
+      assertDeferred(before, until = start + 60_000L)
+      assertThat(callbackLog).hasSize(1)
+      listOf(resolver.calls, hook.calls, after.calls, decider.calls).forEach { assertThat(it).isEmpty() }
+    }
+
+  @Test
+  fun `lifecycle_teardown_retiresInstalls_untilNewAttach, an orphaned beforeDispatch holds the item unsent too`() =
+    runTest {
+      answerAll(200)
+      val id = enqueue()
+      val before = row(id)
+      val start = clock.now()
+      val hook = installBefore { proceed() }
+      hybrid.retire()
+      val events = collectEvents()
+
+      newDispatcher(callbackTimeoutMs = 60_000.0).flush()
+
+      assertThat(server.requestCount).isEqualTo(0)
+      assertDeferred(before, until = start + 60_000L)
+      events.assertDeferredEvent(id, attempt = 1)
+      assertThat(hook.calls).isEmpty()
+      assertThat(callbackLog.single()).matches(
+        "beforeDispatch for item $id \\(beforeDispatch:\\d+\\): the JS runtime that installed it is gone; " +
+          "the item is not sent in this cycle",
+      )
+      assertThat(callbackPriorities.single()).isEqualTo(Log.INFO)
+    }
+
+  @Test
+  fun `lifecycle_teardown_retiresInstalls_untilNewAttach, an orphaned decider leaves the retry to the policy`() =
+    runBlocking<Unit> {
+      server.enqueue(MockResponse().setResponseCode(503))
+      val id = enqueue()
+      val start = clock.now()
+      val decider = installDecider { FakeJs.decision(RetryAction.DEAD_LETTER) }
+      val after = installAfter()
+      hybrid.retire()
+      val events = collectEvents()
+      val started = System.nanoTime()
+
+      newDispatcher(callbackTimeoutMs = 60_000.0).flush()
+
+      // The policy's 1 s for attempt 1, at once, and no dead letter.
+      assertThat(elapsedMs(started)).isLessThan(AT_ONCE_MS)
+      assertThat(row(id).nextRetryAt).isEqualTo(start + 1_000L)
+      assertThat(db.syncDeadLetterDao().count()).isEqualTo(0)
+      assertThat(events.of(id).map { it.type }).containsExactly(SyncEventType.ITEM_RETRYING)
+      // afterDispatch is only logged, after the decider's line.
+      awaitUntil { callbackLog.size == 2 && callbacks.gateway.pendingCount == 0 }
+      assertThat(callbackLog[0]).matches(
+        "retryDecider for item $id \\(retryDecider:\\d+\\): the JS runtime that installed it is gone; " +
+          "the retry policy applies",
+      )
+      assertThat(callbackLog[1]).matches(
+        "afterDispatch for item $id \\(afterDispatch:\\d+\\): the JS runtime that installed it is gone; " +
+          "nothing changes",
+      )
+      assertThat(callbackPriorities).containsExactly(Log.INFO, Log.INFO)
+      assertThat(decider.calls).isEmpty()
+      assertThat(after.calls).isEmpty()
+    }
+
+  @Test
+  fun `android_interceptor_persistedHeadDeferred_nextItemProbes, alone`() = runTest {
+    server.dispatcher = object : Dispatcher() {
+      override fun dispatch(request: RecordedRequest): MockResponse =
+        MockResponse().setResponseCode(if (request.path == "/second") 401 else 200)
+    }
+    val first = seed("first", createdAt = 1L)
+    seed("second", createdAt = 2L)
+    val third = seed("third", createdAt = 3L)
+    val resolver = installResolver { context ->
+      if (context.itemId == "first") FakeJs.failed("no token yet") else FakeJs.headers(emptyMap())
+    }
+    val events = collectEvents()
+
+    val result = newDispatcher(credentials = { CredentialPolicy.PERSISTED }).flush()
+
+    // The deferred head tested no credential, so the next item went alone, and its rejection
+    // gave the rest of the batch back unsent.
+    assertThat(requestsByPath().keys).containsExactly("/second")
+    assertThat(row("first").lastErrorCode).isEqualTo(SyncErrorCode.INTERCEPTOR_FAILED.name)
+    assertThat(row("first").attempts).isEqualTo(first.attempts)
+    assertThat(row("second").lastErrorCode).isEqualTo(SyncErrorCode.UNAUTHORIZED.name)
+    assertThat(row("third")).isEqualTo(third)
+    assertThat(resolver.calls.map { it.itemId }).containsExactly("first", "second").inOrder()
+    events.assertDeferredEvent("first", attempt = 1)
+    assertThat(events.of("third")).isEmpty()
+    assertThat(result.successCount + result.failureCount).isEqualTo(0.0)
+  }
+
+  private companion object {
+    /** How long a fake decision takes, on the test clock. */
+    const val DECIDE_MS = 300L
+
+    /** An item attempted once before, whose header resolver fails. */
+    const val FAILING = "01FAILING"
+
+    /** Well inside every long callback timeout here: what "at once" allows on a loaded machine. */
+    const val AT_ONCE_MS = 10_000L
+
+    /** How long a resolver takes to answer, in real time, where a duration must leave it out. */
+    const val RESOLVER_WAIT_MS = 1_000L
+
+    /** The headers OkHttp sets on its own, from the body or the connection. */
+    val OKHTTP_HEADERS = listOf("Content-Type", "Content-Length", "Host", "Connection", "Accept-Encoding", "User-Agent")
   }
 }

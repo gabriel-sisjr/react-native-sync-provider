@@ -61,6 +61,11 @@ final class SyncEngine: @unchecked Sendable {
     /// The one HEAD probe of the process: measurements and the health check
     /// share it, and with it one connection to the host.
     let probe: HeadProbing
+    /// The JS callbacks installed in this process, by the hybrid that
+    /// installed each. See ``attachCallbacks()``.
+    let callbacks: CallbackRegistry
+    /// Where native waits for the answers of those callbacks.
+    let gateway: CallbackGateway
 
     private let configStore: SyncConfigStore
     private let recovery: RecoveryManager
@@ -131,6 +136,8 @@ final class SyncEngine: @unchecked Sendable {
     ///   - retryTimer: tests fire it explicitly.
     ///   - heldWakeTimer: re-checks a held wake; tests fire it explicitly.
     ///   - wrapWakeSource: test seam around the deadline queries.
+    ///   - callbackTimer: the timeouts of the JS callbacks; tests fire them
+    ///     explicitly.
     init(stack: CoreDataStack = .shared,
          configStore: SyncConfigStore = SyncConfigStore(),
          backgroundStore: BackgroundSyncOptionsStore = BackgroundSyncOptionsStore(),
@@ -143,12 +150,15 @@ final class SyncEngine: @unchecked Sendable {
          clock: SyncClock = SystemClock(),
          retryTimer: RetryWakeScheduling = RetryWakeTimer(),
          heldWakeTimer: RetryWakeScheduling = RetryWakeTimer(),
-         wrapWakeSource: ((RetryWakeSource) -> RetryWakeSource)? = nil) {
+         wrapWakeSource: ((RetryWakeSource) -> RetryWakeSource)? = nil,
+         callbackTimer: CallbackTimer = DispatchCallbackTimer()) {
         let loaded = configStore.load()
         let storage = SyncQueueStorage(dao: SyncItemDao(stack: stack, clock: clock),
                                        capacity: loaded.options.queueCapacity)
         let config = loaded.options.toDispatcherConfig(source: loaded.source,
                                                        credentialsUnavailable: loaded.credentialsUnavailable)
+        let callbacks = CallbackRegistry()
+        let gateway = CallbackGateway(timer: callbackTimer)
         let dispatcher: SyncDispatcher
         if let sessions {
             dispatcher = SyncDispatcher(storage: storage,
@@ -157,13 +167,19 @@ final class SyncEngine: @unchecked Sendable {
                                         config: config,
                                         foregroundSession: sessions.foreground,
                                         backgroundSession: sessions.background,
-                                        paused: loaded.paused)
+                                        paused: loaded.paused,
+                                        callbacks: callbacks,
+                                        gateway: gateway,
+                                        clock: clock)
         } else {
             dispatcher = SyncDispatcher(storage: storage,
                                         emitter: emitter,
                                         connectivity: connectivity,
                                         config: config,
-                                        paused: loaded.paused)
+                                        paused: loaded.paused,
+                                        callbacks: callbacks,
+                                        gateway: gateway,
+                                        clock: clock)
         }
 
         self.clock = clock
@@ -190,6 +206,8 @@ final class SyncEngine: @unchecked Sendable {
         self.qualityMonitor = qualityMonitor
         self.healthCheck = healthCheck
         self.probe = probe
+        self.callbacks = callbacks
+        self.gateway = gateway
 
         // Noted when the cycle ends, before the next one can start, so a late
         // re-arm cannot put an older end over a newer one.
@@ -278,19 +296,47 @@ final class SyncEngine: @unchecked Sendable {
         }
     }
 
+    /// The owner token of the JS callbacks a newly created hybrid installs.
+    /// That hybrid becomes their only owner: what older hybrids installed is
+    /// evicted, what a hybrid torn down before a JS reload left orphaned say,
+    /// and their pending waits end at once, as when no answer comes. Nothing
+    /// is installed again until this hybrid's JS calls a `set…`.
+    func attachCallbacks() -> UInt64 {
+        let owner = callbacks.attach()
+        gateway.retireOwners(below: owner)
+        return owner
+    }
+
+    /// A hybrid went away. Its pending waits end at once, as when no answer
+    /// comes, and what it installed stays registered, orphaned, until a newer
+    /// hybrid attaches. Every later request for an orphan ends at once,
+    /// without calling JS: the header resolver and `beforeDispatch` defer
+    /// their items, the retry decider leaves the retry policy's verdict, and
+    /// `afterDispatch` is only logged. So from the teardown to the next attach,
+    /// no item goes out without the headers its resolver adds, or past a
+    /// `beforeDispatch` that could skip it. A newer hybrid's installs are left
+    /// alone.
+    func detachCallbacks(owner: UInt64) {
+        // The gateway first: from here on, no request for `owner` calls JS.
+        gateway.retireOwner(owner)
+        callbacks.detach(owner: owner)
+    }
+
     /// Returns once a flush started by connectivity coming back has finished.
     func waitForReconnectWake() async {
         await lock.withLock { reconnectWake }?.value
     }
 
     /// Stops the engine's timers and subscriptions for good: a wake already in
-    /// flight will not re-arm. The shared engine lives as long as the process;
-    /// this exists for short-lived instances.
+    /// flight will not re-arm, and every wait for a JS callback ends at once,
+    /// as when no answer comes. The shared engine lives as long as the
+    /// process; this exists for short-lived instances.
     func shutdown() {
         lock.withLock { isShutDown = true }
         retryTimer.cancel()
         heldWakeTimer.cancel()
         qualityMonitor.stop()
+        gateway.retireAll()
     }
 
     // MARK: - Network

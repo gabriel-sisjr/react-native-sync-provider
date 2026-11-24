@@ -119,6 +119,7 @@ internal class SyncConfigStore(
       putOptionalString(KEY_HEALTH_CHECK_URL, options.healthCheckUrl)
       putOptionalDouble(KEY_HEALTH_CHECK_TTL_MS, options.healthCheckTtlMs)
       putOptionalDouble(KEY_HEALTH_CHECK_BACKOFF_MS, options.healthCheckBackoffMs)
+      putOptionalDouble(KEY_CALLBACK_TIMEOUT_MS, options.callbackTimeoutMs)
       putBoolean(KEY_HAS_DEFAULT_HEADERS, hasDefaultHeaders)
     }.commit()
   }
@@ -145,6 +146,7 @@ internal class SyncConfigStore(
         healthCheckUrl = readHealthCheckUrl(),
         healthCheckTtlMs = readOptionalMs(KEY_HEALTH_CHECK_TTL_MS),
         healthCheckBackoffMs = readOptionalMs(KEY_HEALTH_CHECK_BACKOFF_MS),
+        callbackTimeoutMs = readCallbackTimeoutMs(),
       )
     }.onFailure {
       Log.w(TAG, "Persisted configuration is unreadable; using defaults: ${it.javaClass.simpleName}")
@@ -189,6 +191,17 @@ internal class SyncConfigStore(
     return null
   }
 
+  /**
+   * `configureSync` accepts only a finite value of at least 1, so a value that is not one comes
+   * from a damaged record: it loads as unset, which means the default wait.
+   */
+  private fun readCallbackTimeoutMs(): Double? {
+    val value = readOptionalDouble(KEY_CALLBACK_TIMEOUT_MS) ?: return null
+    if (CallbackTimeout.isValid(value)) return value
+    Log.w(TAG, "Persisted $KEY_CALLBACK_TIMEOUT_MS is unusable; leaving it unset.")
+    return null
+  }
+
   private fun readDouble(key: String): Double =
     readOptionalDouble(key) ?: throw IllegalStateException("Missing $key")
 
@@ -227,6 +240,7 @@ internal class SyncConfigStore(
     const val KEY_HEALTH_CHECK_URL = "healthCheckUrl"
     const val KEY_HEALTH_CHECK_TTL_MS = "healthCheckTtlMs"
     const val KEY_HEALTH_CHECK_BACKOFF_MS = "healthCheckBackoffMs"
+    const val KEY_CALLBACK_TIMEOUT_MS = "callbackTimeoutMs"
     const val KEY_HAS_DEFAULT_HEADERS = "hasDefaultHeaders"
     const val KEY_PAUSED = "paused"
   }

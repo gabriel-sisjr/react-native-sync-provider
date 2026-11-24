@@ -32,9 +32,10 @@ graph TD
 
 ### Layer 1: TypeScript Facade
 
-Source of every public symbol: 24 functions (22 wrap the HybridObject, and `drainUntilEmpty` and `cancelDrain` are JS-side), 2 listener helpers, 9 hooks, the `SyncProvider` context, every type and enum, the `SyncError` class. Located under `src/`. Responsibilities:
+Source of every public symbol: 33 functions (31 wrap the HybridObject, and `drainUntilEmpty` and `cancelDrain` are JS-side), 2 listener helpers, 9 hooks, the `SyncProvider` context, every type and enum, the `SyncError` class. Located under `src/`. Responsibilities:
 
-- Validate inputs (`validateSyncItem`, and `validateSyncOptions` for the quality-gate and health-check options).
+- Validate inputs (`validateSyncItem`, and `validateSyncOptions` for the quality-gate, health-check and `callbackTimeoutMs` options).
+- Run the app's [retry decider and dispatch interceptors](../guides/dispatch-interceptors.md) when native asks, turn a throw, a rejection or an invalid result into a failed answer, and send the answer back. See [JS Callbacks Through One Gateway](#js-callbacks-through-one-gateway).
 - Translate the native sentinel `startedAt === 0 && finishedAt === 0` for `getLastSyncResult` into `undefined`.
 - Wrap raw native errors in [`SyncError`](../api-reference/errors.md) with a typed [`SyncErrorCode`](../api-reference/errors.md#syncerrorcode).
 - Provide React hooks that subscribe to native events and re-render on relevant transitions.
@@ -42,7 +43,7 @@ Source of every public symbol: 24 functions (22 wrap the HybridObject, and `drai
 
 ### Layer 2: Nitro Spec
 
-`src/SyncProvider.nitro.ts` declares a `HybridObject<{ ios: 'swift'; android: 'kotlin' }>` interface. This is the source of truth for the JS↔native contract. Running `yarn nitrogen` produces:
+`src/SyncProvider.nitro.ts` declares a `HybridObject<{ ios: 'swift'; android: 'kotlin' }>` interface. This is the source of truth for the JS↔native contract. It has 34 methods: the 31 the facade wraps, `addListener` and `removeListener` behind the listener helpers, and the internal `answerCallback`, which only the facade calls. Running `yarn nitrogen` produces:
 
 - A C++ spec header per platform (`HybridSyncProviderSpec`).
 - iOS autolinking ruby (`SyncProvider+autolinking.rb`) included by the podspec.
@@ -83,9 +84,21 @@ The New Architecture is required: the library is built and tested only on it. Ni
 
 The sync engine lives in native code, so a background run needs no JS. On iOS, `SyncEngine.shared` owns the queue, the dispatcher, the retry timer and the configuration, and is built on first use by JS creating the hybrid or by a fired BGTask. On Android, `SyncProviderRuntime` is the process-wide container that WorkManager workers share, and it restores the persisted configuration whichever process builds it. See [iOS Native Architecture](./ios-native.md#syncengine) and [Android Native Architecture](./android-native.md#directory-map).
 
+The JS callbacks are the one part that needs JS. A run with no JS has nothing installed: it sends the stored `defaultHeaders`, and the declarative `RetryPolicy` decides its retries.
+
 ### Configuration Persisted for Background Runs
 
-`configureSync` persists its options, so a worker or BGTask in a process the app never spoke to honors them. `defaultHeaders` are encrypted at rest, with an Android Keystore key and in the iOS Keychain, and a call without them deletes the stored copy. The library does not refresh tokens. See [Cold-start configuration](../guides/background-sync.md#cold-start-configuration).
+`configureSync` persists its options, so a worker or BGTask in a process the app never spoke to honors them. `defaultHeaders` are encrypted at rest, with an Android Keystore key and in the iOS Keychain, and a call without them deletes the stored copy. The library does not refresh tokens. While JS runs, a [header resolver](../guides/dispatch-interceptors.md#header-resolver) can supply one for each request, but a run with no JS sends the stored copy. See [Cold-start configuration](../guides/background-sync.md#cold-start-configuration).
+
+### JS Callbacks Through One Gateway {#js-callbacks-through-one-gateway}
+
+The retry decider and the three dispatch interceptors are JS functions that native calls in the middle of a cycle. Each crosses the bridge as a function that returns nothing and takes a native request id. The facade runs the app's function, sync or async, and answers through the internal `answerCallback(requestId, answer)`. The wrapper never throws into React Native: a throw, a rejection or an invalid result becomes a failed answer at once.
+
+On each platform, one gateway owned by the process-wide engine, not by a hybrid, does every wait. It registers the request before it calls JS, and ends it exactly once: on the answer, on a failed answer, after `callbackTimeoutMs`, on a cancellation, or when the runtime that installed the function goes away. A late, unknown or repeated answer does nothing. No callback is called or awaited under a lock that the answer path takes. Native cannot tell a hung JS thread from a runtime that a reload replaced, so both end in the timeout. That is why the wait is a native timer, not an await on a JS promise, which cannot be cancelled.
+
+What a callback that gives no usable answer costs depends on its kind: the retry decider leaves the decision to the policy, the header resolver and `beforeDispatch` defer the item without sending it, and `afterDispatch` is only logged.
+
+Each install belongs to the hybrid that made it. A newer hybrid's creation, the first library call of a new JS runtime, evicts every older install. A teardown retires its own installs: they stay registered and count as installed, but are never called. Each consult of one ends at once, the way a failed answer does, so until a newer hybrid attaches, a resolver's items are deferred instead of going out without its headers. See [Reloads and Teardown](../guides/dispatch-interceptors.md#reloads-and-teardown).
 
 ### At-Least-Once Delivery
 
@@ -165,6 +178,7 @@ A single native monitor per process (`ConnectivityMonitor`) emits `CONNECTION_CH
 
 - The bridge is **Nitro Modules**, not TurboModules. Object payloads (e.g. `SyncItem`) cross the JSI boundary as native objects — no JSON `parse`/`stringify` tax.
 - The native dispatcher runs off the JS thread. Hooks subscribe via Nitro callbacks.
+- An installed callback costs a JS round trip per item, bounded by `callbackTimeoutMs`. With JS busy or hung, iOS pays that wait per item, while Android's concurrent batch pays it about once.
 - Default batch size is `25`. Tunable via `configureSync({ batchSize })`. Android sends a batch concurrently, except that with `defaultHeaders` restored from disk the first item goes out alone first. iOS sends one item at a time.
 - Background dispatch on iOS uses `URLSessionConfiguration.background` when the app is not active, unless `foregroundOnly` is set, so the OS may finish an upload while the app is suspended.
 

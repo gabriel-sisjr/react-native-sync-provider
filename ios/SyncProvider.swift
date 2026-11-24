@@ -43,6 +43,12 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
     private let listenerLock = NSLock()
     private var listenerIds: [String: Set<String>] = [:]
 
+    // MARK: - JS callbacks
+
+    /// The owner token of the callbacks installed through this instance. See
+    /// ``SyncEngine/attachCallbacks()``.
+    let callbackOwner: UInt64
+
     // MARK: - Init
 
     public override convenience init() {
@@ -51,6 +57,9 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
 
     init(engine: SyncEngine) {
         self.engine = engine
+        // Before anything is installed through this instance: a hybrid from
+        // before a JS reload may have left callbacks behind, orphaned.
+        self.callbackOwner = engine.attachCallbacks()
         super.init()
         engine.attachHybrid()
 
@@ -59,6 +68,11 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
     }
 
     deinit {
+        // Retires only this instance's callbacks: their waits end, and what it
+        // installed stays, orphaned and never called, until a newer hybrid
+        // attaches. After a reload, the new runtime's hybrid may have
+        // installed its own already.
+        engine.detachCallbacks(owner: callbackOwner)
         let channels = listenerLock.withLock { listenerIds }
         for (channel, ids) in channels {
             for id in ids {
@@ -253,6 +267,7 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
             do {
                 let snapshot = Self.translate(options: options)
                 try snapshot.validateNetworkHealth()
+                try snapshot.validateCallbackTimeout()
                 await self.engine.configure(snapshot)
             } catch {
                 throw wrapAsSyncProviderError(error)
@@ -366,6 +381,107 @@ public final class HybridSyncProvider: HybridSyncProviderSpec {
             _ = listenerIds[event]?.remove(subscriptionId)
         }
         engine.emitter.removeListener(channel: event, id: subscriptionId)
+        return Promise.resolved()
+    }
+
+    // MARK: - JS callbacks
+    //
+    // Each call answers from memory: settled on return. An install holds the
+    // JS function and nothing of this instance, so the engine, which outlives
+    // every runtime, never keeps a hybrid alive after its runtime is gone.
+
+    /// Installs the retry decider, replacing any earlier one. Rejected with
+    /// `NATIVE_MODULE_UNAVAILABLE`, with nothing changed, once a newer hybrid
+    /// has attached: a newer JS runtime owns the callbacks.
+    public func setRetryDecider(decider: @escaping (_ requestId: String,
+                                                    _ context: RetryDeciderContext) -> Void) throws -> Promise<Void> {
+        let js = JSFunction(decider)
+        let install = CallbackInstall<RetryDeciderRequest>(owner: callbackOwner) { requestId, request in
+            js.call(requestId, HybridSyncProvider.translate(decider: request))
+        }
+        return Self.settled(installed: engine.callbacks.setRetryDecider(install))
+    }
+
+    /// Removes the retry decider this instance installed, if any.
+    public func clearRetryDecider() throws -> Promise<Void> {
+        engine.callbacks.clearRetryDecider(owner: callbackOwner)
+        return Promise.resolved()
+    }
+
+    /// `true` while a retry decider this instance installed is in place.
+    public func isRetryDeciderInstalled() throws -> Promise<Bool> {
+        return Promise.resolved(withResult: engine.callbacks.retryDecider?.owner == callbackOwner)
+    }
+
+    /// Installs the header resolver. See ``setRetryDecider(decider:)``.
+    public func setHeaderResolver(resolver: @escaping (_ requestId: String,
+                                                       _ context: HeaderResolverContext) -> Void) throws -> Promise<Void> {
+        let js = JSFunction(resolver)
+        let install = CallbackInstall<HeaderResolverRequest>(owner: callbackOwner) { requestId, request in
+            js.call(requestId, HybridSyncProvider.translate(resolver: request))
+        }
+        return Self.settled(installed: engine.callbacks.setHeaderResolver(install))
+    }
+
+    /// Removes the header resolver this instance installed, if any.
+    public func clearHeaderResolver() throws -> Promise<Void> {
+        engine.callbacks.clearHeaderResolver(owner: callbackOwner)
+        return Promise.resolved()
+    }
+
+    /// Installs `beforeDispatch`. See ``setRetryDecider(decider:)``.
+    public func setBeforeDispatch(hook: @escaping (_ requestId: String,
+                                                   _ context: BeforeDispatchContext) -> Void) throws -> Promise<Void> {
+        let js = JSFunction(hook)
+        let install = CallbackInstall<BeforeDispatchRequest>(owner: callbackOwner) { requestId, request in
+            js.call(requestId, HybridSyncProvider.translate(before: request))
+        }
+        return Self.settled(installed: engine.callbacks.setBeforeDispatch(install))
+    }
+
+    /// Removes the `beforeDispatch` hook this instance installed, if any.
+    public func clearBeforeDispatch() throws -> Promise<Void> {
+        engine.callbacks.clearBeforeDispatch(owner: callbackOwner)
+        return Promise.resolved()
+    }
+
+    /// Installs `afterDispatch`. See ``setRetryDecider(decider:)``.
+    ///
+    /// The hook is called through the main queue, behind the `ITEM_*` event
+    /// the emitter queued there for the same request, so JS hears that event
+    /// first. This is best effort: React Native runs the two calls in the
+    /// order they were queued, which it does not promise.
+    public func setAfterDispatch(hook: @escaping (_ requestId: String,
+                                                  _ context: AfterDispatchContext) -> Void) throws -> Promise<Void> {
+        let js = JSFunction(hook)
+        let install = CallbackInstall<AfterDispatchReport>(owner: callbackOwner) { requestId, report in
+            DispatchQueue.main.async {
+                js.call(requestId, HybridSyncProvider.translate(after: report))
+            }
+        }
+        return Self.settled(installed: engine.callbacks.setAfterDispatch(install))
+    }
+
+    /// Removes the `afterDispatch` hook this instance installed, if any.
+    public func clearAfterDispatch() throws -> Promise<Void> {
+        engine.callbacks.clearAfterDispatch(owner: callbackOwner)
+        return Promise.resolved()
+    }
+
+    /// The facade's answer to a callback request. Runs on the JS thread and
+    /// only completes that request: a late, unknown or second answer does
+    /// nothing, and nothing here throws.
+    public func answerCallback(requestId: String, answer: CallbackAnswer) throws {
+        engine.gateway.answer(requestId, Self.translate(answer: answer))
+    }
+
+    /// The promise a `set…` call settles with.
+    private static func settled(installed: Bool) -> Promise<Void> {
+        guard installed else {
+            return Promise.rejected(withError: SyncProviderError(
+                code: .nativeModuleUnavailable,
+                message: "A newer JS runtime has attached; this one can no longer install callbacks."))
+        }
         return Promise.resolved()
     }
 
@@ -507,7 +623,8 @@ extension HybridSyncProvider {
             minNetworkQuality: options.minNetworkQuality.map(Self.translate(quality:)),
             healthCheckUrl: options.healthCheckUrl,
             healthCheckTtlMs: options.healthCheckTtlMs,
-            healthCheckBackoffMs: options.healthCheckBackoffMs
+            healthCheckBackoffMs: options.healthCheckBackoffMs,
+            callbackTimeoutMs: options.callbackTimeoutMs
         )
     }
 
@@ -534,7 +651,8 @@ extension HybridSyncProvider {
                            minNetworkQuality: snapshot.minNetworkQuality.map(Self.translate(level:)),
                            healthCheckUrl: snapshot.healthCheckUrl,
                            healthCheckTtlMs: snapshot.healthCheckTtlMs,
-                           healthCheckBackoffMs: snapshot.healthCheckBackoffMs)
+                           healthCheckBackoffMs: snapshot.healthCheckBackoffMs,
+                           callbackTimeoutMs: snapshot.callbackTimeoutMs)
     }
 
     /// `networkQuality` is the engine's grade, which is `OFFLINE` exactly when
@@ -594,6 +712,105 @@ extension HybridSyncProvider {
                          attempt: payload.attempt,
                          connectionStatus: connStatus,
                          metadata: payload.metadata)
+    }
+
+    // MARK: - JS callbacks
+
+    /// The answer as the gateway reads it. A value this build cannot read, a
+    /// case a newer facade added say, makes it a FAILED answer.
+    static func translate(answer: CallbackAnswer) -> CallbackReply {
+        let status: CallbackReply.Status
+        switch answer.status {
+        case .resolved: status = .resolved
+        case .failed: status = .failed
+        @unknown default: return .failed("the answer's status is unknown to this build")
+        }
+        var decision: RetryDecisionValue?
+        if let raw = answer.decision {
+            let action: RetryDecisionValue.Action
+            switch raw.action {
+            case .retry: action = .retry
+            case .drop: action = .drop
+            case .deadLetter: action = .deadLetter
+            @unknown default: return .failed("the retry action is unknown to this build")
+            }
+            decision = RetryDecisionValue(action: action, delayMs: raw.delayMs)
+        }
+        var beforeDispatch: BeforeDispatchActionValue?
+        if let raw = answer.beforeDispatch {
+            switch raw.action {
+            case .proceed: beforeDispatch = .proceed
+            case .skip: beforeDispatch = .skip
+            @unknown default: return .failed("the beforeDispatch action is unknown to this build")
+            }
+        }
+        return CallbackReply(status: status,
+                             decision: decision,
+                             headers: answer.headers,
+                             beforeDispatch: beforeDispatch,
+                             message: answer.message)
+    }
+
+    static func translate(decider request: RetryDeciderRequest) -> RetryDeciderContext {
+        RetryDeciderContext(itemId: request.itemId,
+                            attempt: Double(request.attempt),
+                            errorCode: SyncErrorCode(fromString: request.errorCode) ?? .networkError,
+                            statusCode: request.statusCode.map(Double.init),
+                            url: request.url,
+                            method: HttpMethod(fromString: request.method) ?? .post,
+                            metadata: request.metadata)
+    }
+
+    static func translate(resolver request: HeaderResolverRequest) -> HeaderResolverContext {
+        HeaderResolverContext(itemId: request.itemId,
+                              attempt: Double(request.attempt),
+                              url: request.url,
+                              method: HttpMethod(fromString: request.method) ?? .post,
+                              metadata: request.metadata)
+    }
+
+    static func translate(before request: BeforeDispatchRequest) -> BeforeDispatchContext {
+        BeforeDispatchContext(itemId: request.itemId,
+                              attempt: Double(request.attempt),
+                              url: request.url,
+                              method: HttpMethod(fromString: request.method) ?? .post,
+                              headers: request.headers,
+                              contentType: request.contentType,
+                              metadata: request.metadata)
+    }
+
+    static func translate(after report: AfterDispatchReport) -> AfterDispatchContext {
+        let outcome: DispatchOutcome
+        switch report.outcome {
+        case .succeeded: outcome = .succeeded
+        case .retrying: outcome = .retrying
+        case .failed: outcome = .failed
+        }
+        return AfterDispatchContext(itemId: report.itemId,
+                                    attempt: Double(report.attempt),
+                                    outcome: outcome,
+                                    statusCode: report.statusCode.map(Double.init),
+                                    errorCode: report.errorCode.flatMap { SyncErrorCode(fromString: $0) },
+                                    url: report.url,
+                                    method: HttpMethod(fromString: report.method) ?? .post,
+                                    metadata: report.metadata,
+                                    durationMs: Double(report.durationMs))
+    }
+}
+
+/// A JS function Nitro handed over. Nitro calls a void JS callback through
+/// `callAndForget`: from any thread, queued on the JS thread, and dropped
+/// with a log line once its runtime is gone, so a call never blocks or
+/// throws.
+private final class JSFunction<Context>: @unchecked Sendable {
+    private let body: (_ requestId: String, _ context: Context) -> Void
+
+    init(_ body: @escaping (_ requestId: String, _ context: Context) -> Void) {
+        self.body = body
+    }
+
+    func call(_ requestId: String, _ context: Context) {
+        body(requestId, context)
     }
 }
 

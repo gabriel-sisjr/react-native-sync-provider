@@ -20,6 +20,8 @@ final class EngineFixture {
     let timer = ManualWakeTimer()
     /// Re-checks a wake held below the network-quality minimum.
     let recheckTimer = ManualWakeTimer()
+    /// The timeouts of the JS callbacks: none fires until a test says so.
+    let callbackTimer = ManualCallbackTimer()
     /// Set before building an engine to intercept its deadline queries.
     var wrapWakeSource: ((RetryWakeSource) -> RetryWakeSource)?
     let foregroundSession = URLSession.stubbed()
@@ -28,10 +30,11 @@ final class EngineFixture {
     private let suite: String
     private var engines: [SyncEngine] = []
 
-    init() {
+    /// - Parameter transactions: logs every transaction of the stack, when set.
+    init(transactions: TransactionLog? = nil) {
         let faults = SaveFaults()
         saveFaults = faults
-        stack = InMemoryCoreDataStack.make(saveFaults: faults)
+        stack = InMemoryCoreDataStack.make(saveFaults: faults, transactions: transactions)
         (defaults, suite) = UserDefaults.ephemeral()
     }
 
@@ -64,7 +67,8 @@ final class EngineFixture {
                                 clock: clock,
                                 retryTimer: timer,
                                 heldWakeTimer: recheckTimer,
-                                wrapWakeSource: wrapWakeSource)
+                                wrapWakeSource: wrapWakeSource,
+                                callbackTimer: callbackTimer)
         engines.append(engine)
         return engine
     }

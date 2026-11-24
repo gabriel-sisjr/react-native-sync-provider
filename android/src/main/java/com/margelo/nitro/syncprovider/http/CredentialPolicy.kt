@@ -1,6 +1,10 @@
 package com.margelo.nitro.syncprovider.http
 
-/** How far the current default headers can be trusted by a flush cycle. */
+/**
+ * How far the current default headers can be trusted by a flush cycle. It depends on where
+ * `defaultHeaders` came from, and on nothing else: headers a JS header resolver supplies never
+ * change it.
+ */
 internal enum class CredentialPolicy {
   /** Supplied by JS in this process, or there are none: a 401/403 is terminal. */
   TRUSTED,

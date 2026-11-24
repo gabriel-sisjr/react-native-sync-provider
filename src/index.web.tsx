@@ -3,10 +3,12 @@
  *
  * Mirrors the public API surface of `src/index.tsx` but every facade
  * function throws `SyncError(NATIVE_MODULE_UNAVAILABLE)` and every hook
- * returns inert state (no throws on render). The exceptions are `cancelDrain`
- * and the listener helpers, which no-op because they sit in cleanup paths. This
- * keeps SSR and web bundles importable while making it impossible to silently
- * miss the lack of native support.
+ * returns inert state (no throws on render). The exceptions are `cancelDrain`,
+ * the listener helpers and the four uninstallers (`clearRetryDecider`,
+ * `clearHeaderResolver`, `clearBeforeDispatch`, `clearAfterDispatch`), which
+ * no-op because they sit in cleanup paths. This keeps SSR and web bundles
+ * importable while making it impossible to silently miss the lack of native
+ * support.
  *
  * Re-exports types, enums, errors, and `generateId` (which works on web).
  *
@@ -23,6 +25,12 @@ import {
   ConnectionType,
   NetworkQuality,
 } from './types/enums';
+import type {
+  AfterDispatchHook,
+  BeforeDispatchHook,
+  HeaderResolver,
+  RetryDecider,
+} from './types/callbacks';
 import type {
   UseConnectionResult,
   UseOfflineQueueResult,
@@ -217,6 +225,73 @@ export async function addSyncEventListener(
 export async function removeSyncEventListener(
   _subscriptionId: string
 ): Promise<void> {
+  // no-op
+}
+
+/* -------------------------------------------------------------------------- */
+/*            Retry decider and dispatch interceptors (throwing)              */
+/* -------------------------------------------------------------------------- */
+
+/** @public */
+export async function setRetryDecider(_decider: RetryDecider): Promise<void> {
+  throw unavailable('setRetryDecider');
+}
+/**
+ * Web no-op twin of `clearRetryDecider`. Nothing is ever installed on web, so
+ * this resolves without doing anything — safe to call from cleanup paths.
+ *
+ * @public
+ */
+export async function clearRetryDecider(): Promise<void> {
+  // no-op
+}
+/** @public */
+export async function isRetryDeciderInstalled(): Promise<boolean> {
+  throw unavailable('isRetryDeciderInstalled');
+}
+/** @public */
+export async function setHeaderResolver(
+  _resolver: HeaderResolver
+): Promise<void> {
+  throw unavailable('setHeaderResolver');
+}
+/**
+ * Web no-op twin of `clearHeaderResolver`. Resolves without doing anything —
+ * safe to call from cleanup paths.
+ *
+ * @public
+ */
+export async function clearHeaderResolver(): Promise<void> {
+  // no-op
+}
+/** @public */
+export async function setBeforeDispatch(
+  _hook: BeforeDispatchHook
+): Promise<void> {
+  throw unavailable('setBeforeDispatch');
+}
+/**
+ * Web no-op twin of `clearBeforeDispatch`. Resolves without doing anything —
+ * safe to call from cleanup paths.
+ *
+ * @public
+ */
+export async function clearBeforeDispatch(): Promise<void> {
+  // no-op
+}
+/** @public */
+export async function setAfterDispatch(
+  _hook: AfterDispatchHook
+): Promise<void> {
+  throw unavailable('setAfterDispatch');
+}
+/**
+ * Web no-op twin of `clearAfterDispatch`. Resolves without doing anything —
+ * safe to call from cleanup paths.
+ *
+ * @public
+ */
+export async function clearAfterDispatch(): Promise<void> {
   // no-op
 }
 

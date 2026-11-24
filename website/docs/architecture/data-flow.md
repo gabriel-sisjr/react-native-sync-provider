@@ -1,7 +1,7 @@
 ---
 sidebar_position: 2
 title: Data Flow
-description: Step-by-step traces for enqueue, foreground flush, background flush, connectivity changes, and recovery in react-native-sync-provider.
+description: Step-by-step traces for enqueue, foreground flush, the JS callbacks around each request, background flush, connectivity changes, and recovery in react-native-sync-provider.
 keywords:
   - data flow
   - enqueue
@@ -87,14 +87,23 @@ flowchart TD
     C --> D["take one batch: up to batchSize eligible items"]
     D --> E{items?}
     E -- no --> F["persist 0/0 SyncResult, emit SYNC_SUCCEEDED"]
-    E -- yes --> G["for each item: one HTTP request"]
-    G --> H{response?}
+    E -- yes --> G["for each item: header resolver, merge, beforeDispatch"]
+    G --> S{deferred?}
+    S -- failed, timed out or SKIP --> T["back to PENDING, no attempt spent, emit ITEM_RETRYING with INTERCEPTOR_FAILED"]
+    S -- no --> R[one HTTP request]
+    R --> H{response?}
     H -- 2xx --> I[delete row, emit ITEM_SUCCEEDED]
-    H -- retriable, attempts left --> J[keep PENDING, write nextRetryAt, emit ITEM_RETRYING]
+    H -- retriable, attempts left --> V{retry decider}
+    V -- not installed, failed or RETRY --> J[keep PENDING, write nextRetryAt, emit ITEM_RETRYING]
+    V -- DEAD_LETTER --> K
+    V -- DROP --> X["delete row, emit ITEM_FAILED with RETRY_DECIDER_REJECTED"]
     H -- permanent --> K[move to the dead-letter queue, emit ITEM_FAILED, then ITEM_DEAD_LETTERED]
-    I --> L[persist SyncResult]
-    J --> L
-    K --> L
+    I --> W["afterDispatch, not awaited"]
+    J --> W
+    K --> W
+    X --> W
+    W --> L[persist SyncResult]
+    T --> L
     L --> M{any permanent failure?}
     M -- no --> N[emit SYNC_SUCCEEDED]
     M -- yes --> O[emit SYNC_FAILED]
@@ -109,12 +118,45 @@ Notes:
 - "Eligible" means `PENDING` with `nextRetryAt <= now`, so cooling items are skipped. Priority decides which items a cycle takes, and on iOS the order they go out.
 - Android sends a batch concurrently, except that with `defaultHeaders` restored from disk the first item goes out alone first. iOS sends it one item at a time, and emits `SYNC_PROGRESS` once per item, before that item's `ITEM_*` event.
 - The dispatcher checks connectivity only through the opt-in quality gate (`minNetworkQuality`), and the backend only through the opt-in health check (`healthCheckUrl`). Both are skipped when unset. See [Checks Before a Cycle](../api-reference/functions.md#checks-before-a-cycle).
-- A permanent failure moves the item, in one transaction, from the queue to the dead-letter queue, except an item removed or cleared while its request was in flight.
-- Cycles do not overlap. On Android, a concurrent `flush()` waits for the running cycle and then runs its own. On iOS, it returns the last result at once.
-- HTTP requests run on the native dispatcher's executor (`URLSession` on iOS, OkHttp + `Dispatchers.IO` on Android). The JS thread is never blocked.
+- A permanent failure moves the item, in one transaction, from the queue to the dead-letter queue, except an item removed or cleared while its request was in flight, and one a retry decider dropped, which is deleted.
+- The callback steps run only for what is installed, in a process with JS. With nothing installed, an item goes straight to its request with the static headers, and the `RetryPolicy` alone decides. See [Order for One Item](../guides/dispatch-interceptors.md#order).
+- A deferred item counts in neither total and holds up no other item. An item that cannot be sent, because its budget is spent or its URL is invalid, reaches no callback.
+- Cycles do not overlap. On Android, a concurrent `flush()` waits for the running cycle and then runs its own. On iOS, it returns the last result at once. So a callback must [never await `flush()`](../guides/dispatch-interceptors.md#never-await-flush-in-a-callback).
+- HTTP requests run on the native dispatcher's executor (`URLSession` on iOS, OkHttp + `Dispatchers.IO` on Android). The JS thread is never blocked: native waits for a callback's answer on its own threads, for at most `callbackTimeoutMs`.
 - The `SyncResult` is persisted to history before the promise resolves.
-- A cycle that dies, for example on a failed storage write, first settles each item it claimed and left without a recorded outcome, then emits `SYNC_FAILED` and rejects, so every cycle ends with a terminal event. Automatic wakes then wait for the [failure hold](../guides/retry-policy.md#the-failure-hold). See [When a Cycle Dies](../guides/error-handling.md#when-a-cycle-dies).
-- A cancelled cycle ends with `SYNC_FAILED` without an `errorCode`, and gives its unsent items back unchanged. See [Cancelled Cycles](../guides/error-handling.md#cancelled-cycles).
+- A cycle that dies, for example on a failed storage write, first settles each item it claimed and left without a recorded outcome, then emits `SYNC_FAILED` and rejects, so every cycle ends with a terminal event. Automatic wakes then wait for the [failure hold](../guides/retry-policy.md#the-failure-hold). See [When a Cycle Dies](../guides/error-handling.md#when-a-cycle-dies). The settle never asks JS: it applies a retry decider's recorded decision, or the policy's. Its retry delay counts from when the outcome was decided on Android, and from the settle's own write on iOS, so the two differ by the duration of one failed write. That difference predates v0.4.
+- A cancelled cycle ends with `SYNC_FAILED` without an `errorCode`, and gives its unsent items back unchanged. An item waiting on an interceptor is one of them. See [Cancelled Cycles](../guides/error-handling.md#cancelled-cycles).
+
+### Callbacks Around One Request
+
+With every callback installed, one item's dispatch runs like this. The facade answers each request through the internal `answerCallback` method, which apps never call:
+
+```mermaid
+sequenceDiagram
+    participant Disp as SyncDispatcher
+    participant GW as Callback gateway
+    participant JS as JS facade
+    participant Net as Network
+
+    Disp->>GW: header resolver, for this item and attempt
+    GW->>JS: call the resolver with a request id
+    JS-->>GW: answerCallback(request id, headers)
+    GW-->>Disp: the headers, or a failure after callbackTimeoutMs
+    Disp->>Disp: merge defaultHeaders, resolver headers, item headers
+    Disp->>GW: beforeDispatch, with the merged headers
+    GW->>JS: call the hook with a request id
+    JS-->>GW: answerCallback(request id, PROCEED)
+    GW-->>Disp: PROCEED
+    Disp->>Disp: check that the item is still queued
+    Disp->>Net: HTTP request
+    Net-->>Disp: response
+    Disp->>GW: retry decider, after a retryable failure with attempts left
+    GW-->>Disp: the decision, or the policy's after callbackTimeoutMs
+    Disp->>Disp: store the outcome, emit the ITEM event
+    Disp-)GW: afterDispatch, not awaited
+```
+
+The two platforms differ in when the item is claimed. On iOS, the interceptors run before the claim, so the item stays `PENDING` during their waits, and the claim is the final check that it is still queued. On Android, the batch is claimed when the cycle starts, so the item waits `IN_FLIGHT`, and a deferral gives it back as `PENDING`. See [Platform Differences](../guides/dispatch-interceptors.md#platform-differences).
 
 ## Background Flush Flow
 
@@ -134,7 +176,7 @@ sequenceDiagram
     Native->>OS: setTaskCompleted(success: true)
 ```
 
-On both platforms, the flush runs the same checks as a foreground one, from the persisted configuration. See [When the gate or the health check skips a window](../guides/background-sync.md#when-the-gate-or-the-health-check-skips-a-window). On iOS the task completes with `success: false` instead when the flush throws or the window [runs out of time](../guides/background-sync.md#when-a-window-runs-out-of-time).
+On both platforms, the flush runs the same checks as a foreground one, from the persisted configuration. See [When the gate or the health check skips a window](../guides/background-sync.md#when-the-gate-or-the-health-check-skips-a-window). A run with no JS calls no callback: its requests carry the stored `defaultHeaders`, and the `RetryPolicy` decides. On iOS the task completes with `success: false` instead when the flush throws or the window [runs out of time](../guides/background-sync.md#when-a-window-runs-out-of-time).
 
 ### Android (WorkManager)
 

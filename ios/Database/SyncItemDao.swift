@@ -40,12 +40,14 @@ struct StoredSyncItem: Sendable, Equatable {
     let attempts: Int32
     let lastAttemptAt: Int64?
     /// Epoch-ms timestamp before which the item is **not** eligible for
-    /// dispatch. `0` means "eligible now": no cooldown or credential hold is
-    /// pending. A positive value is a deadline written by
+    /// dispatch. `0` means "eligible now": no cooldown, credential hold or
+    /// deferral is pending. A positive value is a deadline written by
     /// ``SyncItemDao/markPendingForRetry(id:errorCode:retryDelayMs:)`` (retry
-    /// cooldown) or by
+    /// cooldown), by
     /// ``SyncItemDao/markCredentialRejected(id:errorCode:retryDelayMs:attempts:)``
-    /// (credential hold), never past ``RetryPolicyEvaluator/maxDeadlineMs``,
+    /// (credential hold), or by ``SyncItemDao/deferPending(id:errorCode:delayMs:)``
+    /// (an item the header resolver or `beforeDispatch` deferred, its
+    /// `attempts` untouched), never past ``RetryPolicyEvaluator/maxDeadlineMs``,
     /// the largest valid JavaScript `Date`; a row an older version wrote can
     /// hold a later one until its next attempt. `0` does not mean "never
     /// attempted": a row recovered
@@ -121,6 +123,9 @@ enum ClaimSettlement: Sendable, Equatable {
     /// Moved to the dead-letter store, as
     /// ``SyncItemDao/moveToDeadLetters(id:errorCode:errorMessage:)`` moves it.
     case deadLetter(errorCode: String, errorMessage: String?)
+    /// The retry decider's DROP: the row is deleted, as for ``delivered``,
+    /// and no dead letter is written.
+    case dropped
 }
 
 /// What ``SyncItemDao/settleClaim(id:_:)`` did.
@@ -299,6 +304,14 @@ final class SyncItemDao {
         try await stack.performBackgroundTask { context in
             guard let entity = try Self.fetchEntity(id: id, in: context) else { return nil }
             return try Self.materialize(entity)
+        }
+    }
+
+    /// `true` while the queue row `id` is `PENDING`: neither purged nor
+    /// claimed. A read: the claim that follows it is the check that holds.
+    func isPending(id: String) async throws -> Bool {
+        try await stack.performBackgroundTask { context in
+            try Self.fetchEntity(id: id, in: context)?.status == SyncItemStatus.pending.rawValue
         }
     }
 
@@ -530,6 +543,28 @@ final class SyncItemDao {
         }
     }
 
+    /// Defers a queued item that the header resolver or `beforeDispatch`
+    /// stopped before its claim: it stays `PENDING`, with `errorCode` as its
+    /// `lastErrorCode`, and waits `delayMs` from now. `attempts` and
+    /// `lastAttemptAt` are left alone: no request went out, so no attempt was
+    /// made.
+    ///
+    /// Runs one at a time with the purges and the claim (see
+    /// ``CoreDataStack/performSerializedTask(_:)``). A row purged during the
+    /// wait, a logout say, or no longer `PENDING`, is left alone.
+    ///
+    /// - Returns: the new `nextRetryAt`, or `nil` when nothing was written.
+    func deferPending(id: String, errorCode: String, delayMs: Int) async throws -> Int64? {
+        try await stack.performSerializedTask { [clock] context in
+            guard let entity = try Self.fetchEntity(id: id, in: context),
+                  entity.status == SyncItemStatus.pending.rawValue else { return nil }
+            let deferredUntil = RetryPolicyEvaluator.deadline(fromMs: clock.nowMs(), delayMs: delayMs)
+            entity.lastErrorCode = errorCode
+            entity.nextRetryAt = deferredUntil
+            return deferredUntil
+        }
+    }
+
     /// Writes the outcome of an attempt whose own write failed, for the
     /// settle of the cycle that died of it: `settlement`, in one transaction,
     /// only while the row is still `IN_FLIGHT`. A row purged since, a logout
@@ -550,7 +585,7 @@ final class SyncItemDao {
                 return SettledClaim(applied: false, heldUntil: heldUntil)
             }
             switch settlement {
-            case .delivered:
+            case .delivered, .dropped:
                 context.delete(entity)
             case let .retry(errorCode, delayMs):
                 entity.status = SyncItemStatus.pending.rawValue
@@ -607,6 +642,22 @@ final class SyncItemDao {
             }
             guard let letter = try Self.fetchDeadLetter(id: id, in: context) else { return false }
             context.delete(letter)
+            return true
+        }
+    }
+
+    /// Deletes the queue row `id`, in any status, and only from the queue: a
+    /// dead letter with that id is never touched. The retry decider's DROP.
+    ///
+    /// Runs one at a time with the purges (see
+    /// ``CoreDataStack/performSerializedTask(_:)``).
+    ///
+    /// - Returns: `false` when no queue row has `id`, purged meanwhile.
+    @discardableResult
+    func deleteQueued(id: String) async throws -> Bool {
+        try await stack.performSerializedTask { context in
+            guard let entity = try Self.fetchEntity(id: id, in: context) else { return false }
+            context.delete(entity)
             return true
         }
     }

@@ -2,6 +2,7 @@ package com.margelo.nitro.syncprovider
 
 import android.content.Context
 import android.util.Log
+import com.margelo.nitro.syncprovider.callbacks.JsCallbacks
 import com.margelo.nitro.syncprovider.config.ConfigSource
 import com.margelo.nitro.syncprovider.config.EngineConfig
 import com.margelo.nitro.syncprovider.config.KeystoreSecretStore
@@ -52,8 +53,10 @@ import java.util.concurrent.atomic.AtomicReference
  * - [bootstrap] is idempotent and safe to call from any thread.
  * - [attachEngine] / [detachEngine] track live JS engines. The retry timer and the
  *   connectivity watch only run while one is attached.
- * - [shutdown] cancels the [scope] and drops the singleton; rarely used in
- *   practice (only the test harness calls it).
+ * - The JS callbacks ([callbacks]) are process-wide too, but outside any runtime instance: the
+ *   bridge installs and answers them without building a runtime.
+ * - [shutdown] cancels the [scope], forgets the callbacks and drops the singleton; rarely used
+ *   in practice (only the test harness calls it).
  */
 internal class SyncProviderRuntime private constructor(
   appContext: Context,
@@ -125,6 +128,7 @@ internal class SyncProviderRuntime private constructor(
     healthCheck = healthCheck,
     onHealthCheckSkipped = { retryWake.arm() },
     onCycleFinished = { notBefore, ending -> retryWake.arm(notBefore, ending) },
+    callbacks = callbacks,
   )
 
   private val retryTimer = RetryTimer(
@@ -311,6 +315,7 @@ internal class SyncProviderRuntime private constructor(
     retryTimer.cancel()
     runCatching { connectivityMonitor.stop() }
     runCatching { scope.coroutineContext[Job]?.cancel() }
+    callbacks.reset()
     INSTANCE.set(null)
   }
 
@@ -364,6 +369,13 @@ internal class SyncProviderRuntime private constructor(
 
     private val INSTANCE: AtomicReference<SyncProviderRuntime?> = AtomicReference(null)
 
+    /**
+     * What JS installed through the bridge, and the requests waiting for its answers. It lives as
+     * long as the process, outside every runtime instance, so a hybrid installs, clears and
+     * answers on the JS thread without building a runtime, even after it was disposed.
+     */
+    val callbacks: JsCallbacks = JsCallbacks()
+
     fun bootstrap(context: Context): SyncProviderRuntime =
       bootstrap(context, KeystoreSecretStore(context))
 
@@ -404,6 +416,7 @@ internal class SyncProviderRuntime private constructor(
       healthCheckUrl = null,
       healthCheckTtlMs = null,
       healthCheckBackoffMs = null,
+      callbackTimeoutMs = null,
     )
   }
 }

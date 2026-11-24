@@ -1,9 +1,10 @@
 ---
 sidebar_position: 3
 title: Retry Policy
-description: Configure retry behavior in react-native-sync-provider — maxAttempts, backoff curves (linear, exponential, fibonacci), jitter, and retry-on-status-codes.
+description: Configure retry behavior in react-native-sync-provider — maxAttempts, backoff curves (linear, exponential, fibonacci), jitter, retry-on-status-codes, and the JS retry decider.
 keywords:
   - retry-policy
+  - retry-decider
   - backoff
   - exponential-backoff
   - fibonacci
@@ -19,6 +20,8 @@ This guide explains how failed requests are retried: the retry budget, the backo
 ## Overview
 
 Every queued item carries a retry budget. When a retriable dispatch fails, the item waits out a cooldown from the configured backoff curve, then a later cycle tries again, up to `maxAttempts` attempts in total. After the budget is exhausted, the item fails permanently with `MAX_ATTEMPTS_EXCEEDED`, is reported on `ITEM_FAILED`, and moves to the [dead-letter queue](#permanent-failures).
+
+While JS runs, an optional [retry decider](#retry-decider) can change that decision for each failed attempt: another delay, a drop or a dead letter.
 
 ## `RetryPolicy`
 
@@ -115,7 +118,7 @@ Status codes **not** in the list are permanent failures, with the matching `Sync
 
 ## Permanent Failures
 
-An item fails permanently when it hits a non-retryable failure, or a retriable one with no attempts left. Listen to `ITEM_FAILED`, which works on both platforms, and to `ITEM_DEAD_LETTERED`, which follows it:
+An item fails permanently when it hits a non-retryable failure, or a retriable one with no attempts left, or when a [retry decider](#retry-decider) answers `DROP` or `DEAD_LETTER`. Listen to `ITEM_FAILED`, which works on both platforms, and to `ITEM_DEAD_LETTERED`, which follows it except after a `DROP`:
 
 ```ts
 import {
@@ -133,7 +136,7 @@ useSyncEvents({
 
 Lowering `maxAttempts` can leave items whose budget is already spent. The next cycle dead-letters them without sending a request: `ITEM_FAILED` with `MAX_ATTEMPTS_EXCEEDED`, the stored attempt count and no `statusCode`, then `ITEM_DEAD_LETTERED`, with `lastErrorMessage` set to `Retry budget exhausted`. A `maxAttempts` below `1` reads as `1`, so a new item is always sent once.
 
-In one transaction, the item leaves the queue and enters the dead-letter queue, with its request, its attempt count, the last error code and message, and the time it was moved. Then `ITEM_FAILED` is emitted with the real code and, right after it, `ITEM_DEAD_LETTERED` with `errorCode: 'DEAD_LETTERED'` and `metadata.lastErrorCode` set to that code. Nothing retries a dead letter on its own:
+In one transaction, the item leaves the queue and enters the dead-letter queue, with its request, its attempt count, the last error code and message, and the time it was moved. Then `ITEM_FAILED` is emitted with the real code and, right after it, `ITEM_DEAD_LETTERED` with `errorCode: 'DEAD_LETTERED'` and `metadata.lastErrorCode` set to that code. After a decider's `DEAD_LETTER`, that code is `RETRY_DECIDER_REJECTED`, and `lastErrorMessage` keeps the failure it decided on. A decider's `DROP` is the one exception to the move: the item is deleted, with `ITEM_FAILED` alone. Nothing retries a dead letter on its own:
 
 - [`listDeadLetter`](../api-reference/functions.md#listdeadletter) reads them, oldest first.
 - [`replayDeadLetter`](../api-reference/functions.md#replaydeadletter) puts one back as a fresh item, with `attempts: 0` and `nextRetryAt: 0`. It counts toward `maxQueueSize` like an enqueue.
@@ -147,16 +150,16 @@ Before v0.3, a permanently failed item stayed in the queue store, and Android co
 
 ## Retry Cooldown Across Restarts
 
-**Added in v0.2.** A retriable failure with attempts left puts the item back to `PENDING` with a persisted **`nextRetryAt`**: the clock read after the attempt finished, plus the backoff delay, capped at the largest valid JavaScript `Date`. The dispatcher skips the item until the device clock reaches that deadline, on both platforms and across process death and device reboot. Measuring from the end of the attempt means a slow request or a timeout does not eat into the cooldown.
+**Added in v0.2.** A retriable failure with attempts left puts the item back to `PENDING` with a persisted **`nextRetryAt`**: the clock read after the attempt finished, plus the backoff delay, capped at the largest valid JavaScript `Date`. The dispatcher skips the item until the device clock reaches that deadline, on both platforms and across process death and device reboot. Measuring from the end of the attempt means a slow request or a timeout does not eat into the cooldown. When a [retry decider](#retry-decider) is consulted, the delay counts from its decision instead: see [Delays Count From the Decision](#delays-count-from-the-decision).
 
 [`SyncItem.nextRetryAt`](../api-reference/types.md#syncitem) tells you where an item stands:
 
 - `0` means it is eligible now. It does not mean the item was never attempted: rows carried over from v0.1, and an iOS row whose first attempt was cut short by a process kill, can show `attempts >= 1` with `nextRetryAt: 0`.
-- A positive value means a retry cooldown or a [credential hold](./background-sync.md#when-a-stored-token-expires) is pending. It is eligible once `nextRetryAt <= now`. The value stays in place afterwards, so a timestamp in the past means the wait has elapsed.
+- A positive value means a retry cooldown, a [credential hold](./background-sync.md#when-a-stored-token-expires) or an [interceptor deferral](./dispatch-interceptors.md#when-an-interceptor-fails) is pending. It is eligible once `nextRetryAt <= now`. The value stays in place afterwards, so a timestamp in the past means the wait has elapsed.
 
-Each cycle makes at most one attempt per item, and `attempts` counts the attempts recorded across cycles, so the retry budget survives a restart. `0` means no attempt has been recorded, not that the item was never tried. Android records an attempt with its outcome, so a process kill mid-request leaves the count unchanged, while iOS counts it when the dispatch starts, and refunds it when a [BGTask expiry](./background-sync.md#when-a-window-runs-out-of-time) cancels the request. A credential hold spends no attempt, so a held item can show `attempts: 0` with `nextRetryAt > 0`.
+Each cycle makes at most one attempt per item, and `attempts` counts the attempts recorded across cycles, so the retry budget survives a restart. `0` means no attempt has been recorded, not that the item was never tried. Android records an attempt with its outcome, so a process kill mid-request leaves the count unchanged, while iOS counts it when the dispatch starts, and refunds it when a [BGTask expiry](./background-sync.md#when-a-window-runs-out-of-time) cancels the request. A credential hold spends no attempt, and neither does an interceptor deferral, so a held or deferred item can show `attempts: 0` with `nextRetryAt > 0`.
 
-A cooldown and a hold look the same on a `SyncItem`, which carries neither the last error code nor the last attempt time. An `ITEM_RETRYING` event with `errorCode: 'UNAUTHORIZED'` marks a hold.
+A cooldown, a hold and a deferral look the same on a `SyncItem`, which carries neither the last error code nor the last attempt time. An `ITEM_RETRYING` event with `errorCode: 'UNAUTHORIZED'` marks a hold, and one with `INTERCEPTOR_FAILED` marks a deferral.
 
 > **Note — Capacity vs. eligibility:** A cooling item still counts toward `getQueueSize()` and the `maxQueueSize` cap — it is _in_ the queue, just not _dispatchable right now_. Cooldowns also survive launch recovery: resetting in-flight items back to pending does **not** clear their `nextRetryAt`.
 
@@ -177,7 +180,7 @@ What the timer does and does not do:
 - **It never flushes offline.** Without `minNetworkQuality`, neither dispatcher checks connectivity. An offline cycle can spend attempts on Android, until valid items reach the dead-letter queue. On iOS it waits for the network, with its first item claimed and one attempt spent, and dead-letters nothing. When the timer fires offline, it remembers the wake and flushes when connectivity returns. A manual `flush()` while offline keeps its behavior unless `minNetworkQuality` is set.
 - **It holds below the quality gate, and during a health-check backoff.** With [`minNetworkQuality`](./connectivity-detection.md#the-quality-gate) set, the timer checks the gate first and holds the wake silently, with no event, until the quality reaches the minimum. It re-checks at 30, 60, 120, 240 and 480 seconds, then every 15 minutes, restarting that backoff when a wake passes, the network changes or the timer is armed again, as every `configureSync` does. See [Held wakes](./connectivity-detection.md#held-wakes).
 - **It only exists in a process with JS.** A worker, a boot broadcast, or an iOS background launch where JS never reaches the library arms no timer. Android relies on the kick there.
-- **It looks at items with a deadline.** Only items with `nextRetryAt > 0`, a cooldown or a credential hold, arm it. Items with `nextRetryAt: 0` do not, so it does not replace a flush for new items, though the cycle it starts takes them too. `resumeSync` is the exception: it considers every pending item, so items with no deadline are dispatched at once. On iOS, the timer re-armed after a failed health check also considers every `PENDING` item, cooldown or not.
+- **It looks at items with a deadline.** Only items with `nextRetryAt > 0`, a cooldown, a credential hold or an interceptor deferral, arm it. Items with `nextRetryAt: 0` do not, so it does not replace a flush for new items, though the cycle it starts takes them too. `resumeSync` is the exception: it considers every pending item, so items with no deadline are dispatched at once. On iOS, the timer re-armed after a failed health check also considers every `PENDING` item, cooldown or not.
 - **On iOS it cannot fire while the app is suspended.** It fires on resume.
 - **It waits after a cycle that dies.** See [The Failure Hold](#the-failure-hold).
 
@@ -227,17 +230,112 @@ await configureSync({
 });
 ```
 
-## JS-Side Override (Planned)
+## Retry Decider {#retry-decider}
 
-A JS-side, per-attempt retry override is planned for a later release. Its shape is not settled yet.
+**Added in v0.4.** While JS runs, a retry decider installed with [`setRetryDecider`](../api-reference/functions.md#setretrydecider) can change what the policy does with a failed attempt: retry after another delay, drop the item, or dead-letter it. It cannot retry a failure the policy would not retry, and it cannot add attempts. When it answers in time, its decision wins. The policy decides whenever it cannot: see [When the Policy Decides Instead](#when-the-policy-decides-instead).
 
-It would run only while JS is alive, because every retry decision would need a bridge round-trip. Background dispatch with no JS running cannot consult it, so the declarative `RetryPolicy` would keep deciding there.
+### When It Is Consulted
 
-Until it ships, configure the declarative `RetryPolicy` carefully -- it covers the vast majority of cases.
+Only after an attempt fails with a retryable error and attempts are left: a network error, a timeout, or a status in `retryOnStatusCodes`. It is never consulted for:
+
+- a success;
+- a failure that is not retried, such as a `404` missing from `retryOnStatusCodes`, or a 401 or 403 in a process that called `configureSync`;
+- an attempt that spent the last of the budget;
+- a [credential hold](./background-sync.md#when-a-stored-token-expires), the 401 or 403 to stored `defaultHeaders`;
+- an item that was never sent.
+
+It receives a `RetryDeciderContext`:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `itemId` | `string` | The item's id. |
+| `attempt` | `number` | The 1-based attempt that just failed, as on the `ITEM_RETRYING` or `ITEM_FAILED` that follows. |
+| `errorCode` | `SyncErrorCode` | That attempt's code, such as `SERVER_ERROR`, `NETWORK_ERROR` or `TIMEOUT`. |
+| `statusCode` | `number` | The HTTP status, only when a response came back. |
+| `url` | `string` | The item's URL. |
+| `method` | `HttpMethod` | The item's method. |
+| `metadata` | `Record<string, string>` | The item's `metadata`, when it has any. |
+
+### Actions
+
+It answers a `RetryDecision`, `{ action, delayMs? }`, or a promise of one:
+
+| `action` | What happens to the item | Events | Counted in |
+| --- | --- | --- | --- |
+| `RETRY` | Rescheduled. A valid `delayMs` replaces the policy's delay. | `ITEM_RETRYING`, with the attempt's real code | Neither total |
+| `DEAD_LETTER` | Moved to the dead-letter queue with `lastErrorCode: RETRY_DECIDER_REJECTED`. Its `lastErrorMessage` keeps the real failure, such as `HTTP 503 Service Unavailable`, in each platform's wording. | `ITEM_FAILED` with `RETRY_DECIDER_REJECTED`, the attempt's `statusCode` and `attempt`, then `ITEM_DEAD_LETTERED` with `metadata.lastErrorCode: RETRY_DECIDER_REJECTED` | `failureCount` |
+| `DROP` | Deleted. No dead letter is kept. | `ITEM_FAILED` with `RETRY_DECIDER_REJECTED`, the attempt's `statusCode` and `attempt`. No `ITEM_DEAD_LETTERED` and no `ITEM_REMOVED` | `failureCount`. On Android, also `failedIds` and `errors`, as `RETRY_DECIDER_REJECTED: …` |
+
+> **Warning — `DROP` deletes the request for good:** It is the one way a failed item leaves without a dead letter, so nothing can replay it. Answer `DEAD_LETTER` for anything you may need again.
+
+### `delayMs`
+
+- **Read only with `RETRY`.** `DROP` and `DEAD_LETTER` ignore it.
+- **Used as given.** A finite value of at least `0` replaces the policy's delay, truncated to whole milliseconds, with no jitter and no `maxDelayMs` cap. It is still capped at 2^53 - 1 ms, and the deadline at the largest valid JavaScript `Date`.
+- **The policy's delay otherwise.** A missing `delayMs` means the policy's delay. So does one that is not finite or is negative, which is also logged as a warning.
+
+### Delays Count From the Decision {#delays-count-from-the-decision}
+
+When a decider is consulted, the delay, decided or the policy's, counts from the moment of the decision: its answer, its timeout or the fallback. Without a decider, it counts from the end of the attempt, as described in [Retry Cooldown Across Restarts](#retry-cooldown-across-restarts).
+
+### When the Policy Decides Instead {#when-the-policy-decides-instead}
+
+With no decider installed, or no JS running, as in a background launch, the policy decides silently: no log line and no event.
+
+With a decider installed, the policy's own decision applies, with a native log line and no event, when:
+
+- the decider throws, rejects, returns anything but `{ action, delayMs? }` with a known `action`, or does not answer within [`callbackTimeoutMs`](./dispatch-interceptors.md#callbacktimeoutms), 3000 ms by default;
+- it was left behind by a JS runtime that is gone, or replaced by a newer runtime's installs. See [Reloads and Teardown](./dispatch-interceptors.md#reloads-and-teardown);
+- a BGTask expires or the cycle is cancelled while it waits. The policy's retry is then written at once.
+
+An item removed or cleared while the decider decides stays gone. A `DROP` or `DEAD_LETTER` for it still emits `ITEM_FAILED`, because its request was sent.
+
+If the cycle [dies](./error-handling.md#when-a-cycle-dies) before the decision is written, the settle applies that decision without asking JS again, or the policy's when no decision was taken.
+
+### Example
+
+```ts
+// src/sync/decideRetry.ts
+import {
+  RetryAction,
+  SyncErrorCode,
+  type RetryDecider,
+} from '@gabriel-sisjr/react-native-sync-provider';
+
+export const decideRetry: RetryDecider = ({
+  attempt,
+  errorCode,
+  statusCode,
+  metadata,
+}) => {
+  // Analytics is not worth a second retry.
+  if (metadata?.kind === 'analytics' && attempt >= 2) {
+    return { action: RetryAction.DROP };
+  }
+  // A maintenance window: wait five minutes instead of the backoff.
+  if (statusCode === 503) {
+    return { action: RetryAction.RETRY, delayMs: 5 * 60 * 1000 };
+  }
+  // Park requests that keep timing out, for a replay later.
+  if (errorCode === SyncErrorCode.TIMEOUT && attempt >= 3) {
+    return { action: RetryAction.DEAD_LETTER };
+  }
+  return { action: RetryAction.RETRY }; // the policy's delay
+};
+```
+
+Install it with `setRetryDecider(decideRetry)`, among the first library calls at startup: see [Install Them First at Startup](./dispatch-interceptors.md#install-them-first-at-startup). `isRetryDeciderInstalled()` reports whether the calling JS runtime installed one, and `clearRetryDecider()` lets the policy decide alone again.
+
+### Platform Notes
+
+- **iOS** dispatches one item at a time, so a decider that is slow to answer delays each item it is asked about. **Android** asks for the items of a batch concurrently.
+- **After a JS reload,** each consult falls back at once on iOS, and after waiting `callbackTimeoutMs` on Android, until the new JS first calls the library.
+- **A `DROP`** shows in `SyncResult.failedIds` and `errors` on Android only. On iOS both are always empty.
 
 ## Next Steps
 
 - [Error Handling](./error-handling.md) -- The full `SyncErrorCode` matrix
+- [Dispatch Interceptors](./dispatch-interceptors.md) -- The header resolver, `beforeDispatch` and `afterDispatch`, and the timeout and lifecycle rules the retry decider shares with them
 - [Background Sync](./background-sync.md) -- How retries interact with OS-scheduled fires
 - [Crash Recovery](./crash-recovery.md) -- What recovery keeps of an item's attempts and cooldown
 - [Battery Optimization](./battery-optimization.md) -- Every trigger that starts a flush, and the option that controls it

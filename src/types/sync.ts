@@ -37,7 +37,9 @@ export interface SyncItemInput {
   url: string;
   /**
    * Optional request headers. Values must be strings — encode complex values
-   * (numbers, booleans) on the JS side before passing them in.
+   * (numbers, booleans) on the JS side before passing them in. They override
+   * `SyncOptions.defaultHeaders` and the header resolver's headers, with names
+   * matching case-insensitively.
    */
   headers?: Record<string, string>;
   /** Optional pre-serialized request body (typically JSON / form-encoded). */
@@ -57,7 +59,8 @@ export interface SyncItemInput {
   /**
    * Optional opaque metadata. Persisted with the item and returned by
    * `getPendingItems`. It is not sent with the request and not echoed on sync
-   * events. Values must be strings.
+   * events, but the retry decider and the dispatch interceptors receive it in
+   * their contexts. Values must be strings.
    */
   metadata?: Record<string, string>;
 }
@@ -112,6 +115,8 @@ export interface SyncItem {
    *   spending an attempt: the count ends at its value from before the
    *   dispatch. A held item can therefore show `attempts: 0` with
    *   `nextRetryAt > 0`.
+   * - On both, an item that the header resolver or `beforeDispatch` deferred
+   *   keeps its count too: no request went out, so no attempt is spent.
    *
    * Surfaced **verbatim** by the facade. This is deliberately asymmetric with
    * `getLastSyncResult`, which translates a native sentinel
@@ -127,7 +132,8 @@ export interface SyncItem {
    *
    * - `0` means the item is eligible now. It does not mean the item was never
    *   attempted: see the remarks.
-   * - A positive value means a retry cooldown or a credential hold is pending.
+   * - A positive value means a retry cooldown, a credential hold or an
+   *   interceptor deferral is pending.
    *   The native dispatcher skips the item until the device clock reaches it,
    *   and the value stays in place afterwards, so a timestamp in the past means
    *   the wait has elapsed.
@@ -139,12 +145,13 @@ export interface SyncItem {
    * `nextRetryAt` and {@link SyncItem.attempts} do not move together. Rows
    * carried over from v0.1 can show `attempts >= 1` with `nextRetryAt: 0`, and
    * so does an iOS row whose first attempt was cut short by a process kill. An
-   * item held after a credential rejection can show `attempts: 0` with
-   * `nextRetryAt > 0`.
+   * item held after a credential rejection, or deferred by the header resolver
+   * or `beforeDispatch`, can show `attempts: 0` with `nextRetryAt > 0`.
    *
-   * A cooldown and a credential hold look the same here, because `SyncItem`
-   * carries neither the last error code nor the last attempt time. An
-   * `ITEM_RETRYING` event with `errorCode: 'UNAUTHORIZED'` marks a hold.
+   * A cooldown, a credential hold and a deferral look the same here, because
+   * `SyncItem` carries neither the last error code nor the last attempt time.
+   * An `ITEM_RETRYING` event with `errorCode: 'UNAUTHORIZED'` marks a hold, and
+   * one with `INTERCEPTOR_FAILED` marks a deferral.
    *
    * Surfaced **verbatim** by the facade. Unlike `getLastSyncResult`'s sentinel
    * translation (`isLastSyncSentinel` → `undefined`), `SyncItem.nextRetryAt`'s
@@ -158,8 +165,10 @@ export interface SyncItem {
 
 /**
  * A request that failed permanently and was moved out of the queue into the
- * dead-letter queue, instead of being dropped. Returned by `listDeadLetter()`
- * and by `useSyncSnapshot().deadLetter`.
+ * dead-letter queue, instead of being dropped. The only case where the engine
+ * itself deletes a failed item is a retry decider's `DROP`. Returned by
+ * `listDeadLetter()` and by
+ * `useSyncSnapshot().deadLetter`.
  *
  * It mirrors {@link SyncItem} without the retry schedule (`nextRetryAt`), and
  * adds the failure bookkeeping needed to inspect, replay or discard the request.
@@ -167,14 +176,17 @@ export interface SyncItem {
  * @remarks
  * An item becomes a dead letter whenever it fails permanently: for example when
  * its attempts run out, when the server answers with a status that is not
- * retried, or on a 401 or 403 under credentials set in the current process. An
- * item whose attempts had already reached {@link RetryPolicy.maxAttempts} when
- * a cycle took it, for example because the limit was lowered, becomes one
- * without a request. The move is atomic, so an item is never in the queue and
- * in the dead-letter queue at once. It is followed by `ITEM_FAILED`, then by
- * `ITEM_DEAD_LETTERED`. An item that `removeItem()` or `clearQueue()` removed
- * never becomes one. Removed before its request was sent, it is never sent and
- * gets no outcome event; removed while its request was in flight, its
+ * retried, on a 401 or 403 under credentials set in the current process, or
+ * when the retry decider answers `DEAD_LETTER`. The decider's `DROP` is the
+ * exception: it deletes the item, which gets `ITEM_FAILED` and no dead letter.
+ * An item whose attempts had already reached
+ * {@link RetryPolicy.maxAttempts} when a cycle took it, for example because the
+ * limit was lowered, becomes one without a request. The move is atomic, so an
+ * item is never in the queue and in the dead-letter queue at once. It is
+ * followed by `ITEM_FAILED`, then by `ITEM_DEAD_LETTERED`. An item that
+ * `removeItem()` or `clearQueue()` removed never becomes one. Removed before
+ * its request was sent, it is never sent and gets no outcome event; removed
+ * while its request was in flight, its
  * `ITEM_FAILED` still reports that request, and no `ITEM_DEAD_LETTERED`
  * follows. There is at most one dead letter per id: a newer one replaces an
  * older one with the same id.
@@ -240,9 +252,11 @@ export interface SyncDeadLetterItem {
    * `ITEM_DEAD_LETTERED` event. Never `DEAD_LETTERED`. After a retriable failure
    * with no attempts left it is `MAX_ATTEMPTS_EXCEEDED`, and
    * {@link SyncDeadLetterItem.lastErrorMessage} tells what the last attempt
-   * ran into. A stored code that is empty or unknown to this version, as on an
-   * item that failed under an earlier version without recording one, reads as
-   * `MAX_ATTEMPTS_EXCEEDED`.
+   * ran into. After the retry decider answers `DEAD_LETTER` it is
+   * `RETRY_DECIDER_REJECTED`, and `lastErrorMessage` describes the failure the
+   * decider judged, for example `"HTTP 503 …"`. A stored code that is empty or
+   * unknown to this version, as on an item that failed under an earlier
+   * version without recording one, reads as `MAX_ATTEMPTS_EXCEEDED`.
    */
   lastErrorCode: SyncErrorCode;
   /**
@@ -280,10 +294,17 @@ export interface SyncDeadLetterItem {
  * item.
  *
  * @remarks
- * The policy is intentionally declarative, so it also works with no JS running.
- * A JS-side per-attempt retry override is planned for a later release. It would
- * run only while JS is alive, because every retry decision would need a bridge
- * round-trip.
+ * The policy is declarative, so it also works with no JS running. A retry
+ * decider installed with `setRetryDecider` comes first: for a failed attempt
+ * this policy would retry, it answers `RETRY`, with the policy's delay or its
+ * own, `DROP` or `DEAD_LETTER`. It can never retry a failure the policy would
+ * not, nor add attempts. Once the decider is consulted, the delay counts from
+ * its decision instead of the end of the attempt.
+ *
+ * The policy decides alone when no decider is installed, when the decider
+ * throws, answers something invalid or does not answer within
+ * {@link SyncOptions.callbackTimeoutMs}, and always in a process where no JS
+ * runs, such as a cold background worker or a BGTask launch.
  */
 export interface RetryPolicy {
   /**
@@ -355,7 +376,8 @@ export interface SyncOptions {
    *
    * Android sends the batch concurrently, except that the first item goes
    * alone when `defaultHeaders` were restored from storage. iOS sends one item
-   * at a time.
+   * at a time. The JS callbacks follow: on Android up to this many can be
+   * waiting for an answer at once.
    */
   batchSize?: number;
   /**
@@ -386,20 +408,27 @@ export interface SyncOptions {
    */
   persistQueue?: boolean;
   /**
-   * Headers added to every dispatched request. Per-item headers override
-   * default headers on key collision.
+   * Headers added to every dispatched request. The header resolver's headers
+   * override them, and the item's own headers override both. Names match
+   * case-insensitively, and the winning layer's spelling is kept. Do not set
+   * two names that differ only by case: which one wins is not specified.
    *
    * Encrypted at rest (Android Keystore, iOS Keychain), so a background worker
    * started without JS can dispatch with them. `configureSync` without this
    * field deletes the stored copy, which makes it the way to clear credentials
-   * on logout.
+   * on logout. The header resolver runs only in a live JS runtime, so a
+   * credential the server needs from a worker or a BGTask with no JS belongs
+   * here. With no stored copy, a 401 or 403 to a request sent without JS fails
+   * the item, which is dead-lettered.
    *
    * If the stored copy cannot be read, the worker leaves items pending instead
    * of dispatching without the headers. In a process that has not called
    * `configureSync`, a 401 or 403 does not fail the item, because a stored
    * token can expire and only the app can renew it: the item stays pending, no
    * attempt is spent, and a credential hold keeps every retry wake in the
-   * process back for at least 60 seconds.
+   * process back for at least 60 seconds. Headers from the header resolver do
+   * not change this rule, which depends only on where `defaultHeaders` came
+   * from.
    *
    * The hold lives in memory, so a process restart (an OS kill, a reboot or an
    * app update) drops it. The rejected item keeps its own `nextRetryAt`, but
@@ -534,6 +563,32 @@ export interface SyncOptions {
    * A stored value that is negative or not finite loads as unset.
    */
   healthCheckBackoffMs?: number;
+  /**
+   * How long the engine waits for an installed JS callback to answer, in ms:
+   * the retry decider, the header resolver, `beforeDispatch` and
+   * `afterDispatch` share it. Defaults to `3000`. Fractions truncate toward
+   * zero, and a value above 2147483647 ms (about 24.8 days) is capped there at
+   * use.
+   *
+   * Without an answer in time, the retry decider's attempt falls back to the
+   * policy's own decision, the header resolver and `beforeDispatch` defer the
+   * item (`ITEM_RETRYING` with `INTERCEPTOR_FAILED`), and `afterDispatch` is
+   * only logged. After an Android reload, the old runtime's installs cost this
+   * wait at each call until the new runtime first uses the library. An install
+   * whose runtime was torn down fails at once, without the wait.
+   *
+   * With the JS thread hung, each awaited callback costs this wait. iOS sends
+   * one item at a time, so each item can add this much to the cycle. Android
+   * waits for a batch's callbacks concurrently, but a batch sent on restored
+   * `defaultHeaders` can still take about `batchSize` times this long.
+   *
+   * Persisted with the rest of the configuration. `getSyncConfig()` returns it
+   * only when it was set, as given. `configureSync` rejects a value that is not
+   * a finite number of at least `1` with `INVALID_PAYLOAD`, before anything is
+   * applied or stored. A stored value that is not finite or is below `1` loads
+   * as unset.
+   */
+  callbackTimeoutMs?: number;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -580,12 +635,17 @@ export interface SyncResult {
    * Number of items that failed permanently in this cycle. Each one is now in
    * the dead-letter queue (see `listDeadLetter`), except an item removed or
    * cleared while its request was in flight, which is counted but not
-   * dead-lettered.
+   * dead-lettered, and an item the retry decider dropped, which is counted and
+   * deleted. An item deferred by the header resolver or `beforeDispatch` counts
+   * in neither total.
    */
   failureCount: number;
   /** ULIDs of items that succeeded. Always empty on iOS. */
   succeededIds: string[];
-  /** ULIDs of items that failed permanently. Always empty on iOS. */
+  /**
+   * ULIDs of items that failed permanently, a retry decider's `DROP` and
+   * `DEAD_LETTER` included. Always empty on iOS.
+   */
   failedIds: string[];
   /**
    * Per-failed-item errors, keyed by item ULID, as `"<SyncErrorCode>: <detail>"`.
@@ -622,11 +682,18 @@ export interface SyncResult {
  *   `metadata.failed`.
  * - `ITEM_SUCCEEDED` — `itemId`, `statusCode`, `attempt` set.
  * - `ITEM_FAILED` — `itemId`, `errorCode`, `attempt`, `statusCode?` set.
+ *   `errorCode` is `RETRY_DECIDER_REJECTED` after a retry decider's `DROP` or
+ *   `DEAD_LETTER`, with the judged attempt's `statusCode` and `attempt`.
  * - `ITEM_DEAD_LETTERED` — `itemId` set, `errorCode` is `DEAD_LETTERED`, and
  *   `metadata.lastErrorCode` holds the real failure code. Follows the item's
  *   `ITEM_FAILED`, on both platforms, except for an item removed or cleared
- *   while its request was in flight, which is not dead-lettered.
+ *   while its request was in flight, which is not dead-lettered, and an item
+ *   the retry decider dropped, which is deleted.
  * - `ITEM_RETRYING` — `itemId`, `attempt`, `errorCode`, `statusCode?` set.
+ *   After a retry decider's `RETRY`, `errorCode` is still the attempt's own
+ *   code. For an item the header resolver or `beforeDispatch` deferred,
+ *   `errorCode` is `INTERCEPTOR_FAILED`, `statusCode` is not set and `attempt`
+ *   is the attempt that would have been made.
  * - `QUEUE_CLEARED` — base fields only.
  * - `CONNECTION_CHANGED` — `connectionStatus` set. Emitted only when a
  *   `ConnectionState` field changes, `networkQuality` alone included, and never
@@ -668,7 +735,8 @@ export interface SyncEvent {
   statusCode?: number;
   /**
    * 1-based attempt number. Set for `ITEM_SUCCEEDED`, `ITEM_FAILED` and
-   * `ITEM_RETRYING`.
+   * `ITEM_RETRYING`. On an `ITEM_RETRYING` with `INTERCEPTOR_FAILED`, it is
+   * the attempt that would have been made: no request went out.
    */
   attempt?: number;
   /** Connection status snapshot. Only set for `CONNECTION_CHANGED`. */

@@ -40,8 +40,9 @@ export const SyncErrorCode = {
    * with no `validationErrors`.
    *
    * Thrown by: `enqueue`, `enqueueBatch`, `configureSync` (for
-   * `minNetworkQuality`, `healthCheckTtlMs` and `healthCheckBackoffMs`), and as
-   * that fallback.
+   * `minNetworkQuality`, `healthCheckTtlMs`, `healthCheckBackoffMs` and
+   * `callbackTimeoutMs`), the four `set…` callback functions when their
+   * argument is not a function, and as that fallback.
    *
    * Also reported on item events, for an attempt that fails on its own with an
    * error the engine cannot classify, neither an I/O failure nor an HTTP
@@ -60,10 +61,16 @@ export const SyncErrorCode = {
   QUEUE_FULL: 'QUEUE_FULL',
   /**
    * The native HybridObject could not be resolved at runtime, or the web entry
-   * is in use. It only reaches you from the JS layer: a native rejection carrying
-   * this code maps to the facade's fallback code like any other.
+   * is in use. A native rejection carrying this code maps to the facade's
+   * fallback code like any other.
    *
-   * Thrown by: every facade method when the native module is missing.
+   * Thrown by: every facade method when the native module is missing, except
+   * the ones the web entry turns into no-ops there: `cancelDrain`, the
+   * listener helpers and the four `clear…` callback functions. Also
+   * the fallback code of `setRetryDecider`, `setHeaderResolver`,
+   * `setBeforeDispatch` and `setAfterDispatch`, which native rejects when a
+   * newer JS runtime has attached since the calling one, for example after a
+   * reload.
    */
   NATIVE_MODULE_UNAVAILABLE: 'NATIVE_MODULE_UNAVAILABLE',
   /**
@@ -89,9 +96,11 @@ export const SyncErrorCode = {
   /**
    * The server responded with `401 Unauthorized` or `403 Forbidden`. Permanent
    * — the item becomes a dead letter, and the consumer is expected to refresh
-   * credentials (`configureSync`) before replaying it with `replayDeadLetter`.
-   * The exception is a process running on stored `defaultHeaders`: see
-   * {@link SyncOptions.defaultHeaders}.
+   * credentials (`configureSync`, or the token the header resolver returns)
+   * before replaying it with `replayDeadLetter`. The exception is a process
+   * running on stored `defaultHeaders`: see {@link SyncOptions.defaultHeaders}.
+   * Headers from the header resolver change neither rule, and the retry
+   * decider is never consulted for it.
    *
    * Reported on item events.
    */
@@ -166,6 +175,34 @@ export const SyncErrorCode = {
    * Reported on `ITEM_DEAD_LETTERED`.
    */
   DEAD_LETTERED: 'DEAD_LETTERED',
+  /**
+   * The retry decider answered `DROP` or `DEAD_LETTER` for a failed attempt
+   * that the retry policy would have retried. Permanent: the item is deleted
+   * (`DROP`) or moved to the dead-letter queue (`DEAD_LETTER`).
+   *
+   * Reported on `ITEM_FAILED`, with the attempt's `statusCode` when an HTTP
+   * answer came back. After a `DEAD_LETTER`, also the `metadata.lastErrorCode`
+   * of the `ITEM_DEAD_LETTERED` that follows and the dead letter's
+   * `lastErrorCode`, while its `lastErrorMessage` keeps the real failure. Both
+   * actions count in `SyncResult.failureCount`, and on Android the item is in
+   * `SyncResult.failedIds` and `errors`.
+   */
+  RETRY_DECIDER_REJECTED: 'RETRY_DECIDER_REJECTED',
+  /**
+   * The header resolver or the `beforeDispatch` hook failed for an item, or
+   * the hook answered `SKIP`. A failure is a throw or a rejection, an invalid
+   * result, no answer within `SyncOptions.callbackTimeoutMs`, or an install
+   * left by a JS runtime that went away. Nothing is sent and no attempt is
+   * spent: the item goes back to `PENDING` and becomes due again after the
+   * longer of the policy's delay for that attempt and 60 s. Other items go on,
+   * and the item counts in neither `SyncResult` total. Deferrals never
+   * escalate: a resolver that keeps failing holds its items, but never
+   * dead-letters them.
+   *
+   * Reported on `ITEM_RETRYING`, without a `statusCode`, with the `attempt`
+   * that would have been made.
+   */
+  INTERCEPTOR_FAILED: 'INTERCEPTOR_FAILED',
   // New members go at the end: nitrogen numbers the generated native enum
   // cases by position.
 } as const;

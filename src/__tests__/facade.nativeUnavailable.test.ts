@@ -1,6 +1,7 @@
 import { describe, expect, it } from '@jest/globals';
 
 import { SyncErrorCode } from '../index';
+import type { RetryDecider } from '../types/callbacks';
 import { BackoffStrategy, SyncStrategy } from '../types/enums';
 import type { SyncOptions } from '../types/sync';
 
@@ -51,6 +52,49 @@ describe('dead-letter functions without the native module', () => {
       name: 'SyncError',
       code: SyncErrorCode.NATIVE_MODULE_UNAVAILABLE,
     });
+  });
+});
+
+describe('retry decider and interceptors without the native module', () => {
+  it.each([
+    [
+      'setRetryDecider',
+      (entry: Entry) =>
+        entry.setRetryDecider(() => ({ action: entry.RetryAction.RETRY })),
+    ],
+    ['clearRetryDecider', (entry: Entry) => entry.clearRetryDecider()],
+    [
+      'isRetryDeciderInstalled',
+      (entry: Entry) => entry.isRetryDeciderInstalled(),
+    ],
+    [
+      'setHeaderResolver',
+      (entry: Entry) => entry.setHeaderResolver(() => ({})),
+    ],
+    ['clearHeaderResolver', (entry: Entry) => entry.clearHeaderResolver()],
+    [
+      'setBeforeDispatch',
+      (entry: Entry) => entry.setBeforeDispatch(() => undefined),
+    ],
+    ['clearBeforeDispatch', (entry: Entry) => entry.clearBeforeDispatch()],
+    [
+      'setAfterDispatch',
+      (entry: Entry) => entry.setAfterDispatch(() => undefined),
+    ],
+    ['clearAfterDispatch', (entry: Entry) => entry.clearAfterDispatch()],
+  ])('%s rejects with NATIVE_MODULE_UNAVAILABLE', async (_name, run) => {
+    await expect(withoutNativeModule(run)).resolves.toMatchObject({
+      name: 'SyncError',
+      code: SyncErrorCode.NATIVE_MODULE_UNAVAILABLE,
+    });
+  });
+
+  it('reports a non-function argument before the missing module, like enqueue', async () => {
+    await expect(
+      withoutNativeModule((entry) =>
+        entry.setRetryDecider('decide' as unknown as RetryDecider)
+      )
+    ).resolves.toMatchObject({ code: SyncErrorCode.INVALID_PAYLOAD });
   });
 });
 

@@ -37,6 +37,7 @@ describe('configureSync — network quality and health-check options', () => {
       healthCheckUrl: 'https://api.example.com/health',
       healthCheckTtlMs: 0,
       healthCheckBackoffMs: 45_000,
+      callbackTimeoutMs: 3_000.7,
     };
 
     await expect(configureSync(options)).resolves.toBeUndefined();
@@ -75,6 +76,18 @@ describe('configureSync — network quality and health-check options', () => {
       { healthCheckBackoffMs: Number.POSITIVE_INFINITY },
       SyncErrorCode.INVALID_PAYLOAD,
       'healthCheckBackoffMs',
+    ],
+    [
+      'a zero callbackTimeoutMs',
+      { callbackTimeoutMs: 0 },
+      SyncErrorCode.INVALID_PAYLOAD,
+      'callbackTimeoutMs',
+    ],
+    [
+      'a callbackTimeoutMs below 1',
+      { callbackTimeoutMs: 0.5 },
+      SyncErrorCode.INVALID_PAYLOAD,
+      'callbackTimeoutMs',
     ],
   ])(
     'rejects %s before any native call',
@@ -131,5 +144,6 @@ describe('configureSync — network quality and health-check options', () => {
     expect(config).not.toHaveProperty('healthCheckTtlMs');
     expect(config).not.toHaveProperty('healthCheckBackoffMs');
     expect(config).not.toHaveProperty('minNetworkQuality');
+    expect(config).not.toHaveProperty('callbackTimeoutMs');
   });
 });

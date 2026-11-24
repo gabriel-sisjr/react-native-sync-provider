@@ -1,7 +1,7 @@
 ---
 sidebar_position: 1
 title: Migration Guides
-description: Upgrade guides for breaking and behavior changes between versions of @gabriel-sisjr/react-native-sync-provider, including the v0.2 to v0.3 and v0.1 to v0.2 upgrades.
+description: Upgrade guides for breaking and behavior changes between versions of @gabriel-sisjr/react-native-sync-provider, including the v0.3 to v0.4, v0.2 to v0.3 and v0.1 to v0.2 upgrades.
 keywords:
   - migration
   - upgrade
@@ -15,6 +15,12 @@ keywords:
 The library is pre-1.0, so minor versions can carry breaking changes. Each upgrade has its own guide, listed here newest first.
 
 > **Note:** The canonical list of breaking and behavior changes lives in [`BREAKING_CHANGES.md`](https://github.com/gabriel-sisjr/react-native-sync-provider/blob/develop/BREAKING_CHANGES.md). The guides below turn it into upgrade procedures.
+
+## v0.3 → v0.4 {#v0-3-to-v0-4}
+
+Nothing changes until you install a callback: with nothing installed, dispatch, retries, events and I/O behave as in v0.3.1. The one required change is at compile time: `SyncErrorCode` gains `RETRY_DECIDER_REJECTED` and `INTERCEPTOR_FAILED`, so an exhaustive `switch` with a `never` check needs two more cases. The JS retry decider and the dispatch interceptors are optional. They run only while JS runs, so a credential that requests need without JS stays in `defaultHeaders`. If you adopt them, make their `set…` calls the first library calls at startup: see [Install Callbacks First at Startup](./v0-4-0.md#step-3-install-callbacks-first-at-startup).
+
+Follow the [v0.4.0 migration guide](./v0-4-0.md) for the steps.
 
 ## v0.2 → v0.3 {#v0-2-to-v0-3}
 

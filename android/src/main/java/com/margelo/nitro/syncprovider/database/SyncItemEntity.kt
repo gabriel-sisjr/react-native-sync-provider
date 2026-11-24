@@ -77,12 +77,20 @@ internal data class SyncItemEntity(
   @ColumnInfo(name = "createdAt")
   val createdAt: Long,
 
+  /**
+   * Attempts made for this item across cycles, which its retry budget counts. A credential hold
+   * does not count one, and neither does a deferral by a JS interceptor, which sends nothing.
+   */
   @ColumnInfo(name = "attempts")
   val attempts: Int,
 
   @ColumnInfo(name = "lastAttemptAt")
   val lastAttemptAt: Long?,
 
+  /**
+   * The `SyncErrorCode` name of the last failure: an attempt's, or `INTERCEPTOR_FAILED` when a
+   * JS interceptor kept the request from going out.
+   */
   @ColumnInfo(name = "lastErrorCode")
   val lastErrorCode: String?,
 

@@ -92,6 +92,46 @@ final class BridgePromiseTests: XCTestCase {
         XCTAssertEqual(received.calls, 1, "No call after the removal")
     }
 
+    func test_theCallbackSettersAndClearers_areSettledOnReturn() throws {
+        assertResolvedOnReturn(try hybrid.setRetryDecider { _, _ in })
+        assertResolvedOnReturn(try hybrid.clearRetryDecider())
+        assertResolvedOnReturn(try hybrid.setHeaderResolver { _, _ in })
+        assertResolvedOnReturn(try hybrid.clearHeaderResolver())
+        assertResolvedOnReturn(try hybrid.setBeforeDispatch { _, _ in })
+        assertResolvedOnReturn(try hybrid.clearBeforeDispatch())
+        assertResolvedOnReturn(try hybrid.setAfterDispatch { _, _ in })
+        assertResolvedOnReturn(try hybrid.clearAfterDispatch())
+    }
+
+    func test_isRetryDeciderInstalled_isSettledOnReturn_andFollowsSetAndClear() throws {
+        let before = attachLikeTheBridge(try hybrid.isRetryDeciderInstalled())
+        XCTAssertEqual(try before.value?.get(), false)
+        XCTAssertEqual(before.calls, 1)
+
+        _ = try hybrid.setRetryDecider { _, _ in }
+        XCTAssertEqual(try attachLikeTheBridge(try hybrid.isRetryDeciderInstalled()).value?.get(), true)
+
+        _ = try hybrid.clearRetryDecider()
+        XCTAssertEqual(try attachLikeTheBridge(try hybrid.isRetryDeciderInstalled()).value?.get(), false)
+    }
+
+    /// It is synchronous, on the JS thread, and must never throw: an answer
+    /// with no request waiting is a late or unknown one, and does nothing.
+    func test_answerCallback_neverThrows() {
+        let answers: [CallbackAnswer] = [
+            .deciding(.retry, delayMs: 5_000),
+            .failing("the callback threw"),
+            CallbackAnswer(status: .resolved, decision: nil, headers: [:], beforeDispatch: nil, message: nil),
+            CallbackAnswer(status: .resolved, decision: nil, headers: nil,
+                           beforeDispatch: BeforeDispatchResult(action: .skip), message: nil)
+        ]
+        for answer in answers {
+            XCTAssertNoThrow(try hybrid.answerCallback(requestId: "decider:1", answer: answer))
+            XCTAssertNoThrow(try hybrid.answerCallback(requestId: "", answer: answer))
+        }
+        XCTAssertEqual(engine.gateway.pendingCount, 0)
+    }
+
     // MARK: - What they settle with
 
     func test_getSyncConfig_echoesTheNetworkHealthOptionsOnlyWhenSet() async throws {

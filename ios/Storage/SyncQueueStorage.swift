@@ -65,6 +65,13 @@ actor SyncQueueStorage {
         try await dao.delete(id: id)
     }
 
+    /// Removes the queue row with `id`, whatever its status, and never a dead
+    /// letter. See ``SyncItemDao/deleteQueued(id:)``.
+    @discardableResult
+    func deleteQueued(id: String) async throws -> Bool {
+        try await dao.deleteQueued(id: id)
+    }
+
     /// Removes every item, queued or dead-lettered.
     func clear() async throws {
         try await dao.clear()
@@ -175,6 +182,19 @@ actor SyncQueueStorage {
     /// See ``SyncItemDao/releaseClaim(id:attempts:lastAttemptAt:)``.
     func releaseClaim(id: String, attempts: Int32, lastAttemptAt: Int64?) async throws {
         try await dao.releaseClaim(id: id, attempts: attempts, lastAttemptAt: lastAttemptAt)
+    }
+
+    /// `true` while the queue row `id` is `PENDING`. See ``SyncItemDao/isPending(id:)``.
+    func isPending(id: String) async throws -> Bool {
+        try await dao.isPending(id: id)
+    }
+
+    /// Defer a queued item an interceptor stopped before its claim, keeping
+    /// its attempts. See ``SyncItemDao/deferPending(id:errorCode:delayMs:)``.
+    /// - Returns: the new `nextRetryAt`, or `nil` when the row is gone or not
+    ///   `PENDING`.
+    func deferPending(id: String, errorCode: String, delayMs: Int) async throws -> Int64? {
+        try await dao.deferPending(id: id, errorCode: errorCode, delayMs: delayMs)
     }
 
     /// Write the outcome of a claimed row whose own write failed, only while

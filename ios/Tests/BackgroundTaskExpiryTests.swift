@@ -45,27 +45,44 @@ final class BackgroundTaskExpiryTests: XCTestCase {
 
     /// A manager with background sync on, over a dispatcher whose sessions
     /// both go to ``HeldRequestProtocol``. `appActive` picks the session: the
-    /// foreground one while active, the background one otherwise.
-    private func makeManager(appActive: Bool, stack: CoreDataStack? = nil) throws -> BackgroundSyncManager {
+    /// foreground one while active, the background one otherwise. The JS
+    /// callbacks are `callbacks`, answered through `gateway`. With `clock`, the
+    /// cycle's writes and its timings read that clock.
+    private func makeManager(appActive: Bool,
+                             stack: CoreDataStack? = nil,
+                             callbacks: CallbackRegistry = CallbackRegistry(),
+                             gateway: CallbackGateway = CallbackGateway(timer: ManualCallbackTimer()),
+                             clock: SyncClock? = nil,
+                             retryPolicy: RetryPolicyValue = .default)
+        throws -> BackgroundSyncManager {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [HeldRequestProtocol.self]
         delegate = BackgroundURLSessionDelegate()
         delegateQueue = OperationQueue()
         delegateQueue.maxConcurrentOperationCount = 1
         backgroundSession = URLSession(configuration: configuration, delegate: delegate, delegateQueue: delegateQueue)
-        let storage = stack.map { SyncQueueStorage(dao: SyncItemDao(stack: $0), capacity: 10) } ?? self.storage!
+        let storage: SyncQueueStorage
+        if stack != nil || clock != nil {
+            let dao = SyncItemDao(stack: stack ?? self.stack, clock: clock ?? SystemClock())
+            storage = SyncQueueStorage(dao: dao, capacity: 10)
+        } else {
+            storage = self.storage
+        }
         dispatcher = SyncDispatcher(storage: storage,
                                     emitter: emitter,
                                     connectivity: FakeConnectivity(),
                                     // Long enough that no session timeout ends a held request.
-                                    config: DispatcherConfig(retryPolicy: .default,
+                                    config: DispatcherConfig(retryPolicy: retryPolicy,
                                                              requestTimeoutMs: 600_000,
                                                              batchSize: 25,
                                                              defaultHeaders: [:]),
                                     foregroundSession: URLSession(configuration: configuration),
                                     backgroundSession: backgroundSession,
                                     backgroundDelegate: delegate,
-                                    isAppActive: { appActive })
+                                    isAppActive: { appActive },
+                                    callbacks: callbacks,
+                                    gateway: gateway,
+                                    clock: clock ?? SystemClock())
         let manager = BackgroundSyncManager(dispatcher: dispatcher,
                                             emitter: emitter,
                                             scheduler: FakeBackgroundTaskScheduler(),
@@ -315,6 +332,229 @@ final class BackgroundTaskExpiryTests: XCTestCase {
         XCTAssertNil(failed.first?.errorCode, "a cancelled cycle failed nothing")
         let stored = try await queue.getAll().first { $0.id == id }
         XCTAssertEqual(stored?.status, "IN_FLIGHT", "left for launch recovery")
+    }
+
+    // MARK: - The retry decider
+
+    /// The expiry lands while the retry decider is asked about a 503: the
+    /// wait ends at once, not at its timeout, and the retry policy's verdict
+    /// is written, since the answer came before the expiry. The cycle then
+    /// claims nothing more.
+    func test_decider_stopMidWait_appliesPolicy() async throws {
+        let callbacks = CallbackRegistry()
+        let callbackTimer = ManualCallbackTimer()
+        let gateway = CallbackGateway(timer: callbackTimer)
+        let manager = try makeManager(appActive: true, callbacks: callbacks, gateway: gateway)
+        HeldRequestProtocol.answerNewRequests(with: 503)
+        let first = try await storage.enqueue(input: .sample(priority: "HIGH"))
+        let second = try await storage.enqueue(input: .sample(url: "https://api.test/second", priority: "LOW"))
+        let task = FakeBackgroundTask()
+        let decider = FakeDecider(registry: callbacks, gateway: gateway) { _, _ in
+            task.expirationHandler?()
+            return nil
+        }
+        let sentAfter = Self.nowMs()
+
+        manager.handleProcessing(task: task)
+        await emitter.wait(for: "BACKGROUND_SYNC_COMPLETED", in: self)
+
+        XCTAssertEqual(task.completedResults, [false], "completed once, at the expiry")
+        XCTAssertEqual(decider.callCount, 1)
+        XCTAssertEqual(callbackTimer.delays, [3_000], "armed, and never fired")
+        XCTAssertEqual(gateway.pendingCount, 0)
+        let firstRow = try await row(first)
+        XCTAssertEqual(firstRow?.status, "PENDING")
+        XCTAssertEqual(firstRow?.attempts, 1, "the request went out: its attempt is spent")
+        XCTAssertEqual(firstRow?.lastErrorCode, "SERVER_ERROR")
+        XCTAssertGreaterThan(firstRow?.nextRetryAt ?? 0, sentAfter, "the policy's cooldown")
+        XCTAssertEqual(emitter.events(ofType: "ITEM_RETRYING").map(\.itemId), [first])
+        let secondRow = try await row(second)
+        XCTAssertEqual(secondRow?.status, "PENDING")
+        XCTAssertEqual(secondRow?.attempts, 0, "never claimed")
+        XCTAssertNil(secondRow?.lastAttemptAt)
+        let failed = emitter.events(ofType: "SYNC_FAILED")
+        XCTAssertEqual(failed.count, 1)
+        XCTAssertNil(failed.first?.errorCode, "a cancelled cycle failed nothing")
+        XCTAssertEqual(emitter.events(ofType: "BACKGROUND_SYNC_COMPLETED").first?.metadata,
+                       ["kind": "processing", "ok": "false"])
+        XCTAssertEqual(HeldRequestProtocol.startedCount, 1, "only the first item was sent")
+    }
+
+    /// The decider was waited on for a while before the expiry: the policy's
+    /// delay counts from the stop, which is when the verdict is written, not
+    /// from the end of the request.
+    func test_decider_stopMidWait_appliesPolicy_theDelayCountsFromTheStop() async throws {
+        let clock = ManualClock()
+        let callbacks = CallbackRegistry()
+        let gateway = CallbackGateway(timer: ManualCallbackTimer())
+        let manager = try makeManager(appActive: true,
+                                      callbacks: callbacks,
+                                      gateway: gateway,
+                                      clock: clock,
+                                      retryPolicy: .exact(maxAttempts: 5, baseDelayMs: 1_000))
+        HeldRequestProtocol.answerNewRequests(with: 503)
+        let id = try await storage.enqueue(input: .sample())
+        let task = FakeBackgroundTask()
+        let requestEnded = clock.nowMs()
+        let decider = FakeDecider(registry: callbacks, gateway: gateway) { _, _ in
+            clock.advance(ms: 5_000)
+            task.expirationHandler?()
+            return nil
+        }
+
+        manager.handleProcessing(task: task)
+        await emitter.wait(for: "BACKGROUND_SYNC_COMPLETED", in: self)
+
+        XCTAssertEqual(task.completedResults, [false], "completed once, at the expiry")
+        XCTAssertEqual(decider.callCount, 1)
+        let stored = try await row(id)
+        XCTAssertEqual(stored?.status, "PENDING")
+        XCTAssertEqual(stored?.attempts, 1)
+        XCTAssertEqual(stored?.nextRetryAt, requestEnded + 5_000 + 1_000, "The policy's 1 s, from the stop")
+    }
+
+    /// The expiry lands while the request is out: no outcome came, so the
+    /// decider is never asked, and the row comes back as before.
+    func test_decider_stopMidWait_appliesPolicy_anExpiryDuringTheRequestNeverAsksIt() async throws {
+        let callbacks = CallbackRegistry()
+        let gateway = CallbackGateway(timer: ManualCallbackTimer())
+        let manager = try makeManager(appActive: true, callbacks: callbacks, gateway: gateway)
+        let decider = FakeDecider(registry: callbacks, gateway: gateway) { _, _ in .decision(.drop) }
+        let id = try await storage.enqueue(input: .sample())
+        let sentAfter = Self.nowMs()
+        let task = await fireWithARequestOut(.processing, on: manager)
+
+        task.expirationHandler?()
+
+        try await assertExpired(task, kind: "processing", itemId: id, sentAfter: sentAfter)
+        XCTAssertEqual(decider.callCount, 0)
+    }
+
+    // MARK: - The header resolver and beforeDispatch
+
+    /// The expiry lands while the header resolver is asked: the wait ends at
+    /// once, and that is no failure. They run before the claim, so nothing
+    /// was claimed or sent: the row is exactly as it was, with no event and
+    /// no deferral, and the cycle ends cancelled, claiming nothing more.
+    func test_interceptor_stopMidWait_sendsNothing() async throws {
+        let callbacks = CallbackRegistry()
+        let callbackTimer = ManualCallbackTimer()
+        let gateway = CallbackGateway(timer: callbackTimer)
+        let manager = try makeManager(appActive: true, callbacks: callbacks, gateway: gateway)
+        HeldRequestProtocol.answerNewRequests(with: 200)
+        // Attempted once, so "as it was" is more than a fresh row.
+        let first = try await storage.enqueue(input: .sample(priority: "HIGH"))
+        try await storage.markInFlight(id: first)
+        try await storage.releaseClaim(id: first, attempts: 1, lastAttemptAt: nil)
+        let second = try await storage.enqueue(input: .sample(url: "https://api.test/second", priority: "LOW"))
+        let firstBefore = try await row(first)
+        let secondBefore = try await row(second)
+        let task = FakeBackgroundTask()
+        let owner = callbacks.attach()
+        let resolver = FakeCallback(owner: owner, gateway: gateway, install: callbacks.setHeaderResolver) { _, _ in
+            task.expirationHandler?()
+            return nil
+        }
+        let before = FakeCallback(owner: owner, gateway: gateway, install: callbacks.setBeforeDispatch) { _, _ in
+            .before(.proceed)
+        }
+        let after = FakeCallback(owner: owner, gateway: gateway, install: callbacks.setAfterDispatch) { _, _ in
+            .resolvedEmpty
+        }
+
+        manager.handleProcessing(task: task)
+        await emitter.wait(for: "BACKGROUND_SYNC_COMPLETED", in: self)
+
+        XCTAssertEqual(task.completedResults, [false], "completed once, at the expiry")
+        XCTAssertEqual(resolver.callCount, 1)
+        XCTAssertEqual(before.callCount, 0)
+        XCTAssertEqual(after.callCount, 0)
+        XCTAssertEqual(callbackTimer.delays, [3_000], "armed, and never fired")
+        XCTAssertEqual(gateway.pendingCount, 0)
+        XCTAssertEqual(HeldRequestProtocol.startedCount, 0, "nothing was sent")
+        let firstRow = try await row(first)
+        XCTAssertEqual(firstRow, firstBefore, "no claim, no deferral, no INTERCEPTOR_FAILED")
+        let secondRow = try await row(second)
+        XCTAssertEqual(secondRow, secondBefore, "never asked about")
+        XCTAssertEqual(emitter.emittedEvents.map(\.type).filter { $0.hasPrefix("ITEM_") }, [])
+        let failed = emitter.events(ofType: "SYNC_FAILED")
+        XCTAssertEqual(failed.count, 1)
+        XCTAssertNil(failed.first?.errorCode, "a cancelled cycle failed nothing")
+        XCTAssertEqual(emitter.events(ofType: "BACKGROUND_SYNC_COMPLETED").first?.metadata,
+                       ["kind": "processing", "ok": "false"])
+    }
+
+    /// The expiry lands while `beforeDispatch` is asked, after the resolver
+    /// answered: as during the resolver's wait, nothing is claimed or sent.
+    func test_interceptor_stopMidWait_sendsNothing_anExpiryDuringBeforeDispatch() async throws {
+        let callbacks = CallbackRegistry()
+        let callbackTimer = ManualCallbackTimer()
+        let gateway = CallbackGateway(timer: callbackTimer)
+        let manager = try makeManager(appActive: true, callbacks: callbacks, gateway: gateway)
+        HeldRequestProtocol.answerNewRequests(with: 200)
+        let id = try await storage.enqueue(input: .sample())
+        let rowBefore = try await row(id)
+        let task = FakeBackgroundTask()
+        let owner = callbacks.attach()
+        let resolver = FakeCallback(owner: owner, gateway: gateway, install: callbacks.setHeaderResolver) { _, _ in
+            .headers([:])
+        }
+        let before = FakeCallback(owner: owner, gateway: gateway, install: callbacks.setBeforeDispatch) { _, _ in
+            task.expirationHandler?()
+            return nil
+        }
+
+        manager.handleProcessing(task: task)
+        await emitter.wait(for: "BACKGROUND_SYNC_COMPLETED", in: self)
+
+        try await assertStoppedBeforeTheClaim(task, itemId: id, rowBefore: rowBefore)
+        XCTAssertEqual([resolver.callCount, before.callCount], [1, 1])
+        XCTAssertEqual(callbackTimer.delays, [3_000, 3_000], "Both armed, and neither fired")
+        XCTAssertEqual(gateway.pendingCount, 0)
+    }
+
+    /// The expiry lands just after `beforeDispatch` answered PROCEED: the
+    /// cycle checks for it before the claim, so nothing is claimed or sent.
+    func test_interceptor_stopMidWait_sendsNothing_anExpiryAfterProceed() async throws {
+        let callbacks = CallbackRegistry()
+        let gateway = CallbackGateway(timer: ManualCallbackTimer())
+        let manager = try makeManager(appActive: true, callbacks: callbacks, gateway: gateway)
+        HeldRequestProtocol.answerNewRequests(with: 200)
+        let id = try await storage.enqueue(input: .sample())
+        let rowBefore = try await row(id)
+        let task = FakeBackgroundTask()
+        let before = FakeCallback(owner: callbacks.attach(),
+                                  gateway: gateway,
+                                  install: callbacks.setBeforeDispatch) { requestId, _ in
+            gateway.answer(requestId, .before(.proceed))
+            task.expirationHandler?()
+            return nil
+        }
+
+        manager.handleProcessing(task: task)
+        await emitter.wait(for: "BACKGROUND_SYNC_COMPLETED", in: self)
+
+        try await assertStoppedBeforeTheClaim(task, itemId: id, rowBefore: rowBefore)
+        XCTAssertEqual(before.callCount, 1)
+        XCTAssertEqual(gateway.pendingCount, 0)
+    }
+
+    /// What an expiry that stopped a cycle before its claim leaves: one
+    /// completion with `false`, nothing sent, the row as it was, no item
+    /// event, and a cancelled cycle that failed nothing.
+    private func assertStoppedBeforeTheClaim(_ task: FakeBackgroundTask,
+                                             itemId id: String,
+                                             rowBefore: StoredSyncItem?,
+                                             file: StaticString = #filePath,
+                                             line: UInt = #line) async throws {
+        XCTAssertEqual(task.completedResults, [false], "completed once, at the expiry", file: file, line: line)
+        XCTAssertEqual(HeldRequestProtocol.startedCount, 0, "nothing was sent", file: file, line: line)
+        let stored = try await row(id)
+        XCTAssertEqual(stored, rowBefore, "no claim, no deferral", file: file, line: line)
+        XCTAssertEqual(emitter.emittedEvents.map(\.type).filter { $0.hasPrefix("ITEM_") }, [], file: file, line: line)
+        let failed = emitter.events(ofType: "SYNC_FAILED")
+        XCTAssertEqual(failed.count, 1, file: file, line: line)
+        XCTAssertNil(failed.first?.errorCode, "a cancelled cycle failed nothing", file: file, line: line)
     }
 
     // MARK: - Exactly once on the other paths

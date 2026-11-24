@@ -11,6 +11,8 @@ keywords:
   - bgtaskscheduler
   - core data
   - room
+  - retry decider
+  - dispatch interceptors
 ---
 
 # Troubleshooting
@@ -290,6 +292,7 @@ After an upgrade, the type checker reports errors in files that did not change.
 - **Stored headers cannot be read.** `defaultHeaders` were configured, but they cannot be recovered in this process, so nothing is dispatched: sending without them would fail every item. This happens when the Keystore key was invalidated, when the iOS device has not been unlocked since boot, or after a backup restore onto another device. With Android `allowBackup`, the ciphertext comes back but the key does not.
 - **Quality gate.** The network quality is below `minNetworkQuality`. The flush emits `SYNC_FAILED` with `NETWORK_QUALITY_TOO_LOW`. See [the next entry](#symptom-nothing-syncs-with-minnetworkquality-or-healthcheckurl-set).
 - **Health check.** The `HEAD` to `healthCheckUrl` failed, or its backoff is running. The flush emits `SYNC_FAILED` with `HEALTH_CHECK_FAILED`. See [the next entry](#symptom-nothing-syncs-with-minnetworkquality-or-healthcheckurl-set).
+- **Deferred by an interceptor.** Your header resolver or `beforeDispatch` failed, or answered `SKIP`, for each item it was asked about. Each deferred item emits `ITEM_RETRYING` with `INTERCEPTOR_FAILED`, and the cycle ends with `SYNC_SUCCEEDED`. See [Items stay pending with `INTERCEPTOR_FAILED`](#symptom-items-stay-pending-with-interceptor_failed).
 
 A cycle that found nothing eligible emits `SYNC_STARTED` and `SYNC_SUCCEEDED` and adds a 0/0 row to the sync history. A `flush()` blocked by a pause, unreadable headers, the gate or the health check runs no cycle: it emits no `SYNC_STARTED` and writes no history row. On Android it also returns `0` for `startedAt` and `finishedAt`. On iOS both are the time the check stopped the flush, so only the missing event and history row tell the two apart. On iOS, a `flush()` that joins a running cycle returns the last finished cycle's result, or a 0/0 one.
 
@@ -333,11 +336,117 @@ Your server logs a `401` for the item at each wake, and the item stays `PENDING`
 
 **Cause.** A stored token expired. In a process that has not called `configureSync`, a 401 or 403 holds the item instead of failing it: it stays `PENDING`, no attempt is spent, the next try waits at least 60 seconds, and the cycle stops. You see `ITEM_RETRYING` with `UNAUTHORIZED`, if anything is listening. Retry wakes wait for the hold, but a process restart drops it, and a periodic worker or BGTask window does not wait for it, so each of those can cost one more request. See [When a stored token expires](./guides/background-sync.md#when-a-stored-token-expires).
 
+A header resolver does not change this. In a process that has called `configureSync`, a 401 or 403 is terminal, the resolver's token included: the item is dead-lettered with `UNAUTHORIZED`.
+
 **Fix.**
 
 1. Call `configureSync` with a fresh token at launch and whenever it changes. The library does not refresh tokens, and a process with no JS cannot renew one. Each held item then dispatches once its hold ends.
+2. While JS runs, a [header resolver](./guides/dispatch-interceptors.md#header-resolver) can supply a fresh token for each request. Refresh it before it expires. A run with no JS calls no resolver and sends the stored `defaultHeaders`, so keep them current too.
 
 **Related:** [Background Sync](./guides/background-sync.md#tokens-and-logout)
+
+---
+
+### Items stay pending with `INTERCEPTOR_FAILED` {#symptom-items-stay-pending-with-interceptor_failed}
+
+Items never go out, each attempt emits `ITEM_RETRYING` with `INTERCEPTOR_FAILED`, and every cycle ends with `SYNC_SUCCEEDED` and 0/0.
+
+**Cause.** Your header resolver or `beforeDispatch` fails for the item, or `beforeDispatch` answers `SKIP`. A failure is a throw, a rejection, an invalid result or no answer within `callbackTimeoutMs`. Each one defers the item, unsent and with no attempt spent, for at least 60 seconds, and a deferral never escalates, so a broken resolver holds its items for good. Common causes:
+
+- The resolver returns something other than a plain object whose values are all strings: `undefined`, a `Map`, a class instance, a number value.
+- A header name or value holds a character native refuses: a space or a non-ASCII character in a name, a non-ASCII character or a line break in a value.
+- The resolver is a method passed without its object, as in `setHeaderResolver(auth.getHeaders)`. It runs without a `this`, and throws.
+- `beforeDispatch` returns an `action` other than `PROCEED` or `SKIP`.
+- A token refresh takes longer than `callbackTimeoutMs`.
+- On Android, a JS reload: until the new JS first calls the library, each consult of the old install times out. See [After a reload, items are deferred or go out without the resolver's headers](#symptom-after-a-reload-items-are-deferred-or-go-out-without-the-resolvers-headers).
+
+A `SyncItem` carries no error code, so only the event shows it, and the queue hooks do not refresh on `ITEM_RETRYING`.
+
+**Fix.**
+
+1. Read the native log, which gives each failure's reason once: tag `SyncCallbacks` in logcat, or category `callbacks` on iOS. See [Debugging](./development/debugging.md).
+2. Fix the function, or call `clearHeaderResolver()` or `clearBeforeDispatch()` to send with the static headers again.
+3. If the answer is slow for a good reason, raise `callbackTimeoutMs`.
+4. A deferred item goes out once its `nextRetryAt` passes. A `flush()` before then skips it.
+
+**Related:** [Dispatch Interceptors](./guides/dispatch-interceptors.md#when-an-interceptor-fails)
+
+---
+
+### After a reload, items are deferred or go out without the resolver's headers {#symptom-after-a-reload-items-are-deferred-or-go-out-without-the-resolvers-headers}
+
+Right after a JS reload, items emit `ITEM_RETRYING` with `INTERCEPTOR_FAILED`, or a few requests go out with only `defaultHeaders`.
+
+**Cause.** An install belongs to the JS runtime that made it:
+
+- **Before the new JS's first library call,** the old installs fail closed. On iOS the old runtime's teardown retired them, so each consult ends at once, and the retry timer is disarmed while no hybrid is attached, so a retry due then waits for the new runtime. On Android a reload runs no teardown, so each consult waits `callbackTimeoutMs` first: an item whose retry falls due then is deferred for about 60 seconds, then goes out with the new runtime's headers. A resolver or `beforeDispatch` defers its item, and the retry decider leaves the decision to the policy.
+- **After that call,** the old installs are gone, and nothing is installed until the new JS's own `set…` calls land. An item that is due in between goes out with the static headers. Installing first keeps that gap short, but cannot close it.
+- **A `set…` call from a replaced runtime** rejects with `NATIVE_MODULE_UNAVAILABLE`.
+
+**Fix.**
+
+1. Make the `set…` calls the first library calls at startup, at module scope of your entry file. See [Install Them First at Startup](./guides/dispatch-interceptors.md#install-them-first-at-startup).
+2. Install unconditionally, never behind `isRetryDeciderInstalled()`: a new runtime starts with nothing installed.
+3. Keep the credentials your backend needs in `defaultHeaders` too, so a request sent in the gap is not refused.
+
+**Related:** [Dispatch Interceptors](./guides/dispatch-interceptors.md#reloads-and-teardown)
+
+---
+
+### The retry decider's answer is ignored {#symptom-the-retry-deciders-answer-is-ignored}
+
+Items retry on the policy's schedule, and your decider's `DROP`, `DEAD_LETTER` or `delayMs` seems to have no effect.
+
+**Cause.** The policy decides whenever the decider cannot:
+
+- **It is not consulted for that failure:** a success, a failure that is not retried, the last attempt, a credential hold, or an item never sent.
+- **It failed:** a throw, a rejection, an answer other than `{ action, delayMs? }` with a known `action`, or no answer within `callbackTimeoutMs`. The fallback is logged natively and emits no event.
+- **Its `delayMs` is not usable:** not finite, or negative. The policy's delay applies, with a warning in the log.
+- **It is not installed in that process:** no JS runs there, or a reload replaced the runtime that installed it. The policy then decides silently, with no log line. `isRetryDeciderInstalled()` answers for the calling runtime.
+- **The wait was cut:** a BGTask expired, or the cycle was cancelled, while it decided.
+
+**Fix.**
+
+1. Read the native log: tag `SyncCallbacks` in logcat, or category `callbacks` on iOS.
+2. Install the decider among the first library calls at startup, unconditionally.
+3. Answer within `callbackTimeoutMs`. A synchronous decider answers at once.
+
+**Related:** [Retry Policy](./guides/retry-policy.md#when-the-policy-decides-instead)
+
+---
+
+### Cycles take seconds per item while JS is busy {#symptom-cycles-take-seconds-per-item-while-js-is-busy}
+
+With callbacks installed, a cycle lasts far longer than its requests, or many items are deferred with `INTERCEPTOR_FAILED` at once, while the JS thread is busy or hung.
+
+**Cause.** Native waits up to `callbackTimeoutMs` for each answer, and cannot tell a slow answer from a JS thread that is busy, hung or gone after a reload. What that costs depends on the platform:
+
+| Platform | Cost of a hung JS thread |
+| -------- | ------------------------ |
+| iOS | Items go one at a time, so each awaited callback adds up to `callbackTimeoutMs` to its item: about `batchSize` × `callbackTimeoutMs` for a full batch. |
+| Android | A batch goes concurrently, so the waits overlap: about one `callbackTimeoutMs`. With `defaultHeaders` restored from disk, items probe the credential one at a time, so a cycle can take about `batchSize` × `callbackTimeoutMs`. |
+
+**Fix.**
+
+1. Keep callbacks fast, and keep slow work off the JS thread they run on.
+2. Set `callbackTimeoutMs` no longer than your slowest legitimate answer.
+3. On Android, up to `batchSize` resolver calls run at once: share one token refresh between them.
+
+**Related:** [Dispatch Interceptors](./guides/dispatch-interceptors.md#concurrency)
+
+---
+
+### A callback that awaits `flush()` stalls the sync {#symptom-a-callback-that-awaits-flush-stalls-the-sync}
+
+On Android, a cycle stops for `callbackTimeoutMs` each time a callback calls `flush()` or `drainUntilEmpty()`, and then the item is deferred or the policy decides. On iOS, that `flush()` returns at once and sends nothing.
+
+**Cause.** A callback runs inside the cycle that asked it. On Android, the cycle waits for the callback and `flush()` waits for the cycle, until the callback's timeout ends the wait. On iOS, `flush()` during a running cycle returns the last result.
+
+**Fix.**
+
+1. Never await `flush()` or `drainUntilEmpty()` in a callback. Flush from your own code instead.
+
+**Related:** [Dispatch Interceptors](./guides/dispatch-interceptors.md#never-await-flush-in-a-callback)
 
 ---
 
@@ -445,11 +554,14 @@ An item is gone from `getPendingItems()` and from the queue hooks, although it w
 
 **Cause.** It failed permanently and moved to the dead-letter queue, where `getQueueSize()`, `getPendingItems()` and the queue hooks do not look. Its `ITEM_FAILED` carried the code, and `ITEM_DEAD_LETTERED` followed. Items that had failed permanently before the upgrade to v0.3 were moved there too.
 
+The exception is an item your [retry decider](./guides/retry-policy.md#retry-decider) answered `DROP` for. It was deleted: its `ITEM_FAILED` carried `RETRY_DECIDER_REJECTED`, no `ITEM_DEAD_LETTERED` followed, and it is in neither queue.
+
 **Fix.**
 
-1. Read it with [`listDeadLetter`](./api-reference/functions.md#listdeadletter) or `useSyncSnapshot().deadLetter`. `lastErrorCode` and `lastErrorMessage` say why it failed.
+1. Read it with [`listDeadLetter`](./api-reference/functions.md#listdeadletter) or `useSyncSnapshot().deadLetter`. `lastErrorCode` and `lastErrorMessage` say why it failed. `RETRY_DECIDER_REJECTED` means your decider answered `DEAD_LETTER`, and `lastErrorMessage` holds the failure it decided on.
 2. Replay it with `replayDeadLetter` once the cause is fixed, or delete it with `discardDeadLetter` or `removeItem`.
 3. Nothing prunes the dead-letter queue, so discard what you do not replay.
+4. A dropped item cannot be read back. Answer `DEAD_LETTER` in your decider for anything you may need again.
 
 **Related:** [Error Handling](./guides/error-handling.md#dead-letter-flows)
 
@@ -515,7 +627,7 @@ During an Android flush, `useSyncStatus().progress` stays at `0` until the cycle
    });
    ```
 
-`result.failedIds` and `result.errors` hold the same detail on Android, and are always empty on iOS. The failed items themselves are in the dead-letter queue, except one purged while its request was in flight: read them with [`listDeadLetter`](./api-reference/functions.md#listdeadletter).
+`result.failedIds` and `result.errors` hold the same detail on Android, and are always empty on iOS. The failed items themselves are in the dead-letter queue, except one purged while its request was in flight and one your retry decider dropped: read them with [`listDeadLetter`](./api-reference/functions.md#listdeadletter).
 
 **Related:** [Error Handling](./guides/error-handling.md#listening-for-failures-via-events)
 
@@ -672,7 +784,7 @@ The library does not encrypt it. Per-item `headers` and `body` are stored in pla
 
 ### What happens to a request that fails permanently?
 
-It moves to the dead-letter queue, with its last error code and message, and `ITEM_FAILED` then `ITEM_DEAD_LETTERED` are emitted. Nothing retries or prunes it: read it with `listDeadLetter()`, put it back with `replayDeadLetter(id)` once the cause is fixed, or delete it with `discardDeadLetter(id)`.
+It moves to the dead-letter queue, with its last error code and message, and `ITEM_FAILED` then `ITEM_DEAD_LETTERED` are emitted. Nothing retries or prunes it: read it with `listDeadLetter()`, put it back with `replayDeadLetter(id)` once the cause is fixed, or delete it with `discardDeadLetter(id)`. The one exception is a [retry decider](./guides/retry-policy.md#retry-decider) that answers `DROP`: the item is then deleted, with `ITEM_FAILED` alone.
 
 **Related:** [Retry Policy](./guides/retry-policy.md#permanent-failures), [Error Handling](./guides/error-handling.md#dead-letter-flows)
 

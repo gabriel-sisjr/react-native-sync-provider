@@ -84,6 +84,27 @@ enum NumericOption {
         values.compactMap(int32)
     }
 
+    /// `callbackTimeoutMs`, in milliseconds: 3000 when it is unset or
+    /// unusable (not finite, or below 1, which `configureSync` rejects and a
+    /// stored record drops). Fractions truncate, and it is at most 2147483647,
+    /// which also keeps the timer's conversion to nanoseconds in range.
+    static func callbackTimeoutMs(_ value: Double?) -> Int {
+        guard let value, SyncOptionsSnapshot.isUsableCallbackTimeout(value) else {
+            return SyncOptionsSnapshot.defaultCallbackTimeoutMs
+        }
+        return Int(min(value.rounded(.towardZero), Double(int32Max)))
+    }
+
+    /// The retry decider's `delayMs`, in whole milliseconds, or `nil` when it
+    /// must be ignored: missing, not finite, or negative, so the policy's
+    /// delay applies. Fractions truncate, and anything above ``maxDelayMs``
+    /// is ``maxDelayMs``; the deadline then stops at
+    /// ``RetryPolicyEvaluator/maxDeadlineMs``.
+    static func decidedDelayMs(_ value: Double?) -> Int? {
+        guard let value, value.isFinite, value >= 0 else { return nil }
+        return Int(min(value.rounded(.towardZero), Double(maxDelayMs)))
+    }
+
     /// The `getSyncHistory` limit, where 0 means every result. NaN,
     /// -Infinity and anything below 1 give 0; +Infinity and 2^31 or more give
     /// 2147483647.

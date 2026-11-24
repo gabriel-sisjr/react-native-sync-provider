@@ -21,6 +21,7 @@ const sidebars: SidebarsConfig = {
         'guides/offline-queue',
         'guides/background-sync',
         'guides/retry-policy',
+        'guides/dispatch-interceptors',
         'guides/connectivity-detection',
         'guides/error-handling',
         'guides/priority-and-ordering',
@@ -80,7 +81,12 @@ const sidebars: SidebarsConfig = {
     {
       type: 'category',
       label: 'Migration',
-      items: ['migration/index', 'migration/v0-3-0', 'migration/v0-2-0'],
+      items: [
+        'migration/index',
+        'migration/v0-4-0',
+        'migration/v0-3-0',
+        'migration/v0-2-0',
+      ],
     },
     {
       type: 'category',

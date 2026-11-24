@@ -17,6 +17,11 @@ import androidx.work.testing.WorkManagerTestInitHelper
 import com.google.common.collect.Range
 import com.google.common.truth.Truth.assertThat
 import com.google.common.truth.Truth.assertWithMessage
+import com.margelo.nitro.syncprovider.callbacks.CallbackAnswers
+import com.margelo.nitro.syncprovider.callbacks.CallbackKind
+import com.margelo.nitro.syncprovider.callbacks.CallbackResult
+import com.margelo.nitro.syncprovider.callbacks.HybridInstalls
+import com.margelo.nitro.syncprovider.callbacks.SkipReason
 import com.margelo.nitro.syncprovider.config.ConfigSource
 import com.margelo.nitro.syncprovider.config.SecretStore
 import com.margelo.nitro.syncprovider.connectivity.ConnectivityMonitor
@@ -37,6 +42,7 @@ import io.mockk.coEvery
 import io.mockk.every
 import io.mockk.mockkConstructor
 import io.mockk.unmockkConstructor
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -46,6 +52,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.onSubscription
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
@@ -1162,7 +1169,123 @@ internal class SyncProviderRuntimeTest {
       assertThat(options.healthCheckUrl).isNull()
       assertThat(options.healthCheckTtlMs).isNull()
       assertThat(options.healthCheckBackoffMs).isNull()
+      assertThat(options.callbackTimeoutMs).isNull()
     }
+  }
+
+  /* ------------------------------- the JS callbacks ------------------------------- */
+
+  @Test
+  fun `options_callbackTimeoutMs_echoedOnlyWhenSet_andPersisted`() = runBlocking<Unit> {
+    // The 3000 ms default applies where the wait happens; it is never echoed.
+    assertThat(runtime.currentOptions().callbackTimeoutMs).isNull()
+
+    runtime.configure(TestData.syncOptions(callbackTimeoutMs = 3_000.7))
+    assertThat(runtime.currentOptions().callbackTimeoutMs).isEqualTo(3_000.7)
+    restartProcess()
+    assertThat(runtime.configSource).isEqualTo(ConfigSource.PERSISTED)
+    assertThat(runtime.currentOptions().callbackTimeoutMs).isEqualTo(3_000.7)
+
+    runtime.configure(TestData.syncOptions())
+    assertThat(runtime.currentOptions().callbackTimeoutMs).isNull()
+    restartProcess()
+    assertThat(runtime.currentOptions().callbackTimeoutMs).isNull()
+  }
+
+  @Test
+  fun `options_callbackTimeoutMs_validation, configureSync rejects before anything changes`() =
+    runBlocking<Unit> {
+      val applied = TestData.syncOptions(callbackTimeoutMs = 5_000.0)
+      runtime.configure(applied)
+
+      val rejections = listOf(Double.NaN, Double.POSITIVE_INFINITY, 0.0, -1.0, 0.5)
+        .map { value ->
+          runCatching { runtime.configure(TestData.syncOptions(callbackTimeoutMs = value)) }
+            .exceptionOrNull() as? SyncException
+        }
+
+      assertThat(rejections.map { it?.code }).containsExactly(
+        SyncErrorCode.INVALID_PAYLOAD,
+        SyncErrorCode.INVALID_PAYLOAD,
+        SyncErrorCode.INVALID_PAYLOAD,
+        SyncErrorCode.INVALID_PAYLOAD,
+        SyncErrorCode.INVALID_PAYLOAD,
+      )
+      assertThat(runtime.currentOptions()).isEqualTo(applied)
+      restartProcess()
+      assertThat(runtime.currentOptions()).isEqualTo(applied)
+    }
+
+  @Test
+  fun `a shutdown forgets every installed callback, which live outside the runtime`() {
+    val hybrid = HybridInstalls(SyncProviderRuntime.callbacks)
+    assertThat(hybrid.setRetryDecider { _, _ -> }).isTrue()
+    assertThat(hybrid.setAfterDispatch { _, _ -> }).isTrue()
+
+    restartProcess()
+
+    assertThat(SyncProviderRuntime.callbacks.registry.retryDecider.installed).isNull()
+    assertThat(SyncProviderRuntime.callbacks.registry.afterDispatch.installed).isNull()
+  }
+
+  @Test
+  fun `lifecycle_shutdown_endsEveryWait, the current hybrid's too, at once`() = runBlocking<Unit> {
+    val hybrid = HybridInstalls(SyncProviderRuntime.callbacks)
+    val gateway = SyncProviderRuntime.callbacks.gateway
+    val asked = CompletableDeferred<Unit>()
+    val waiting = async(Dispatchers.Default) {
+      gateway.request(
+        CallbackKind.RETRY_DECIDER, hybrid.owner, "waiting", AWAIT_TIMEOUT_MS * 3, null,
+        "the retry policy applies", CallbackAnswers::decision,
+      ) { asked.complete(Unit) }
+    }
+    withTimeout(AWAIT_TIMEOUT_MS) { asked.await() }
+    val started = System.nanoTime()
+
+    // A live owner's wait, which no retirement would end.
+    runtime.shutdown()
+
+    assertThat(withTimeout(AWAIT_TIMEOUT_MS) { waiting.await() })
+      .isEqualTo(CallbackResult.Skipped(SkipReason.OWNER_GONE))
+    assertThat((System.nanoTime() - started) / 1_000_000L).isLessThan(AWAIT_TIMEOUT_MS)
+    assertThat(gateway.pendingCount).isEqualTo(0)
+  }
+
+  @Test
+  fun `lifecycle_setBeforeConfigure_installsAndIsUsed, by the runtime's next cycle`() = runBlocking<Unit> {
+    // The hybrid's set calls come first, before any configureSync, as the startup rule asks.
+    assertThat(runtime.configSource).isEqualTo(ConfigSource.DEFAULTS)
+    val hybrid = HybridInstalls(SyncProviderRuntime.callbacks)
+    val asked: MutableList<String> = CopyOnWriteArrayList()
+    assertThat(
+      hybrid.setHeaderResolver { requestId, context ->
+        asked += "headerResolver ${context.itemId}"
+        SyncProviderRuntime.callbacks.gateway.answer(
+          requestId,
+          CallbackAnswer(CallbackAnswerStatus.RESOLVED, null, mapOf("Authorization" to TOKEN), null, null),
+        )
+      },
+    ).isTrue()
+    assertThat(
+      hybrid.setRetryDecider { requestId, context ->
+        asked += "retryDecider ${context.itemId}"
+        SyncProviderRuntime.callbacks.gateway.answer(
+          requestId,
+          CallbackAnswer(CallbackAnswerStatus.RESOLVED, RetryDecision(RetryAction.DROP, null), null, null, null),
+        )
+      },
+    ).isTrue()
+
+    runtime.configure(TestData.syncOptions())
+    server.enqueue(MockResponse().setResponseCode(503))
+    insert("decided")
+    runtime.dispatcher.flush()
+
+    assertThat(runtime.configSource).isEqualTo(ConfigSource.LIVE)
+    assertThat(server.takeRequest(1, TimeUnit.SECONDS)!!.getHeader("Authorization")).isEqualTo(TOKEN)
+    assertThat(asked).containsExactly("headerResolver decided", "retryDecider decided").inOrder()
+    assertThat(row("decided")).isNull()
+    assertThat(deadLetter("decided")).isNull()
   }
 
   @Test

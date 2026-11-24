@@ -47,6 +47,9 @@ struct SyncOptionsSnapshot: Sendable, Equatable {
     var healthCheckTtlMs: Double? = nil
     /// As set. Read ``effectiveHealthCheckBackoffMs`` to use it.
     var healthCheckBackoffMs: Double? = nil
+    /// As set, `nil` while unset. Converted by
+    /// ``toDispatcherConfig(source:credentialsUnavailable:)``.
+    var callbackTimeoutMs: Double? = nil
 
     static let `default` = SyncOptionsSnapshot(
         strategy: "AUTOMATIC",
@@ -81,7 +84,43 @@ struct SyncOptionsSnapshot: Sendable, Equatable {
                          minNetworkQuality: minNetworkQuality,
                          healthCheckUrl: healthCheckUrl.flatMap { URL(string: $0) },
                          healthCheckTtlMs: effectiveHealthCheckTtlMs,
-                         healthCheckBackoffMs: effectiveHealthCheckBackoffMs)
+                         healthCheckBackoffMs: effectiveHealthCheckBackoffMs,
+                         callbackTimeoutMs: NumericOption.callbackTimeoutMs(callbackTimeoutMs))
+    }
+}
+
+// MARK: - Callback timeout
+
+extension SyncOptionsSnapshot {
+    /// `callbackTimeoutMs` when unset: how long native waits for the answer of
+    /// an installed JS callback.
+    static let defaultCallbackTimeoutMs = 3_000
+
+    /// Rejects a `callbackTimeoutMs` that `configureSync` must not accept,
+    /// after ``validateNetworkHealth()``, in the facade's field order.
+    ///
+    /// - Throws: `INVALID_PAYLOAD` when it is set and is not a finite number
+    ///   of at least 1: 0 would time every callback out at once.
+    func validateCallbackTimeout() throws {
+        guard let callbackTimeoutMs, !Self.isUsableCallbackTimeout(callbackTimeoutMs) else { return }
+        throw SyncProviderError(code: .invalidPayload,
+                                message: "SyncOptions.callbackTimeoutMs must be a finite number of at least 1, "
+                                    + "was \(callbackTimeoutMs).")
+    }
+
+    /// The options with a `callbackTimeoutMs` that
+    /// ``validateCallbackTimeout()`` would reject dropped, as if never set.
+    /// A configuration read back from disk goes through this.
+    func droppingInvalidCallbackTimeout() -> SyncOptionsSnapshot {
+        guard let callbackTimeoutMs, !Self.isUsableCallbackTimeout(callbackTimeoutMs) else { return self }
+        SyncLogger.error("Stored callbackTimeoutMs is unusable; ignoring it", category: "general")
+        var options = self
+        options.callbackTimeoutMs = nil
+        return options
+    }
+
+    static func isUsableCallbackTimeout(_ value: Double) -> Bool {
+        value.isFinite && value >= 1
     }
 }
 

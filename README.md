@@ -27,7 +27,8 @@ A cross-platform React Native library for offline-first HTTP sync built on Nitro
 
 - Persistent HTTP request queue (Room on Android, Core Data on iOS) that survives a force-quit and a device reboot
 - OS-scheduled background sync (WorkManager on Android, BGTaskScheduler on iOS) that flushes the queue while the app is not running, at times the OS chooses
-- Declarative retry policy with linear, exponential or Fibonacci backoff, jitter and a status-code allowlist. Cooldowns persist across restarts
+- Declarative retry policy with linear, exponential or Fibonacci backoff, jitter and a status-code allowlist. Cooldowns persist across restarts. While the app runs, an optional JS [retry decider](#retry-decider-and-dispatch-interceptors-optional) can change a retry's delay, drop the item or dead-letter it
+- Optional JS [dispatch interceptors](#retry-decider-and-dispatch-interceptors-optional): a header resolver that supplies headers right before each request, such as a fresh access token, and `beforeDispatch` and `afterDispatch` hooks that hold or trace each request
 - Connectivity monitoring (ConnectivityManager on Android, NWPathMonitor on iOS) with a network-quality level on every snapshot, plus an opt-in [quality gate and health check](#network-quality-and-health-checks-optional)
 - Dead-letter queue: a request that fails permanently is kept with its last error until you replay or discard it
 - Persisted configuration that background workers honor without JS. `defaultHeaders` are encrypted at rest (Android Keystore, iOS Keychain)
@@ -76,6 +77,7 @@ import {
 
 // 1. Configure on app boot, and again whenever the token changes.
 //    defaultHeaders are encrypted at rest and available to background workers.
+//    While the app runs, a header resolver can supply a fresh token (see below).
 export async function startSync(token: string) {
   await configureSync({
     strategy: SyncStrategy.AUTOMATIC,
@@ -124,6 +126,8 @@ export function SyncStatusBar() {
 
 Enqueueing does not dispatch: a flush does, from `useAutoSync`, `flush()`, or an OS background window. The queue survives a force-quit, but background windows do not: iOS does not launch an app the user force-quit, and Android stops its work after a Force Stop, until the user opens the app again. See the [Quick Start guide](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/getting-started/quick-start) for a complete screen and the `<SyncProvider>` setup.
 
+A background worker or BGTask launch where no JS runs sends the stored `defaultHeaders` alone, so keep the token there even if you add a [header resolver](#retry-decider-and-dispatch-interceptors-optional).
+
 ## Network Quality and Health Checks (optional)
 
 Every connection snapshot carries a `networkQuality` level, from worst to best `OFFLINE`, `POOR`, `MODERATE`, `GOOD` and `EXCELLENT`. Two opt-in checks can skip a flush cycle, and both are off by default. With `minNetworkQuality`, a flush on a link below that level runs no cycle. With `healthCheckUrl`, the engine checks an endpoint of yours before a cycle, and also uses it to measure the link's latency. Without that URL nothing is measured and no extra request is sent, so the level comes from link signals only and never reaches `EXCELLENT`.
@@ -170,6 +174,59 @@ A skipped cycle changes no item, spends no attempt and emits no `SYNC_STARTED`. 
 
 The probes carry no `defaultHeaders`, so point `healthCheckUrl` at an endpoint that answers without authentication. The in-process retry timer checks before it flushes: it holds a wake the gate blocks, and waits out the backoff after a failed check, without emitting `SYNC_FAILED`. See the Connectivity Detection guide for [how the level is classified](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/guides/connectivity-detection#network-quality), [the quality gate](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/guides/connectivity-detection#the-quality-gate) and [the health check](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/guides/connectivity-detection#health-check).
 
+## Retry Decider and Dispatch Interceptors (optional)
+
+Four JS callbacks can take part in dispatch while the app runs, and none is installed by default. A retry decider sees each failed attempt that the `RetryPolicy` would retry, and answers `RETRY`, optionally with its own delay, `DROP` or `DEAD_LETTER`. A header resolver supplies headers right before each request, such as a fresh access token, merged over `defaultHeaders` and under the item's own `headers`. A `beforeDispatch` hook sees each request before it is sent and can `SKIP` it, and an `afterDispatch` hook observes each request that went out. Each callback may be sync or async. Where no JS runs, as in a cold background worker or a BGTask launch, nothing is installed: requests go out with the stored `defaultHeaders`, and the `RetryPolicy` decides alone.
+
+```tsx
+import {
+  configureSync,
+  RetryAction,
+  setAfterDispatch,
+  setHeaderResolver,
+  setRetryDecider,
+  type SyncOptions,
+} from '@gabriel-sisjr/react-native-sync-provider';
+// Your own modules. getAccessToken shares one refresh between overlapping calls.
+import { getAccessToken, metrics } from './app';
+
+// Run once at startup, before <SyncProvider> or any hook mounts.
+export async function startSyncWithCallbacks(options: SyncOptions) {
+  // 1. The callbacks first. Start every call before awaiting any of them.
+  await Promise.all([
+    // A fresh token right before each request.
+    setHeaderResolver(async () => ({
+      Authorization: `Bearer ${await getAccessToken()}`,
+    })),
+    // Give up early on analytics, and let the policy time the other retries.
+    setRetryDecider(({ attempt, metadata }) =>
+      metadata?.kind === 'analytics' && attempt >= 2
+        ? { action: RetryAction.DROP }
+        : { action: RetryAction.RETRY }
+    ),
+    // Trace each request that went out. Dispatch does not wait for it.
+    setAfterDispatch(({ url, outcome, durationMs }) => {
+      metrics.record(url, outcome, durationMs);
+    }),
+  ]);
+  // 2. Then the configuration.
+  await configureSync({ ...options, callbackTimeoutMs: 5000 });
+}
+```
+
+| Option              | Default | Description                                                                                                                                                                                                                                      |
+| ------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `callbackTimeoutMs` | `3000`  | How long the engine waits for an installed callback to answer, in ms, even when its promise never settles. A finite number of at least `1`. Past it, the decider's item gets the policy's verdict, the resolver's or `beforeDispatch`'s item is deferred, and an `afterDispatch` call is only logged |
+
+The header resolver and `beforeDispatch` fail closed. On a throw, a rejection, an invalid result or no answer in time, and on a `SKIP`, nothing is sent and no attempt is spent. The item is due again after the policy's delay, and no sooner than 60 s. A decider that fails leaves the decision to the policy. No call throws the two new codes; they are reported on events:
+
+| Error code               | Reported when                                                                                                                                                        |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RETRY_DECIDER_REJECTED` | The retry decider answered `DROP` or `DEAD_LETTER`. On `ITEM_FAILED`, and after a `DEAD_LETTER` also as the dead letter's `lastErrorCode`                            |
+| `INTERCEPTOR_FAILED`     | The header resolver or `beforeDispatch` failed or did not answer in time, or `beforeDispatch` answered `SKIP`. On `ITEM_RETRYING`, without a `statusCode`: nothing was sent |
+
+Make the `set…` calls the first library calls at startup: the first library call starts the native engine, which can dispatch an item that is already due, with only the static headers. Installing first keeps that window short; it does not close it. A credential that requests need without JS must stay in `defaultHeaders`. On Android a batch dispatches concurrently, so up to `batchSize` callbacks can run at once. Never await `flush()` inside a callback, pass arrow functions rather than unbound methods, and keep secrets out of the errors your callbacks throw, because native logs their messages. See the [Dispatch Interceptors guide](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/guides/dispatch-interceptors), the [Retry Policy guide](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/guides/retry-policy) and the [v0.4 migration guide](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/migration/v0-4-0).
+
 ## Documentation
 
 - [Introduction](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/getting-started/introduction)
@@ -185,6 +242,7 @@ The probes carry no `defaultHeaders`, so point `healthCheckUrl` at an endpoint t
 - [Errors](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/api-reference/errors)
 - [Background Sync Guide](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/guides/background-sync)
 - [Connectivity Detection Guide](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/guides/connectivity-detection)
+- [Dispatch Interceptors Guide](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/guides/dispatch-interceptors)
 - [Performance Notes](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/architecture/overview#performance-notes)
 - [Production Checklist](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/production/production-checklist)
 - [Platform Comparison](https://gabriel-sisjr.github.io/react-native-sync-provider/docs/production/platform-comparison)

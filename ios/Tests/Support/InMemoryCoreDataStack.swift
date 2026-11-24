@@ -91,9 +91,18 @@ enum InMemoryCoreDataStack {
     /// Build a fresh `CoreDataStack` whose container is loaded against an
     /// in-memory store. The returned stack is safe to pass to
     /// `SyncItemDao(stack:)`. With `saveFaults`, its saves fail on demand.
-    static func make(saveFaults: SaveFaults? = nil, file: StaticString = #file, line: UInt = #line) -> CoreDataStack {
+    /// With `transactions`, every transaction the stack runs is logged there.
+    static func make(saveFaults: SaveFaults? = nil,
+                     transactions: TransactionLog? = nil,
+                     file: StaticString = #file,
+                     line: UInt = #line) -> CoreDataStack {
         let model = makeModel()
-        let container = NSPersistentContainer(name: "SyncProvider", managedObjectModel: model)
+        let container: NSPersistentContainer
+        if let transactions {
+            container = LoggedPersistentContainer(name: "SyncProvider", managedObjectModel: model, log: transactions)
+        } else {
+            container = NSPersistentContainer(name: "SyncProvider", managedObjectModel: model)
+        }
 
         let description = NSPersistentStoreDescription()
         description.type = NSSQLiteStoreType
@@ -201,6 +210,78 @@ final class SaveFaults: @unchecked Sendable {
             throw NSError(domain: NSCocoaErrorDomain,
                           code: NSPersistentStoreSaveError,
                           userInfo: [NSLocalizedDescriptionKey: "A save the test made fail"])
+        }
+    }
+}
+
+/// What a stack's transactions did. Pass it to
+/// ``InMemoryCoreDataStack/make(saveFaults:transactions:file:line:)``.
+final class TransactionLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var started = 0
+    private var unsaved: [String: Int64] = [:]
+
+    /// The transactions started since the last ``reset()``: every background
+    /// context the stack asked for, a read's or a write's.
+    var count: Int {
+        lock.withLock { started }
+    }
+
+    /// The `nextRetryAt` the last transaction whose save failed tried to give
+    /// the queue row `id`, if one did.
+    func unsavedNextRetryAt(_ id: String) -> Int64? {
+        lock.withLock { unsaved[id] }
+    }
+
+    func reset() {
+        lock.withLock { started = 0 }
+    }
+
+    fileprivate func recordStart() {
+        lock.withLock { started += 1 }
+    }
+
+    /// Keeps what `context` still holds after its transaction. Runs on the
+    /// context's queue.
+    fileprivate func recordUnsaved(_ context: NSManagedObjectContext) {
+        var deadlines: [String: Int64] = [:]
+        for object in context.updatedObjects where object.entity.name == "SyncItemEntity" {
+            if let id = object.value(forKey: "id") as? String,
+               let nextRetryAt = (object.value(forKey: "nextRetryAt") as? NSNumber)?.int64Value {
+                deadlines[id] = nextRetryAt
+            }
+        }
+        lock.withLock { unsaved.merge(deadlines) { $1 } }
+    }
+}
+
+/// A container that tells a ``TransactionLog`` about every transaction. Its
+/// `performBackgroundTask` makes its context through `newBackgroundContext()`,
+/// a private-queue context as the system's does, so each transaction is
+/// counted once, and it keeps what a transaction whose save failed left in
+/// its context.
+private final class LoggedPersistentContainer: NSPersistentContainer, @unchecked Sendable {
+    private let log: TransactionLog
+
+    init(name: String, managedObjectModel model: NSManagedObjectModel, log: TransactionLog) {
+        self.log = log
+        super.init(name: name, managedObjectModel: model)
+    }
+
+    override func newBackgroundContext() -> NSManagedObjectContext {
+        log.recordStart()
+        return super.newBackgroundContext()
+    }
+
+    override func performBackgroundTask(_ block: @escaping (NSManagedObjectContext) -> Void) {
+        let context = newBackgroundContext()
+        let log = self.log
+        context.perform {
+            block(context)
+            // A save that failed leaves its changes in the context.
+            if context.hasChanges {
+                log.recordUnsaved(context)
+            }
         }
     }
 }

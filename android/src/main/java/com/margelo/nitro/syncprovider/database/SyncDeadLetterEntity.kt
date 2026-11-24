@@ -8,15 +8,18 @@ import androidx.room.PrimaryKey
 
 /**
  * A queued request that failed for good: attempts exhausted, a response that is not
- * retried, or a credential rejected while it was live. It leaves the queue in the same
- * transaction, so it is never in both tables, and it counts toward no capacity cap.
+ * retried, a credential rejected while it was live, or a retry the JS retry decider turned
+ * down. It leaves the queue in the same transaction, so it is never in both tables, and it
+ * counts toward no capacity cap.
  *
  * The request fields are the queue row's, unchanged.
  *
  * @property attempts attempts made in total.
  * @property lastAttemptAt epoch millis of the final attempt.
  * @property lastErrorCode the [com.margelo.nitro.syncprovider.SyncErrorCode] name of the
- *   final failure. A row moved from a schema without one holds `MAX_ATTEMPTS_EXCEEDED`.
+ *   final failure, or `RETRY_DECIDER_REJECTED` when the retry decider turned the retry down; the
+ *   message then still describes the failure. A row moved from a schema without one holds
+ *   `MAX_ATTEMPTS_EXCEEDED`.
  * @property lastErrorMessage the final failure's status line or exception message, at most
  *   [MAX_ERROR_MESSAGE_LENGTH] characters. Never a header or a body. `null` for a row
  *   moved from an earlier schema.

@@ -1,7 +1,7 @@
 ---
 sidebar_position: 5
 title: Error Handling
-description: Discriminate errors thrown by react-native-sync-provider — SyncError class, SyncErrorCode matrix, retryable codes, skipped cycles, dead-letter flows, and recommended handler patterns.
+description: Discriminate errors thrown by react-native-sync-provider — SyncError class, SyncErrorCode matrix, retryable codes, interceptor deferrals, skipped cycles, dead-letter flows, and recommended handler patterns.
 keywords:
   - error-handling
   - sync-error
@@ -83,7 +83,7 @@ try {
 | `NATIVE_MODULE_UNAVAILABLE` | No | every facade method | Verify New Architecture; rebuild native app. |
 | `BACKGROUND_TASK_REGISTRATION_FAILED` | No | `enableBackgroundSync`. `disableBackgroundSync` and `isBackgroundSyncEnabled` reject with it only as the fallback code for a native rejection | iOS: check the `Info.plist` identifiers, that you are on a physical device, and that Background App Refresh is on. Android: make sure WorkManager can initialize: an app that removes its default initializer must implement `Configuration.Provider`. |
 | `INVALID_URL` | No | `enqueue`, `configureSync` (`healthCheckUrl`) | Pass an absolute http(s) URL. |
-| `UNAUTHORIZED` | No | Item events, dead letters | Call `configureSync` with a fresh token, then replay the dead letters. |
+| `UNAUTHORIZED` | No | Item events, dead letters | Renew the token: in `defaultHeaders` with `configureSync`, and in your [header resolver](./dispatch-interceptors.md#header-resolver) if you installed one. Then replay the dead letters. |
 | `TIMEOUT` | Yes | Item events | Engine retries; raise `requestTimeoutMs` if requests legitimately take longer. On Android, `TIMEOUT` also covers the HTTP client's fixed socket timeouts: 10 s to connect, or 30 s for a stalled read or write. Raising `requestTimeoutMs` does not lengthen those. |
 | `MAX_ATTEMPTS_EXCEEDED` | No | `ITEM_FAILED`, dead letters | Replay once the cause is fixed. Raise `maxAttempts` or expand `retryOnStatusCodes` if it recurs. |
 | `DUPLICATE_ITEM` | No | Never: reserved | None. |
@@ -91,6 +91,8 @@ try {
 | `NETWORK_QUALITY_TOO_LOW` | Yes (the cycle is skipped) | `SYNC_FAILED` | Nothing for automatic wakes. Call `flush()` again later. See [Skipped cycles](#skipped-cycles). |
 | `HEALTH_CHECK_FAILED` | Yes (the cycle is skipped) | `SYNC_FAILED` | Check the health endpoint. Cycles resume after the backoff. |
 | `DEAD_LETTERED` | No | `ITEM_DEAD_LETTERED` | Inspect, replay or discard the dead letter. |
+| `RETRY_DECIDER_REJECTED` | No | `ITEM_FAILED`, dead letters, `afterDispatch` | Your [retry decider](./retry-policy.md#retry-decider) answered `DROP` or `DEAD_LETTER`. A dead letter's `lastErrorMessage` keeps the failure it decided on. |
+| `INTERCEPTOR_FAILED` | Yes (the item is deferred, with no attempt spent) | `ITEM_RETRYING` | Your header resolver or `beforeDispatch` failed, did not answer in time, or answered `SKIP`. See [When an Interceptor Fails](./dispatch-interceptors.md#when-an-interceptor-fails). |
 
 ## Wrapping Your Own Calls
 
@@ -124,7 +126,7 @@ export async function safeFlush(): Promise<SyncResult | null> {
 
 ## Per-Item Failures via `SyncResult`
 
-`failureCount` works on both platforms. The per-item detail does not: `failedIds` and `errors` are always empty on iOS. On Android, `errors` maps each failed item to `"<SyncErrorCode>: <detail>"`:
+`failureCount` works on both platforms. The per-item detail does not: `failedIds` and `errors` are always empty on iOS. On Android, `errors` maps each failed item to `"<SyncErrorCode>: <detail>"`, an item a retry decider dropped included:
 
 ```ts
 const result = await flush();
@@ -137,7 +139,7 @@ if (result.failureCount > 0) {
 }
 ```
 
-An item that went back to wait for a retry counts as neither a success nor a failure, so a cycle whose items all failed retriably is 0/0.
+An item that went back to wait for a retry counts as neither a success nor a failure, so a cycle whose items all failed retriably is 0/0. So is a cycle whose items an [interceptor deferred](./dispatch-interceptors.md#when-an-interceptor-fails).
 
 ## Listening for Failures via Events
 
@@ -154,8 +156,9 @@ useSyncEvents({
 });
 ```
 
-- `ITEM_FAILED` is emitted when an item fails permanently, with a real `errorCode`.
-- `ITEM_DEAD_LETTERED` follows it right after, once the item is in the dead-letter queue. Its `errorCode` is always `DEAD_LETTERED`, and `metadata.lastErrorCode` repeats the real code. An item removed or cleared while its request was in flight gets `ITEM_FAILED` alone: it is never dead-lettered. See [What a Purge Stops](../api-reference/functions.md#what-a-purge-stops).
+- `ITEM_FAILED` is emitted when an item fails permanently, with a real `errorCode`, or with `RETRY_DECIDER_REJECTED` when your [retry decider](./retry-policy.md#retry-decider) dropped or dead-lettered it.
+- `ITEM_DEAD_LETTERED` follows it right after, once the item is in the dead-letter queue. Its `errorCode` is always `DEAD_LETTERED`, and `metadata.lastErrorCode` repeats the code `ITEM_FAILED` carried. An item removed or cleared while its request was in flight gets `ITEM_FAILED` alone, and is never dead-lettered: see [What a Purge Stops](../api-reference/functions.md#what-a-purge-stops). An item the decider dropped gets `ITEM_FAILED` alone too, because it is deleted.
+- `ITEM_RETRYING` with `INTERCEPTOR_FAILED` is not a failure: your header resolver or `beforeDispatch` deferred the item, unsent, with no attempt spent.
 - `SYNC_FAILED` is emitted when a cycle ends with at least one permanent failure, [dies](#when-a-cycle-dies), is [cancelled](#cancelled-cycles), or is skipped. Its `errorCode` is set only when the cycle died or was skipped, so read per-item codes from `ITEM_FAILED`.
 
 ### Skipped Cycles
@@ -194,6 +197,8 @@ A cycle dies when something around an attempt fails, rather than the attempt its
 | Android only: a request that went out, with no answer read yet | The attempt counts, with `NETWORK_ERROR` and the policy's backoff, or `MAX_ATTEMPTS_EXCEEDED` on its last attempt. |
 | No request went out | Back in the queue exactly as before the cycle, with no event. |
 
+With a [retry decider](./retry-policy.md#retry-decider) installed, a retryable failure is settled with the decision taken for that attempt, without asking JS again, or with the policy's when none was taken.
+
 The cycle then ends with `SYNC_FAILED`. Its `errorCode` is the library error's own code, or `NETWORK_ERROR` for any other cause, a storage error included. The `flush()` that ran it rejects with `NETWORK_ERROR`, and automatic wakes wait for the [failure hold](./retry-policy.md#the-failure-hold) before they run another cycle.
 
 Only when the settling write fails too do the items stay `IN_FLIGHT`, until the next [recovery](./crash-recovery.md) puts them back in the queue, and they are sent again. Delivery stays at least once, so keep your endpoints [idempotent](./idempotency.md).
@@ -206,10 +211,11 @@ A cycle can be stopped by cancellation: on Android, a worker that WorkManager st
 - No item fails because of it. The items it claimed and has not sent go back to the queue unchanged.
 - A request already on the wire finishes on Android, and its answer is recorded with the attempt counted. iOS cancels it, and its item goes back to `PENDING` with the attempt refunded.
 - It neither starts nor ends the [failure hold](./retry-policy.md#the-failure-hold).
+- A cancellation during a callback wait sends nothing more. An item waiting on the header resolver or `beforeDispatch` stays as it was, with no event, and one waiting on the retry decider gets the policy's retry.
 
 ## Dead-Letter Flows
 
-An item that fails permanently moves, in one transaction, from the queue to the dead-letter queue. It keeps the original request and adds `attempts`, `lastAttemptAt`, `lastErrorCode`, an optional `lastErrorMessage` and `deadLetteredAt`: see [`SyncDeadLetterItem`](../api-reference/types.md#syncdeadletteritem). Nothing retries it, nothing prunes it, and it counts toward no capacity cap.
+An item that fails permanently moves, in one transaction, from the queue to the dead-letter queue, except one your retry decider dropped, which is deleted. It keeps the original request and adds `attempts`, `lastAttemptAt`, `lastErrorCode`, an optional `lastErrorMessage` and `deadLetteredAt`: see [`SyncDeadLetterItem`](../api-reference/types.md#syncdeadletteritem). Nothing retries it, nothing prunes it, and it counts toward no capacity cap.
 
 ### Inspect
 
@@ -228,6 +234,8 @@ for (const item of deadLetters) {
 ```
 
 `lastErrorMessage` never contains headers or bodies, but `url` can carry a token in its query string: redact before you log it. In a component, [`useSyncSnapshot().deadLetter`](../api-reference/hooks/useSyncSnapshot.md) keeps the list current.
+
+A dead letter with `lastErrorCode: RETRY_DECIDER_REJECTED` is one your [retry decider](./retry-policy.md#retry-decider) sent there. Its `lastErrorMessage` holds the failure it decided on, such as an HTTP 503.
 
 ### Replay After Fixing the Cause
 
@@ -290,5 +298,6 @@ Clear before you drop the credentials: in the other order, a cycle that starts i
 ## Next Steps
 
 - [Errors](../api-reference/errors.md) -- The full `SyncErrorCode` enum with TSDoc
-- [Retry Policy](./retry-policy.md) -- How retryable codes are scheduled
+- [Retry Policy](./retry-policy.md) -- How retryable codes are scheduled, and the retry decider
+- [Dispatch Interceptors](./dispatch-interceptors.md) -- What a failing header resolver or `beforeDispatch` does to an item
 - [Troubleshooting](../troubleshooting.md) -- Symptom / cause / fix for common errors

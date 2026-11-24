@@ -1,6 +1,6 @@
 # React Native Sync Provider
 
-> Cross-platform React Native Nitro Module for offline-first HTTP sync on Android and iOS: a native, persistent request queue with a declarative retry policy and OS-scheduled background dispatch.
+> Cross-platform React Native Nitro Module for offline-first HTTP sync on Android and iOS: a native, persistent request queue with a declarative retry policy, an optional JS retry decider and dispatch interceptors, and OS-scheduled background dispatch.
 
 ## Package
 
@@ -11,7 +11,7 @@
 
 ## Overview
 
-A cross-platform React Native library for offline-first HTTP sync built on Nitro Modules, for the New Architecture. Persists outbound requests on the native side, retries them on a persisted backoff, and can dispatch them in OS-scheduled background windows while the app is not running, on both Android and iOS. Android uses Room, OkHttp and WorkManager; iOS uses Core Data, URLSession and BGTaskScheduler. Features include a queue that survives a force-quit and a reboot, linear, exponential or Fibonacci backoff with jitter, a dead-letter queue for requests that fail permanently, a network-quality level on every connection snapshot with an opt-in quality gate and health check, configuration persisted for background workers with `defaultHeaders` encrypted at rest, priority lanes, nine React hooks, and typed events and errors.
+A cross-platform React Native library for offline-first HTTP sync built on Nitro Modules, for the New Architecture. Persists outbound requests on the native side, retries them on a persisted backoff, and can dispatch them in OS-scheduled background windows while the app is not running, on both Android and iOS. Android uses Room, OkHttp and WorkManager; iOS uses Core Data, URLSession and BGTaskScheduler. Features include a queue that survives a force-quit and a reboot, linear, exponential or Fibonacci backoff with jitter, a dead-letter queue for requests that fail permanently, a network-quality level on every connection snapshot with an opt-in quality gate and health check, configuration persisted for background workers with `defaultHeaders` encrypted at rest, a JS retry decider and dispatch interceptors (a per-request header resolver, `beforeDispatch` and `afterDispatch`) that run while JS is alive, priority lanes, nine React hooks, and typed events and errors.
 
 ## Requirements
 
@@ -31,7 +31,11 @@ A cross-platform React Native library for offline-first HTTP sync built on Nitro
 - `MANUAL` stops the engine from scheduling flushes, not `useAutoSync`: the hook never reads the strategy. Pass `enabled: false` for a manual flow.
 - Each cycle dispatches one batch of eligible items, up to `batchSize` (default 25). Use `drainUntilEmpty()` to loop.
 - `flush()` checks connectivity only through `minNetworkQuality`. Unset, a flush while offline costs attempts: on Android it can spend retry attempts and move valid items to the dead-letter queue, and on iOS it waits for the network with its first item claimed and one attempt spent. `minNetworkQuality: 'POOR'` blocks only `OFFLINE`. `useAutoSync`'s interval and foreground flushes, the native retry timer and `drainUntilEmpty()` do not flush while `DISCONNECTED`.
-- Per-item failures never reject. Read them from `ITEM_FAILED` events. A permanent failure moves the item to the dead-letter queue: `ITEM_FAILED`, then `ITEM_DEAD_LETTERED`. Nothing prunes that queue: replay or discard each dead letter.
+- Per-item failures never reject. Read them from `ITEM_FAILED` events. A permanent failure moves the item to the dead-letter queue: `ITEM_FAILED`, then `ITEM_DEAD_LETTERED`. The only case where the engine itself deletes a failed item is a retry decider's `DROP`, with `ITEM_FAILED` and `RETRY_DECIDER_REJECTED`. Nothing prunes that queue: replay or discard each dead letter.
+- The retry decider and the dispatch interceptors run only in a live JS runtime that installed them. Make the `set…` calls the first library calls at startup, before `configureSync` and before mounting `SyncProvider` or any hook. In a worker or BGTask with no JS, requests go out with the persisted `defaultHeaders` and the `RetryPolicy` decides, so a credential needed there must be in `defaultHeaders`.
+- After a reload or a teardown, the old runtime's installs stay in place and fail until the new runtime first uses the library. On Android a reload makes each such call wait `callbackTimeoutMs` (default 3000 ms) first.
+- A failing header resolver or `beforeDispatch` fails closed: nothing is sent, no attempt is spent, `ITEM_RETRYING` carries `INTERCEPTOR_FAILED`, and the item is due again after at least 60 s. A `beforeDispatch` result without an `action` key proceeds. A failing retry decider leaves the decision to the policy.
+- Never await `flush()` inside a callback: on Android the cycle stalls until `callbackTimeoutMs`. `afterDispatch` is fire-and-forget, so `flush()` may resolve before it runs. On Android up to `batchSize` callbacks run at once, so a header resolver must share one token refresh.
 - A cycle the quality gate or the health check skips runs nothing: `SYNC_FAILED` with `NETWORK_QUALITY_TOO_LOW` or `HEALTH_CHECK_FAILED`, no `SYNC_STARTED`, no item change, no history row, and a 0/0 result.
 - Without `healthCheckUrl`, `networkQuality` never reaches `EXCELLENT`, so `minNetworkQuality: 'EXCELLENT'` blocks every flush. Compare levels by their index in `Object.values(NetworkQuality)`, never as strings.
 - `CONNECTION_CHANGED` carries only `connectionStatus`, also when only `networkQuality` changed, and is never emitted for the starting state. Read `getConnectionStatus()` at start and on each event, or use `useConnection()`.
@@ -66,8 +70,8 @@ A cross-platform React Native library for offline-first HTTP sync built on Nitro
 - `isSyncing()` — `true` only while a cycle runs, once a flush has passed its pause, credentials, quality-gate and health-check checks.
 
 ### Configuration Functions
-- `configureSync(options)` — Replace and persist the active `SyncOptions`. Validates `minNetworkQuality`, `healthCheckUrl`, `healthCheckTtlMs` and `healthCheckBackoffMs` in JS.
-- `getSyncConfig()` — Read the active `SyncOptions`. Those four options appear only when they were set. Numbers come back as configured, NaN and `±Infinity` included.
+- `configureSync(options)` — Replace and persist the active `SyncOptions`. Validates `minNetworkQuality`, `healthCheckUrl`, `healthCheckTtlMs`, `healthCheckBackoffMs` and `callbackTimeoutMs` in JS.
+- `getSyncConfig()` — Read the active `SyncOptions`. Those five options appear only when they were set. Numbers come back as configured, NaN and `±Infinity` included.
 
 ### History Functions
 - `getLastSyncResult()` — Most recent persisted `SyncResult`, or `undefined`.
@@ -81,6 +85,19 @@ A cross-platform React Native library for offline-first HTTP sync built on Nitro
 - `enableBackgroundSync(options)` — Schedule OS background work: WorkManager on Android, BGTaskScheduler on iOS.
 - `disableBackgroundSync()` — Cancel it, including the Android retry kick.
 - `isBackgroundSyncEnabled()` — Reports intent, not OS state.
+
+### Retry Decider Functions
+- `setRetryDecider(decider)` — Install a JS function consulted after an attempt fails with an error the `RetryPolicy` would retry, while attempts are left. It answers `RETRY` (optionally with its own `delayMs`), `DROP` or `DEAD_LETTER`. A throw, an invalid answer or no answer within `callbackTimeoutMs` leaves the decision to the policy. Once consulted, the delay counts from the decision.
+- `clearRetryDecider()` — Uninstall this runtime's decider. A no-op on web.
+- `isRetryDeciderInstalled()` — Whether this runtime's decider is installed. Never reports another runtime's install. Do not use it to skip the install.
+
+### Dispatch Interceptor Functions
+- `setHeaderResolver(resolver)` — Supply headers right before each request, merged as `defaultHeaders` < resolver < item `headers`, names case-insensitive. A failure fails closed. Its headers do not change how a 401 or 403 is handled.
+- `clearHeaderResolver()` — Uninstall it. A no-op on web.
+- `setBeforeDispatch(hook)` — See each request's merged headers (no body) after the resolver, and answer `{ action: 'PROCEED' }` or `{ action: 'SKIP' }`. `SKIP` defers the item like a failure.
+- `clearBeforeDispatch()` — Uninstall it. A no-op on web.
+- `setAfterDispatch(hook)` — Observe each request that went out, after its outcome and event: `outcome`, `statusCode?`, `errorCode?`, `durationMs`. Never awaited, never given headers or a body.
+- `clearAfterDispatch()` — Uninstall it. A no-op on web.
 
 ### Event Listeners
 - `addSyncEventListener(callback)` — Subscribe to the `sync-event` channel. Returns a subscription id.
@@ -115,13 +132,16 @@ A cross-platform React Native library for offline-first HTTP sync built on Nitro
 - `SyncEventType` (16) — ITEM_ENQUEUED, ITEM_REMOVED, SYNC_STARTED, SYNC_PROGRESS, SYNC_SUCCEEDED, SYNC_FAILED, ITEM_SUCCEEDED, ITEM_FAILED, ITEM_RETRYING, QUEUE_CLEARED, CONNECTION_CHANGED, PAUSED, RESUMED, BACKGROUND_SYNC_STARTED, BACKGROUND_SYNC_COMPLETED, ITEM_DEAD_LETTERED
 - `ConnectionStatus` — CONNECTED, DISCONNECTED, METERED, UNKNOWN
 - `ConnectionType` — WIFI, CELLULAR, ETHERNET, BLUETOOTH (Android only), VPN (Android only), OTHER, NONE, UNKNOWN
-- `SyncErrorCode` (15) — NETWORK_ERROR, SERVER_ERROR, INVALID_PAYLOAD, QUEUE_FULL, NATIVE_MODULE_UNAVAILABLE, BACKGROUND_TASK_REGISTRATION_FAILED, INVALID_URL, UNAUTHORIZED, TIMEOUT, MAX_ATTEMPTS_EXCEEDED, DUPLICATE_ITEM, DRAIN_ALREADY_ACTIVE, NETWORK_QUALITY_TOO_LOW, HEALTH_CHECK_FAILED, DEAD_LETTERED
+- `SyncErrorCode` (17) — NETWORK_ERROR, SERVER_ERROR, INVALID_PAYLOAD, QUEUE_FULL, NATIVE_MODULE_UNAVAILABLE, BACKGROUND_TASK_REGISTRATION_FAILED, INVALID_URL, UNAUTHORIZED, TIMEOUT, MAX_ATTEMPTS_EXCEEDED, DUPLICATE_ITEM, DRAIN_ALREADY_ACTIVE, NETWORK_QUALITY_TOO_LOW, HEALTH_CHECK_FAILED, DEAD_LETTERED, RETRY_DECIDER_REJECTED, INTERCEPTOR_FAILED
+- `RetryAction` — RETRY, DROP, DEAD_LETTER
+- `BeforeDispatchAction` — PROCEED, SKIP
+- `DispatchOutcome` — SUCCEEDED, RETRYING, FAILED
 
 ### Key Types
 - `SyncItemInput` — What you enqueue: `{ method, url, headers?, body?, contentType?, priority?, metadata? }`
 - `SyncItem` — `SyncItemInput` + `{ id, createdAt, attempts, nextRetryAt }`
 - `SyncDeadLetterItem` — A permanently failed request: the `SyncItem` fields except `nextRetryAt`, plus `{ lastAttemptAt, lastErrorCode, lastErrorMessage?, deadLetteredAt }`
-- `SyncOptions` — `{ strategy, retryPolicy, batchSize?, requestTimeoutMs?, maxQueueSize?, persistQueue?, defaultHeaders?, minNetworkQuality?, healthCheckUrl?, healthCheckTtlMs?, healthCheckBackoffMs? }`
+- `SyncOptions` — `{ strategy, retryPolicy, batchSize?, requestTimeoutMs?, maxQueueSize?, persistQueue?, defaultHeaders?, minNetworkQuality?, healthCheckUrl?, healthCheckTtlMs?, healthCheckBackoffMs?, callbackTimeoutMs? }`
 - `RetryPolicy` — `{ maxAttempts, backoff, baseDelayMs, maxDelayMs, jitter, retryOnStatusCodes }`
 - `SyncResult` — `{ startedAt, finishedAt, successCount, failureCount, succeededIds, failedIds, errors }`. The ids and `errors` are always empty on iOS
 - `DrainOptions` — `{ maxIterations?, timeoutMs?, delayBetweenCyclesMs? }`
@@ -131,6 +151,13 @@ A cross-platform React Native library for offline-first HTTP sync built on Nitro
 - `SyncEvent` — Flat object: `{ type, timestamp, itemId?, progress?, errorCode?, statusCode?, attempt?, connectionStatus?, metadata? }`
 - `SyncError` — `Error` subclass with `.code`, `.cause?` and `.validationErrors?`
 - `ValidationIssue` — `{ field, reason, value?, itemIndex? }`
+- `RetryDeciderContext` — `{ itemId, attempt, errorCode, statusCode?, url, method, metadata? }`; `attempt` is the attempt that failed
+- `RetryDecision` — `{ action: RetryAction, delayMs? }`
+- `HeaderResolverContext` — `{ itemId, attempt, url, method, metadata? }`; `attempt` is the attempt about to be made
+- `BeforeDispatchContext` — `{ itemId, attempt, url, method, headers, contentType?, metadata? }`; no body
+- `BeforeDispatchResult` — `{ action: BeforeDispatchAction }`
+- `AfterDispatchContext` — `{ itemId, attempt, outcome, statusCode?, errorCode?, url, method, metadata?, durationMs }`
+- `RetryDecider`, `HeaderResolver`, `BeforeDispatchHook`, `AfterDispatchHook` — The functions the `set…` calls accept; each may be sync or async
 
 ## Documentation Pages
 
@@ -145,6 +172,7 @@ A cross-platform React Native library for offline-first HTTP sync built on Nitro
 - Offline Queue Guide: /docs/guides/offline-queue
 - Background Sync Guide: /docs/guides/background-sync
 - Retry Policy Guide: /docs/guides/retry-policy
+- Dispatch Interceptors Guide: /docs/guides/dispatch-interceptors
 - Connectivity Detection Guide: /docs/guides/connectivity-detection
 - Network Quality: /docs/guides/connectivity-detection#network-quality
 - The Quality Gate: /docs/guides/connectivity-detection#the-quality-gate
@@ -156,6 +184,8 @@ A cross-platform React Native library for offline-first HTTP sync built on Nitro
 - Battery Optimization Guide: /docs/guides/battery-optimization
 - Functions: /docs/api-reference/functions
 - Dead-Letter Functions: /docs/api-reference/functions#dead-letters
+- Retry Decider Functions: /docs/api-reference/functions#retry-decider
+- Dispatch Interceptor Functions: /docs/api-reference/functions#dispatch-interceptors
 - Event Listeners: /docs/api-reference/listeners
 - useConnection: /docs/api-reference/hooks/useConnection
 - useSyncQueue: /docs/api-reference/hooks/useSyncQueue
@@ -181,6 +211,7 @@ A cross-platform React Native library for offline-first HTTP sync built on Nitro
 - Android Native Architecture: /docs/architecture/android-native
 - iOS Native Architecture: /docs/architecture/ios-native
 - Migration Guides: /docs/migration
+- Migration from v0.3.x to v0.4.0: /docs/migration/v0-4-0
 - Migration from v0.2.x to v0.3.0: /docs/migration/v0-3-0
 - Migration from v0.1.x to v0.2.0: /docs/migration/v0-2-0
 - Contributing: /docs/development/contributing

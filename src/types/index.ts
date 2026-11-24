@@ -11,14 +11,31 @@
 /* ------------------------------- enums ----------------------------------- */
 export {
   BackoffStrategy,
+  BeforeDispatchAction,
   ConnectionStatus,
   ConnectionType,
+  DispatchOutcome,
   HttpMethod,
   NetworkQuality,
+  RetryAction,
   SyncEventType,
   SyncPriority,
   SyncStrategy,
 } from './enums';
+
+/* ---------------------------- callback types ----------------------------- */
+export type {
+  AfterDispatchContext,
+  AfterDispatchHook,
+  BeforeDispatchContext,
+  BeforeDispatchHook,
+  BeforeDispatchResult,
+  HeaderResolver,
+  HeaderResolverContext,
+  RetryDecider,
+  RetryDeciderContext,
+  RetryDecision,
+} from './callbacks';
 
 /* --------------------------- connection types ---------------------------- */
 export type { ConnectionState } from './connection';

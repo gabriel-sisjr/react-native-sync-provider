@@ -38,6 +38,12 @@ internal sealed interface AbortedClaim {
   data class Delivered(override val id: String) : AbortedClaim
 
   /**
+   * The retry decider dropped it after a failed attempt: the row is removed, with no dead letter,
+   * and reported as failed.
+   */
+  data class Dropped(override val id: String) : AbortedClaim
+
+  /**
    * Back to `PENDING` with these values: a retry, which counts its attempt, or a credential hold,
    * which does not. The row waits for [nextRetryAt].
    */
@@ -140,7 +146,9 @@ internal class SyncQueueStorage(
       if (claims.isEmpty()) return@withContext emptyList()
       val applied = deadLetterDao.settleAbortedClaims(
         unsent = claims.filterIsInstance<AbortedClaim.Unsent>().map { it.id },
-        delivered = claims.filterIsInstance<AbortedClaim.Delivered>().map { it.id },
+        removed = claims
+          .filter { it is AbortedClaim.Delivered || it is AbortedClaim.Dropped }
+          .map { it.id },
         retries = claims.filterIsInstance<AbortedClaim.Retry>().map {
           ScheduledRetry(
             id = it.id,
@@ -217,6 +225,16 @@ internal class SyncQueueStorage(
   }
 
   /**
+   * The retry decider dropped item [id]: its queue row is deleted, whatever its status. A dead
+   * letter with that id is never touched.
+   *
+   * @return false when the queue had no such row, a purge having removed it.
+   */
+  suspend fun markDropped(id: String): Boolean = withContext(Dispatchers.IO) {
+    itemDao.deleteById(id) > 0
+  }
+
+  /**
    * Re-queue a retriable item as `PENDING` and persist its cooldown deadline.
    * The row is excluded from [claimPending] until `nextRetryAt <= now`.
    */
@@ -235,6 +253,22 @@ internal class SyncQueueStorage(
       lastErrorCode = lastErrorCode.name,
       nextRetryAt = nextRetryAt,
     )
+  }
+
+  /**
+   * A JS interceptor kept claimed item [id]'s request from going out: the row goes back to
+   * `PENDING` until [nextRetryAt], with [lastErrorCode]. Its `attempts` and `lastAttemptAt` are
+   * left as they were, since no attempt was made.
+   *
+   * @return false, with nothing written, when the queue holds no such row in flight: a purge
+   *   removed it, or it is no longer claimed.
+   */
+  suspend fun markDeferred(
+    id: String,
+    lastErrorCode: SyncErrorCode,
+    nextRetryAt: Long,
+  ): Boolean = withContext(Dispatchers.IO) {
+    itemDao.deferById(id, lastErrorCode.name, nextRetryAt) > 0
   }
 
   /**

@@ -73,6 +73,8 @@ Read this value with the [`useSyncContext`](./hooks/useSyncContext.md) hook (sug
 | `options` or `backgroundSync` prop change | Runs the unmount step, then the mount step again. So a change to either one disables background sync, if the Provider owned it, and enables it again.                                                                                       |
 | Unmount                                  | If the provider claimed background-sync ownership, calls `disableBackgroundSync()`. Does **not** revert `configureSync` -- the engine keeps running with the last applied config.                                                            |
 
+> **Note — Install callbacks before mounting:** The Provider's `configureSync` arms the retry wake, so an item that is due can go out on mount. Call [`setRetryDecider`](./functions.md#setretrydecider), [`setHeaderResolver`](./functions.md#setheaderresolver), [`setBeforeDispatch`](./functions.md#setbeforedispatch) and [`setAfterDispatch`](./functions.md#setafterdispatch) before the Provider mounts, as the first library calls at startup. See [Install Order and Lifetime](./functions.md#install-order-and-lifetime).
+
 ---
 
 ## Usage
@@ -126,7 +128,7 @@ function ConfiguredApp({ env }: { env: 'dev' | 'prod' }) {
 }
 ```
 
-The provider re-applies `configureSync` whenever `options` changes identity, so memoize the value if it is constructed inline. If the options carry a token, rebuild them when the token changes, and keep `defaultHeaders` in them.
+The provider re-applies `configureSync` whenever `options` changes identity, so memoize the value if it is constructed inline. If the options carry a token, rebuild them when the token changes, and keep `defaultHeaders` in them. A token that changes often can come from a [header resolver](./functions.md#setheaderresolver) instead, without rebuilding the options, but only while JS runs: a credential a background worker needs stays in `defaultHeaders`.
 
 ---
 
